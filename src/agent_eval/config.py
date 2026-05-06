@@ -1,0 +1,69 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_ENV_FILE = ".env"
+
+
+class DatabaseSettings(BaseSettings):
+    host: str = "localhost"
+    port: int = 5432
+    user: str = "postgres"
+    password: str = "postgres"
+    name: str = "agent_eval"
+
+    model_config = SettingsConfigDict(env_prefix="DB_", env_file=_ENV_FILE, extra="ignore")
+
+    @property
+    def async_url(self) -> str:
+        return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+
+
+class LLMSettings(BaseSettings):
+    provider: str = "openai"
+    base_url: str = ""
+    model: str = "gpt-4o"
+    judge_model: str = "gpt-4o"
+    temperature: float = 0.0
+    max_tokens: int = 4096
+    api_key: str = ""
+
+    model_config = SettingsConfigDict(env_prefix="LLM_", env_file=_ENV_FILE, extra="ignore")
+
+
+class EvalSettings(BaseSettings):
+    batch_concurrency: int = 5
+    failure_threshold: float = 0.7
+    regression_threshold: float = 0.05
+
+    model_config = SettingsConfigDict(env_prefix="EVAL_", env_file=_ENV_FILE, extra="ignore")
+
+
+class LoopSettings(BaseSettings):
+    target_score: float = 0.85
+    max_iterations: int = 10
+    min_improvement: float = 0.01
+    stagnation_patience: int = 3
+    regression_tolerance: float = 0.05
+    enable_ab_test: bool = True
+    ab_test_ratio: float = 0.3
+
+    model_config = SettingsConfigDict(env_prefix="LOOP_", env_file=_ENV_FILE, extra="ignore")
+
+
+class LangSmithSettings(BaseSettings):
+    api_key: str = ""
+    api_url: str = "https://api.smith.langchain.com"
+    project_name: str = ""
+    default_dataset: str = ""
+
+    model_config = SettingsConfigDict(env_prefix="LANGSMITH_", env_file=_ENV_FILE, extra="ignore")
+
+
+class Settings(BaseSettings):
+    db: DatabaseSettings = DatabaseSettings()
+    llm: LLMSettings = LLMSettings()
+    eval: EvalSettings = EvalSettings()
+    loop: LoopSettings = LoopSettings()
+    langsmith: LangSmithSettings = LangSmithSettings()
+
+
+settings = Settings()
