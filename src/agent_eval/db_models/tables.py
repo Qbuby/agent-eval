@@ -151,6 +151,118 @@ class OptimizationRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class UserRow(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    email: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class RefreshTokenRow(Base):
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    token: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class SystemConfigRow(Base):
+    __tablename__ = "system_configs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    key: Mapped[str] = mapped_column(String(256), unique=True, nullable=False, index=True)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, default="general")
+    description: Mapped[str | None] = mapped_column(Text)
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class RoutingRuleRow(Base):
+    __tablename__ = "routing_rules"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    source_project: Mapped[str] = mapped_column(String(256), nullable=False)
+    conditions: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    target_dataset: Mapped[str] = mapped_column(String(256), nullable=False)
+    transform_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class RoutingLogRow(Base):
+    __tablename__ = "routing_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    rule_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("routing_rules.id"), index=True
+    )
+    run_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    source_project: Mapped[str] = mapped_column(String(256), nullable=False)
+    target_dataset: Mapped[str | None] = mapped_column(String(256))
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class AuditLogRow(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    entity_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), index=True
+    )
+    details: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+
+
+class ExampleFingerprintRow(Base):
+    __tablename__ = "example_fingerprints"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    dataset_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    example_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class TraceWatchCursorRow(Base):
+    __tablename__ = "trace_watch_cursors"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    project_name: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
+    last_seen_run_id: Mapped[str | None] = mapped_column(String(256))
+    last_seen_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    runs_fetched_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class LoopControlLogRow(Base):
     __tablename__ = "loop_control_log"
 
