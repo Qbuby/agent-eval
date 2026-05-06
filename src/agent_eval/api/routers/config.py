@@ -62,10 +62,18 @@ async def get_config(
     if ConfigService.is_sensitive(key):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sensitive config not accessible via API")
 
-    rows = await config_service.list()
-    for r in rows:
-        if r.key == key:
-            return _to_response(r)
+    from agent_eval.db import async_session_factory
+    from sqlalchemy import select
+    from agent_eval.db_models.tables import SystemConfigRow
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(SystemConfigRow).where(SystemConfigRow.key == key)
+        )
+        row = result.scalar_one_or_none()
+
+    if row is not None:
+        return _to_response(row)
 
     value = await config_service.get(key)
     if value is None:
@@ -90,23 +98,7 @@ async def update_config(
     if ConfigService.is_sensitive(key):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Sensitive config cannot be modified via API")
 
-    row = await config_service.set(key, body.value, user_id=admin.id)
-    if body.description is not None:
-        from agent_eval.db import async_session_factory
-        from sqlalchemy import select
-        from agent_eval.db_models.tables import SystemConfigRow
-
-        async with async_session_factory() as session:
-            result = await session.execute(
-                select(SystemConfigRow).where(SystemConfigRow.key == key)
-            )
-            db_row = result.scalar_one_or_none()
-            if db_row:
-                db_row.description = body.description
-                await session.commit()
-                await session.refresh(db_row)
-                row = db_row
-
+    row = await config_service.set(key, body.value, user_id=admin.id, description=body.description)
     return _to_response(row)
 
 
