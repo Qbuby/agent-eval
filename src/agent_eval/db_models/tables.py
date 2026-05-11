@@ -11,6 +11,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -161,7 +162,9 @@ class UserRow(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
 
 class RefreshTokenRow(Base):
@@ -224,6 +227,22 @@ class RoutingLogRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class DatasetMetadataRow(Base):
+    __tablename__ = "dataset_metadata"
+    __table_args__ = (
+        UniqueConstraint("dataset_name", name="uq_dataset_metadata_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    dataset_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    source_project: Mapped[str | None] = mapped_column(String(256))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    max_examples: Mapped[int | None] = mapped_column(Integer)
+    retention_policy: Mapped[str | None] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class AuditLogRow(Base):
     __tablename__ = "audit_logs"
 
@@ -240,6 +259,9 @@ class AuditLogRow(Base):
 
 class ExampleFingerprintRow(Base):
     __tablename__ = "example_fingerprints"
+    __table_args__ = (
+        UniqueConstraint("dataset_name", "fingerprint", name="uq_dataset_fingerprint"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
     dataset_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
@@ -254,6 +276,7 @@ class TraceWatchCursorRow(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
     project_name: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
     last_seen_run_id: Mapped[str | None] = mapped_column(String(256))
+    last_seen_run_ids: Mapped[list | None] = mapped_column(JSONB)
     last_seen_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     runs_fetched_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -282,4 +305,120 @@ class LoopControlLogRow(Base):
     converged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     safety_stopped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark & Candidate tables
+# ---------------------------------------------------------------------------
+
+
+class ProjectRow(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CategoryRow(Base):
+    __tablename__ = "categories"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    schema_config: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_category_project_name"),
+    )
+
+
+class BenchmarkVersionRow(Base):
+    __tablename__ = "benchmark_versions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version_tag: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    case_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "version_tag", name="uq_benchmark_version_project_tag"),
+    )
+
+
+class BenchmarkCaseRow(Base):
+    __tablename__ = "benchmark_cases"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    category_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("categories.id", ondelete="SET NULL"), index=True
+    )
+    version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("benchmark_versions.id", ondelete="SET NULL"), index=True
+    )
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    reference_answer: Mapped[str | None] = mapped_column(Text)
+    key_points: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    negative_points: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    tags: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
+    difficulty: Mapped[str | None] = mapped_column(String(16))
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    source_case_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    extra_fields: Mapped[dict | None] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class CandidateCaseRow(Base):
+    __tablename__ = "candidate_cases"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"), index=True
+    )
+    dataset_name: Mapped[str | None] = mapped_column(String(256), index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str | None] = mapped_column(Text)
+    key_points: Mapped[list | None] = mapped_column(JSONB)
+    negative_points: Mapped[list | None] = mapped_column(JSONB)
+    tags: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
+    extra_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    langsmith_example_id: Mapped[str | None] = mapped_column(String(256))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ImportBatchRow(Base):
+    __tablename__ = "import_batches"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    file_name: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    imported_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pending_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="completed")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

@@ -13,7 +13,7 @@ from agent_eval.config import settings
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import SystemConfigRow
 
-SENSITIVE_PREFIXES = ("auth.", "llm.api_key", "db.")
+SENSITIVE_PREFIXES = ("auth.", "db.")
 
 DEFAULT_CONFIGS: list[dict[str, Any]] = [
     {
@@ -23,34 +23,58 @@ DEFAULT_CONFIGS: list[dict[str, Any]] = [
         "description": "LangSmith API 地址",
     },
     {
-        "key": "langsmith.project_name",
-        "value": {"v": settings.langsmith.project_name},
-        "category": "langsmith",
-        "description": "默认项目名",
-    },
-    {
-        "key": "langsmith.default_dataset",
-        "value": {"v": settings.langsmith.default_dataset},
-        "category": "langsmith",
-        "description": "默认数据集",
-    },
-    {
-        "key": "scheduler.poll_interval_seconds",
-        "value": {"v": 60},
-        "category": "scheduler",
-        "description": "轮询间隔（秒）",
-    },
-    {
-        "key": "scheduler.enabled",
-        "value": {"v": True},
-        "category": "scheduler",
-        "description": "调度器开关",
-    },
-    {
-        "key": "routing.default_dataset",
+        "key": "langsmith.api_key",
         "value": {"v": ""},
-        "category": "routing",
-        "description": "默认路由目标数据集",
+        "category": "langsmith",
+        "description": "LangSmith API Key",
+    },
+    {
+        "key": "llm.base_url",
+        "value": {"v": ""},
+        "category": "llm",
+        "description": "LLM 服务地址",
+    },
+    {
+        "key": "llm.api_key",
+        "value": {"v": ""},
+        "category": "llm",
+        "description": "LLM API Key",
+    },
+    {
+        "key": "target_agent.endpoint_url",
+        "value": {"v": ""},
+        "category": "target_agent",
+        "description": "测试目标模型 POST 接口地址",
+    },
+    {
+        "key": "target_agent.api_key",
+        "value": {"v": ""},
+        "category": "target_agent",
+        "description": "测试目标模型 API Key（如需鉴权）",
+    },
+    {
+        "key": "target_agent.timeout",
+        "value": {"v": "30"},
+        "category": "target_agent",
+        "description": "请求超时时间（秒）",
+    },
+    {
+        "key": "target_agent.request_template",
+        "value": {"v": "{\"query\": \"{{question}}\"}"},
+        "category": "target_agent",
+        "description": "请求体模板（JSON），用 {{question}} 作为问题占位符",
+    },
+    {
+        "key": "target_agent.response_path",
+        "value": {"v": "data.answer"},
+        "category": "target_agent",
+        "description": "从响应 JSON 中提取答案的路径（点分隔）",
+    },
+    {
+        "key": "target_agent.headers",
+        "value": {"v": "{\"Content-Type\": \"application/json\"}"},
+        "category": "target_agent",
+        "description": "自定义请求头（JSON 格式）",
     },
 ]
 
@@ -82,11 +106,9 @@ class ConfigService:
         if len(parts) != 2:
             return None
         section, field = parts
-        section_map = {
+        section_map: dict[str, Any] = {
             "langsmith": settings.langsmith,
-            "scheduler": None,
-            "routing": None,
-            "general": None,
+            "llm": settings.llm if hasattr(settings, "llm") else None,
         }
         obj = section_map.get(section)
         if obj is None:
@@ -231,7 +253,7 @@ class ConfigService:
     @staticmethod
     def _infer_category(key: str) -> str:
         prefix = key.split(".")[0]
-        if prefix in ("langsmith", "scheduler", "routing"):
+        if prefix in ("langsmith", "llm", "target_agent"):
             return prefix
         return "general"
 

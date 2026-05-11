@@ -13,7 +13,9 @@ from rich.table import Table
 
 app = typer.Typer(name="agent-eval", help="Agent automated testing and optimization loop system")
 dataset_app = typer.Typer(name="dataset", help="Dataset management (LangSmith-backed)")
+bench_app = typer.Typer(name="bench", help="Run standard benchmarks (BFCL-v4, etc.)")
 app.add_typer(dataset_app)
+app.add_typer(bench_app)
 console = Console()
 
 
@@ -852,15 +854,66 @@ def run(
 @app.command()
 def evaluate(
     dataset: str = typer.Argument(..., help="Dataset name"),
-    agent_module: str = typer.Option(..., help="Python module path for agent factory"),
-    concurrency: int = typer.Option(5, help="Evaluation concurrency"),
+    agent_module: str | None = typer.Option(None, "--agent-module", help="Python module path for agent factory"),
+    api_url: str | None = typer.Option(None, "--api-url", help="Agent API endpoint URL"),
+    api_type: str = typer.Option("openai", "--api-type", help="API type: openai | sse"),
+    api_key: str | None = typer.Option(None, "--api-key", help="API key for the agent endpoint"),
+    api_model: str = typer.Option("default", "--api-model", help="Model name for OpenAI-compatible API"),
+    api_headers: str | None = typer.Option(None, "--api-headers", help="Extra headers as JSON string"),
+    api_payload_template: str | None = typer.Option(None, "--api-payload-template", help="Payload template as JSON (for SSE)"),
+    judge_model: str | None = typer.Option(None, "--judge-model", help="Judge LLM model name"),
+    config_file: str | None = typer.Option(None, "--config", "-c", help="YAML config file path"),
+    concurrency: int = typer.Option(3, help="Evaluation concurrency"),
     split: str | None = typer.Option(None, help="Filter cases by split"),
     tag: list[str] | None = typer.Option(None, help="Filter cases by tag"),
+    output: str = typer.Option("./eval_results", "--output", "-o", help="Output directory"),
+    limit: int | None = typer.Option(None, "--limit", "-n", help="Max cases to evaluate"),
 ):
-    """Run evaluation only (no optimization loop)."""
+    """Run evaluation against an agent (HTTP API or Python module)."""
     from agent_eval.config import settings
 
     async def _run():
+        if config_file:
+            from agent_eval.evaluation.bench_config import BenchConfig
+            cfg = BenchConfig.from_yaml(config_file)
+            await _run_bench_eval(cfg)
+            return
+
+        if api_url:
+            from agent_eval.evaluation.bench_config import (
+                AgentConfig, BenchConfig, JudgeConfig,
+            )
+            headers = json.loads(api_headers) if api_headers else {}
+            payload_tpl = json.loads(api_payload_template) if api_payload_template else {}
+
+            cfg = BenchConfig(
+                agent=AgentConfig(
+                    type=api_type,
+                    url=api_url,
+                    api_key=api_key or "",
+                    model=api_model,
+                    headers=headers,
+                    payload_template=payload_tpl,
+                ),
+                judge=JudgeConfig(
+                    model=judge_model or settings.llm.judge_model,
+                    base_url=settings.llm.base_url,
+                    api_key=settings.llm.api_key,
+                ),
+                dataset=dataset,
+                split=split,
+                tags=tag,
+                concurrency=concurrency,
+                output_dir=output,
+                limit=limit,
+            )
+            await _run_bench_eval(cfg)
+            return
+
+        if not agent_module:
+            console.print("[red]Must provide --api-url or --agent-module[/red]")
+            raise typer.Exit(1)
+
         factory = _import_factory(agent_module)
         evaluator, *_ = _build_components(settings, concurrency)
 
@@ -957,6 +1010,143 @@ def _print_final_result(result: Any) -> None:
     console.print(f"Strategies applied: {len(result.optimization_history)}")
 
 
+async def _run_bench_eval(cfg) -> None:
+    """Execute a benchmark evaluation using HTTP adapter + LLM Judge."""
+    import asyncio as _asyncio
+
+    from agent_eval.evaluation.agent_adapter import OpenAICompatibleAdapter, SSEStreamAdapter
+    from agent_eval.evaluation.bench_config import BenchConfig
+    from agent_eval.evaluation.report import BenchReport, CaseResult
+    from agent_eval.evaluation.scorers.llm_judge import JudgeDimension, LLMJudgeScorer
+
+    mgr = _get_manager()
+    test_cases = await mgr.load_cases(
+        cfg.dataset,
+        splits=[cfg.split] if cfg.split else None,
+        tags=cfg.tags,
+    )
+
+    if not test_cases:
+        console.print(f"[red]No test cases found in '{cfg.dataset}'[/red]")
+        raise typer.Exit(1)
+
+    if cfg.limit:
+        test_cases = test_cases[:cfg.limit]
+
+    console.print(f"Loaded {len(test_cases)} test cases from '{cfg.dataset}'")
+
+    # Build agent adapter
+    if cfg.agent.type == "sse":
+        adapter = SSEStreamAdapter(
+            url=cfg.agent.url,
+            headers=cfg.agent.headers or None,
+            payload_template=cfg.agent.payload_template or None,
+            timeout=cfg.agent.timeout,
+        )
+    else:
+        adapter = OpenAICompatibleAdapter(
+            base_url=cfg.agent.url,
+            api_key=cfg.agent.api_key,
+            model=cfg.agent.model,
+            timeout=cfg.agent.timeout,
+            extra_headers=cfg.agent.headers or None,
+        )
+
+    # Build judge
+    from langchain_openai import ChatOpenAI
+    from agent_eval.config import settings
+
+    judge_model = cfg.judge.model or settings.llm.judge_model
+    judge_base_url = cfg.judge.base_url or settings.llm.base_url
+    judge_api_key = cfg.judge.api_key or settings.llm.api_key
+
+    judge_kwargs: dict[str, Any] = {"model": judge_model, "temperature": cfg.judge.temperature}
+    if judge_api_key:
+        judge_kwargs["api_key"] = judge_api_key
+    if judge_base_url:
+        judge_kwargs["base_url"] = judge_base_url
+
+    judge_llm = ChatOpenAI(**judge_kwargs)
+
+    dimensions = [
+        JudgeDimension(name=d.name, weight=d.weight, description=d.description)
+        for d in cfg.judge.dimensions
+    ]
+    scorer = LLMJudgeScorer(llm=judge_llm, dimensions=dimensions)
+
+    # Run evaluation
+    report = BenchReport(model_name=cfg.agent.model or cfg.agent.url, dataset=cfg.dataset)
+    sem = _asyncio.Semaphore(cfg.concurrency)
+    total = len(test_cases)
+
+    async def _eval_one(idx: int, case) -> CaseResult:
+        question = ""
+        if case.input_messages:
+            for msg in reversed(case.input_messages):
+                if msg.get("role") == "user":
+                    question = msg.get("content", "")
+                    break
+
+        async with sem:
+            try:
+                resp = await adapter.invoke(case.input_messages)
+                answer = resp.content
+                latency = resp.latency_ms
+            except Exception as e:
+                return CaseResult(
+                    case_id=case.id, question=question,
+                    answer="", latency_ms=0, error=str(e),
+                )
+
+        console.print(
+            f"  [{idx+1}/{total}] {question[:40]}{'...' if len(question)>40 else ''} "
+            f"→ {answer[:60]}{'...' if len(answer)>60 else ''} "
+            f"({latency:.0f}ms)"
+        )
+
+        try:
+            judge_result = await scorer.score(question, answer)
+        except Exception as e:
+            return CaseResult(
+                case_id=case.id, question=question,
+                answer=answer, latency_ms=latency, error=f"Judge error: {e}",
+            )
+
+        scores = {r.dimension: r.score for r in judge_result.dimensions}
+        reasons = {r.dimension: r.reason for r in judge_result.dimensions}
+
+        return CaseResult(
+            case_id=case.id, question=question, answer=answer,
+            latency_ms=latency, scores=scores,
+            aggregate_score=judge_result.aggregate_score, reasons=reasons,
+        )
+
+    console.print(f"\nStarting evaluation (concurrency={cfg.concurrency})...\n")
+
+    tasks = [_eval_one(i, tc) for i, tc in enumerate(test_cases)]
+    results = await _asyncio.gather(*tasks)
+    report.results = list(results)
+    report.compute_summary()
+
+    # Print summary
+    table = Table(title="Evaluation Results")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+    table.add_row("Total Cases", str(report.total_cases))
+    table.add_row("Average Score", f"{report.avg_score:.2f} / 10")
+    table.add_row("Pass Rate (≥7)", f"{report.pass_rate:.1%}")
+    table.add_row("Avg Latency", f"{report.avg_latency_ms:.0f} ms")
+    for dim, avg in report.dimension_averages.items():
+        table.add_row(f"  {dim}", f"{avg:.2f}")
+    console.print(table)
+
+    # Save report
+    report_path = report.save(cfg.output_dir)
+    console.print(f"\n[green]Report saved to {report_path}[/green]")
+
+    await adapter.close()
+
+
 @app.command()
 def server(
     host: str = typer.Option("0.0.0.0", help="Bind host"),
@@ -971,6 +1161,77 @@ def server(
         port=port,
         reload=reload,
     )
+
+
+# ---------------------------------------------------------------------------
+# bench bfcl
+# ---------------------------------------------------------------------------
+
+@bench_app.command("bfcl")
+def bench_bfcl(
+    api_url: str | None = typer.Option(None, "--api-url", help="Model API endpoint (OpenAI-compatible)"),
+    api_key: str | None = typer.Option(None, "--api-key", help="API key"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Model name"),
+    categories: str = typer.Option(
+        "simple",
+        "--categories", "-c",
+        help="Comma-separated categories or presets: all, simple, non_live, live, multi_turn, agentic, or individual subset names",
+    ),
+    concurrency: int = typer.Option(5, "--concurrency", help="Concurrent requests"),
+    limit: int | None = typer.Option(None, "--limit", "-n", help="Max samples per subset (for debugging)"),
+    fc_model: bool = typer.Option(True, "--fc-model/--no-fc-model", help="Use native function calling"),
+    serpapi_key: str | None = typer.Option(None, "--serpapi-key", help="SerpAPI key for web search tasks"),
+    output: str = typer.Option("./bfcl_results", "--output", "-o", help="Output/cache directory"),
+    temperature: float = typer.Option(0.0, "--temperature", help="Generation temperature"),
+    config_file: str | None = typer.Option(None, "--config", help="YAML config file"),
+):
+    """Run BFCL-v4 (Berkeley Function Calling Leaderboard) benchmark.
+
+    Evaluates function calling capability using the standard BFCL-v4 benchmark
+    via EvalScope. Requires: pip install evalscope bfcl-eval
+    """
+    from agent_eval.evaluation.bfcl_runner import BFCLConfig, CATEGORY_PRESETS, run_bfcl
+
+    if config_file:
+        cfg = BFCLConfig.from_yaml(config_file)
+    else:
+        from agent_eval.config import settings
+
+        cfg = BFCLConfig(
+            model=model or settings.llm.model,
+            api_url=api_url or settings.llm.base_url,
+            api_key=api_key or settings.llm.api_key,
+            categories=[c.strip() for c in categories.split(",")],
+            concurrency=concurrency,
+            fc_model=fc_model,
+            temperature=temperature,
+            serpapi_key=serpapi_key or "",
+            output_dir=output,
+            limit=limit,
+        )
+
+    subsets = cfg.resolve_subsets()
+
+    console.print(f"[bold]BFCL-v4 Benchmark[/bold]")
+    console.print(f"  Model: {cfg.model}")
+    console.print(f"  API: {cfg.api_url}")
+    console.print(f"  Subsets ({len(subsets)}): {', '.join(subsets[:5])}{'...' if len(subsets) > 5 else ''}")
+    console.print(f"  Concurrency: {cfg.concurrency}")
+    if cfg.limit:
+        console.print(f"  Limit: {cfg.limit} samples/subset")
+    console.print()
+
+    try:
+        results = run_bfcl(cfg)
+    except ImportError as e:
+        console.print(f"[red]Missing dependency: {e}[/red]")
+        console.print("[dim]Install with: pip install evalscope bfcl-eval[/dim]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Benchmark failed: {e}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"\n[green]Benchmark complete. Results saved to {cfg.output_dir}[/green]")
 
 
 if __name__ == "__main__":

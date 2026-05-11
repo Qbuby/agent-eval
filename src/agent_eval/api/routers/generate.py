@@ -16,9 +16,12 @@ async def generate_from_scenario(
     gen: CaseGenerator = Depends(get_generator),
     mgr: DatasetManager = Depends(get_manager),
 ):
+    scenario = f"Test scenario: {req.test_scenario}\nCase category: {req.case_category}"
+    tags = [f"scenario:{req.test_scenario}", f"category:{req.case_category}"]
+
     cases = await gen.generate_from_scenario(
-        req.scenario, count=req.count, context=req.context,
-        tags=req.tags or None,
+        scenario, count=req.count, context=req.context,
+        tags=tags,
     )
     if not cases:
         raise HTTPException(status_code=422, detail="LLM returned no valid cases")
@@ -26,7 +29,7 @@ async def generate_from_scenario(
     result = [c.model_dump(mode="json", exclude_none=True) for c in cases]
 
     if not req.dry_run:
-        await mgr.add_cases_batch(req.dataset, cases, split=req.split)
+        await mgr.add_cases_batch(req.dataset, cases)
 
     return {"generated": len(cases), "saved": not req.dry_run, "cases": result}
 

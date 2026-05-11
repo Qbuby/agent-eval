@@ -58,12 +58,45 @@ class LangSmithSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LANGSMITH_", env_file=_ENV_FILE, extra="ignore")
 
 
+class AuthSettings(BaseSettings):
+    secret_key: str
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
+    refresh_token_expire_days: int = 7
+    enabled: bool = True
+
+    model_config = SettingsConfigDict(env_prefix="AUTH_", env_file=_ENV_FILE, extra="ignore")
+
+
+class RoutingSettings(BaseSettings):
+    enabled: bool = True
+    max_retries: int = 3
+    retry_delay_base: float = 2.0
+    default_dataset: str = ""
+
+    model_config = SettingsConfigDict(env_prefix="ROUTING_", env_file=_ENV_FILE, extra="ignore")
+
+
+class GovernanceSettings(BaseSettings):
+    dedup_strategy: str = "skip"
+    require_expected_output: bool = False
+    max_messages_per_example: int = 100
+    max_examples_per_dataset: int = 10000
+    retention_policy: str = "fifo"
+    capacity_warning_threshold: float = 0.9
+
+    model_config = SettingsConfigDict(env_prefix="GOV_", env_file=_ENV_FILE, extra="ignore")
+
+
 class Settings(BaseSettings):
     db: DatabaseSettings = DatabaseSettings()
     llm: LLMSettings = LLMSettings()
     eval: EvalSettings = EvalSettings()
     loop: LoopSettings = LoopSettings()
     langsmith: LangSmithSettings = LangSmithSettings()
+    auth: AuthSettings = AuthSettings()
+    routing: RoutingSettings = RoutingSettings()
+    governance: GovernanceSettings = GovernanceSettings()
 
 
 settings = Settings()
