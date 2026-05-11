@@ -10,6 +10,7 @@ class CreateDatasetRequest(BaseModel):
     name: str
     description: str = ""
     metadata: dict[str, Any] | None = None
+    source_project: str | None = None
 
 
 class DatasetResponse(BaseModel):
@@ -19,6 +20,7 @@ class DatasetResponse(BaseModel):
     example_count: int
     created_at: datetime | None = None
     metadata: dict[str, Any] = {}
+    source_project: str | None = None
 
 
 class VersionResponse(BaseModel):
@@ -41,7 +43,7 @@ class TestCaseInput(BaseModel):
     description: str = ""
     tags: list[str] = []
     source: str = "manual"
-    input_messages: list[dict[str, str]]
+    input_messages: list[dict[str, Any]]
     agent_config_override: dict[str, Any] | None = None
     expected_output: str | None = None
     expected_output_criteria: list[str] = []
@@ -63,12 +65,17 @@ class BatchDeleteRequest(BaseModel):
 
 class GenerateScenarioRequest(BaseModel):
     dataset: str
-    scenario: str
+    test_scenario: str = Field(
+        description="测试场景: faithfulness, context_recall, answer_relevancy, "
+        "context_precision, context_relevancy, hallucination"
+    )
+    case_category: str = Field(
+        default="normal",
+        description="样例类别: normal, bad_case, edge_case"
+    )
     count: int = 5
     context: str = ""
-    tags: list[str] = []
-    split: str | None = None
-    dry_run: bool = False
+    dry_run: bool = True
 
 
 class GenerateMutateRequest(BaseModel):
@@ -88,7 +95,9 @@ class ListRunsRequest(BaseModel):
     end_time: datetime | None = None
     status: str | None = "success"
     tags: list[str] | None = None
-    limit: int = 100
+    limit: int = Field(default=50, le=100)
+    page: int = 1
+    page_size: int = 20
 
 
 class RunSummaryResponse(BaseModel):
@@ -102,6 +111,7 @@ class RunSummaryResponse(BaseModel):
     tags: list[str] = []
     input_preview: str = ""
     output_preview: str = ""
+    model_name: str = ""
 
 
 class ExtractRequest(BaseModel):
@@ -114,6 +124,7 @@ class ExtractRequest(BaseModel):
 class ImportTracesRequest(BaseModel):
     dataset: str
     run_ids: list[str]
+    project_name: str | None = None
     source: str = "trace_derived"
     default_tags: list[str] = []
     include_output_as_expected: bool = False
@@ -125,3 +136,57 @@ class PullDatasetRequest(BaseModel):
     target_dataset: str | None = None
     split: str | None = None
     limit: int | None = None
+
+
+class RunDetailRequest(BaseModel):
+    run_id: str
+    project_name: str | None = None
+
+
+class FillModelsRequest(BaseModel):
+    project_name: str
+    # Each entry is (run_id, start_time). start_time is optional; if absent for
+    # all entries the backend will have to read_run each root (slow fallback).
+    runs: list[dict[str, Any]] = Field(
+        description="Each item: {id: str, start_time: ISO-8601 string | null}"
+    )
+
+
+class FillModelsResponse(BaseModel):
+    models: dict[str, str]
+    missing: list[str] = []
+
+
+class RunChildMeta(BaseModel):
+    id: str
+    name: str
+    run_type: str
+    status: str
+    start_time: datetime | None = None
+    latency_s: float | None = None
+    total_tokens: int | None = None
+    error: str | None = None
+    has_children: bool = False
+
+
+class RunDetailResponse(BaseModel):
+    id: str
+    name: str
+    run_type: str
+    status: str
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    latency_s: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    error: str | None = None
+    inputs: dict[str, Any] | None = None
+    outputs: dict[str, Any] | None = None
+    extra: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
+    tags: list[str] = []
+    parent_run_id: str | None = None
+    trace_id: str | None = None
+    children: list[RunChildMeta] = []
+    children_truncated: bool = False

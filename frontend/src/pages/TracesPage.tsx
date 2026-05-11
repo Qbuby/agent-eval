@@ -1,0 +1,1230 @@
+import { useState, useEffect, useMemo, useCallback, useRef, memo } from 'react'
+import { tracesApi, datasetsApi } from '@/services'
+import type { ListRunsRequest, RunSummary, Dataset, RunDetail, RunChildMeta } from '@/types'
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+
+interface NodeState {
+  data?: RunDetail
+  loading: boolean
+  error?: string
+}
+
+type NodeCache = Record<string, NodeState>
+
+// --- sort/stat helpers kept at module scope so they don't re-allocate per render ---
+
+function tsDesc(a: string | null, b: string | null): number {
+  const ta = a ? new Date(a).getTime() : 0
+  const tb = b ? new Date(b).getTime() : 0
+  return tb - ta
+}
+
+// Hoare's quickselect — O(n) average for an unordered array.
+function quickselect(arr: number[], k: number): number {
+  let lo = 0
+  let hi = arr.length - 1
+  while (lo < hi) {
+    const pivot = arr[(lo + hi) >> 1]
+    let i = lo
+    let j = hi
+    while (i <= j) {
+      while (arr[i] < pivot) i++
+      while (arr[j] > pivot) j--
+      if (i <= j) {
+        const t = arr[i]; arr[i] = arr[j]; arr[j] = t
+        i++; j--
+      }
+    }
+    if (k <= j) hi = j
+    else if (k >= i) lo = i
+    else return arr[k]
+  }
+  return arr[k]
+}
+
+interface LatencyStat {
+  model: string
+  count: number
+  coveredQuestions: number  // distinct input_previews in this model's slice
+  min: number
+  max: number
+  avg: number
+  median: number
+  p95: number
+  variance: number
+}
+
+function computeLatencyStats(
+  values: number[],
+  model: string,
+  coveredQuestions: number,
+): LatencyStat {
+  // Welford pass + min/max in a single scan — no sort yet.
+  let min = Infinity
+  let max = -Infinity
+  let mean = 0
+  let m2 = 0
+  let n = 0
+  for (const v of values) {
+    n += 1
+    const delta = v - mean
+    mean += delta / n
+    m2 += delta * (v - mean)
+    if (v < min) min = v
+    if (v > max) max = v
+  }
+  const variance = n > 0 ? m2 / n : 0
+  // median / p95 need partial order → use quickselect on a single scratch copy.
+  const scratch = values.slice()
+  const medianIdx = Math.floor(scratch.length / 2)
+  const medianRaw = scratch.length ? quickselect(scratch, medianIdx) : 0
+  // For even-length arrays, fall back to a second pick for the lower-mid element.
+  let median = medianRaw
+  if (scratch.length > 0 && scratch.length % 2 === 0) {
+    // scratch is partially reordered around medianIdx; scan left half for its max
+    let lowerMax = -Infinity
+    for (let i = 0; i < medianIdx; i++) if (scratch[i] > lowerMax) lowerMax = scratch[i]
+    median = (lowerMax + medianRaw) / 2
+  }
+  const p95Scratch = values.slice()
+  const p95Idx = Math.min(p95Scratch.length - 1, Math.floor(p95Scratch.length * 0.95))
+  const p95 = p95Scratch.length ? quickselect(p95Scratch, p95Idx) : 0
+  return {
+    model,
+    count: n,
+    coveredQuestions,
+    min: n ? +min.toFixed(2) : 0,
+    max: n ? +max.toFixed(2) : 0,
+    avg: +mean.toFixed(2),
+    median: +median.toFixed(2),
+    p95: +p95.toFixed(2),
+    variance: +variance.toFixed(3),
+  }
+}
+
+export default function TracesPage() {
+  const [projectName, setProjectName] = useState('')
+  const [allRuns, setAllRuns] = useState<RunSummary[]>([])
+  const [page, setPage] = useState(1)
+  const [pageSize] = useState(20)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [datasets, setDatasets] = useState<Dataset[]>([])
+  const [showImportModal, setShowImportModal] = useState(false)
+  const [importTarget, setImportTarget] = useState('')
+  const [newDatasetName, setNewDatasetName] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [detailRunId, setDetailRunId] = useState<string | null>(null)
+  const [nodeCache, setNodeCache] = useState<NodeCache>({})
+  const nodeCacheRef = useRef(nodeCache)
+  nodeCacheRef.current = nodeCache
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [modelFilter, setModelFilter] = useState('')
+  const [sortBy, setSortBy] = useState<'time' | 'latency_asc' | 'latency_desc'>('time')
+  const [showChart, setShowChart] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [hasMore, setHasMore] = useState(false)
+  const [fillingModels, setFillingModels] = useState(false)
+  const [fillModelsMsg, setFillModelsMsg] = useState('')
+  // Chart scope filters (independent of list filters)
+  const [chartRecentN, setChartRecentN] = useState<number>(0) // 0 = all
+  const [chartStatus, setChartStatus] = useState<'all' | 'success' | 'error'>('all')
+  const [chartSelectedModels, setChartSelectedModels] = useState<Set<string>>(new Set())
+  const [chartQuestions, setChartQuestions] = useState<Set<string>>(new Set()) // empty = no question filter
+  const [showQuestionPicker, setShowQuestionPicker] = useState(false)
+  const [questionPickerSearch, setQuestionPickerSearch] = useState('')
+  const [questionPickerCrossOnly, setQuestionPickerCrossOnly] = useState(false)
+
+  useEffect(() => {
+    datasetsApi.list().then(res => setDatasets(res.data)).catch(() => {})
+  }, [])
+
+  const fetchRuns = async (mode: 'fresh' | 'more' = 'fresh') => {
+    if (!projectName.trim()) return
+    setError('')
+    if (mode === 'fresh') setLoading(true)
+    else setLoadingMore(true)
+    try {
+      const req: ListRunsRequest = {
+        project_name: projectName,
+        limit: 100,
+        page: 1,
+        page_size: 100,
+        status: 'success',
+      }
+      if (mode === 'more' && allRuns.length > 0) {
+        // Use the earliest already-loaded start_time as the upper bound
+        const earliest = allRuns
+          .map(r => r.start_time)
+          .filter((x): x is string => !!x)
+          .sort()[0]
+        if (earliest) req.end_time = earliest
+      }
+      const res = await tracesApi.listRuns(req)
+      const newItems = res.data.items
+      if (mode === 'fresh') {
+        // Assume server returns newest-first; enforce the invariant defensively.
+        const sorted = [...newItems].sort((a, b) => tsDesc(a.start_time, b.start_time))
+        setAllRuns(sorted)
+        setPage(1)
+        setSelectedIds(new Set())
+      } else {
+        // Dedupe by id — LangSmith may return the boundary run again
+        setAllRuns(prev => {
+          const seen = new Set(prev.map(r => r.id))
+          const merged = prev.concat(newItems.filter(r => !seen.has(r.id)))
+          merged.sort((a, b) => tsDesc(a.start_time, b.start_time))
+          return merged
+        })
+      }
+      setHasMore(newItems.length >= 100)
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setError(msg || '查询失败')
+    } finally {
+      setLoading(false)
+      setLoadingMore(false)
+    }
+  }
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault()
+    await fetchRuns('fresh')
+  }
+
+  const handleClear = () => {
+    setAllRuns([])
+    setSelectedIds(new Set())
+    setNodeCache({})
+    setExpanded(new Set())
+    setHasMore(false)
+    setPage(1)
+    setError('')
+    setModelFilter('')
+    setChartRecentN(0)
+    setChartStatus('all')
+    setChartSelectedModels(new Set())
+    setChartQuestions(new Set())
+    setShowQuestionPicker(false)
+    setQuestionPickerSearch('')
+    setQuestionPickerCrossOnly(false)
+    setFillModelsMsg('')
+  }
+
+  const handleFillModels = useCallback(async () => {
+    if (fillingModels) return
+    const missing = allRuns.filter(r => !r.model_name)
+    if (missing.length === 0) {
+      setFillModelsMsg('所有 run 都已有 model')
+      return
+    }
+    setFillingModels(true)
+    setFillModelsMsg(`正在补齐 ${missing.length} 条 model…（首次约 30-90s）`)
+    try {
+      const payload = missing.map(r => ({ id: r.id, start_time: r.start_time }))
+      const res = await tracesApi.fillModels({ project_name: projectName, runs: payload })
+      const { models, missing: stillMissing } = res.data
+      setAllRuns(prev => prev.map(r => {
+        if (r.model_name) return r
+        const m = models[r.id]
+        return m ? { ...r, model_name: m } : r
+      }))
+      const resolvedCount = Object.keys(models).length
+      setFillModelsMsg(
+        `补齐 ${resolvedCount}/${missing.length}${
+          stillMissing.length > 0 ? `，${stillMissing.length} 条无 LLM 子 run` : ''
+        }`
+      )
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setFillModelsMsg(`补齐失败：${msg || '未知错误'}`)
+    } finally {
+      setFillingModels(false)
+    }
+  }, [allRuns, projectName, fillingModels])
+
+  // Derived: unique model names (O(n), no sort of the main runs list)
+  const modelNames = useMemo(() => {
+    const names = new Set<string>()
+    for (const r of allRuns) {
+      if (r.model_name) names.add(r.model_name)
+    }
+    return Array.from(names).sort()
+  }, [allRuns])
+
+  // Derived: filtered and sorted runs.
+  // `allRuns` is already time-desc, so the 'time' branch is zero-cost.
+  const filteredRuns = useMemo(() => {
+    const base = modelFilter ? allRuns.filter(r => r.model_name === modelFilter) : allRuns
+    if (sortBy === 'time') return base
+    const copy = base.slice()
+    if (sortBy === 'latency_asc') {
+      copy.sort((a, b) => (a.latency_s ?? Infinity) - (b.latency_s ?? Infinity))
+    } else {
+      copy.sort((a, b) => (b.latency_s ?? 0) - (a.latency_s ?? 0))
+    }
+    return copy
+  }, [allRuns, modelFilter, sortBy])
+
+  const total = filteredRuns.length
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const pageRuns = useMemo(
+    () => filteredRuns.slice((page - 1) * pageSize, page * pageSize),
+    [filteredRuns, page, pageSize]
+  )
+
+  // Derived: runs scoped for the latency chart (independent of list filters).
+  // Relies on `allRuns` being time-desc so "最近 N 条" is a slice, not a sort.
+  const chartScopedRuns = useMemo(() => {
+    const needsStatusFilter = chartStatus !== 'all'
+    const needsModelFilter = chartSelectedModels.size > 0
+    const needsQuestionFilter = chartQuestions.size > 0
+    const result: RunSummary[] = []
+    const limit = chartRecentN > 0 ? chartRecentN : Infinity
+    for (const r of allRuns) {
+      if (result.length >= limit) break
+      if (needsStatusFilter && r.status !== chartStatus) continue
+      if (needsModelFilter && !chartSelectedModels.has(r.model_name || '(unknown)')) continue
+      if (needsQuestionFilter && !chartQuestions.has(r.input_preview)) continue
+      result.push(r)
+    }
+    return result
+  }, [allRuns, chartStatus, chartSelectedModels, chartRecentN, chartQuestions])
+
+  // Derived: all distinct questions (input_preview) found in allRuns, with how
+  // many distinct models ran each and total run count. Used by the question
+  // picker; supports filtering "cross-model only" in the picker UI.
+  // Sorted by cross-model preference (more models first, then more runs).
+  const allQuestions = useMemo(() => {
+    const byPreview = new Map<string, { models: Set<string>; count: number }>()
+    for (const r of allRuns) {
+      const p = r.input_preview
+      if (!p) continue
+      const m = r.model_name || '(unknown)'
+      let entry = byPreview.get(p)
+      if (!entry) {
+        entry = { models: new Set(), count: 0 }
+        byPreview.set(p, entry)
+      }
+      entry.models.add(m)
+      entry.count++
+    }
+    const result: { preview: string; modelCount: number; runCount: number }[] = []
+    for (const [preview, entry] of byPreview) {
+      result.push({ preview, modelCount: entry.models.size, runCount: entry.count })
+    }
+    result.sort((a, b) => b.modelCount - a.modelCount || b.runCount - a.runCount)
+    return result
+  }, [allRuns])
+
+  // Questions shown inside the picker panel, after applying its own filters
+  // (search text + "cross-model only" toggle). Kept separate from `allQuestions`
+  // so that clearing a filter doesn't recompute the base index.
+  const pickerQuestions = useMemo(() => {
+    const needle = questionPickerSearch.trim().toLowerCase()
+    return allQuestions.filter(q => {
+      if (questionPickerCrossOnly && q.modelCount < 2) return false
+      if (needle && !q.preview.toLowerCase().includes(needle)) return false
+      return true
+    })
+  }, [allQuestions, questionPickerSearch, questionPickerCrossOnly])
+
+  // Derived: latency stats per model for the chart (O(n), no full sort).
+  // Also tracks distinct questions each model answered — so the user can
+  // eyeball how comparable the per-model slices actually are when they've
+  // picked a batch of questions (e.g. model A covered 8/10 picks, B covered 5/10).
+  const latencyStats = useMemo(() => {
+    const groups = new Map<string, { values: number[]; questions: Set<string> }>()
+    for (const run of chartScopedRuns) {
+      if (run.latency_s == null) continue
+      const model = run.model_name || '(unknown)'
+      let bucket = groups.get(model)
+      if (!bucket) {
+        bucket = { values: [], questions: new Set() }
+        groups.set(model, bucket)
+      }
+      bucket.values.push(run.latency_s)
+      if (run.input_preview) bucket.questions.add(run.input_preview)
+    }
+    const stats: LatencyStat[] = []
+    for (const [model, b] of groups) {
+      stats.push(computeLatencyStats(b.values, model, b.questions.size))
+    }
+    stats.sort((a, b) => a.avg - b.avg)
+    return stats
+  }, [chartScopedRuns])
+
+  const toggleSelect = useCallback((id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  const toggleSelectAll = useCallback(() => {
+    setSelectedIds(prev => {
+      if (prev.size === pageRuns.length && pageRuns.length > 0) return new Set()
+      return new Set(pageRuns.map(r => r.id))
+    })
+  }, [pageRuns])
+
+  const handleImport = async () => {
+    const target = importTarget === '__new__' ? newDatasetName.trim() : importTarget
+    if (!target) return
+    setImporting(true)
+    try {
+      if (importTarget === '__new__') {
+        await datasetsApi.create({ name: target, description: `Imported from ${projectName} traces`, source_project: projectName })
+      }
+      const res = await tracesApi.import({ dataset: target, run_ids: Array.from(selectedIds), project_name: projectName })
+      setShowImportModal(false)
+      setSelectedIds(new Set())
+      setImportTarget('')
+      setNewDatasetName('')
+      alert(`成功导入 ${res.data.imported} 条用例到 ${target}`)
+      datasetsApi.list().then(r => setDatasets(r.data)).catch(() => {})
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      alert(msg || '导入失败')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const fetchNode = useCallback(async (runId: string) => {
+    setNodeCache(prev => (prev[runId]?.data || prev[runId]?.loading) ? prev : { ...prev, [runId]: { loading: true } })
+    try {
+      const res = await tracesApi.getDetail({ run_id: runId, project_name: projectName || undefined })
+      setNodeCache(prev => ({ ...prev, [runId]: { loading: false, data: res.data } }))
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setNodeCache(prev => ({ ...prev, [runId]: { loading: false, error: msg || '加载失败' } }))
+    }
+  }, [projectName])
+
+  const openDetail = useCallback((runId: string) => {
+    setDetailRunId(runId)
+    if (!nodeCacheRef.current[runId]?.data) fetchNode(runId)
+  }, [fetchNode])
+
+  const closeDetail = useCallback(() => {
+    setDetailRunId(null)
+    setExpanded(new Set())
+  }, [])
+
+  const toggleExpand = useCallback((runId: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev)
+      if (next.has(runId)) {
+        next.delete(runId)
+      } else {
+        next.add(runId)
+        const cached = nodeCacheRef.current[runId]
+        if (!cached?.data && !cached?.loading) {
+          fetchNode(runId)
+        }
+      }
+      return next
+    })
+  }, [fetchNode])
+
+  return (
+    <div>
+      <header className="mb-8">
+        <h1 className="text-lg font-light tracking-tight mb-1">Traces</h1>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">Execution runs &middot; performance metrics</p>
+      </header>
+
+      <form onSubmit={handleSearch} className="flex gap-2.5 items-center mb-4">
+        <input
+          placeholder="Project name..."
+          value={projectName}
+          onChange={(e) => setProjectName(e.target.value)}
+          required
+          className="flex-1 max-w-[280px] py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 placeholder:text-text-tertiary transition-all duration-200"
+        />
+        <button
+          type="submit"
+          disabled={loading}
+          className="inline-flex items-center gap-1.5 py-2 px-3.5 text-[11px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent cursor-pointer hover:opacity-90 active:scale-[0.97] disabled:opacity-40 transition-all duration-200"
+        >
+          {loading ? (
+            <span className="inline-block w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />
+          ) : 'Query'}
+        </button>
+        {allRuns.length > 0 && (
+          <button
+            type="button"
+            onClick={handleClear}
+            className="inline-flex items-center py-2 px-3 text-[11px] tracking-wide rounded-[6px] border border-border bg-surface text-text-secondary hover:border-accent hover:text-accent transition-all duration-200"
+          >
+            清空
+          </button>
+        )}
+        {allRuns.length > 0 && allRuns.some(r => !r.model_name) && (
+          <button
+            type="button"
+            onClick={handleFillModels}
+            disabled={fillingModels}
+            title="用多轮时间窗口 + OR 查询补齐缺失的 model_name。首次 30-90s，结果缓存 1 小时。"
+            className="inline-flex items-center gap-1.5 py-2 px-3 text-[11px] tracking-wide rounded-[6px] border border-border bg-surface text-text-secondary hover:border-accent hover:text-accent disabled:opacity-40 transition-all duration-200"
+          >
+            {fillingModels ? (
+              <>
+                <span className="inline-block w-3 h-3 border border-accent/40 border-t-accent rounded-full animate-spin" />
+                补齐中
+              </>
+            ) : `补齐 Model (${allRuns.filter(r => !r.model_name).length})`}
+          </button>
+        )}
+        {selectedIds.size > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowImportModal(true)}
+            className="inline-flex items-center gap-1.5 py-2 px-3.5 text-[11px] font-medium tracking-wide rounded-[6px] bg-[#1a6] text-white border border-[#1a6] cursor-pointer hover:opacity-90 active:scale-[0.97] transition-all duration-200"
+          >
+            导入到备选数据集 ({selectedIds.size})
+          </button>
+        )}
+      </form>
+
+      {fillModelsMsg && (
+        <p className="text-[11px] text-text-tertiary mb-3 animate-fade-in">{fillModelsMsg}</p>
+      )}
+
+      {allRuns.length > 0 && (
+        <div className="flex items-center gap-3 mb-4 flex-wrap">
+          <select
+            value={modelFilter}
+            onChange={e => { setModelFilter(e.target.value); setPage(1) }}
+            className="py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
+          >
+            <option value="">全部模型</option>
+            {modelNames.map(m => <option key={m} value={m}>{m}</option>)}
+          </select>
+          <select
+            value={sortBy}
+            onChange={e => setSortBy(e.target.value as typeof sortBy)}
+            className="py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
+          >
+            <option value="time">按时间排序</option>
+            <option value="latency_asc">Latency 升序</option>
+            <option value="latency_desc">Latency 降序</option>
+          </select>
+          <button
+            onClick={() => setShowChart(v => !v)}
+            className={`py-2 px-3 text-[11px] rounded-[6px] border transition-all ${showChart ? 'border-accent text-accent bg-accent/5' : 'border-border text-text-secondary hover:border-accent'}`}
+          >
+            {showChart ? '隐藏对比图' : '模型 Latency 对比'}
+          </button>
+        </div>
+      )}
+
+      {error && <p className="text-[11px] text-negative mb-3 animate-fade-in">{error}</p>}
+
+      {showChart && (
+        <div className="border border-border rounded-[6px] bg-surface p-5 mb-5">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-[12px] font-medium">模型 Latency 对比</h3>
+            <span className="text-[10px] text-text-tertiary">
+              对比样本：{chartScopedRuns.length} 条
+              {chartQuestions.size > 0 && ` · ${chartQuestions.size} 个问题`}
+              （总加载 {allRuns.length} 条）
+            </span>
+          </div>
+
+          {/* Chart scope filters */}
+          <div className="flex items-start gap-4 flex-wrap mb-4 p-3 bg-accent-subtle/40 rounded-[6px] border border-border">
+            <div className="flex items-center gap-2">
+              <label className="text-[10px] tracking-widest uppercase text-text-tertiary">最近</label>
+              <select
+                value={chartRecentN}
+                onChange={e => setChartRecentN(Number(e.target.value))}
+                className="py-1 px-2 text-[11px] border border-border rounded-[4px] bg-surface outline-none focus:border-accent"
+              >
+                <option value={0}>全部</option>
+                <option value={10}>10 条</option>
+                <option value={20}>20 条</option>
+                <option value={50}>50 条</option>
+                <option value={100}>100 条</option>
+                <option value={200}>200 条</option>
+              </select>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <label className="text-[10px] tracking-widest uppercase text-text-tertiary">状态</label>
+              <select
+                value={chartStatus}
+                onChange={e => setChartStatus(e.target.value as typeof chartStatus)}
+                className="py-1 px-2 text-[11px] border border-border rounded-[4px] bg-surface outline-none focus:border-accent"
+              >
+                <option value="all">全部</option>
+                <option value="success">success</option>
+                <option value="error">error</option>
+              </select>
+            </div>
+
+            <div className="flex items-start gap-2 flex-1 min-w-[200px]">
+              <label className="text-[10px] tracking-widest uppercase text-text-tertiary mt-1 shrink-0">模型</label>
+              <div className="flex flex-wrap gap-1.5">
+                {modelNames.length === 0 ? (
+                  <span className="text-[10px] text-text-tertiary">无可选模型</span>
+                ) : modelNames.map(m => {
+                  const on = chartSelectedModels.has(m)
+                  return (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => {
+                        setChartSelectedModels(prev => {
+                          const next = new Set(prev)
+                          if (next.has(m)) next.delete(m); else next.add(m)
+                          return next
+                        })
+                      }}
+                      className={`text-[10px] px-2 py-0.5 rounded-full border transition-all ${
+                        on
+                          ? 'border-accent bg-accent text-white'
+                          : 'border-border bg-surface text-text-secondary hover:border-accent'
+                      }`}
+                    >
+                      {m}
+                    </button>
+                  )
+                })}
+                {chartSelectedModels.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setChartSelectedModels(new Set())}
+                    className="text-[10px] px-2 py-0.5 rounded-full border border-border text-text-tertiary hover:border-accent"
+                  >
+                    清除
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2 w-full">
+              <div className="flex items-center gap-2 flex-wrap">
+                <label className="text-[10px] tracking-widest uppercase text-text-tertiary shrink-0">问题集</label>
+                <button
+                  type="button"
+                  onClick={() => setShowQuestionPicker(v => !v)}
+                  disabled={allQuestions.length === 0}
+                  className="inline-flex items-center gap-1.5 py-1 px-2.5 text-[11px] border border-border rounded-[4px] bg-surface text-text-primary hover:border-accent disabled:opacity-50 transition-all"
+                  title="勾选一批问题后，每个模型用自己在这批问题里的 runs 各算一次 latency 指标，方便横向对比"
+                >
+                  {chartQuestions.size === 0
+                    ? (allQuestions.length === 0 ? '无可选问题' : `选择问题（共 ${allQuestions.length} 个）`)
+                    : `已选 ${chartQuestions.size} / ${allQuestions.length} 个问题`}
+                  <span className="text-text-tertiary">{showQuestionPicker ? '▴' : '▾'}</span>
+                </button>
+                {chartQuestions.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setChartQuestions(new Set())}
+                    className="text-[10px] px-2 py-0.5 rounded-full border border-border text-text-tertiary hover:border-accent"
+                  >
+                    清空选择
+                  </button>
+                )}
+                <span className="text-[10px] text-text-tertiary ml-auto">
+                  空=不按问题过滤；多选=每模型在自己的覆盖子集上算 latency
+                </span>
+              </div>
+
+              {showQuestionPicker && (
+                <div className="border border-border rounded-[6px] bg-surface p-3 flex flex-col gap-2 max-h-[360px]">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <input
+                      type="text"
+                      placeholder="搜索问题内容…"
+                      value={questionPickerSearch}
+                      onChange={e => setQuestionPickerSearch(e.target.value)}
+                      className="flex-1 min-w-[200px] py-1 px-2 text-[11px] border border-border rounded-[4px] bg-surface outline-none focus:border-accent"
+                    />
+                    <label className="inline-flex items-center gap-1.5 text-[10px] text-text-secondary cursor-pointer select-none">
+                      <input
+                        type="checkbox"
+                        checked={questionPickerCrossOnly}
+                        onChange={e => setQuestionPickerCrossOnly(e.target.checked)}
+                        className="w-3 h-3 accent-accent"
+                      />
+                      仅跨模型问题（≥2 models）
+                    </label>
+                    <div className="flex items-center gap-1 ml-auto">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setChartQuestions(prev => {
+                            const next = new Set(prev)
+                            for (const q of pickerQuestions) next.add(q.preview)
+                            return next
+                          })
+                        }}
+                        disabled={pickerQuestions.length === 0}
+                        className="text-[10px] px-2 py-0.5 rounded-full border border-border text-text-secondary hover:border-accent disabled:opacity-40"
+                      >
+                        全选当前列表
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setChartQuestions(prev => {
+                            const next = new Set(prev)
+                            for (const q of pickerQuestions) next.delete(q.preview)
+                            return next
+                          })
+                        }}
+                        disabled={pickerQuestions.length === 0}
+                        className="text-[10px] px-2 py-0.5 rounded-full border border-border text-text-secondary hover:border-accent disabled:opacity-40"
+                      >
+                        取消选择
+                      </button>
+                    </div>
+                  </div>
+                  <div className="text-[10px] text-text-tertiary">
+                    显示 {pickerQuestions.length} / {allQuestions.length} 个问题
+                    {chartQuestions.size > 0 && `（当前共选中 ${chartQuestions.size} 个）`}
+                  </div>
+                  <div className="flex-1 overflow-y-auto border border-border rounded-[4px] bg-accent-subtle/20 divide-y divide-border">
+                    {pickerQuestions.length === 0 ? (
+                      <div className="text-center py-6 text-[11px] text-text-tertiary">
+                        {questionPickerCrossOnly
+                          ? '当前搜索下没有跨模型问题；取消「仅跨模型」试试'
+                          : '没有匹配的问题'}
+                      </div>
+                    ) : pickerQuestions.map(q => {
+                      const checked = chartQuestions.has(q.preview)
+                      const isCross = q.modelCount >= 2
+                      return (
+                        <label
+                          key={q.preview}
+                          className="flex items-start gap-2 py-1.5 px-2 hover:bg-accent-subtle/60 cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => {
+                              setChartQuestions(prev => {
+                                const next = new Set(prev)
+                                if (next.has(q.preview)) next.delete(q.preview)
+                                else next.add(q.preview)
+                                return next
+                              })
+                            }}
+                            className="mt-0.5 w-3 h-3 accent-accent shrink-0"
+                          />
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
+                            isCross ? 'bg-accent text-white' : 'bg-border text-text-tertiary'
+                          }`}>
+                            {q.modelCount}m · {q.runCount}r
+                          </span>
+                          <span className="text-[11px] text-text-primary flex-1 break-all">
+                            {q.preview.length > 180 ? q.preview.slice(0, 180) + '…' : q.preview}
+                          </span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {latencyStats.length === 0 ? (
+            <div className="text-center py-8 text-[11px] text-text-tertiary">
+              当前筛选条件下无数据
+            </div>
+          ) : (
+            <>
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={latencyStats} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
+                  <XAxis dataKey="model" tick={{ fontSize: 10 }} />
+                  <YAxis tick={{ fontSize: 10 }} label={{ value: 'seconds', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
+                  <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
+                  <Legend wrapperStyle={{ fontSize: 10 }} />
+                  <Bar dataKey="min" name="Min" fill="#93c5fd" radius={[2, 2, 0, 0]} />
+                  <Bar dataKey="avg" name="Avg" fill="#3b82f6" radius={[2, 2, 0, 0]} />
+                  <Bar dataKey="median" name="Median" fill="#6366f1" radius={[2, 2, 0, 0]} />
+                  <Bar dataKey="p95" name="P95" fill="#a855f7" radius={[2, 2, 0, 0]} />
+                  <Bar dataKey="max" name="Max" fill="#f87171" radius={[2, 2, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+              <div className="mt-4 overflow-x-auto">
+                <table className="w-full text-[11px] border-collapse">
+                  <thead>
+                    <tr className="text-text-tertiary">
+                      <th className="text-left py-1.5 px-2 font-normal">Model</th>
+                      <th className="text-right py-1.5 px-2 font-normal">Runs</th>
+                      <th className="text-right py-1.5 px-2 font-normal" title="该模型在选中问题集里覆盖了多少个不同的问题 / 当前选中问题总数">
+                        Questions
+                      </th>
+                      <th className="text-right py-1.5 px-2 font-normal">Min</th>
+                      <th className="text-right py-1.5 px-2 font-normal">Avg</th>
+                      <th className="text-right py-1.5 px-2 font-normal">Median</th>
+                      <th className="text-right py-1.5 px-2 font-normal">P95</th>
+                      <th className="text-right py-1.5 px-2 font-normal">Max</th>
+                      <th className="text-right py-1.5 px-2 font-normal">Variance</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {latencyStats.map(s => (
+                      <tr key={s.model} className="border-t border-border">
+                        <td className="py-1.5 px-2 font-medium">{s.model}</td>
+                        <td className="py-1.5 px-2 text-right">{s.count}</td>
+                        <td className="py-1.5 px-2 text-right">
+                          {chartQuestions.size > 0
+                            ? `${s.coveredQuestions} / ${chartQuestions.size}`
+                            : s.coveredQuestions}
+                        </td>
+                        <td className="py-1.5 px-2 text-right">{s.min}s</td>
+                        <td className="py-1.5 px-2 text-right">{s.avg}s</td>
+                        <td className="py-1.5 px-2 text-right">{s.median}s</td>
+                        <td className="py-1.5 px-2 text-right">{s.p95}s</td>
+                        <td className="py-1.5 px-2 text-right">{s.max}s</td>
+                        <td className="py-1.5 px-2 text-right">{s.variance}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      <div className="border border-border rounded-[3px] overflow-hidden bg-surface">
+        <table className="w-full border-collapse">
+          <thead>
+            <tr>
+              <th className="w-8 text-center py-2 px-2 border-b border-border bg-accent-subtle">
+                <input
+                  type="checkbox"
+                  checked={pageRuns.length > 0 && selectedIds.size === pageRuns.length}
+                  onChange={toggleSelectAll}
+                  className="w-3.5 h-3.5 accent-accent"
+                />
+              </th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Name</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Model</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Status</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Input</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Output</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Latency</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Tokens</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Time</th>
+            </tr>
+          </thead>
+          <tbody>
+            {pageRuns.map((run) => (
+              <tr key={run.id} className="hover:bg-accent-subtle group cursor-default">
+                <td className="text-center py-2.5 px-2 border-b border-border">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(run.id)}
+                    onChange={() => toggleSelect(run.id)}
+                    className="w-3.5 h-3.5 accent-accent"
+                  />
+                </td>
+                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-primary max-w-[120px] truncate">
+                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent hover:underline transition-colors">{run.name}</button>
+                </td>
+                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-secondary whitespace-nowrap">
+                  {run.model_name || '—'}
+                </td>
+                <td className="py-2.5 px-3 border-b border-border text-[12px]">
+                  <span className={`inline-block px-2 py-0.5 rounded-full text-[9px] tracking-wide font-medium ${
+                    run.status === 'success'
+                      ? 'bg-[#e6f7ed] text-[#1a6]'
+                      : run.status === 'error'
+                        ? 'bg-[#fde8e8] text-[#b33]'
+                        : 'bg-[#f5f5f5] text-[#999]'
+                  }`}>
+                    {run.status}
+                  </span>
+                </td>
+                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-secondary max-w-[180px] truncate">
+                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent transition-colors truncate block w-full">{run.input_preview || '—'}</button>
+                </td>
+                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-secondary max-w-[180px] truncate">
+                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent transition-colors truncate block w-full">{run.output_preview || '—'}</button>
+                </td>
+                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-secondary whitespace-nowrap">
+                  {run.latency_s ? `${run.latency_s.toFixed(2)}s` : '—'}
+                </td>
+                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-secondary whitespace-nowrap">
+                  {run.total_tokens ?? '—'}
+                </td>
+                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-tertiary whitespace-nowrap">
+                  {run.start_time ? new Date(run.start_time).toLocaleString() : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {pageRuns.length === 0 && !loading && (
+          <div className="text-center py-10 text-text-tertiary text-[12px]">输入项目名称查询 Runs</div>
+        )}
+      </div>
+
+      {total > 0 && (
+        <div className="flex items-center justify-between mt-4 text-[11px] text-text-secondary">
+          <span>共 {total} 条结果（已加载 {allRuns.length}）</span>
+          <div className="flex items-center gap-2">
+            <button
+              disabled={page <= 1}
+              onClick={() => setPage(p => p - 1)}
+              className="px-2.5 py-1 rounded border border-border bg-surface hover:bg-accent-subtle disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+            >
+              上一页
+            </button>
+            <span>{page} / {totalPages}</span>
+            <button
+              disabled={page >= totalPages}
+              onClick={() => setPage(p => p + 1)}
+              className="px-2.5 py-1 rounded border border-border bg-surface hover:bg-accent-subtle disabled:opacity-40 disabled:cursor-not-allowed transition-all"
+            >
+              下一页
+            </button>
+            {hasMore && (
+              <button
+                onClick={() => fetchRuns('more')}
+                disabled={loadingMore}
+                className="ml-2 px-2.5 py-1 rounded border border-accent text-accent bg-accent/5 hover:bg-accent/10 disabled:opacity-40 transition-all inline-flex items-center gap-1.5"
+              >
+                {loadingMore ? (
+                  <>
+                    <span className="inline-block w-3 h-3 border border-accent/40 border-t-accent rounded-full animate-spin" />
+                    加载中
+                  </>
+                ) : '加载更早 100 条'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showImportModal && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowImportModal(false)}>
+          <div className="bg-surface border border-border rounded-lg p-6 w-[400px] shadow-lg" onClick={e => e.stopPropagation()}>
+            <h3 className="text-[14px] font-medium mb-4">导入到数据集</h3>
+            <p className="text-[11px] text-text-secondary mb-4">已选择 {selectedIds.size} 条 Runs，将提取为测试用例导入目标数据集。</p>
+            <div className="mb-4">
+              <label className="text-[11px] text-text-secondary block mb-1.5">目标数据集</label>
+              <select
+                value={importTarget}
+                onChange={e => setImportTarget(e.target.value)}
+                className="w-full py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent"
+              >
+                <option value="">选择数据集...</option>
+                {datasets.map(d => (
+                  <option key={d.id} value={d.name}>{d.name} ({d.example_count} 条)</option>
+                ))}
+                <option value="__new__">+ 新建数据集</option>
+              </select>
+            </div>
+            {importTarget === '__new__' && (
+              <div className="mb-4">
+                <label className="text-[11px] text-text-secondary block mb-1.5">新数据集名称</label>
+                <input
+                  value={newDatasetName}
+                  onChange={e => setNewDatasetName(e.target.value)}
+                  placeholder="输入数据集名称..."
+                  className="w-full py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent"
+                />
+              </div>
+            )}
+            <div className="flex justify-end gap-2 mt-6">
+              <button
+                onClick={() => setShowImportModal(false)}
+                className="px-3.5 py-2 text-[11px] rounded-[6px] border border-border hover:bg-accent-subtle transition-all"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleImport}
+                disabled={importing || (!importTarget || (importTarget === '__new__' && !newDatasetName.trim()))}
+                className="px-3.5 py-2 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 disabled:opacity-40 transition-all"
+              >
+                {importing ? `导入中 (${selectedIds.size} 条)...` : '确认导入'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {detailRunId && (
+        <RunDetailModal
+          rootId={detailRunId}
+          projectName={projectName}
+          nodeCache={nodeCache}
+          expanded={expanded}
+          onClose={closeDetail}
+          onToggle={toggleExpand}
+          onRetry={fetchNode}
+        />
+      )}
+    </div>
+  )
+}
+
+interface RunDetailModalProps {
+  rootId: string
+  projectName: string
+  nodeCache: NodeCache
+  expanded: Set<string>
+  onClose: () => void
+  onToggle: (id: string) => void
+  onRetry: (id: string) => void
+}
+
+function RunDetailModal({ rootId, projectName, nodeCache, expanded, onClose, onToggle, onRetry }: RunDetailModalProps) {
+  const rootState = nodeCache[rootId]
+  return (
+    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={onClose}>
+      <div className="bg-surface border border-border rounded-lg w-[860px] max-w-[95vw] max-h-[88vh] overflow-y-auto shadow-lg" onClick={e => e.stopPropagation()}>
+        <div className="sticky top-0 bg-surface border-b border-border px-6 py-4 flex justify-between items-center z-10">
+          <h3 className="text-[14px] font-medium">Run 详情</h3>
+          <button onClick={onClose} className="text-text-tertiary hover:text-text-primary text-lg">×</button>
+        </div>
+        <div className="p-6">
+          {rootState?.loading && !rootState.data && <LoadingSkeleton />}
+          {rootState?.error && !rootState.data && (
+            <div className="text-negative text-[12px]">
+              {rootState.error}
+              <button onClick={() => onRetry(rootId)} className="ml-3 underline">重试</button>
+            </div>
+          )}
+          {rootState?.data && (
+            <>
+              <RunDetailBody detail={rootState.data} />
+              <div className="mt-6">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="text-[12px] font-medium">Children ({rootState.data.children.length})</h4>
+                  {rootState.data.children_truncated && (
+                    <span className="text-[10px] text-[#b87b00] bg-[#fff4d6] px-2 py-0.5 rounded">已截断前 100 个子节点</span>
+                  )}
+                </div>
+                {rootState.data.children.length === 0 ? (
+                  <div className="text-[11px] text-text-tertiary">无子 Run</div>
+                ) : (
+                  <div className="border border-border rounded-[6px] overflow-hidden">
+                    {rootState.data.children.map(c => (
+                      <RunNodeRow
+                        key={c.id}
+                        meta={c}
+                        depth={0}
+                        projectName={projectName}
+                        isOpen={expanded.has(c.id)}
+                        state={nodeCache[c.id]}
+                        nodeCache={nodeCache}
+                        expanded={expanded}
+                        onToggle={onToggle}
+                        onRetry={onRetry}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const RUN_TYPE_COLORS: Record<string, { border: string; badge: string }> = {
+  llm: { border: '#3b82f6', badge: 'bg-blue-50 text-blue-700' },
+  tool: { border: '#10b981', badge: 'bg-emerald-50 text-emerald-700' },
+  chain: { border: '#8b5cf6', badge: 'bg-violet-50 text-violet-700' },
+  retriever: { border: '#f59e0b', badge: 'bg-amber-50 text-amber-700' },
+  prompt: { border: '#ec4899', badge: 'bg-pink-50 text-pink-700' },
+}
+const DEFAULT_TYPE_COLOR = { border: '#9ca3af', badge: 'bg-gray-50 text-gray-700' }
+
+interface RunNodeRowProps {
+  meta: RunChildMeta
+  depth: number
+  projectName: string
+  isOpen: boolean
+  state: NodeState | undefined
+  nodeCache: NodeCache
+  expanded: Set<string>
+  onToggle: (id: string) => void
+  onRetry: (id: string) => void
+}
+
+const RunNodeRow = memo(function RunNodeRow({
+  meta, depth, projectName, isOpen, state, nodeCache, expanded, onToggle, onRetry,
+}: RunNodeRowProps) {
+  const color = RUN_TYPE_COLORS[meta.run_type] || DEFAULT_TYPE_COLOR
+  const canExpand = meta.has_children
+
+  return (
+    <div>
+      <div
+        className="flex items-center gap-2 py-1.5 border-b border-border hover:bg-accent-subtle cursor-default text-[11px]"
+        style={{ paddingLeft: 12 + depth * 16, borderLeft: `2px solid ${color.border}` }}
+      >
+        <button
+          type="button"
+          onClick={() => canExpand && onToggle(meta.id)}
+          className={`w-4 text-center select-none ${canExpand ? 'text-text-secondary hover:text-accent cursor-pointer' : 'text-transparent'}`}
+        >
+          {isOpen ? '▾' : '▸'}
+        </button>
+        <span className={`inline-block px-1.5 py-0.5 rounded text-[9px] tracking-wide uppercase ${color.badge}`}>
+          {meta.run_type || '—'}
+        </span>
+        <span className="flex-1 truncate text-text-primary font-medium">{meta.name || '—'}</span>
+        {meta.error && <span className="w-1.5 h-1.5 rounded-full bg-negative" title={meta.error} />}
+        <span className="text-text-tertiary tabular-nums">
+          {meta.latency_s != null ? `${meta.latency_s.toFixed(2)}s` : '—'}
+        </span>
+        <span className="text-text-tertiary tabular-nums w-16 text-right">
+          {meta.total_tokens != null ? `${meta.total_tokens} tok` : '—'}
+        </span>
+      </div>
+
+      {isOpen && (
+        <div style={{ paddingLeft: 12 + depth * 16 }} className="border-b border-border">
+          {state?.loading && !state.data && <div className="py-3 px-3 text-[11px] text-text-tertiary">加载中…</div>}
+          {state?.error && !state.data && (
+            <div className="py-3 px-3 text-[11px] text-negative">
+              {state.error}
+              <button onClick={() => onRetry(meta.id)} className="ml-3 underline">重试</button>
+            </div>
+          )}
+          {state?.data && (
+            <div className="py-3 px-3 space-y-3 bg-accent-subtle/40">
+              <RunDetailBody detail={state.data} compact />
+              {state.data.children.length > 0 && (
+                <div className="mt-3">
+                  <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
+                    Children ({state.data.children.length}) {state.data.children_truncated && <span className="ml-2 text-[#b87b00]">已截断</span>}
+                  </div>
+                  <div className="border border-border rounded-[4px] bg-surface">
+                    {state.data.children.map(c => (
+                      <RunNodeRow
+                        key={c.id}
+                        meta={c}
+                        depth={depth + 1}
+                        projectName={projectName}
+                        isOpen={expanded.has(c.id)}
+                        state={nodeCache[c.id]}
+                        nodeCache={nodeCache}
+                        expanded={expanded}
+                        onToggle={onToggle}
+                        onRetry={onRetry}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}, (prev, next) =>
+  prev.meta === next.meta &&
+  prev.depth === next.depth &&
+  prev.projectName === next.projectName &&
+  prev.isOpen === next.isOpen &&
+  prev.state === next.state &&
+  prev.onToggle === next.onToggle &&
+  prev.onRetry === next.onRetry
+  // Intentionally ignore nodeCache/expanded: they change reference whenever any
+  // other node toggles, but this row only cares about its own state/isOpen.
+  // Child rows receive fresh nodeCache/expanded, so they re-render correctly
+  // when this row is open (parent branch re-renders) but siblings stay memo'd.
+)
+
+const RunDetailBody = memo(function RunDetailBody({ detail, compact }: { detail: RunDetail; compact?: boolean }) {
+  const size = compact ? 'text-[11px]' : 'text-[12px]'
+  return (
+    <div className={`space-y-4 ${size}`}>
+      <div className="grid grid-cols-2 gap-3">
+        <PreviewField label="Name" value={detail.name} />
+        <PreviewField label="Run Type" value={detail.run_type || '—'} />
+        <PreviewField label="Status" value={detail.status} />
+        <PreviewField label="ID" value={detail.id} mono />
+        <PreviewField label="Latency" value={detail.latency_s != null ? `${detail.latency_s.toFixed(3)}s` : '—'} />
+        <PreviewField label="Tokens" value={formatTokens(detail)} />
+        <PreviewField label="Start" value={detail.start_time ? new Date(detail.start_time).toLocaleString() : '—'} />
+        <PreviewField label="End" value={detail.end_time ? new Date(detail.end_time).toLocaleString() : '—'} />
+      </div>
+      {detail.tags.length > 0 && <PreviewField label="Tags" value={detail.tags.join(', ')} />}
+      {detail.error && <PreviewField label="Error" value={detail.error} error />}
+      <JsonField label="Inputs" value={detail.inputs} />
+      <JsonField label="Outputs" value={detail.outputs} />
+      {detail.metadata && <JsonField label="Metadata" value={detail.metadata} collapsed />}
+      {detail.extra && <JsonField label="Extra" value={detail.extra} collapsed />}
+    </div>
+  )
+})
+
+function formatTokens(detail: RunDetail): string {
+  const { prompt_tokens, completion_tokens, total_tokens } = detail
+  if (total_tokens == null && prompt_tokens == null && completion_tokens == null) return '—'
+  const parts: string[] = []
+  if (prompt_tokens != null) parts.push(`prompt ${prompt_tokens}`)
+  if (completion_tokens != null) parts.push(`completion ${completion_tokens}`)
+  if (total_tokens != null) parts.push(`total ${total_tokens}`)
+  return parts.join(' · ')
+}
+
+function LoadingSkeleton() {
+  return (
+    <div className="animate-pulse space-y-3">
+      <div className="h-4 bg-border/40 rounded w-1/3" />
+      <div className="h-16 bg-border/40 rounded" />
+      <div className="h-4 bg-border/40 rounded w-1/4" />
+      <div className="h-24 bg-border/40 rounded" />
+    </div>
+  )
+}
+
+function JsonField({ label, value, collapsed }: { label: string; value: unknown; collapsed?: boolean }) {
+  const [open, setOpen] = useState(!collapsed)
+  if (value == null || (typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value as object).length === 0)) {
+    return <PreviewField label={label} value="—" />
+  }
+  const text = JSON.stringify(value, null, 2)
+  return (
+    <div>
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="flex items-center gap-1 text-[10px] tracking-widest uppercase text-text-tertiary mb-1 hover:text-accent"
+      >
+        <span>{open ? '▾' : '▸'}</span>
+        <span>{label}</span>
+        <span className="normal-case tracking-normal text-[9px] opacity-60">({text.length} chars)</span>
+      </button>
+      {open && (
+        <pre className="text-[11px] leading-relaxed whitespace-pre-wrap break-all p-2.5 rounded-[6px] border border-border bg-accent-subtle text-text-primary font-mono max-h-80 overflow-y-auto">
+          {text}
+        </pre>
+      )}
+    </div>
+  )
+}
+
+function PreviewField({ label, value, mono, error }: { label: string; value: string | null | undefined; mono?: boolean; error?: boolean }) {
+  const text = value || '—'
+  return (
+    <div>
+      <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">{label}</div>
+      <div className={`text-[12px] leading-relaxed whitespace-pre-wrap break-all p-2.5 rounded-[6px] border border-border bg-accent-subtle ${mono ? 'font-mono text-[11px]' : ''} ${error ? 'text-negative bg-[#fde8e8] border-negative/20' : 'text-text-primary'}`}>
+        {text}
+      </div>
+    </div>
+  )
+}

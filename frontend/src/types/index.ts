@@ -1,0 +1,329 @@
+export interface LoginRequest {
+  username: string
+  password: string
+}
+
+export interface RegisterRequest {
+  username: string
+  email: string
+  password: string
+}
+
+export interface TokenResponse {
+  access_token: string
+  refresh_token: string
+  token_type: string
+}
+
+export interface User {
+  id: string
+  username: string
+  email: string
+  role: string
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface UserUpdateRequest {
+  email?: string
+  password?: string
+}
+
+export interface Dataset {
+  id: string
+  name: string
+  description: string
+  example_count: number
+  created_at: string | null
+  metadata: Record<string, unknown>
+}
+
+export interface CreateDatasetRequest {
+  name: string
+  description?: string
+  source_project?: string
+  metadata?: Record<string, unknown>
+}
+
+export interface DatasetStats {
+  total_cases: number
+  by_source: Record<string, number>
+  by_tag: Record<string, number>
+  has_expected_output: number
+  has_criteria: number
+  has_tool_calls: number
+  avg_messages_per_case: number
+}
+
+export interface TestCase {
+  id?: string
+  name: string
+  description?: string
+  tags?: string[]
+  source?: string
+  input_messages: Array<{ role: string; content: string }>
+  agent_config_override?: Record<string, unknown>
+  expected_output?: string
+  expected_output_criteria?: string[]
+  expected_tool_calls?: Array<Record<string, unknown>>
+  max_tool_calls?: number
+  max_latency_ms?: number
+  max_tokens?: number
+  scoring_mode?: string
+}
+
+export interface AddCasesRequest {
+  cases: TestCase[]
+  split?: string
+}
+
+export interface GenerateScenarioRequest {
+  dataset: string
+  scenario: string
+  count?: number
+  context?: string
+  tags?: string[]
+  split?: string
+  dry_run?: boolean
+}
+
+export interface GenerateMutateRequest {
+  dataset: string
+  case_id: string
+  count?: number
+  strategy?: string
+  target_dataset?: string
+  tags?: string[]
+  split?: string
+  dry_run?: boolean
+}
+
+export interface ListRunsRequest {
+  project_name: string
+  start_time?: string
+  end_time?: string
+  status?: string
+  tags?: string[]
+  limit?: number
+  page?: number
+  page_size?: number
+}
+
+export interface PaginatedRuns {
+  items: RunSummary[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface RunSummary {
+  id: string
+  name: string
+  status: string
+  start_time: string | null
+  latency_s: number | null
+  total_tokens: number | null
+  error: string | null
+  tags: string[]
+  input_preview: string
+  output_preview: string
+  model_name: string
+}
+
+export interface ExtractRequest {
+  run_ids: string[]
+  source?: string
+  default_tags?: string[]
+  include_output_as_expected?: boolean
+}
+
+export interface ImportTracesRequest {
+  dataset: string
+  run_ids: string[]
+  project_name?: string
+  source?: string
+  default_tags?: string[]
+  include_output_as_expected?: boolean
+  split?: string
+}
+
+export interface PullDatasetRequest {
+  source_dataset: string
+  target_dataset?: string
+  split?: string
+  limit?: number
+}
+
+export interface RunChildMeta {
+  id: string
+  name: string
+  run_type: string
+  status: string
+  start_time: string | null
+  latency_s: number | null
+  total_tokens: number | null
+  error: string | null
+  has_children: boolean
+}
+
+export interface RunDetail {
+  id: string
+  name: string
+  run_type: string
+  status: string
+  start_time: string | null
+  end_time: string | null
+  latency_s: number | null
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  total_tokens: number | null
+  error: string | null
+  inputs: Record<string, unknown> | null
+  outputs: Record<string, unknown> | null
+  extra: Record<string, unknown> | null
+  metadata: Record<string, unknown> | null
+  tags: string[]
+  parent_run_id: string | null
+  trace_id: string | null
+  children: RunChildMeta[]
+  children_truncated: boolean
+}
+
+export interface RunDetailRequest {
+  run_id: string
+  project_name?: string
+}
+
+export interface FillModelsRequest {
+  project_name: string
+  runs: { id: string; start_time: string | null }[]
+}
+
+export interface FillModelsResponse {
+  models: Record<string, string>
+  missing: string[]
+}
+
+export interface ConfigItem {
+  key: string
+  value: unknown
+  category: string
+  description: string | null
+  updated_by: string | null
+  updated_at: string | null
+}
+
+export interface ConfigUpdateRequest {
+  value: unknown
+  description?: string
+}
+
+export interface AuditLog {
+  id: string
+  entity_type: string
+  entity_id: string
+  action: string
+  user_id: string | null
+  details: Record<string, unknown> | null
+  created_at: string
+}
+
+export interface AuditLogList {
+  items: AuditLog[]
+  total: number
+}
+
+export interface RoutingRule {
+  id: string
+  name: string
+  priority: number
+  source_project: string
+  conditions: Record<string, unknown>
+  target_dataset: string
+  transform_config: Record<string, unknown>
+  is_active: boolean
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface CreateRuleRequest {
+  name: string
+  priority?: number
+  source_project: string
+  conditions?: {
+    tags?: string[]
+    metadata_match?: Record<string, unknown>
+    status?: string
+    min_duration_ms?: number
+  }
+  target_dataset: string
+  transform_config?: {
+    include_output_as_expected?: boolean
+    default_tags?: string[]
+    split?: string
+  }
+  is_active?: boolean
+}
+
+export interface RoutingLog {
+  id: string
+  rule_id: string | null
+  run_id: string
+  source_project: string
+  target_dataset: string | null
+  status: string
+  error_message: string | null
+  created_at: string | null
+}
+
+export interface PaginatedRoutingLogs {
+  items: RoutingLog[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface RoutingStats {
+  rule_id: string | null
+  total: number
+  routed: number
+  failed: number
+  skipped: number
+}
+
+export interface SchedulerStatus {
+  running: boolean
+  watches: Array<{
+    project_name: string
+    status: string
+    last_poll: string | null
+  }>
+}
+
+export interface DatasetVersion {
+  version_id: string
+  created_at: string | null
+}
+
+export interface DuplicateInfo {
+  fingerprint: string
+  count: number
+  example_ids: string[]
+}
+
+export interface QualityReport {
+  total: number
+  valid: number
+  needs_review: number
+  issues_by_field: Record<string, number>
+  results: Array<Record<string, unknown>>
+}
+
+export interface CapacityInfo {
+  dataset_name: string
+  current_count: number
+  max_count: number
+  usage_ratio: number
+  warning: boolean
+}
