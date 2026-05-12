@@ -112,6 +112,7 @@ class RunSummaryResponse(BaseModel):
     input_preview: str = ""
     output_preview: str = ""
     model_name: str = ""
+    first_token_s: float | None = None
 
 
 class ExtractRequest(BaseModel):

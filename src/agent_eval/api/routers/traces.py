@@ -41,7 +41,7 @@ async def list_runs(
             id=r.id, name=r.name, status=r.status, start_time=r.start_time,
             latency_s=r.latency_s, total_tokens=r.total_tokens, error=r.error,
             tags=r.tags, input_preview=r.input_preview, output_preview=r.output_preview,
-            model_name=r.model_name,
+            model_name=r.model_name, first_token_s=r.first_token_s,
         )
         for r in runs
     ]

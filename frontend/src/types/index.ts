@@ -129,6 +129,7 @@ export interface RunSummary {
   input_preview: string
   output_preview: string
   model_name: string
+  first_token_s: number | null
 }
 
 export interface ExtractRequest {

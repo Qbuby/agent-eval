@@ -43,6 +43,8 @@ function quickselect(arr: number[], k: number): number {
 }
 
 interface LatencyStat {
+  // General-purpose "seconds distribution" stats — used for both end-to-end
+  // latency and time-to-first-token, since both are per-run seconds values.
   model: string
   count: number
   coveredQuestions: number  // distinct input_previews in this model's slice
@@ -330,29 +332,32 @@ export default function TracesPage() {
     })
   }, [allQuestions, questionPickerSearch, questionPickerCrossOnly])
 
-  // Derived: latency stats per model for the chart (O(n), no full sort).
-  // Also tracks distinct questions each model answered — so the user can
-  // eyeball how comparable the per-model slices actually are when they've
-  // picked a batch of questions (e.g. model A covered 8/10 picks, B covered 5/10).
-  const latencyStats = useMemo(() => {
-    const groups = new Map<string, { values: number[]; questions: Set<string> }>()
+  // Derived: latency + first-token stats per model for the two charts.
+  // Single pass groups runs by model and collects both latency and ttft values
+  // plus a question set, so the per-model "coveredQuestions" is shared.
+  const { latencyStats, firstTokenStats } = useMemo(() => {
+    type Bucket = { latency: number[]; ttft: number[]; questions: Set<string> }
+    const groups = new Map<string, Bucket>()
     for (const run of chartScopedRuns) {
-      if (run.latency_s == null) continue
       const model = run.model_name || '(unknown)'
       let bucket = groups.get(model)
       if (!bucket) {
-        bucket = { values: [], questions: new Set() }
+        bucket = { latency: [], ttft: [], questions: new Set() }
         groups.set(model, bucket)
       }
-      bucket.values.push(run.latency_s)
+      if (run.latency_s != null) bucket.latency.push(run.latency_s)
+      if (run.first_token_s != null) bucket.ttft.push(run.first_token_s)
       if (run.input_preview) bucket.questions.add(run.input_preview)
     }
-    const stats: LatencyStat[] = []
+    const latency: LatencyStat[] = []
+    const ttft: LatencyStat[] = []
     for (const [model, b] of groups) {
-      stats.push(computeLatencyStats(b.values, model, b.questions.size))
+      if (b.latency.length > 0) latency.push(computeLatencyStats(b.latency, model, b.questions.size))
+      if (b.ttft.length > 0) ttft.push(computeLatencyStats(b.ttft, model, b.questions.size))
     }
-    stats.sort((a, b) => a.avg - b.avg)
-    return stats
+    latency.sort((a, b) => a.avg - b.avg)
+    ttft.sort((a, b) => a.avg - b.avg)
+    return { latencyStats: latency, firstTokenStats: ttft }
   }, [chartScopedRuns])
 
   const toggleSelect = useCallback((id: string) => {
@@ -518,7 +523,7 @@ export default function TracesPage() {
             onClick={() => setShowChart(v => !v)}
             className={`py-2 px-3 text-[11px] rounded-[6px] border transition-all ${showChart ? 'border-accent text-accent bg-accent/5' : 'border-border text-text-secondary hover:border-accent'}`}
           >
-            {showChart ? '隐藏对比图' : '模型 Latency 对比'}
+            {showChart ? '隐藏对比图' : '模型性能对比'}
           </button>
         </div>
       )}
@@ -528,7 +533,7 @@ export default function TracesPage() {
       {showChart && (
         <div className="border border-border rounded-[6px] bg-surface p-5 mb-5">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-[12px] font-medium">模型 Latency 对比</h3>
+            <h3 className="text-[12px] font-medium">模型性能对比</h3>
             <span className="text-[10px] text-text-tertiary">
               对比样本：{chartScopedRuns.length} 条
               {chartQuestions.size > 0 && ` · ${chartQuestions.size} 个问题`}
@@ -735,65 +740,25 @@ export default function TracesPage() {
             </div>
           </div>
 
-          {latencyStats.length === 0 ? (
+          {latencyStats.length === 0 && firstTokenStats.length === 0 ? (
             <div className="text-center py-8 text-[11px] text-text-tertiary">
               当前筛选条件下无数据
             </div>
           ) : (
-            <>
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={latencyStats} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
-                  <XAxis dataKey="model" tick={{ fontSize: 10 }} />
-                  <YAxis tick={{ fontSize: 10 }} label={{ value: 'seconds', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
-                  <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
-                  <Legend wrapperStyle={{ fontSize: 10 }} />
-                  <Bar dataKey="min" name="Min" fill="#93c5fd" radius={[2, 2, 0, 0]} />
-                  <Bar dataKey="avg" name="Avg" fill="#3b82f6" radius={[2, 2, 0, 0]} />
-                  <Bar dataKey="median" name="Median" fill="#6366f1" radius={[2, 2, 0, 0]} />
-                  <Bar dataKey="p95" name="P95" fill="#a855f7" radius={[2, 2, 0, 0]} />
-                  <Bar dataKey="max" name="Max" fill="#f87171" radius={[2, 2, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-              <div className="mt-4 overflow-x-auto">
-                <table className="w-full text-[11px] border-collapse">
-                  <thead>
-                    <tr className="text-text-tertiary">
-                      <th className="text-left py-1.5 px-2 font-normal">Model</th>
-                      <th className="text-right py-1.5 px-2 font-normal">Runs</th>
-                      <th className="text-right py-1.5 px-2 font-normal" title="该模型在选中问题集里覆盖了多少个不同的问题 / 当前选中问题总数">
-                        Questions
-                      </th>
-                      <th className="text-right py-1.5 px-2 font-normal">Min</th>
-                      <th className="text-right py-1.5 px-2 font-normal">Avg</th>
-                      <th className="text-right py-1.5 px-2 font-normal">Median</th>
-                      <th className="text-right py-1.5 px-2 font-normal">P95</th>
-                      <th className="text-right py-1.5 px-2 font-normal">Max</th>
-                      <th className="text-right py-1.5 px-2 font-normal">Variance</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {latencyStats.map(s => (
-                      <tr key={s.model} className="border-t border-border">
-                        <td className="py-1.5 px-2 font-medium">{s.model}</td>
-                        <td className="py-1.5 px-2 text-right">{s.count}</td>
-                        <td className="py-1.5 px-2 text-right">
-                          {chartQuestions.size > 0
-                            ? `${s.coveredQuestions} / ${chartQuestions.size}`
-                            : s.coveredQuestions}
-                        </td>
-                        <td className="py-1.5 px-2 text-right">{s.min}s</td>
-                        <td className="py-1.5 px-2 text-right">{s.avg}s</td>
-                        <td className="py-1.5 px-2 text-right">{s.median}s</td>
-                        <td className="py-1.5 px-2 text-right">{s.p95}s</td>
-                        <td className="py-1.5 px-2 text-right">{s.max}s</td>
-                        <td className="py-1.5 px-2 text-right">{s.variance}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
+            <div className="flex flex-col gap-6">
+              <DistributionChart
+                title="端到端 Latency"
+                stats={latencyStats}
+                emptyHint="所选数据里没有 latency 字段"
+                pickedQuestions={chartQuestions.size}
+              />
+              <DistributionChart
+                title="首 Token 时延 (TTFT)"
+                stats={firstTokenStats}
+                emptyHint="所选数据里没有 first_token_s —— 这类 run 多见于非流式调用或采集失败"
+                pickedQuestions={chartQuestions.size}
+              />
+            </div>
           )}
         </div>
       )}
@@ -1047,6 +1012,81 @@ const RUN_TYPE_COLORS: Record<string, { border: string; badge: string }> = {
   prompt: { border: '#ec4899', badge: 'bg-pink-50 text-pink-700' },
 }
 const DEFAULT_TYPE_COLOR = { border: '#9ca3af', badge: 'bg-gray-50 text-gray-700' }
+
+interface DistributionChartProps {
+  title: string
+  stats: LatencyStat[]
+  emptyHint: string
+  pickedQuestions: number  // 0 means no question filter active
+}
+
+const DistributionChart = memo(function DistributionChart({ title, stats, emptyHint, pickedQuestions }: DistributionChartProps) {
+  if (stats.length === 0) {
+    return (
+      <div>
+        <h4 className="text-[11px] font-medium text-text-secondary mb-2">{title}</h4>
+        <div className="text-center py-6 text-[11px] text-text-tertiary border border-dashed border-border rounded-[4px]">
+          {emptyHint}
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div>
+      <h4 className="text-[11px] font-medium text-text-secondary mb-2">{title}</h4>
+      <ResponsiveContainer width="100%" height={240}>
+        <BarChart data={stats} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
+          <XAxis dataKey="model" tick={{ fontSize: 10 }} />
+          <YAxis tick={{ fontSize: 10 }} label={{ value: 'seconds', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
+          <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
+          <Legend wrapperStyle={{ fontSize: 10 }} />
+          <Bar dataKey="min" name="Min" fill="#93c5fd" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="avg" name="Avg" fill="#3b82f6" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="median" name="Median" fill="#6366f1" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="p95" name="P95" fill="#a855f7" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="max" name="Max" fill="#f87171" radius={[2, 2, 0, 0]} />
+        </BarChart>
+      </ResponsiveContainer>
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full text-[11px] border-collapse">
+          <thead>
+            <tr className="text-text-tertiary">
+              <th className="text-left py-1.5 px-2 font-normal">Model</th>
+              <th className="text-right py-1.5 px-2 font-normal">Runs</th>
+              <th className="text-right py-1.5 px-2 font-normal" title="该模型在选中问题集里覆盖了多少个不同的问题 / 当前选中问题总数">
+                Questions
+              </th>
+              <th className="text-right py-1.5 px-2 font-normal">Min</th>
+              <th className="text-right py-1.5 px-2 font-normal">Avg</th>
+              <th className="text-right py-1.5 px-2 font-normal">Median</th>
+              <th className="text-right py-1.5 px-2 font-normal">P95</th>
+              <th className="text-right py-1.5 px-2 font-normal">Max</th>
+              <th className="text-right py-1.5 px-2 font-normal">Variance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stats.map(s => (
+              <tr key={s.model} className="border-t border-border">
+                <td className="py-1.5 px-2 font-medium">{s.model}</td>
+                <td className="py-1.5 px-2 text-right">{s.count}</td>
+                <td className="py-1.5 px-2 text-right">
+                  {pickedQuestions > 0 ? `${s.coveredQuestions} / ${pickedQuestions}` : s.coveredQuestions}
+                </td>
+                <td className="py-1.5 px-2 text-right">{s.min}s</td>
+                <td className="py-1.5 px-2 text-right">{s.avg}s</td>
+                <td className="py-1.5 px-2 text-right">{s.median}s</td>
+                <td className="py-1.5 px-2 text-right">{s.p95}s</td>
+                <td className="py-1.5 px-2 text-right">{s.max}s</td>
+                <td className="py-1.5 px-2 text-right">{s.variance}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+})
 
 interface RunNodeRowProps {
   meta: RunChildMeta

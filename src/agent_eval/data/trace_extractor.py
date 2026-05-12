@@ -103,6 +103,26 @@ class RunSummary:
     input_preview: str = ""
     output_preview: str = ""
     model_name: str = ""
+    first_token_s: float | None = None  # Time-to-first-token (seconds from run start)
+
+
+def _compute_ttft(run: Any) -> float | None:
+    """Return seconds from run.start_time to run.first_token_time, or None.
+
+    LangSmith returns start_time with tzinfo but first_token_time as naive UTC,
+    so we normalize both to naive UTC before subtracting.
+    """
+    start = getattr(run, "start_time", None)
+    ttft = getattr(run, "first_token_time", None)
+    if start is None or ttft is None:
+        return None
+    try:
+        s = start.replace(tzinfo=None) if start.tzinfo else start
+        t = ttft.replace(tzinfo=None) if ttft.tzinfo else ttft
+        delta = (t - s).total_seconds()
+        return delta if delta >= 0 else None
+    except Exception:
+        return None
 
 
 class TraceExtractor:
@@ -176,6 +196,7 @@ class TraceExtractor:
                     input_preview=input_preview,
                     output_preview=output_preview,
                     model_name=model_name,
+                    first_token_s=_compute_ttft(run),
                 )
             )
         _list_runs_cache_set(cache_key, summaries)
