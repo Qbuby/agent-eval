@@ -1,0 +1,35 @@
+# Agent 评测配置示例
+# 使用方式: agent-eval evaluate <dataset> --config eval_config.yaml
+
+agent:
+  type: sse  # sse | openai
+  url: https://cs.noblelink.cloud/adagent/omnimind/api/v1/stream
+  headers:
+    Authorization: "eyJhbGciOiJIUzI1NiJ9..."
+    Cookie: "SESSION=xxx"
+    X-Tenant-ID: "default"
+  payload_template:
+    question: "{input}"
+    messages: []
+    language: "请用中文回复"
+    research: false
+  timeout: 120
+
+judge:
+  model: claude-opus-4-6
+  # base_url 和 api_key 默认从 .env 读取 LLM_BASE_URL / LLM_API_KEY
+  dimensions:
+    - name: 准确性
+      weight: 0.4
+      description: "回答是否准确、事实正确"
+    - name: 完整性
+      weight: 0.3
+      description: "回答是否完整覆盖问题要点"
+    - name: 相关性
+      weight: 0.3
+      description: "回答是否与问题相关、不跑题"
+
+dataset: noble-agent-dataset-test
+concurrency: 3
+output_dir: ./eval_results
+# limit: 10  # 取消注释可限制评测数量

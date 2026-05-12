@@ -12,6 +12,8 @@ from agent_eval.db_models.tables import (
     EvaluationScoreRow,
     LoopControlLogRow,
     OptimizationRow,
+    RoutingLogRow,
+    RoutingRuleRow,
     TestCaseRow,
     TestResultRow,
     TestRunRow,
@@ -157,3 +159,104 @@ class Repository:
         self.session.add(row)
         await self.session.flush()
         return row
+
+    # ---- Routing Rules ----
+
+    async def create_routing_rule(self, **kwargs: Any) -> RoutingRuleRow:
+        row = RoutingRuleRow(**kwargs)
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_routing_rule(self, rule_id: uuid.UUID) -> RoutingRuleRow | None:
+        stmt = select(RoutingRuleRow).where(RoutingRuleRow.id == rule_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_routing_rules(self, active_only: bool = False) -> list[RoutingRuleRow]:
+        stmt = select(RoutingRuleRow).order_by(RoutingRuleRow.priority)
+        if active_only:
+            stmt = stmt.where(RoutingRuleRow.is_active == True)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def update_routing_rule(self, rule_id: uuid.UUID, **kwargs: Any) -> RoutingRuleRow | None:
+        stmt = select(RoutingRuleRow).where(RoutingRuleRow.id == rule_id)
+        result = await self.session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        for key, value in kwargs.items():
+            setattr(row, key, value)
+        from datetime import datetime, timezone
+        row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    async def delete_routing_rule(self, rule_id: uuid.UUID) -> bool:
+        stmt = select(RoutingRuleRow).where(RoutingRuleRow.id == rule_id)
+        result = await self.session.execute(stmt)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+        await self.session.delete(row)
+        await self.session.flush()
+        return True
+
+    # ---- Routing Logs ----
+
+    async def create_routing_log(self, **kwargs: Any) -> RoutingLogRow:
+        row = RoutingLogRow(**kwargs)
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def list_routing_logs(
+        self,
+        source_project: str | None = None,
+        target_dataset: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[RoutingLogRow], int]:
+        stmt = select(RoutingLogRow)
+        if source_project:
+            stmt = stmt.where(RoutingLogRow.source_project == source_project)
+        if target_dataset:
+            stmt = stmt.where(RoutingLogRow.target_dataset == target_dataset)
+        if status:
+            stmt = stmt.where(RoutingLogRow.status == status)
+
+        from sqlalchemy import func
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        count_result = await self.session.execute(count_stmt)
+        total = count_result.scalar() or 0
+
+        stmt = stmt.order_by(RoutingLogRow.created_at.desc()).offset(offset).limit(limit)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all()), total
+
+    async def get_routing_stats(self) -> list[dict[str, Any]]:
+        from sqlalchemy import case, func
+        stmt = (
+            select(
+                RoutingLogRow.rule_id,
+                func.count().label("total"),
+                func.count(case((RoutingLogRow.status == "routed", 1))).label("routed"),
+                func.count(case((RoutingLogRow.status == "failed", 1))).label("failed"),
+                func.count(case((RoutingLogRow.status == "skipped", 1))).label("skipped"),
+            )
+            .group_by(RoutingLogRow.rule_id)
+        )
+        result = await self.session.execute(stmt)
+        rows = result.all()
+        return [
+            {
+                "rule_id": str(r.rule_id) if r.rule_id else None,
+                "total": r.total,
+                "routed": r.routed,
+                "failed": r.failed,
+                "skipped": r.skipped,
+            }
+            for r in rows
+        ]

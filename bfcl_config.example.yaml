@@ -1,0 +1,27 @@
+# BFCL-v4 评测配置
+# 使用方式: agent-eval bench bfcl --config bfcl_config.yaml
+
+model: claude-opus-4-6
+api_url: https://kiro.aidong-ai.com/v1
+api_key: ""  # 留空则从 .env 的 LLM_API_KEY 读取
+
+# 评测子集选择
+# 预设: all, simple, non_live, live, multi_turn, agentic
+# 或指定具体子集: simple_python, multiple, parallel, parallel_multiple, etc.
+categories:
+  - simple_python
+  - multiple
+  - parallel
+  - parallel_multiple
+  - multi_turn_base
+
+concurrency: 5
+fc_model: true           # 使用原生 function calling
+underscore_to_dot: true  # 函数名中的点转下划线
+temperature: 0
+
+# Web search 类别需要 SerpAPI key
+# serpapi_key: ""
+
+output_dir: ./bfcl_results
+# limit: 10  # 取消注释限制每个子集的样本数（调试用）

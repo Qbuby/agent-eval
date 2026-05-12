@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -94,14 +95,40 @@ class LangSmithDatasetProvider:
         ds = await to_thread(self.client.read_dataset, dataset_name=dataset_name)
         all_params = [converter.case_to_example(c, split=split) for c in cases]
 
+        batch_size = 20
+        if len(all_params) <= batch_size:
+            return await self._create_batch(ds.id, all_params, split, source_run_ids)
+
+        all_ids: list[str] = []
+        batches = [all_params[i:i + batch_size] for i in range(0, len(all_params), batch_size)]
+        src_batches = None
+        if source_run_ids:
+            src_batches = [source_run_ids[i:i + batch_size] for i in range(0, len(source_run_ids), batch_size)]
+
+        async def _do_batch(idx: int) -> list[str]:
+            src = src_batches[idx] if src_batches else None
+            return await self._create_batch(ds.id, batches[idx], split, src)
+
+        results = await asyncio.gather(*[_do_batch(i) for i in range(len(batches))])
+        for ids in results:
+            all_ids.extend(ids)
+        return all_ids
+
+    async def _create_batch(
+        self,
+        dataset_id: Any,
+        params: list[dict[str, Any]],
+        split: str | None,
+        source_run_ids: list[str] | None,
+    ) -> list[str]:
         kwargs: dict[str, Any] = {
-            "inputs": [p["inputs"] for p in all_params],
-            "outputs": [p["outputs"] for p in all_params],
-            "metadata": [p["metadata"] for p in all_params],
-            "dataset_id": ds.id,
+            "inputs": [p["inputs"] for p in params],
+            "outputs": [p["outputs"] for p in params],
+            "metadata": [p["metadata"] for p in params],
+            "dataset_id": dataset_id,
         }
         if split:
-            kwargs["splits"] = [p.get("split") for p in all_params]
+            kwargs["splits"] = [p.get("split") for p in params]
         if source_run_ids:
             kwargs["source_run_ids"] = source_run_ids
 

@@ -1,0 +1,72 @@
+import api from './client'
+import type {
+  Dataset,
+  CreateDatasetRequest,
+  DatasetStats,
+  DatasetVersion,
+  TestCase,
+  AddCasesRequest,
+  DuplicateInfo,
+  QualityReport,
+  CapacityInfo,
+} from '@/types'
+
+export const datasetsApi = {
+  list(filter?: string) {
+    return api.get<Dataset[]>('/datasets', { params: filter ? { filter } : undefined })
+  },
+  get(name: string) {
+    return api.get<Dataset>(`/datasets/${name}`)
+  },
+  create(data: CreateDatasetRequest) {
+    return api.post<{ id: string; name: string }>('/datasets', data)
+  },
+  delete(name: string) {
+    return api.delete(`/datasets/${name}`)
+  },
+  getStats(name: string, params?: { split?: string; tag?: string[] }) {
+    return api.get<DatasetStats>(`/datasets/${name}/stats`, { params })
+  },
+  export(name: string, params?: { split?: string; tag?: string[]; as_of?: string }) {
+    return api.get(`/datasets/${name}/export`, { params })
+  },
+  listVersions(name: string) {
+    return api.get<DatasetVersion[]>(`/datasets/${name}/versions`)
+  },
+  listCases(name: string, params?: { split?: string; tag?: string[]; as_of?: string; limit?: number }) {
+    return api.get<TestCase[]>(`/datasets/${name}/cases`, { params })
+  },
+  listCasesPaginated(name: string, params?: { page?: number; page_size?: number; search?: string; tag?: string }) {
+    return api.get<{ items: TestCase[]; total: number; page: number; page_size: number }>(`/datasets/${name}/cases`, { params })
+  },
+  addCases(name: string, data: AddCasesRequest) {
+    return api.post<{ added: number; ids: string[] }>(`/datasets/${name}/cases`, data)
+  },
+  updateCase(exampleId: string, data: TestCase) {
+    return api.put(`/cases/${exampleId}`, data)
+  },
+  deleteCase(exampleId: string) {
+    return api.delete(`/cases/${exampleId}`)
+  },
+  batchDeleteCases(exampleIds: string[]) {
+    return api.post('/cases/batch-delete', { example_ids: exampleIds })
+  },
+  getDuplicates(name: string) {
+    return api.get<DuplicateInfo[]>(`/datasets/${name}/duplicates`)
+  },
+  deduplicate(name: string, strategy?: string) {
+    return api.post(`/datasets/${name}/deduplicate`, strategy ? { strategy } : undefined)
+  },
+  getQuality(name: string) {
+    return api.get<QualityReport>(`/datasets/${name}/quality`)
+  },
+  getCapacity(name: string) {
+    return api.get<CapacityInfo>(`/datasets/${name}/capacity`)
+  },
+  archive(name: string) {
+    return api.post(`/datasets/${name}/archive`)
+  },
+  activate(name: string) {
+    return api.post(`/datasets/${name}/activate`)
+  },
+}

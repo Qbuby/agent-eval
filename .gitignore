@@ -1,8 +1,39 @@
-.env
+# Python
 __pycache__/
 *.pyc
 *.egg-info/
-dist/
-build/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+
+# Build / dist
+dist/
+build/
+
+# Env files (keep .env.example, frontend/.env.development, frontend/.env.production)
+# Prefix with / is NOT used -> match at any depth (frontend/.env too).
+.env
+.env.local
+.env.*.local
+!frontend/.env.development
+!frontend/.env.production
+!.env.example
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temp / probe files
+*.tmp
+*.tmp.json
+*.tmp.*
+_probe*.py
+_probe*.js
