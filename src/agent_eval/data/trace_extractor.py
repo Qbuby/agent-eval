@@ -5,7 +5,7 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from langsmith import Client
@@ -591,8 +591,16 @@ class TraceExtractor:
             if starts:
                 window_start = min(starts)
                 window_end = max(starts)
-                cursor_end = window_end
-                MAX_ROUNDS = 5
+                # LangSmith end_time is exclusive (< cursor_end), so nudge past
+                # window_end on the first pass to include any root whose
+                # start_time equals the newest boundary.
+                cursor_end = window_end + timedelta(microseconds=1)
+                # Tool density is higher than LLM density (typ. 3-6 tools per
+                # root vs. 3-5 llm calls, but tools are short and sometimes the
+                # agent chains many in quick succession). A 100-per-page cap
+                # means each round covers only ~10-25 roots, so we need more
+                # rounds than for models. 12 covers ~100 roots at 25s budget.
+                MAX_ROUNDS = 12
                 for round_idx in range(MAX_ROUNDS):
                     kwargs = {
                         "project_name": project_name,
@@ -622,9 +630,48 @@ class TraceExtractor:
                         prev = found_earliest.get(tid)
                         if prev is None or st < prev:
                             found_earliest[tid] = st
+                    # Early-exit: every pending root already has an earliest
+                    # tool — later rounds would only downgrade already-found
+                    # entries to an even earlier start, which is impossible
+                    # since we walk backwards in time. Save the remaining rounds.
+                    if len(found_earliest) >= len(pending_tool_ids):
+                        break
                     if oldest is None or oldest <= window_start:
                         break
                     cursor_end = oldest
+
+            # OR-fallback for roots still missing a tool entry (covers trace
+            # genuinely missed by the window because of dense neighboring
+            # activity). Small OR-5 chunks — ~6s per chunk on LangSmith.
+            still_missing = pending_tool_ids - set(found_earliest.keys())
+            if still_missing:
+                miss_list = list(still_missing)
+                miss_chunks = [miss_list[i : i + 5] for i in range(0, len(miss_list), 5)]
+                for chunk in miss_chunks:
+                    flt = (
+                        f'eq(trace_id, "{chunk[0]}")'
+                        if len(chunk) == 1
+                        else "or(" + ",".join([f'eq(trace_id, "{i}")' for i in chunk]) + ")"
+                    )
+                    try:
+                        tool_runs = list(await to_thread(
+                            self.client.list_runs,
+                            project_name=project_name,
+                            run_type="tool",
+                            filter=flt,
+                            limit=100,
+                        ))
+                    except Exception as e:
+                        logger.warning("fill_enrichments: tool OR chunk failed: %s", e)
+                        continue
+                    for t in tool_runs:
+                        st = getattr(t, "start_time", None)
+                        tid = str(t.trace_id) if getattr(t, "trace_id", None) else None
+                        if not tid or tid not in pending_tool_ids or st is None:
+                            continue
+                        prev = found_earliest.get(tid)
+                        if prev is None or st < prev:
+                            found_earliest[tid] = st
 
             # Compute seconds-from-root-start; fall back to naive arithmetic
             # because LangSmith tool.start_time is tz-aware but root start_time
