@@ -130,6 +130,7 @@ export interface RunSummary {
   output_preview: string
   model_name: string
   first_token_s: number | null
+  first_tool_call_s: number | null
 }
 
 export interface ExtractRequest {
@@ -203,6 +204,7 @@ export interface FillModelsRequest {
 
 export interface FillModelsResponse {
   models: Record<string, string>
+  first_tool_calls: Record<string, number>
   missing: string[]
 }
 

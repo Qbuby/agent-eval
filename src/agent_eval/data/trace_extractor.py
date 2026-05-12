@@ -32,6 +32,13 @@ _MODEL_NAME_CACHE_MAX = 4096
 _MODEL_NAME_CACHE_TTL_S = 3600
 _model_name_cache: "OrderedDict[str, tuple[float, str]]" = OrderedDict()
 
+# Per-(project, root_id) first-tool-call latency (seconds from root start).
+# Sentinel: cache stores -1.0 when the root is known to make no tool calls
+# (positive cache of "no tool"); any non-negative float means "tool found".
+_FIRST_TOOL_CACHE_MAX = 4096
+_FIRST_TOOL_CACHE_TTL_S = 3600
+_first_tool_cache: "OrderedDict[str, tuple[float, float]]" = OrderedDict()
+
 
 def _list_runs_cache_get(key: str) -> list | None:
     entry = _list_runs_cache.get(key)
@@ -71,6 +78,25 @@ def _model_name_cache_set(key: str, value: str) -> None:
         _model_name_cache.popitem(last=False)
 
 
+def _first_tool_cache_get(key: str) -> float | None:
+    entry = _first_tool_cache.get(key)
+    if entry is None:
+        return None
+    ts, value = entry
+    if time.monotonic() - ts > _FIRST_TOOL_CACHE_TTL_S:
+        _first_tool_cache.pop(key, None)
+        return None
+    _first_tool_cache.move_to_end(key)
+    return value
+
+
+def _first_tool_cache_set(key: str, value: float) -> None:
+    _first_tool_cache[key] = (time.monotonic(), value)
+    _first_tool_cache.move_to_end(key)
+    while len(_first_tool_cache) > _FIRST_TOOL_CACHE_MAX:
+        _first_tool_cache.popitem(last=False)
+
+
 def _cache_get(key: str) -> dict | None:
     entry = _detail_cache.get(key)
     if entry is None:
@@ -104,6 +130,7 @@ class RunSummary:
     output_preview: str = ""
     model_name: str = ""
     first_token_s: float | None = None  # Time-to-first-token (seconds from run start)
+    first_tool_call_s: float | None = None  # Seconds from run start to the first tool child's start (None if not yet resolved; see fill endpoint)
 
 
 def _compute_ttft(run: Any) -> float | None:
@@ -183,6 +210,15 @@ class TraceExtractor:
             input_preview = truncate(str(run.inputs or {}), 120)
             output_preview = truncate(str(run.outputs or {}), 120)
             model_name = model_map.get(str(run.id), "")
+            # first_tool_call_s is populated later via the enrich endpoint;
+            # surface whatever is already cached so subsequent list_runs after
+            # an enrich call can show the tool-call column without another rpc.
+            ft_cached = _first_tool_cache_get(f"{project_name}:{run.id}")
+            first_tool_call_s: float | None
+            if ft_cached is None or ft_cached < 0:
+                first_tool_call_s = None
+            else:
+                first_tool_call_s = ft_cached
             summaries.append(
                 RunSummary(
                     id=str(run.id),
@@ -197,6 +233,7 @@ class TraceExtractor:
                     output_preview=output_preview,
                     model_name=model_name,
                     first_token_s=_compute_ttft(run),
+                    first_tool_call_s=first_tool_call_s,
                 )
             )
         _list_runs_cache_set(cache_key, summaries)
@@ -380,12 +417,12 @@ class TraceExtractor:
 
         return model_map
 
-    async def fill_models(
+    async def fill_enrichments(
         self,
         project_name: str,
         runs: list[dict[str, Any]],
-    ) -> tuple[dict[str, str], list[str]]:
-        """Thorough model_name resolution for a known set of root run ids.
+    ) -> tuple[dict[str, str], dict[str, float], list[str]]:
+        """Thorough enrichment (model_name + first_tool_call_s) for a set of roots.
 
         `runs` is a list of `{id, start_time}` dicts — the caller already has
         start_time from its previous list_runs page, so we skip a round-trip
@@ -393,138 +430,231 @@ class TraceExtractor:
         rejects or(eq(id, ...)) filters across different "tables", so there
         is no cheap way to bulk-read roots by id.)
 
-        Strategy (cache-aware):
-        1. Short-circuit ids already in _model_name_cache
-        2. Walk back time-window LLM queries (5 rounds, each limit=100)
-        3. For any root still missing, OR-5 trace_id batches as fallback
+        Strategy (cache-aware, llm + tool queries run sequentially — LangSmith
+        serializes same-project queries anyway, so firing them in parallel
+        doesn't help and sometimes hurts):
 
-        Slower than list_runs (~30-75s cold), but covers ~100% when LangSmith
-        has the data. Results cache for 1h, so repeat calls and later
-        list_runs of the same project return instantly.
+        1. Short-circuit ids already covered by BOTH caches (model_name + first_tool)
+        2. Walk back time-window LLM queries (5 rounds, each limit=100) for model_name
+           + small OR-5 trace_id fallback for any missing root
+        3. Walk back time-window tool queries (5 rounds, each limit=100) for
+           first tool child's start_time. Roots with no tool child after all
+           rounds are negative-cached as "no tool" (-1.0 sentinel).
+
+        Slower than list_runs (~30-120s cold depending on round count), but
+        covers ~100% when LangSmith has the data. Results cache for 1h, so
+        repeat calls and later list_runs of the same project return instantly.
+
+        Returns:
+            (models, first_tool_calls, missing)
+              models: {root_id: model_name} for resolved roots
+              first_tool_calls: {root_id: seconds} for roots with a tool child
+              missing: root_ids whose model_name couldn't be resolved (tool
+                      coverage is "best effort" — absence just means "no tool
+                      detected within the scanned window")
         """
         if not runs:
-            return {}, []
+            return {}, {}, []
 
-        resolved: dict[str, str] = {}
-        pending: list[dict[str, Any]] = []
+        # Parse {id: start_time_dt} once.
+        id_to_start: dict[str, datetime | None] = {}
         for r in runs:
             rid = r.get("id")
             if not rid:
                 continue
-            key = f"{project_name}:{rid}"
-            cached = _model_name_cache_get(key)
-            if cached:
-                resolved[rid] = cached
-            elif cached is None:
-                pending.append(r)
-            else:
-                # Negative-cached; retry in thorough mode.
-                pending.append(r)
-
-        if not pending:
-            return resolved, []
-
-        # Bound the time window from supplied start_times.
-        starts: list[datetime] = []
-        for r in pending:
             st = r.get("start_time")
+            parsed: datetime | None = None
             if isinstance(st, str):
                 try:
-                    starts.append(datetime.fromisoformat(st.replace("Z", "+00:00")))
+                    parsed = datetime.fromisoformat(st.replace("Z", "+00:00"))
                 except ValueError:
                     pass
             elif isinstance(st, datetime):
-                starts.append(st)
+                parsed = st
+            id_to_start[str(rid)] = parsed
 
-        pending_ids = {str(r["id"]) for r in pending}
+        # ── Phase 1: model_name ──
+        resolved_models: dict[str, str] = {}
+        pending_models: list[dict[str, Any]] = []
+        for r in runs:
+            rid = r.get("id")
+            if not rid:
+                continue
+            cached = _model_name_cache_get(f"{project_name}:{rid}")
+            if cached:
+                resolved_models[rid] = cached
+            else:
+                # None or ""(negative): retry in thorough mode.
+                pending_models.append(r)
 
-        if starts:
-            window_start = min(starts)
-            window_end = max(starts)
-            cursor_end: datetime | None = window_end
-            MAX_ROUNDS = 5
+        if pending_models:
+            pending_ids = {str(r["id"]) for r in pending_models}
+            starts = [id_to_start[str(r["id"])] for r in pending_models if id_to_start.get(str(r["id"]))]
+            if starts:
+                window_start = min(starts)
+                window_end = max(starts)
+                cursor_end: datetime | None = window_end
+                MAX_ROUNDS = 5
+                for round_idx in range(MAX_ROUNDS):
+                    kwargs: dict[str, Any] = {
+                        "project_name": project_name,
+                        "run_type": "llm",
+                        "start_time": window_start,
+                        "limit": 100,
+                    }
+                    if cursor_end is not None:
+                        kwargs["end_time"] = cursor_end
+                    try:
+                        llm_runs = list(await to_thread(self.client.list_runs, **kwargs))
+                    except Exception as e:
+                        logger.warning("fill_enrichments: llm window round %d failed: %s", round_idx, e)
+                        break
+                    if not llm_runs:
+                        break
+                    oldest = None
+                    for l in llm_runs:
+                        st = getattr(l, "start_time", None)
+                        if st and (oldest is None or st < oldest):
+                            oldest = st
+                        tid = str(l.trace_id) if getattr(l, "trace_id", None) else None
+                        if not tid or tid not in pending_ids or tid in resolved_models:
+                            continue
+                        name = self._model_name_from_run(l)
+                        if name:
+                            resolved_models[tid] = name
+                    still = pending_ids - set(resolved_models.keys())
+                    if not still:
+                        break
+                    if oldest is None or oldest <= window_start:
+                        break
+                    cursor_end = oldest
 
-            for round_idx in range(MAX_ROUNDS):
-                kwargs: dict[str, Any] = {
-                    "project_name": project_name,
-                    "run_type": "llm",
-                    "start_time": window_start,
-                    "limit": 100,
-                }
-                if cursor_end is not None:
-                    kwargs["end_time"] = cursor_end
-                try:
-                    llm_runs = list(await to_thread(self.client.list_runs, **kwargs))
-                except Exception as e:
-                    logger.warning(
-                        "fill_models: window round %d failed: %s", round_idx, e,
+            # OR-fallback for roots still missing a model name.
+            still_missing = pending_ids - set(resolved_models.keys())
+            if still_missing:
+                miss_list = list(still_missing)
+                miss_chunks = [miss_list[i : i + 5] for i in range(0, len(miss_list), 5)]
+                for chunk in miss_chunks:
+                    flt = (
+                        f'eq(trace_id, "{chunk[0]}")'
+                        if len(chunk) == 1
+                        else "or(" + ",".join([f'eq(trace_id, "{i}")' for i in chunk]) + ")"
                     )
-                    break
-                if not llm_runs:
-                    break
-
-                oldest = None
-                for l in llm_runs:
-                    st = getattr(l, "start_time", None)
-                    if st and (oldest is None or st < oldest):
-                        oldest = st
-                    tid = str(l.trace_id) if getattr(l, "trace_id", None) else None
-                    if not tid or tid not in pending_ids or tid in resolved:
+                    try:
+                        llm_runs = list(await to_thread(
+                            self.client.list_runs,
+                            project_name=project_name,
+                            run_type="llm",
+                            filter=flt,
+                            limit=100,
+                        ))
+                    except Exception as e:
+                        logger.warning("fill_enrichments: llm OR chunk failed: %s", e)
                         continue
-                    name = self._model_name_from_run(l)
-                    if name:
-                        resolved[tid] = name
+                    for l in llm_runs:
+                        tid = str(l.trace_id) if getattr(l, "trace_id", None) else None
+                        if not tid or tid in resolved_models:
+                            continue
+                        name = self._model_name_from_run(l)
+                        if name:
+                            resolved_models[tid] = name
 
-                still_missing = pending_ids - set(resolved.keys())
-                if not still_missing:
-                    break
-                if oldest is None or oldest <= window_start:
-                    break
-                cursor_end = oldest
-
-        still_missing = pending_ids - set(resolved.keys())
-
-        # OR-filter fallback for roots not covered by any time window (or when
-        # the caller supplied no start_times at all).
-        if still_missing:
-            BATCH_OR = 5
-            miss_list = list(still_missing)
-            miss_chunks = [miss_list[i : i + BATCH_OR] for i in range(0, len(miss_list), BATCH_OR)]
-            for chunk in miss_chunks:
-                flt = (
-                    f'eq(trace_id, "{chunk[0]}")'
-                    if len(chunk) == 1
-                    else "or(" + ",".join([f'eq(trace_id, "{i}")' for i in chunk]) + ")"
+            # Write model cache (negative-cache unresolved).
+            for r in pending_models:
+                rid = str(r["id"])
+                _model_name_cache_set(
+                    f"{project_name}:{rid}", resolved_models.get(rid, ""),
                 )
-                try:
-                    llm_runs = list(await to_thread(
-                        self.client.list_runs,
-                        project_name=project_name,
-                        run_type="llm",
-                        filter=flt,
-                        limit=100,
-                    ))
-                except Exception as e:
-                    logger.warning("fill_models: OR fallback chunk failed: %s", e)
+
+        # ── Phase 2: first_tool_call_s ──
+        # For tool runs, we take the EARLIEST tool child's start_time per trace.
+        resolved_tool: dict[str, float] = {}
+        pending_tool: list[dict[str, Any]] = []
+        for r in runs:
+            rid = r.get("id")
+            if not rid:
+                continue
+            cached = _first_tool_cache_get(f"{project_name}:{rid}")
+            if cached is None:
+                pending_tool.append(r)
+            elif cached >= 0:
+                resolved_tool[rid] = cached
+            # cached < 0 is "confirmed no tool" — don't expose, don't re-query.
+
+        # Earliest tool start per pending trace (only keep if it's less than
+        # any existing entry).
+        found_earliest: dict[str, datetime] = {}
+
+        if pending_tool:
+            pending_tool_ids = {str(r["id"]) for r in pending_tool}
+            starts = [id_to_start[str(r["id"])] for r in pending_tool if id_to_start.get(str(r["id"]))]
+            if starts:
+                window_start = min(starts)
+                window_end = max(starts)
+                cursor_end = window_end
+                MAX_ROUNDS = 5
+                for round_idx in range(MAX_ROUNDS):
+                    kwargs = {
+                        "project_name": project_name,
+                        "run_type": "tool",
+                        "start_time": window_start,
+                        "limit": 100,
+                    }
+                    if cursor_end is not None:
+                        kwargs["end_time"] = cursor_end
+                    try:
+                        tool_runs = list(await to_thread(self.client.list_runs, **kwargs))
+                    except Exception as e:
+                        logger.warning("fill_enrichments: tool window round %d failed: %s", round_idx, e)
+                        break
+                    if not tool_runs:
+                        break
+                    oldest = None
+                    for t in tool_runs:
+                        st = getattr(t, "start_time", None)
+                        if st and (oldest is None or st < oldest):
+                            oldest = st
+                        tid = str(t.trace_id) if getattr(t, "trace_id", None) else None
+                        if not tid or tid not in pending_tool_ids:
+                            continue
+                        if st is None:
+                            continue
+                        prev = found_earliest.get(tid)
+                        if prev is None or st < prev:
+                            found_earliest[tid] = st
+                    if oldest is None or oldest <= window_start:
+                        break
+                    cursor_end = oldest
+
+            # Compute seconds-from-root-start; fall back to naive arithmetic
+            # because LangSmith tool.start_time is tz-aware but root start_time
+            # might be naive in rare cases.
+            for tid, tool_start in found_earliest.items():
+                root_start = id_to_start.get(tid)
+                if root_start is None:
                     continue
-                for l in llm_runs:
-                    tid = str(l.trace_id) if getattr(l, "trace_id", None) else None
-                    if not tid or tid in resolved:
-                        continue
-                    name = self._model_name_from_run(l)
-                    if name:
-                        resolved[tid] = name
+                try:
+                    a = tool_start.replace(tzinfo=None) if tool_start.tzinfo else tool_start
+                    b = root_start.replace(tzinfo=None) if root_start.tzinfo else root_start
+                    delta = (a - b).total_seconds()
+                    if delta >= 0:
+                        resolved_tool[tid] = delta
+                except Exception:
+                    pass
 
-        # Persist to cache. Resolved → name; still-missing → negative cache so
-        # thorough re-runs don't keep paying the cost. Negative entries expire
-        # with the 1h TTL, so brand-new LLM data gets picked up eventually.
-        for r in pending:
-            rid = str(r["id"])
-            key = f"{project_name}:{rid}"
-            _model_name_cache_set(key, resolved.get(rid, ""))
+            # Cache writes: resolved → positive; unresolved after all rounds
+            # → -1.0 (= "no tool call detected within scanned window, don't
+            # re-query for 1 hour"). This is the same negative-cache trick we
+            # use for model_name.
+            for r in pending_tool:
+                rid = str(r["id"])
+                if rid in resolved_tool:
+                    _first_tool_cache_set(f"{project_name}:{rid}", resolved_tool[rid])
+                else:
+                    _first_tool_cache_set(f"{project_name}:{rid}", -1.0)
 
-        missing_out = [str(r["id"]) for r in pending if str(r["id"]) not in resolved]
-        return resolved, missing_out
+        missing_models = [rid for rid in id_to_start if rid not in resolved_models]
+        return resolved_models, resolved_tool, missing_models
 
     @staticmethod
     def _model_name_from_run(llm_run: Any) -> str:

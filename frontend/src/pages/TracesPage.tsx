@@ -134,6 +134,7 @@ export default function TracesPage() {
   const [chartStatus, setChartStatus] = useState<'all' | 'success' | 'error'>('all')
   const [chartSelectedModels, setChartSelectedModels] = useState<Set<string>>(new Set())
   const [chartQuestions, setChartQuestions] = useState<Set<string>>(new Set()) // empty = no question filter
+  const [excludeTail5, setExcludeTail5] = useState(false)
   const [showQuestionPicker, setShowQuestionPicker] = useState(false)
   const [questionPickerSearch, setQuestionPickerSearch] = useState('')
   const [questionPickerCrossOnly, setQuestionPickerCrossOnly] = useState(false)
@@ -208,6 +209,7 @@ export default function TracesPage() {
     setChartStatus('all')
     setChartSelectedModels(new Set())
     setChartQuestions(new Set())
+    setExcludeTail5(false)
     setShowQuestionPicker(false)
     setQuestionPickerSearch('')
     setQuestionPickerCrossOnly(false)
@@ -216,27 +218,32 @@ export default function TracesPage() {
 
   const handleFillModels = useCallback(async () => {
     if (fillingModels) return
-    const missing = allRuns.filter(r => !r.model_name)
-    if (missing.length === 0) {
-      setFillModelsMsg('所有 run 都已有 model')
+    // Fill what's missing: a run without a model_name OR without a known
+    // first_tool_call_s (null could mean "not yet queried" OR "confirmed no
+    // tool call" — backend's negative cache makes a second call cheap, so
+    // re-fill is safe).
+    const needsFill = allRuns.filter(r => !r.model_name || r.first_tool_call_s == null)
+    if (needsFill.length === 0) {
+      setFillModelsMsg('所有 run 的信息都已完整')
       return
     }
     setFillingModels(true)
-    setFillModelsMsg(`正在补齐 ${missing.length} 条 model…（首次约 30-90s）`)
+    setFillModelsMsg(`正在补齐 ${needsFill.length} 条 model 和首次工具调用时延…（首次约 30-120s）`)
     try {
-      const payload = missing.map(r => ({ id: r.id, start_time: r.start_time }))
+      const payload = needsFill.map(r => ({ id: r.id, start_time: r.start_time }))
       const res = await tracesApi.fillModels({ project_name: projectName, runs: payload })
-      const { models, missing: stillMissing } = res.data
+      const { models, first_tool_calls, missing: stillMissing } = res.data
       setAllRuns(prev => prev.map(r => {
-        if (r.model_name) return r
-        const m = models[r.id]
-        return m ? { ...r, model_name: m } : r
+        const m = r.model_name || models[r.id] || ''
+        const t = r.first_tool_call_s ?? (r.id in first_tool_calls ? first_tool_calls[r.id] : null)
+        if (m === r.model_name && t === r.first_tool_call_s) return r
+        return { ...r, model_name: m, first_tool_call_s: t }
       }))
-      const resolvedCount = Object.keys(models).length
+      const resolvedModels = Object.keys(models).length
+      const resolvedTools = Object.keys(first_tool_calls).length
       setFillModelsMsg(
-        `补齐 ${resolvedCount}/${missing.length}${
-          stillMissing.length > 0 ? `，${stillMissing.length} 条无 LLM 子 run` : ''
-        }`
+        `补齐 ${resolvedModels}/${needsFill.length} model，${resolvedTools} 条有首次工具调用` +
+        (stillMissing.length > 0 ? `，${stillMissing.length} 条无 LLM 子 run` : '')
       )
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
@@ -276,23 +283,47 @@ export default function TracesPage() {
     [filteredRuns, page, pageSize]
   )
 
-  // Derived: runs scoped for the latency chart (independent of list filters).
+  // Derived: runs scoped for the chart block (independent of list filters).
   // Relies on `allRuns` being time-desc so "最近 N 条" is a slice, not a sort.
+  // `excludeTail5` is applied AFTER all other filters: per-model drop the
+  // slowest 5% by latency. This keeps the comparison robust to a handful of
+  // stuck / timeout runs that would otherwise dominate avg and P95. Applied
+  // symmetrically to all three charts (latency / ttft / tool-call) so they
+  // agree on which rows count.
   const chartScopedRuns = useMemo(() => {
     const needsStatusFilter = chartStatus !== 'all'
     const needsModelFilter = chartSelectedModels.size > 0
     const needsQuestionFilter = chartQuestions.size > 0
-    const result: RunSummary[] = []
+    const scoped: RunSummary[] = []
     const limit = chartRecentN > 0 ? chartRecentN : Infinity
     for (const r of allRuns) {
-      if (result.length >= limit) break
+      if (scoped.length >= limit) break
       if (needsStatusFilter && r.status !== chartStatus) continue
       if (needsModelFilter && !chartSelectedModels.has(r.model_name || '(unknown)')) continue
       if (needsQuestionFilter && !chartQuestions.has(r.input_preview)) continue
-      result.push(r)
+      scoped.push(r)
     }
-    return result
-  }, [allRuns, chartStatus, chartSelectedModels, chartRecentN, chartQuestions])
+    if (!excludeTail5) return scoped
+    // Per-model tail trim: drop the slowest 5% (by latency_s) from each group.
+    // Small groups round down to 0 dropped, so this won't wipe a model with
+    // only a few runs.
+    const byModel = new Map<string, RunSummary[]>()
+    for (const r of scoped) {
+      const m = r.model_name || '(unknown)'
+      const list = byModel.get(m)
+      if (list) list.push(r)
+      else byModel.set(m, [r])
+    }
+    const dropIds = new Set<string>()
+    for (const group of byModel.values()) {
+      const dropN = Math.floor(group.length * 0.05)
+      if (dropN === 0) continue
+      const sorted = [...group].sort((a, b) => (b.latency_s ?? -Infinity) - (a.latency_s ?? -Infinity))
+      for (let i = 0; i < dropN; i++) dropIds.add(sorted[i].id)
+    }
+    if (dropIds.size === 0) return scoped
+    return scoped.filter(r => !dropIds.has(r.id))
+  }, [allRuns, chartStatus, chartSelectedModels, chartRecentN, chartQuestions, excludeTail5])
 
   // Derived: all distinct questions (input_preview) found in allRuns, with how
   // many distinct models ran each and total run count. Used by the question
@@ -332,32 +363,35 @@ export default function TracesPage() {
     })
   }, [allQuestions, questionPickerSearch, questionPickerCrossOnly])
 
-  // Derived: latency + first-token stats per model for the two charts.
-  // Single pass groups runs by model and collects both latency and ttft values
-  // plus a question set, so the per-model "coveredQuestions" is shared.
-  const { latencyStats, firstTokenStats } = useMemo(() => {
-    type Bucket = { latency: number[]; ttft: number[]; questions: Set<string> }
+  // Derived: latency + first-token + first-tool-call stats per model, in one
+  // pass. All three charts share the same per-model question-coverage count.
+  const { latencyStats, firstTokenStats, firstToolCallStats } = useMemo(() => {
+    type Bucket = { latency: number[]; ttft: number[]; firstTool: number[]; questions: Set<string> }
     const groups = new Map<string, Bucket>()
     for (const run of chartScopedRuns) {
       const model = run.model_name || '(unknown)'
       let bucket = groups.get(model)
       if (!bucket) {
-        bucket = { latency: [], ttft: [], questions: new Set() }
+        bucket = { latency: [], ttft: [], firstTool: [], questions: new Set() }
         groups.set(model, bucket)
       }
       if (run.latency_s != null) bucket.latency.push(run.latency_s)
       if (run.first_token_s != null) bucket.ttft.push(run.first_token_s)
+      if (run.first_tool_call_s != null) bucket.firstTool.push(run.first_tool_call_s)
       if (run.input_preview) bucket.questions.add(run.input_preview)
     }
     const latency: LatencyStat[] = []
     const ttft: LatencyStat[] = []
+    const tool: LatencyStat[] = []
     for (const [model, b] of groups) {
       if (b.latency.length > 0) latency.push(computeLatencyStats(b.latency, model, b.questions.size))
       if (b.ttft.length > 0) ttft.push(computeLatencyStats(b.ttft, model, b.questions.size))
+      if (b.firstTool.length > 0) tool.push(computeLatencyStats(b.firstTool, model, b.questions.size))
     }
     latency.sort((a, b) => a.avg - b.avg)
     ttft.sort((a, b) => a.avg - b.avg)
-    return { latencyStats: latency, firstTokenStats: ttft }
+    tool.sort((a, b) => a.avg - b.avg)
+    return { latencyStats: latency, firstTokenStats: ttft, firstToolCallStats: tool }
   }, [chartScopedRuns])
 
   const toggleSelect = useCallback((id: string) => {
@@ -469,12 +503,12 @@ export default function TracesPage() {
             清空
           </button>
         )}
-        {allRuns.length > 0 && allRuns.some(r => !r.model_name) && (
+        {allRuns.length > 0 && allRuns.some(r => !r.model_name || r.first_tool_call_s == null) && (
           <button
             type="button"
             onClick={handleFillModels}
             disabled={fillingModels}
-            title="用多轮时间窗口 + OR 查询补齐缺失的 model_name。首次 30-90s，结果缓存 1 小时。"
+            title="用多轮时间窗口补齐 model_name 与首次工具调用时延。首次 30-120s，结果缓存 1 小时。"
             className="inline-flex items-center gap-1.5 py-2 px-3 text-[11px] tracking-wide rounded-[6px] border border-border bg-surface text-text-secondary hover:border-accent hover:text-accent disabled:opacity-40 transition-all duration-200"
           >
             {fillingModels ? (
@@ -482,7 +516,7 @@ export default function TracesPage() {
                 <span className="inline-block w-3 h-3 border border-accent/40 border-t-accent rounded-full animate-spin" />
                 补齐中
               </>
-            ) : `补齐 Model (${allRuns.filter(r => !r.model_name).length})`}
+            ) : `补齐信息 (${allRuns.filter(r => !r.model_name || r.first_tool_call_s == null).length})`}
           </button>
         )}
         {selectedIds.size > 0 && (
@@ -610,6 +644,23 @@ export default function TracesPage() {
                   </button>
                 )}
               </div>
+            </div>
+
+            <div className="flex items-center gap-2 w-full">
+              <label className="inline-flex items-center gap-2 text-[11px] text-text-secondary cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={excludeTail5}
+                  onChange={e => setExcludeTail5(e.target.checked)}
+                  className="w-3.5 h-3.5 accent-accent"
+                />
+                <span>排除各模型最慢 5% （避免 outlier 拉高 avg / P95）</span>
+              </label>
+              {excludeTail5 && (
+                <span className="text-[10px] text-text-tertiary">
+                  按 latency 倒序每模型去头；小样本（&lt;20）floor 为 0 不影响
+                </span>
+              )}
             </div>
 
             <div className="flex flex-col gap-2 w-full">
@@ -740,7 +791,7 @@ export default function TracesPage() {
             </div>
           </div>
 
-          {latencyStats.length === 0 && firstTokenStats.length === 0 ? (
+          {latencyStats.length === 0 && firstTokenStats.length === 0 && firstToolCallStats.length === 0 ? (
             <div className="text-center py-8 text-[11px] text-text-tertiary">
               当前筛选条件下无数据
             </div>
@@ -756,6 +807,12 @@ export default function TracesPage() {
                 title="首 Token 时延 (TTFT)"
                 stats={firstTokenStats}
                 emptyHint="所选数据里没有 first_token_s —— 这类 run 多见于非流式调用或采集失败"
+                pickedQuestions={chartQuestions.size}
+              />
+              <DistributionChart
+                title="首次工具调用时延"
+                stats={firstToolCallStats}
+                emptyHint="所选数据里没有 first_tool_call_s —— 未调用工具的 run，或尚未点「补齐信息」"
                 pickedQuestions={chartQuestions.size}
               />
             </div>

@@ -113,6 +113,7 @@ class RunSummaryResponse(BaseModel):
     output_preview: str = ""
     model_name: str = ""
     first_token_s: float | None = None
+    first_tool_call_s: float | None = None
 
 
 class ExtractRequest(BaseModel):
@@ -155,6 +156,10 @@ class FillModelsRequest(BaseModel):
 
 class FillModelsResponse(BaseModel):
     models: dict[str, str]
+    # first_tool_calls: per-root-id seconds from run start to the first tool
+    # child's start_time. Populated by the same enrich walk; absent for roots
+    # that made no tool call.
+    first_tool_calls: dict[str, float] = {}
     missing: list[str] = []
 
 

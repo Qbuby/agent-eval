@@ -42,6 +42,7 @@ async def list_runs(
             latency_s=r.latency_s, total_tokens=r.total_tokens, error=r.error,
             tags=r.tags, input_preview=r.input_preview, output_preview=r.output_preview,
             model_name=r.model_name, first_token_s=r.first_token_s,
+            first_tool_call_s=r.first_tool_call_s,
         )
         for r in runs
     ]
@@ -129,14 +130,20 @@ async def fill_models(
     req: FillModelsRequest,
     ext: TraceExtractor = Depends(get_extractor),
 ):
-    """Thorough model_name resolution for a list of root run ids.
+    """Thorough enrichment (model_name + first_tool_call_s) for a list of root runs.
 
-    Slow (~30-75s cold path) vs. /runs (~23s), so the UI invokes it only on
-    explicit user action ("Fill models"). Results are cached for 1 hour, so
-    repeat calls and later /runs of the same project return instantly.
+    Slow (~30-120s cold path) vs. /runs (~23s), so the UI invokes it only on
+    explicit user action. Results are cached for 1 hour, so repeat calls and
+    later /runs of the same project return instantly.
     """
     try:
-        models, missing = await ext.fill_models(req.project_name, req.runs)
+        models, first_tool_calls, missing = await ext.fill_enrichments(
+            req.project_name, req.runs,
+        )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LangSmith API error: {e}") from e
-    return FillModelsResponse(models=models, missing=missing)
+    return FillModelsResponse(
+        models=models,
+        first_tool_calls=first_tool_calls,
+        missing=missing,
+    )
