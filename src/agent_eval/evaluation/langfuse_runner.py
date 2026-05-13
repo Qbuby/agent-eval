@@ -672,17 +672,7 @@ async def _backfill_langsmith_traces(
                     limit=50,
                 ))
                 for r in runs:
-                    inp = r.inputs or {}
-                    if isinstance(inp, dict):
-                        msgs = inp.get("messages")
-                        if isinstance(msgs, list) and msgs:
-                            last = msgs[-1] if isinstance(msgs[-1], dict) else None
-                            txt = (last or {}).get("content", "")
-                        else:
-                            txt = inp.get("question") or ""
-                    else:
-                        txt = ""
-                    if txt == question:
+                    if _run_matches_question(r, question):
                         return str(r.id)
             except Exception as e:
                 logger.warning("backfill search err: %s", e)
@@ -711,6 +701,25 @@ async def _backfill_langsmith_traces(
         "backfill: project=%s run=%s matched %d/%d cases",
         project, run_id, hits, len(per_case_results),
     )
+
+
+def _run_matches_question(run_obj: Any, question: str) -> bool:
+    """Return True if ``run_obj.inputs`` carries the same user question.
+
+    Accepts either ``inputs.messages[-1].content`` (LangChain ChatModel
+    convention) or ``inputs.question`` (plain dict). Tolerant to missing
+    fields — never raises.
+    """
+    inp = getattr(run_obj, "inputs", None)
+    if not isinstance(inp, dict):
+        return False
+    msgs = inp.get("messages")
+    if isinstance(msgs, list) and msgs:
+        last = msgs[-1] if isinstance(msgs[-1], dict) else None
+        txt = (last or {}).get("content", "")
+    else:
+        txt = inp.get("question") or ""
+    return isinstance(txt, str) and txt == question
 
 
 # ───────────────────────────────────────────────────────────────────────────

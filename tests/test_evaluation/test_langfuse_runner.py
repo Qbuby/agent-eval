@@ -14,6 +14,7 @@ from agent_eval.evaluation.langfuse_runner import (
     _evaluator_tool_sequence,
     _extract_tool_calls_from_response,
     _extract_usage,
+    _run_matches_question,
     BUILTIN_EVALUATORS,
 )
 from agent_eval.evaluation.agent_adapter import AgentResponse
@@ -191,3 +192,38 @@ def test_builtin_evaluators_registry_shape():
         assert "is_async" in spec and isinstance(spec["is_async"], bool)
         assert "description" in spec
         assert "params_schema" in spec and isinstance(spec["params_schema"], dict)
+
+
+# ─── _run_matches_question (backfill inner matcher) ─────────────────────────
+
+class _FakeRun:
+    def __init__(self, inputs):
+        self.inputs = inputs
+
+
+def test_run_matches_langchain_messages_shape():
+    run = _FakeRun({"messages": [{"role": "user", "content": "how do I swap the battery?"}]})
+    assert _run_matches_question(run, "how do I swap the battery?") is True
+    assert _run_matches_question(run, "different q") is False
+
+
+def test_run_matches_plain_question_shape():
+    run = _FakeRun({"question": "hello"})
+    assert _run_matches_question(run, "hello") is True
+
+
+def test_run_matches_picks_last_user_message():
+    run = _FakeRun({"messages": [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "mid"},
+        {"role": "user", "content": "second"},
+    ]})
+    assert _run_matches_question(run, "second") is True
+    assert _run_matches_question(run, "first") is False
+
+
+def test_run_matches_handles_missing_inputs():
+    assert _run_matches_question(_FakeRun(None), "x") is False
+    assert _run_matches_question(_FakeRun({}), "x") is False
+    # messages list exists but last entry isn't a dict
+    assert _run_matches_question(_FakeRun({"messages": ["stray"]}), "x") is False
