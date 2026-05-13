@@ -21,7 +21,7 @@ export default function CandidatesPage() {
   const [editNegativePoints, setEditNegativePoints] = useState('')
   const [showPromote, setShowPromote] = useState(false)
   const [promoteProjectId, setPromoteProjectId] = useState('')
-  const [promoteCategoryId, setPromoteCategoryId] = useState('')
+  const [promoteCategoryId, _setPromoteCategoryId] = useState('')
 
   const pageSize = 20
 
