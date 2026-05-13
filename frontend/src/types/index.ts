@@ -330,3 +330,102 @@ export interface CapacityInfo {
   usage_ratio: number
   warning: boolean
 }
+
+// ─── Evaluation (Langfuse-backed) ───
+
+export interface EvalAgentConfig {
+  type: 'openai' | 'sse'
+  url: string
+  api_key?: string
+  model?: string
+  headers?: Record<string, string>
+  payload_template?: Record<string, unknown>
+  timeout?: number
+}
+
+export interface EvaluatorConfig {
+  name: string
+  params?: Record<string, unknown>
+}
+
+export interface StartEvalRequest {
+  benchmark_version_id?: string | null
+  project_id?: string | null
+  case_ids?: string[] | null
+  filter_tags?: string[] | null
+  filter_category_id?: string | null
+  limit?: number | null
+  agent: EvalAgentConfig
+  evaluators: EvaluatorConfig[]
+  concurrency?: number
+  run_name?: string | null
+}
+
+export interface StartEvalResponse {
+  run_id: string
+  status: string
+  case_count: number
+}
+
+export interface EvalRunSummary {
+  id: string
+  benchmark_version_id: string | null
+  status: string
+  started_at: string | null
+  finished_at: string | null
+  langfuse_run_name: string | null
+  agent_config: Record<string, unknown>
+  summary_scores: {
+    counts?: { total?: number; passed?: number; failed?: number }
+    dimension_averages?: Record<string, number>
+    cost_success?: Record<string, number | null>
+    cost_failure?: Record<string, number | null>
+    langfuse_dataset?: string
+    langfuse_run_name?: string
+    langfuse_host?: string
+    error?: string
+    stopped_early?: boolean
+  } | null
+  progress: { total?: number; completed?: number; failed?: number }
+  created_at: string | null
+}
+
+export interface EvalRunDetail extends EvalRunSummary {
+  evaluator_configs: Array<Record<string, unknown>>
+}
+
+export interface EvalResultRow {
+  id: string
+  benchmark_case_id: string | null
+  test_case_id: string | null
+  status: string
+  actual_output: string | null
+  latency_ms: number | null
+  total_tokens: number | null
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  tool_call_count: number | null
+  error_message: string | null
+  langfuse_trace_id: string | null
+  scores: Record<string, number>
+}
+
+export interface EvalResultsPage {
+  items: EvalResultRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface EvalRunsPage {
+  items: EvalRunSummary[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface BuiltinEvaluator {
+  name: string
+  description: string
+  params_schema: Record<string, unknown>
+}

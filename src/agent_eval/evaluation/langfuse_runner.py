@@ -644,6 +644,7 @@ async def _execute_run(
             "cost_failure": _aggregate_cost(fail),
             "langfuse_dataset": dataset_name,
             "langfuse_run_name": langfuse_run_name,
+            "langfuse_host": settings.langfuse.host,
         }
         if cancel_event.is_set():
             summary["stopped_early"] = True

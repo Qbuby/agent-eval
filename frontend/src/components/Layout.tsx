@@ -9,6 +9,7 @@ const navItems = [
   { to: '/projects', label: '基准测试集', icon: 'target' },
   { to: '/generate', label: '生成', icon: 'sparkle' },
   { to: '/traces', label: 'Traces', icon: 'activity' },
+  { to: '/evaluation', label: '评估', icon: 'gauge' },
   { to: '/auto-collect', label: '自动采集', icon: 'route' },
   { to: '/config', label: '配置', icon: 'settings' },
   { to: '/audit', label: '审计日志', icon: 'file' },
@@ -52,6 +53,13 @@ function NavIcon({ name }: { name: string }) {
     route: (
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-4 h-4">
         <path d="M3 13V8a4 4 0 0 1 4-4h6M10 1l3 3-3 3"/>
+      </svg>
+    ),
+    gauge: (
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-4 h-4">
+        <path d="M2 11a6 6 0 1 1 12 0"/>
+        <path d="M8 11l3-3"/>
+        <circle cx="8" cy="11" r="0.6" fill="currentColor"/>
       </svg>
     ),
     clock: (
