@@ -58,17 +58,24 @@ class Repository:
 
     async def create_test_run(
         self,
-        dataset_version_id: uuid.UUID,
-        agent_config: dict,
+        dataset_version_id: uuid.UUID | None = None,
+        agent_config: dict | None = None,
         optimization_id: uuid.UUID | None = None,
         ab_group: str | None = None,
+        benchmark_version_id: uuid.UUID | None = None,
+        langfuse_run_name: str | None = None,
+        evaluator_configs: list | None = None,
+        status: str = "running",
     ) -> TestRunRow:
         row = TestRunRow(
             dataset_version_id=dataset_version_id,
-            agent_config=agent_config,
+            benchmark_version_id=benchmark_version_id,
+            agent_config=agent_config or {},
             optimization_id=optimization_id,
             ab_group=ab_group,
-            status="running",
+            langfuse_run_name=langfuse_run_name,
+            evaluator_configs=evaluator_configs or [],
+            status=status,
             started_at=datetime.now(timezone.utc),
         )
         self.session.add(row)
@@ -85,10 +92,50 @@ class Repository:
         row.finished_at = datetime.now(timezone.utc)
         row.summary_scores = summary_scores
 
+    async def get_test_run(self, run_id: uuid.UUID) -> TestRunRow | None:
+        stmt = select(TestRunRow).where(TestRunRow.id == run_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_test_runs(
+        self,
+        *,
+        benchmark_version_id: uuid.UUID | None = None,
+        status: str | None = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> tuple[list[TestRunRow], int]:
+        from sqlalchemy import func
+        base = select(TestRunRow).order_by(TestRunRow.created_at.desc())
+        count_stmt = select(func.count(TestRunRow.id))
+        if benchmark_version_id is not None:
+            base = base.where(TestRunRow.benchmark_version_id == benchmark_version_id)
+            count_stmt = count_stmt.where(TestRunRow.benchmark_version_id == benchmark_version_id)
+        if status is not None:
+            base = base.where(TestRunRow.status == status)
+            count_stmt = count_stmt.where(TestRunRow.status == status)
+        total = (await self.session.execute(count_stmt)).scalar_one()
+        rows = (await self.session.execute(
+            base.offset((page - 1) * page_size).limit(page_size)
+        )).scalars().all()
+        return list(rows), int(total)
+
     # ---- Test Results ----
 
-    async def create_test_result(self, run_id: uuid.UUID, test_case_id: uuid.UUID, **kwargs: Any) -> TestResultRow:
-        row = TestResultRow(run_id=run_id, test_case_id=test_case_id, **kwargs)
+    async def create_test_result(
+        self,
+        run_id: uuid.UUID,
+        *,
+        test_case_id: uuid.UUID | None = None,
+        benchmark_case_id: uuid.UUID | None = None,
+        **kwargs: Any,
+    ) -> TestResultRow:
+        row = TestResultRow(
+            run_id=run_id,
+            test_case_id=test_case_id,
+            benchmark_case_id=benchmark_case_id,
+            **kwargs,
+        )
         self.session.add(row)
         await self.session.flush()
         return row
@@ -97,6 +144,20 @@ class Repository:
         stmt = select(TestResultRow).where(TestResultRow.run_id == run_id)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def get_results_paginated(
+        self, run_id: uuid.UUID, page: int = 1, page_size: int = 50,
+    ) -> tuple[list[TestResultRow], int]:
+        from sqlalchemy import func
+        count_stmt = select(func.count(TestResultRow.id)).where(TestResultRow.run_id == run_id)
+        total = (await self.session.execute(count_stmt)).scalar_one()
+        rows = (await self.session.execute(
+            select(TestResultRow)
+            .where(TestResultRow.run_id == run_id)
+            .order_by(TestResultRow.created_at.asc())
+            .offset((page - 1) * page_size).limit(page_size)
+        )).scalars().all()
+        return list(rows), int(total)
 
     # ---- Evaluation Scores ----
 

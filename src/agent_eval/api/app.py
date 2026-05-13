@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from agent_eval.api.routers import (
-    auth, benchmark, candidates, cases, config, datasets, generate,
+    auth, benchmark, candidates, cases, config, datasets, evaluation, generate,
     governance, projects, routing, scheduler, traces,
 )
 
@@ -15,11 +15,29 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Make sure agent_eval.* INFO logs land in stdout. uvicorn's default config
+    # leaves the root logger at WARNING; without this, our diagnostics get swallowed.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
+    logging.getLogger("agent_eval").setLevel(logging.INFO)
+
     from agent_eval.config_service import config_service
     from agent_eval.db import close_db
+    from agent_eval.evaluation.langfuse_runner import sweep_orphaned_runs
     from agent_eval.scheduler.service import SchedulerService
 
     await config_service.init_defaults()
+
+    # Mark any test_runs left in 'running' from a previous process as 'interrupted'.
+    try:
+        n = await sweep_orphaned_runs()
+        if n:
+            logger.info("swept %d orphaned eval runs to 'interrupted'", n)
+    except Exception as e:
+        logger.warning("orphaned eval run sweep failed: %s", e)
 
     svc = SchedulerService()
     scheduler.set_scheduler(svc)
@@ -67,6 +85,7 @@ def create_app() -> FastAPI:
     app.include_router(governance.router)
     app.include_router(routing.router)
     app.include_router(scheduler.router)
+    app.include_router(evaluation.router)
 
     @app.get("/health")
     async def health():
