@@ -62,6 +62,7 @@ class LangfuseSettings(BaseSettings):
     host: str = ""
     public_key: str = ""
     secret_key: str = ""
+    remote_write: bool = False  # default off; PR3a moves trace storage to LangSmith
 
     model_config = SettingsConfigDict(env_prefix="LANGFUSE_", env_file=_ENV_FILE, extra="ignore")
 

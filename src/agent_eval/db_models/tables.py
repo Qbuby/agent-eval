@@ -82,14 +82,20 @@ class TestRunRow(Base):
         UUID(as_uuid=True), ForeignKey("benchmark_versions.id", ondelete="SET NULL"),
         nullable=True, index=True,
     )
+    eval_case_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("eval_case_sources.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
     agent_config: Mapped[dict] = mapped_column(JSONB, nullable=False)
     optimization_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     ab_group: Mapped[str | None] = mapped_column(String(16))
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    eval_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     summary_scores: Mapped[dict | None] = mapped_column(JSONB)
     langfuse_run_name: Mapped[str | None] = mapped_column(Text)
+    langsmith_project: Mapped[str | None] = mapped_column(Text)
     evaluator_configs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
@@ -108,6 +114,10 @@ class TestResultRow(Base):
         UUID(as_uuid=True), ForeignKey("benchmark_cases.id", ondelete="SET NULL"),
         nullable=True, index=True,
     )
+
+    question: Mapped[str | None] = mapped_column(Text)
+    thread_id: Mapped[str | None] = mapped_column(Text)
+    langsmith_run_id: Mapped[str | None] = mapped_column(Text)
 
     actual_output: Mapped[str | None] = mapped_column(Text)
     actual_tool_calls: Mapped[list | None] = mapped_column(JSONB)
@@ -433,3 +443,41 @@ class ImportBatchRow(Base):
     pending_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="completed")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class EvalCaseSourceRow(Base):
+    """Ephemeral per-upload case list (user-provided JSON/JSONL file).
+
+    One row per upload. The ``cases`` JSONB is a list of
+    ``{"name": str, "question": str, "expected_keywords": [str]}`` objects,
+    matching the shape produced by ``D:/files/EPtestcases/testcases_*.json``.
+    """
+    __tablename__ = "eval_case_sources"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="file")
+    file_format: Mapped[str | None] = mapped_column(String(16))
+    cases: Mapped[list] = mapped_column(JSONB, nullable=False)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class EvaluatorConfigRow(Base):
+    """Named reusable evaluator instances.
+
+    Each row is one evaluator (e.g. ``name='strict LLM judge'``,
+    ``evaluator_type='llm_judge'``, ``params={...custom prompt...}``).
+    Evaluation runs pick from these by id; raw evaluator_type never leaks into
+    the run config, which keeps runs immutable against future template edits.
+    """
+    __tablename__ = "evaluator_configs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    evaluator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

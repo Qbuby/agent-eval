@@ -183,24 +183,25 @@ class EvaluatorConfig(BaseModel):
 
 
 class StartEvalRequest(BaseModel):
-    # Source: pick ONE of benchmark_version_id or project_id (project_id covers
-    # the common case where the user hasn't versioned the bench yet — every
-    # benchmark_case is filtered by project_id with version_id IS NULL).
+    # Source: exactly one of these three should be set.
     benchmark_version_id: str | None = None
-    project_id: str | None = None
-    # Sample selection — one of:
-    #   - all (default): all cases in the version/project
-    #   - case_ids: explicit subset
-    #   - filter: tag/category match
+    project_id: str | None = None                # use all benchmark_cases of a project
+    case_source_id: str | None = None            # uploaded file (eval_case_sources.id)
+    # Sample selection for benchmark-backed sources:
     case_ids: list[str] | None = None
     filter_tags: list[str] | None = None
     filter_category_id: str | None = None
     limit: int | None = None
 
     agent: EvalAgentConfig
-    evaluators: list[EvaluatorConfig]
+    # Evaluator instances by id (evaluator_configs table). Empty list is not allowed.
+    evaluator_ids: list[str] = Field(default_factory=list)
     concurrency: int = Field(default=3, ge=1, le=20)
-    run_name: str | None = None  # langfuse run name; auto-generated if None
+    run_name: str | None = None
+    # LangSmith project where the agent will write its own trace. The
+    # evaluation service uses this to backfill test_results.langsmith_run_id
+    # after the agent call completes. Leave blank to skip backfill.
+    langsmith_project: str | None = None
 
 
 class EvalRunSummary(BaseModel):
@@ -248,6 +249,52 @@ class BuiltinEvaluator(BaseModel):
     name: str
     description: str
     params_schema: dict[str, Any] = {}  # JSON-schema-ish for UI to render
+
+
+# ─── Evaluator instances (named, reusable) ───
+
+class EvaluatorInstance(BaseModel):
+    id: str
+    name: str
+    evaluator_type: str  # one of BUILTIN_EVALUATORS keys
+    description: str | None = None
+    params: dict[str, Any] = {}
+    is_active: bool = True
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class CreateEvaluatorRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    evaluator_type: str
+    description: str | None = None
+    params: dict[str, Any] = {}
+    is_active: bool = True
+
+
+class UpdateEvaluatorRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = None
+    params: dict[str, Any] | None = None
+    is_active: bool | None = None
+
+
+# ─── Uploaded case sources ───
+
+class UploadCasesResponse(BaseModel):
+    source_id: str
+    name: str
+    count: int
+    preview: list[dict[str, Any]]  # first N cases for display
+
+
+class EvalCaseSourceSummary(BaseModel):
+    id: str
+    name: str
+    source_kind: str
+    file_format: str | None = None
+    count: int
+    created_at: datetime | None = None
 
 
 class RunChildMeta(BaseModel):

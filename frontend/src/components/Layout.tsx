@@ -9,6 +9,7 @@ const navItems = [
   { to: '/projects', label: '基准测试集', icon: 'target' },
   { to: '/generate', label: '生成', icon: 'sparkle' },
   { to: '/traces', label: 'Traces', icon: 'activity' },
+  { to: '/evaluators', label: '评估器', icon: 'settings' },
   { to: '/evaluation', label: '评估', icon: 'gauge' },
   { to: '/auto-collect', label: '自动采集', icon: 'route' },
   { to: '/config', label: '配置', icon: 'settings' },

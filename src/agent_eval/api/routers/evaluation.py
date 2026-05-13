@@ -1,20 +1,26 @@
-"""HTTP API for the Langfuse-backed evaluation workbench."""
+"""HTTP API for the evaluation workbench."""
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from sqlalchemy import select
 
 from agent_eval.api.schemas import (
     BuiltinEvaluator,
+    CreateEvaluatorRequest,
+    EvalCaseSourceSummary,
     EvalRunDetail,
     EvalRunSummary,
     EvalResultRow,
     EvalResultsPage,
+    EvaluatorInstance,
     StartEvalRequest,
+    UpdateEvaluatorRequest,
+    UploadCasesResponse,
 )
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
@@ -48,47 +54,107 @@ async def list_builtin_evaluators():
 
 @router.post("/runs/start")
 async def start_eval(req: StartEvalRequest):
-    if not req.benchmark_version_id and not req.project_id:
-        raise HTTPException(status_code=400, detail="benchmark_version_id or project_id is required")
-    # ── 1. resolve cases from the benchmark scope ──
-    async with async_session_factory() as session:
-        stmt = select(BenchmarkCaseRow)
-        if req.benchmark_version_id:
-            stmt = stmt.where(BenchmarkCaseRow.version_id == uuid.UUID(req.benchmark_version_id))
-        else:
-            stmt = stmt.where(BenchmarkCaseRow.project_id == uuid.UUID(req.project_id))
-        if req.case_ids:
-            ids = [uuid.UUID(x) for x in req.case_ids]
-            stmt = stmt.where(BenchmarkCaseRow.id.in_(ids))
-        if req.filter_category_id:
-            stmt = stmt.where(BenchmarkCaseRow.category_id == uuid.UUID(req.filter_category_id))
-        if req.filter_tags:
-            # postgres array overlap
-            stmt = stmt.where(BenchmarkCaseRow.tags.overlap(req.filter_tags))
-        if req.limit:
-            stmt = stmt.limit(req.limit)
-        cases = (await session.execute(stmt)).scalars().all()
+    # ── 1. resolve cases ──────────────────────────────────────────
+    sources = [x for x in (req.benchmark_version_id, req.project_id, req.case_source_id) if x]
+    if not sources:
+        raise HTTPException(
+            status_code=400,
+            detail="one of benchmark_version_id / project_id / case_source_id is required",
+        )
+    if len(sources) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="provide only one source: benchmark_version_id OR project_id OR case_source_id",
+        )
 
-    if not cases:
-        raise HTTPException(status_code=400, detail="no cases match the selection")
+    cases: list[dict[str, Any]] = []
+
+    async with async_session_factory() as session:
+        repo = Repository(session)
+
+        if req.case_source_id:
+            # ── uploaded file ──
+            src = await repo.get_eval_case_source(uuid.UUID(req.case_source_id))
+            if src is None:
+                raise HTTPException(status_code=404, detail="case_source not found")
+            raw_cases = src.cases or []
+            if req.limit:
+                raw_cases = raw_cases[: req.limit]
+            for c in raw_cases:
+                cases.append({
+                    "id": c.get("name") or f"case-{len(cases)+1}",
+                    "name": c.get("name") or f"case-{len(cases)+1}",
+                    "question": c.get("question") or "",
+                    "expected_output": c.get("expected_output") or "",
+                    "expected_tool_calls": [],
+                    "metadata": c.get("metadata") or {},
+                    "source": "file",
+                })
+        else:
+            # ── benchmark dataset ──
+            stmt = select(BenchmarkCaseRow)
+            if req.benchmark_version_id:
+                stmt = stmt.where(BenchmarkCaseRow.version_id == uuid.UUID(req.benchmark_version_id))
+            else:
+                stmt = stmt.where(BenchmarkCaseRow.project_id == uuid.UUID(req.project_id))
+            if req.case_ids:
+                stmt = stmt.where(BenchmarkCaseRow.id.in_([uuid.UUID(x) for x in req.case_ids]))
+            if req.filter_category_id:
+                stmt = stmt.where(BenchmarkCaseRow.category_id == uuid.UUID(req.filter_category_id))
+            if req.filter_tags:
+                stmt = stmt.where(BenchmarkCaseRow.tags.overlap(req.filter_tags))
+            if req.limit:
+                stmt = stmt.limit(req.limit)
+            bench_rows = (await session.execute(stmt)).scalars().all()
+            for b in bench_rows:
+                expected_tool_calls = []
+                if isinstance(b.extra_fields, dict):
+                    for t in (b.extra_fields.get("expected_tool_calls") or []):
+                        nm = t.get("tool_name") or t.get("name") if isinstance(t, dict) else None
+                        if nm:
+                            expected_tool_calls.append({"tool_name": nm})
+                cases.append({
+                    "id": str(b.id),
+                    "name": str(b.id)[:8],
+                    "question": b.question,
+                    "expected_output": b.reference_answer or "",
+                    "expected_tool_calls": expected_tool_calls,
+                    "metadata": {"tags": list(b.tags or [])},
+                    "source": "benchmark",
+                })
+
+        if not cases:
+            raise HTTPException(status_code=400, detail="no cases match the selection")
+
+        # ── 2. resolve evaluator instances ──
+        if not req.evaluator_ids:
+            raise HTTPException(status_code=400, detail="at least one evaluator_id is required")
+        evaluator_specs: list[dict[str, Any]] = []
+        for eid in req.evaluator_ids:
+            row = await repo.get_evaluator_config(uuid.UUID(eid))
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"evaluator not found: {eid}")
+            if not row.is_active:
+                raise HTTPException(status_code=400, detail=f"evaluator inactive: {row.name}")
+            evaluator_specs.append({
+                "id": str(row.id),
+                "label": row.name,
+                "evaluator_type": row.evaluator_type,
+                "params": row.params or {},
+            })
 
     agent_cfg = req.agent.model_dump()
-    evaluator_cfgs = [e.model_dump() for e in req.evaluators]
-    if not evaluator_cfgs:
-        raise HTTPException(status_code=400, detail="at least one evaluator required")
-    for ev in evaluator_cfgs:
-        if ev["name"] not in BUILTIN_EVALUATORS:
-            raise HTTPException(status_code=400, detail=f"unknown evaluator: {ev['name']}")
 
     try:
         run_id = await start_run(
-            benchmark_version_id=req.benchmark_version_id,
-            project_id=req.project_id,
-            cases=list(cases),
+            cases=cases,
             agent_cfg=agent_cfg,
-            evaluator_cfgs=evaluator_cfgs,
+            evaluator_specs=evaluator_specs,
             concurrency=req.concurrency,
             run_name=req.run_name,
+            langsmith_project=req.langsmith_project,
+            benchmark_version_id=req.benchmark_version_id,
+            eval_case_source_id=req.case_source_id,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"failed to start run: {e}") from e
@@ -194,3 +260,198 @@ async def stop_run(run_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="run not found or already finished")
     return {"run_id": run_id, "status": "stopping"}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Evaluator instance CRUD
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _row_to_instance(row) -> EvaluatorInstance:
+    return EvaluatorInstance(
+        id=str(row.id),
+        name=row.name,
+        evaluator_type=row.evaluator_type,
+        description=row.description,
+        params=row.params or {},
+        is_active=row.is_active,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get("/evaluators", response_model=list[EvaluatorInstance])
+async def list_evaluator_instances(active_only: bool = Query(default=False)):
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        rows = await repo.list_evaluator_configs(active_only=active_only)
+    return [_row_to_instance(r) for r in rows]
+
+
+@router.post("/evaluators", response_model=EvaluatorInstance)
+async def create_evaluator_instance(req: CreateEvaluatorRequest):
+    if req.evaluator_type not in BUILTIN_EVALUATORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"evaluator_type must be one of {list(BUILTIN_EVALUATORS.keys())}",
+        )
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        try:
+            row = await repo.create_evaluator_config(
+                name=req.name, evaluator_type=req.evaluator_type,
+                description=req.description, params=req.params,
+                is_active=req.is_active,
+            )
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=f"创建失败：{e}") from e
+    return _row_to_instance(row)
+
+
+@router.put("/evaluators/{evaluator_id}", response_model=EvaluatorInstance)
+async def update_evaluator_instance(evaluator_id: str, req: UpdateEvaluatorRequest):
+    updates = {k: v for k, v in req.model_dump(exclude_unset=True).items() if v is not None}
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        row = await repo.update_evaluator_config(uuid.UUID(evaluator_id), **updates)
+        if row is None:
+            raise HTTPException(status_code=404, detail="evaluator not found")
+        await session.commit()
+    return _row_to_instance(row)
+
+
+@router.delete("/evaluators/{evaluator_id}")
+async def delete_evaluator_instance(evaluator_id: str):
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        ok = await repo.delete_evaluator_config(uuid.UUID(evaluator_id))
+        if not ok:
+            raise HTTPException(status_code=404, detail="evaluator not found")
+        await session.commit()
+    return {"id": evaluator_id, "deleted": True}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Upload test case files (JSON / JSONL)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _parse_cases_payload(raw: bytes, filename: str) -> tuple[list[dict[str, Any]], str]:
+    """Return (cases, file_format). Accepts both JSON (with or without
+    ``test_cases`` wrapper) and JSONL (one object per line)."""
+    text = raw.decode("utf-8-sig").strip()
+    if not text:
+        raise ValueError("empty file")
+
+    lower = filename.lower()
+    if lower.endswith(".jsonl"):
+        cases = []
+        for i, line in enumerate(text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                cases.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"JSONL line {i+1} invalid: {e}") from e
+        return cases, "jsonl"
+
+    # Default: JSON
+    data = json.loads(text)
+    if isinstance(data, list):
+        return data, "json"
+    if isinstance(data, dict):
+        if "test_cases" in data and isinstance(data["test_cases"], list):
+            return data["test_cases"], "json"
+        if "cases" in data and isinstance(data["cases"], list):
+            return data["cases"], "json"
+    raise ValueError(
+        "JSON must be a list, or an object with a 'test_cases' / 'cases' array"
+    )
+
+
+def _normalize_cases(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Coerce each entry into {name, question, expected_keywords} shape."""
+    out = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        # Accept several aliases
+        question = (
+            item.get("question")
+            or item.get("input")
+            or item.get("prompt")
+            or item.get("content")
+            or ""
+        )
+        if not question and isinstance(item.get("messages"), list):
+            for m in reversed(item["messages"]):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    question = m.get("content", "")
+                    break
+        if not question:
+            continue
+        out.append({
+            "name": str(item.get("name") or item.get("id") or f"case-{i+1}"),
+            "question": question,
+            "expected_keywords": item.get("expected_keywords") or [],
+            "expected_output": item.get("expected_output") or item.get("reference_answer") or "",
+            "metadata": item.get("metadata") or {},
+        })
+    return out
+
+
+@router.post("/case_sources/upload", response_model=UploadCasesResponse)
+async def upload_cases(file: UploadFile = File(...)):
+    raw = await file.read()
+    try:
+        parsed, file_format = _parse_cases_payload(raw, file.filename or "upload.json")
+        cases = _normalize_cases(parsed)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not cases:
+        raise HTTPException(status_code=400, detail="no valid cases parsed")
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        row = await repo.create_eval_case_source(
+            name=file.filename or "upload", source_kind="file",
+            file_format=file_format, cases=cases,
+        )
+        await session.commit()
+    return UploadCasesResponse(
+        source_id=str(row.id), name=row.name, count=len(cases),
+        preview=cases[:3],
+    )
+
+
+@router.get("/case_sources", response_model=list[EvalCaseSourceSummary])
+async def list_case_sources():
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        rows = await repo.list_eval_case_sources(limit=50)
+    return [
+        EvalCaseSourceSummary(
+            id=str(r.id), name=r.name, source_kind=r.source_kind,
+            file_format=r.file_format, count=len(r.cases or []),
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+@router.get("/case_sources/{source_id}")
+async def get_case_source(source_id: str):
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        row = await repo.get_eval_case_source(uuid.UUID(source_id))
+        if row is None:
+            raise HTTPException(status_code=404, detail="source not found")
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "file_format": row.file_format,
+        "cases": row.cases,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }

@@ -1,21 +1,21 @@
-"""Langfuse-backed evaluation runner.
+"""Evaluation runner (post-PR3a: LangSmith-first, Langfuse optional).
 
 Owns the lifecycle of a single eval run:
-  1. Convert a (subset of) BenchmarkCases → Langfuse dataset items (idempotent)
-  2. For each item: invoke target agent (HTTP/SSE), wrap the call in a Langfuse
-     generation span so cost / tool-calls land in the trace
-  3. Run built-in evaluators over each (input, output, expected) tuple, write
-     scores both back to Langfuse (.score on the trace) and into the local DB
-  4. Aggregate cost/score summaries split by pass/fail, write to test_runs.summary_scores
+  1. Receive a list of normalized cases ({id, name, question, expected_output, metadata, source})
+     produced by the API router from either a benchmark dataset or an uploaded file
+  2. For each case: invoke the target SSE agent (LangGraph v2 protocol by default).
+     We do NOT push any trace to Langfuse at runtime — the agent itself reports
+     its own LangGraph trace to LangSmith.
+  3. Run evaluator instances fetched from the DB (evaluator_configs table) over
+     each (input, output, expected) tuple. Scores land in evaluation_scores.
+  4. Aggregate cost/score summaries (split by pass/fail) → test_runs.summary_scores
+  5. Fire-and-forget backfill task: query LangSmith by (project, start_time >=
+     eval_started_at, inputs.messages[0].content == question) to find the root
+     run id for each case. Writes test_results.langsmith_run_id when found.
 
-Why we manually wrap (vs. dataset.run_experiment):
-  - Self-hosted langfuse is v3.172 server; the v4 SDK's run_experiment expects a
-    newer server, so we use SDK v3 low-level APIs (item.observe + score)
-  - Lets us cap concurrency with our own semaphore and react to user "stop" requests
-
-Run state lives in the in-process _RUN_REGISTRY plus the test_runs table.
-A server restart during a run will leave the row in 'running' — the API layer's
-on_startup hook should sweep those to 'interrupted'.
+Langfuse SDK import is retained so future work can re-enable remote write via
+``settings.langfuse.remote_write=True`` without new dependencies; the live code
+path below never calls dataset / score_trace unless that flag is set.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from langfuse import Langfuse
+from langfuse import Langfuse  # kept for optional remote write; unused otherwise
 from sqlalchemy import select
 
 from agent_eval.config import settings
@@ -237,8 +237,17 @@ def request_stop(run_id: str) -> bool:
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def _make_adapter(agent_cfg: dict) -> Any:
-    t = agent_cfg.get("type", "openai")
+def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
+    """Build the HTTP adapter for one case.
+
+    - ``type='sse'`` defaults to LangGraph v2 payload/event shape (the production
+      agent used in D:/files/EPtestcases/agent_chat_sse_*.py). The caller passes
+      a per-case thread_id so the agent receives a stable conversation handle
+      (even though agent-side id rewriting may change what LangSmith records).
+    - ``type='openai'`` for OpenAI-compatible /v1/chat/completions.
+    - ``type='sse_generic'`` for the legacy templated SSE behaviour.
+    """
+    t = agent_cfg.get("type", "sse")
     if t == "openai":
         return OpenAICompatibleAdapter(
             base_url=agent_cfg["url"],
@@ -247,12 +256,22 @@ def _make_adapter(agent_cfg: dict) -> Any:
             timeout=float(agent_cfg.get("timeout", 120.0)),
             extra_headers=agent_cfg.get("headers") or None,
         )
-    if t == "sse":
+    if t in ("sse", "sse_langgraph"):
+        return SSEStreamAdapter(
+            url=agent_cfg["url"],
+            headers=agent_cfg.get("headers"),
+            timeout=float(agent_cfg.get("timeout", 120.0)),
+            mode="langgraph_v2",
+            thread_id=thread_id,
+            language=agent_cfg.get("language", "请用中文回复"),
+        )
+    if t == "sse_generic":
         return SSEStreamAdapter(
             url=agent_cfg["url"],
             headers=agent_cfg.get("headers"),
             payload_template=agent_cfg.get("payload_template"),
             timeout=float(agent_cfg.get("timeout", 120.0)),
+            mode="generic",
         )
     raise ValueError(f"unknown agent type: {t!r}")
 
@@ -355,19 +374,27 @@ def _extract_usage(resp: AgentResponse) -> dict[str, int | None]:
 
 async def _run_one_case(
     *,
-    langfuse: Langfuse,
-    dataset_run_name: str,
-    item: Any,  # langfuse DatasetItemClient
-    case: BenchmarkCaseRow,
+    case: dict[str, Any],
     agent_cfg: dict,
-    evaluator_cfgs: list[dict],
+    evaluator_specs: list[dict[str, Any]],
     judge_llm: Any,
 ) -> dict[str, Any]:
-    """Execute one case end-to-end. Returns a dict with all info to write to DB."""
-    adapter = _make_adapter(agent_cfg)
-    question = case.question
+    """Execute one case end-to-end. ``case`` is the normalized dict from
+    ``_normalize_cases_for_runner``: {id, name, question, expected_output,
+    expected_tool_calls, source}. ``evaluator_specs`` are pre-resolved
+    {evaluator_type, params, label} dicts (DB lookup already done by caller).
+    Returns one row's worth of data ready to persist."""
+    question = case["question"]
+    expected = case.get("expected_output") or ""
+    expected_tool_calls = case.get("expected_tool_calls") or []
+    # We send a thread_id the agent CAN consume; the agent may rewrite it on
+    # its side (we observed this against ep-agent / ruyi-agent), so we never
+    # treat thread_id as the LangSmith join key — the post-run backfill uses
+    # (start_time, question text) instead.
+    thread_id = f"eval-{case.get('name','case')}-{uuid.uuid4().hex[:8]}"
+
+    adapter = _make_adapter(agent_cfg, thread_id=thread_id)
     messages = [{"role": "user", "content": question}]
-    expected = case.reference_answer or ""
 
     output_text = ""
     error_msg: str | None = None
@@ -378,82 +405,60 @@ async def _run_one_case(
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
         "cache_creation_tokens": None, "cache_read_tokens": None,
     }
-    trace_id: str | None = None
-    scores: dict[str, float] = {}
+    invoked_at = datetime.now(timezone.utc)
 
     try:
-        # v3 API: item.run() is a context manager that yields a LangfuseSpan,
-        # bound to a trace linked to this dataset-item/run pair.
-        with item.run(
-            run_name=dataset_run_name,
-            run_metadata={"benchmark_case_id": str(case.id), "model": agent_cfg.get("model")},
-        ) as root_span:
-            trace_id = getattr(root_span, "trace_id", None)
-            with root_span.start_as_current_generation(
-                name=agent_cfg.get("model", "agent-call"),
-                input=messages,
-                model=agent_cfg.get("model"),
-            ) as generation:
-                try:
-                    resp = await adapter.invoke(messages)
-                    output_text = resp.content
-                    latency_ms = int(resp.latency_ms)
-                    usage = _extract_usage(resp)
-                    actual_tool_calls = _extract_tool_calls_from_response(resp)
-                    generation.update(
-                        output=output_text,
-                        usage_details={
-                            k: v for k, v in usage.items()
-                            if v is not None and k in ("prompt_tokens", "completion_tokens", "total_tokens")
-                        } or None,
-                    )
-                except Exception as e:
-                    generation.update(level="ERROR", status_message=str(e))
-                    error_msg = str(e)
-                    error_type = type(e).__name__
-                    logger.warning("agent invoke failed for case %s: %s", case.id, e)
-
-            # Run evaluators; attach scores to this trace via root_span.score_trace
-            if not error_msg:
-                expected_tool_calls = []
-                if case.extra_fields and isinstance(case.extra_fields, dict):
-                    for t in case.extra_fields.get("expected_tool_calls", []) or []:
-                        expected_tool_calls.append({"tool_name": t.get("tool_name") or t.get("name")})
-                for ev_cfg in evaluator_cfgs:
-                    name = ev_cfg["name"]
-                    spec = BUILTIN_EVALUATORS.get(name)
-                    if spec is None:
-                        logger.warning("unknown evaluator: %s", name)
-                        continue
-                    fn = spec["fn"]
-                    kwargs = {
-                        "input": question,
-                        "output": output_text,
-                        "expected_output": expected,
-                        "expected_tool_calls": expected_tool_calls,
-                        "actual_tool_calls": actual_tool_calls,
-                        "params": ev_cfg.get("params") or {},
-                        "llm_client": judge_llm,
-                    }
-                    try:
-                        result = await fn(**kwargs) if spec["is_async"] else fn(**kwargs)
-                        for score_name, value, comment in result.scores:
-                            scores[score_name] = value
-                            try:
-                                root_span.score_trace(
-                                    name=score_name,
-                                    value=float(value),
-                                    comment=truncate(comment, 200) if comment else None,
-                                )
-                            except Exception as se:
-                                logger.warning("failed to push score %s to langfuse: %s", score_name, se)
-                    except Exception as e:
-                        logger.warning("evaluator %s crashed on case %s: %s", name, case.id, e)
+        try:
+            resp = await adapter.invoke(messages)
+            output_text = resp.content
+            latency_ms = int(resp.latency_ms)
+            usage = _extract_usage(resp)
+            # SSE/LangGraph adapter packs tool_calls into raw_response
+            raw = getattr(resp, "raw_response", None)
+            if isinstance(raw, dict):
+                tcs = raw.get("tool_calls")
+                if isinstance(tcs, list):
+                    actual_tool_calls = tcs
+            if not actual_tool_calls:
+                actual_tool_calls = _extract_tool_calls_from_response(resp)
+        except Exception as e:
+            error_msg = str(e)
+            error_type = type(e).__name__
+            logger.warning("agent invoke failed for case %s: %s", case.get("id"), e)
     finally:
         try:
             await adapter.close()
         except Exception:
             pass
+
+    # ── Run evaluators (no Langfuse server write; scores stay in local DB) ──
+    scores: dict[str, float] = {}
+    if not error_msg:
+        for spec in evaluator_specs:
+            etype = spec["evaluator_type"]
+            ev_def = BUILTIN_EVALUATORS.get(etype)
+            if ev_def is None:
+                logger.warning("unknown evaluator_type: %s", etype)
+                continue
+            fn = ev_def["fn"]
+            label = spec.get("label") or etype
+            kwargs = {
+                "input": question, "output": output_text,
+                "expected_output": expected,
+                "expected_tool_calls": expected_tool_calls,
+                "actual_tool_calls": actual_tool_calls,
+                "params": spec.get("params") or {},
+                "llm_client": judge_llm,
+            }
+            try:
+                result = await fn(**kwargs) if ev_def["is_async"] else fn(**kwargs)
+                for score_name, value, comment in result.scores:
+                    # Prefix with evaluator instance label so multiple instances
+                    # of the same type don't collide.
+                    full = f"{label}.{score_name}" if label != score_name else score_name
+                    scores[full] = float(value)
+            except Exception as e:
+                logger.warning("evaluator %s crashed on case %s: %s", label, case.get("id"), e)
 
     # status: pass if all evaluator scores >= 0.5 and no error
     status = "pass"
@@ -463,8 +468,12 @@ async def _run_one_case(
         status = "fail"
 
     return {
-        "case_id": str(case.id),
-        "trace_id": trace_id,
+        "case_id": case.get("id"),
+        "case_name": case.get("name"),
+        "case_source": case.get("source"),
+        "thread_id": thread_id,
+        "question": question,
+        "invoked_at": invoked_at,
         "status": status,
         "actual_output": output_text,
         "actual_tool_calls": actual_tool_calls,
@@ -480,108 +489,39 @@ async def _run_one_case(
 
 async def _execute_run(
     run_id: str,
-    scope_id: str,
-    cases: list[BenchmarkCaseRow],
+    cases: list[dict[str, Any]],
     agent_cfg: dict,
-    evaluator_cfgs: list[dict],
+    evaluator_specs: list[dict[str, Any]],
     concurrency: int,
-    langfuse_run_name: str,
+    run_name: str,
+    langsmith_project: str | None,
     cancel_event: asyncio.Event,
     handle: _RunHandle,
 ) -> None:
-    """The asyncio.Task body. Owns its own DB sessions per write, langfuse client."""
+    """Background task body. Invokes agent for each case, runs evaluators,
+    persists results. After all cases settle, optionally kicks off the
+    LangSmith backfill (non-blocking)."""
     handle.progress["total"] = len(cases)
-    langfuse = _langfuse_client()
     judge_llm = _make_judge_llm()
 
-    # Step 1: ensure a langfuse dataset exists named by scope_id (version or project)
-    dataset_name = f"benchmark-{scope_id}"
-    try:
-        langfuse.create_dataset(name=dataset_name, description=f"scope={scope_id}")
-    except Exception:
-        pass  # likely exists
-
-    # Step 2: ensure each case has a dataset_item (idempotent on input)
-    case_to_item: dict[str, Any] = {}
-    create_errors = 0
-    for case in cases:
-        triple = _bench_case_to_dataset_input(case)
-        try:
-            langfuse.create_dataset_item(
-                dataset_name=dataset_name,
-                input=triple["input"],
-                expected_output=triple["expected_output"],
-                metadata=triple["metadata"],
-            )
-        except Exception as e:
-            create_errors += 1
-            if create_errors <= 3:
-                logger.warning("create_dataset_item failed for case %s: %s", case.id, e)
-    if create_errors:
-        logger.warning("create_dataset_item: %d failures total (suppressed after first 3)", create_errors)
-    # Force flush so newly-created items are durable on the server
-    try:
-        langfuse.flush()
-    except Exception:
-        pass
-    # Pull the dataset back so we have items with an `.observe` context manager
-    try:
-        ds = langfuse.get_dataset(dataset_name)
-        logger.info("dataset %s has %d items", dataset_name, len(ds.items))
-        for item in ds.items:
-            md = getattr(item, "metadata", None) or {}
-            case_id = md.get("benchmark_case_id") if isinstance(md, dict) else None
-            if case_id:
-                case_to_item[case_id] = item
-        logger.info("matched %d local cases to dataset items", len(case_to_item))
-    except Exception as e:
-        logger.exception("get_dataset failed: %s", e)
-        async with async_session_factory() as session:
-            repo = Repository(session)
-            await repo.finish_test_run(uuid.UUID(run_id), {"error": str(e)}, status="failed")
-            await session.commit()
-        return
-
-    if not case_to_item:
-        # Could not bind any cases to a dataset item — likely create_dataset_item failed
-        logger.warning("no items matched; failing run %s", run_id)
-        async with async_session_factory() as session:
-            repo = Repository(session)
-            await repo.finish_test_run(
-                uuid.UUID(run_id),
-                {"error": "could not create or match any langfuse dataset items",
-                 "dataset": dataset_name, "case_count": len(cases)},
-                status="failed",
-            )
-            await session.commit()
-        _RUN_REGISTRY.pop(run_id, None)
-        return
-
-    # Step 3: run cases under semaphore
     sem = asyncio.Semaphore(max(1, concurrency))
     per_case_results: list[dict[str, Any]] = []
 
-    async def _do_one(case: BenchmarkCaseRow):
+    async def _do_one(case: dict[str, Any]):
         if cancel_event.is_set():
-            return
-        item = case_to_item.get(str(case.id))
-        if item is None:
-            handle.progress["failed"] += 1
             return
         async with sem:
             if cancel_event.is_set():
                 return
             try:
                 res = await _run_one_case(
-                    langfuse=langfuse,
-                    dataset_run_name=langfuse_run_name,
-                    item=item, case=case,
+                    case=case,
                     agent_cfg=agent_cfg,
-                    evaluator_cfgs=evaluator_cfgs,
+                    evaluator_specs=evaluator_specs,
                     judge_llm=judge_llm,
                 )
             except Exception as e:
-                logger.exception("case %s crashed during run: %s", case.id, e)
+                logger.exception("case %s crashed during run: %s", case.get("id"), e)
                 handle.progress["failed"] += 1
                 handle.progress["completed"] += 1
                 return
@@ -594,9 +534,20 @@ async def _execute_run(
             try:
                 async with async_session_factory() as session:
                     repo = Repository(session)
+                    # Accept either benchmark_case_id (when case.source='benchmark')
+                    # or leave both nullable (when case.source='file').
+                    src = case.get("source")
+                    bench_id = None
+                    if src == "benchmark" and case.get("id"):
+                        try:
+                            bench_id = uuid.UUID(case["id"])
+                        except (ValueError, TypeError):
+                            bench_id = None
                     created = await repo.create_test_result(
                         uuid.UUID(run_id),
-                        benchmark_case_id=case.id,
+                        benchmark_case_id=bench_id,
+                        question=res["question"],
+                        thread_id=res["thread_id"],
                         actual_output=res["actual_output"],
                         actual_tool_calls=res["actual_tool_calls"] or None,
                         latency_ms=res["latency_ms"],
@@ -607,18 +558,16 @@ async def _execute_run(
                         error_message=res["error_message"],
                         error_type=res["error_type"],
                         status=res["status"],
-                        full_trace={"langfuse_trace_id": res["trace_id"]} if res["trace_id"] else None,
-                        langfuse_trace_id=res["trace_id"],
                     )
                     for sname, sval in res["scores"].items():
                         await repo.create_eval_score(
                             created.id, dimension=sname, score=sval,
-                            weight=1.0, weighted_score=sval, scoring_method="langfuse",
+                            weight=1.0, weighted_score=sval, scoring_method="eval",
                             details={},
                         )
                     await session.commit()
             except Exception as e:
-                logger.exception("failed to persist results for case %s: %s", case.id, e)
+                logger.exception("failed to persist results for case %s: %s", case.get("id"), e)
 
     try:
         await asyncio.gather(*[_do_one(c) for c in cases])
@@ -626,14 +575,13 @@ async def _execute_run(
         # Aggregate
         succ = [r for r in per_case_results if r["status"] == "pass"]
         fail = [r for r in per_case_results if r["status"] != "pass"]
-        # Per-dimension averages over passing rows (so a few failures don't tank the median)
         all_scores: dict[str, list[float]] = {}
         for r in per_case_results:
             for k, v in r["scores"].items():
                 all_scores.setdefault(k, []).append(v)
         dim_avg = {k: round(sum(vs) / len(vs), 3) for k, vs in all_scores.items() if vs}
 
-        summary = {
+        summary: dict[str, Any] = {
             "counts": {
                 "total": len(per_case_results),
                 "passed": len(succ),
@@ -642,10 +590,16 @@ async def _execute_run(
             "dimension_averages": dim_avg,
             "cost_success": _aggregate_cost(succ),
             "cost_failure": _aggregate_cost(fail),
-            "langfuse_dataset": dataset_name,
-            "langfuse_run_name": langfuse_run_name,
-            "langfuse_host": settings.langfuse.host,
+            "run_name": run_name,
         }
+        if langsmith_project:
+            summary["langsmith_project"] = langsmith_project
+            # LangSmith web root; the UI uses it to deep-link.
+            summary["langsmith_host"] = settings.langsmith.api_url.replace(
+                "api.smith", "smith"
+            ) if settings.langsmith.api_url else None
+        if settings.langfuse.remote_write and settings.langfuse.configured:
+            summary["langfuse_host"] = settings.langfuse.host
         if cancel_event.is_set():
             summary["stopped_early"] = True
 
@@ -659,11 +613,104 @@ async def _execute_run(
             await repo.finish_test_run(uuid.UUID(run_id), summary, status=status)
             await session.commit()
 
-        try:
-            langfuse.flush()
-        except Exception:
-            pass
+        # Fire-and-forget LangSmith backfill. Don't block the run's completion
+        # on slow LangSmith queries — users can refresh the detail page and
+        # gradually see langsmith_run_id fill in.
+        if langsmith_project and per_case_results:
+            asyncio.create_task(
+                _backfill_langsmith_traces(
+                    run_id=run_id,
+                    project=langsmith_project,
+                    per_case_results=per_case_results,
+                )
+            )
+
         _RUN_REGISTRY.pop(run_id, None)
+
+
+async def _backfill_langsmith_traces(
+    *,
+    run_id: str,
+    project: str,
+    per_case_results: list[dict[str, Any]],
+) -> None:
+    """Try to match each local result with a LangSmith root run by
+    (start_time >= invoked_at - 1min) AND inputs.messages[0].content == question.
+
+    One LangSmith query per case keeps the call pattern simple. Cache hits on
+    subsequent reconciliations are handled upstream if we ever add one.
+    """
+    try:
+        from langsmith import Client
+        api_key = settings.langsmith.api_key
+        api_url = settings.langsmith.api_url
+        if not api_key:
+            logger.info("backfill: no LANGSMITH_API_KEY, skipping")
+            return
+        client = Client(api_key=api_key, api_url=api_url)
+    except Exception as e:
+        logger.warning("backfill: langsmith client init failed: %s", e)
+        return
+
+    loop = asyncio.get_event_loop()
+
+    async def _find_one(res: dict[str, Any]) -> tuple[str, str | None]:
+        question = res.get("question") or ""
+        invoked_at = res.get("invoked_at")
+        if not question or not invoked_at:
+            return (res.get("thread_id") or "", None)
+        # 1-minute safety window before invoked_at, generous upper bound.
+        from datetime import timedelta
+        lower = invoked_at - timedelta(minutes=1)
+
+        def _search():
+            try:
+                runs = list(client.list_runs(
+                    project_name=project,
+                    is_root=True,
+                    start_time=lower,
+                    limit=50,
+                ))
+                for r in runs:
+                    inp = r.inputs or {}
+                    if isinstance(inp, dict):
+                        msgs = inp.get("messages")
+                        if isinstance(msgs, list) and msgs:
+                            last = msgs[-1] if isinstance(msgs[-1], dict) else None
+                            txt = (last or {}).get("content", "")
+                        else:
+                            txt = inp.get("question") or ""
+                    else:
+                        txt = ""
+                    if txt == question:
+                        return str(r.id)
+            except Exception as e:
+                logger.warning("backfill search err: %s", e)
+            return None
+
+        found = await loop.run_in_executor(None, _search)
+        return (res.get("thread_id") or "", found)
+
+    pairs = await asyncio.gather(*[_find_one(r) for r in per_case_results])
+    hits = 0
+    async with async_session_factory() as session:
+        from agent_eval.db_models.tables import TestResultRow
+        for thread_id, lsrun in pairs:
+            if not lsrun or not thread_id:
+                continue
+            rows = (await session.execute(
+                select(TestResultRow)
+                .where(TestResultRow.run_id == uuid.UUID(run_id))
+                .where(TestResultRow.thread_id == thread_id)
+            )).scalars().all()
+            for row in rows:
+                row.langsmith_run_id = lsrun
+                hits += 1
+        await session.commit()
+    logger.info(
+        "backfill: project=%s run=%s matched %d/%d cases",
+        project, run_id, hits, len(per_case_results),
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -673,21 +720,28 @@ async def _execute_run(
 
 async def start_run(
     *,
-    benchmark_version_id: str | None = None,
-    project_id: str | None = None,
-    cases: list[BenchmarkCaseRow],
+    cases: list[dict[str, Any]],
     agent_cfg: dict,
-    evaluator_cfgs: list[dict],
+    evaluator_specs: list[dict[str, Any]],
     concurrency: int = 3,
     run_name: str | None = None,
+    langsmith_project: str | None = None,
+    benchmark_version_id: str | None = None,
+    eval_case_source_id: str | None = None,
 ) -> str:
-    """Create a test_runs row, register an asyncio task, return run_id."""
+    """Create a test_runs row, register an asyncio task, return run_id.
+
+    ``cases`` is the pre-normalized list from the API router:
+        [{"id": str, "name": str, "question": str, "expected_output": str,
+          "expected_tool_calls": list, "metadata": dict, "source": "benchmark"|"file"}, ...]
+
+    ``evaluator_specs`` is a list of DB-resolved evaluator configs:
+        [{"evaluator_type": "llm_judge", "params": {...}, "label": "my-judge"}, ...]
+    """
     if not cases:
         raise ValueError("no cases selected")
-    if not evaluator_cfgs:
+    if not evaluator_specs:
         raise ValueError("at least one evaluator required")
-    if not settings.langfuse.configured:
-        raise RuntimeError("Langfuse not configured")
 
     run_name = run_name or f"eval-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
 
@@ -695,26 +749,26 @@ async def start_run(
         repo = Repository(session)
         row = await repo.create_test_run(
             benchmark_version_id=uuid.UUID(benchmark_version_id) if benchmark_version_id else None,
+            eval_case_source_id=uuid.UUID(eval_case_source_id) if eval_case_source_id else None,
             agent_config=agent_cfg,
             langfuse_run_name=run_name,
-            evaluator_configs=evaluator_cfgs,
+            langsmith_project=langsmith_project,
+            evaluator_configs=evaluator_specs,
             status="running",
         )
         await session.commit()
         run_id = str(row.id)
 
-    # Use project_id as the langfuse dataset name when no version is set.
-    scope_id = benchmark_version_id or project_id or "default"
     cancel_event = asyncio.Event()
     handle = _RunHandle(run_id=run_id, task=None, cancel_event=cancel_event)  # type: ignore[arg-type]
     handle.task = asyncio.create_task(_execute_run(
         run_id=run_id,
-        scope_id=scope_id,
         cases=cases,
         agent_cfg=agent_cfg,
-        evaluator_cfgs=evaluator_cfgs,
+        evaluator_specs=evaluator_specs,
         concurrency=concurrency,
-        langfuse_run_name=run_name,
+        run_name=run_name,
+        langsmith_project=langsmith_project,
         cancel_event=cancel_event,
         handle=handle,
     ))

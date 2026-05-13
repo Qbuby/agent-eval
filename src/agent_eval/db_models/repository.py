@@ -9,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_eval.db_models.tables import (
     DatasetVersionRow,
+    EvalCaseSourceRow,
     EvaluationScoreRow,
+    EvaluatorConfigRow,
     LoopControlLogRow,
     OptimizationRow,
     RoutingLogRow,
@@ -63,20 +65,26 @@ class Repository:
         optimization_id: uuid.UUID | None = None,
         ab_group: str | None = None,
         benchmark_version_id: uuid.UUID | None = None,
+        eval_case_source_id: uuid.UUID | None = None,
         langfuse_run_name: str | None = None,
+        langsmith_project: str | None = None,
         evaluator_configs: list | None = None,
         status: str = "running",
+        eval_started_at: datetime | None = None,
     ) -> TestRunRow:
         row = TestRunRow(
             dataset_version_id=dataset_version_id,
             benchmark_version_id=benchmark_version_id,
+            eval_case_source_id=eval_case_source_id,
             agent_config=agent_config or {},
             optimization_id=optimization_id,
             ab_group=ab_group,
             langfuse_run_name=langfuse_run_name,
+            langsmith_project=langsmith_project,
             evaluator_configs=evaluator_configs or [],
             status=status,
             started_at=datetime.now(timezone.utc),
+            eval_started_at=eval_started_at or datetime.now(timezone.utc),
         )
         self.session.add(row)
         await self.session.flush()
@@ -321,3 +329,81 @@ class Repository:
             }
             for r in rows
         ]
+
+    # ---- Eval case sources (ephemeral uploaded case files) ----
+
+    async def create_eval_case_source(
+        self, *, name: str, source_kind: str, file_format: str | None,
+        cases: list, created_by: uuid.UUID | None = None,
+    ) -> EvalCaseSourceRow:
+        row = EvalCaseSourceRow(
+            name=name, source_kind=source_kind, file_format=file_format,
+            cases=cases, created_by=created_by,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_eval_case_source(self, source_id: uuid.UUID) -> EvalCaseSourceRow | None:
+        return (await self.session.execute(
+            select(EvalCaseSourceRow).where(EvalCaseSourceRow.id == source_id)
+        )).scalar_one_or_none()
+
+    async def list_eval_case_sources(
+        self, *, limit: int = 50,
+    ) -> list[EvalCaseSourceRow]:
+        rows = (await self.session.execute(
+            select(EvalCaseSourceRow)
+            .order_by(EvalCaseSourceRow.created_at.desc())
+            .limit(limit)
+        )).scalars().all()
+        return list(rows)
+
+    # ---- Evaluator configs ----
+
+    async def create_evaluator_config(
+        self, *, name: str, evaluator_type: str,
+        description: str | None = None, params: dict | None = None,
+        is_active: bool = True,
+    ) -> EvaluatorConfigRow:
+        row = EvaluatorConfigRow(
+            name=name, evaluator_type=evaluator_type, description=description,
+            params=params or {}, is_active=is_active,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_evaluator_config(self, eid: uuid.UUID) -> EvaluatorConfigRow | None:
+        return (await self.session.execute(
+            select(EvaluatorConfigRow).where(EvaluatorConfigRow.id == eid)
+        )).scalar_one_or_none()
+
+    async def list_evaluator_configs(
+        self, *, active_only: bool = False,
+    ) -> list[EvaluatorConfigRow]:
+        stmt = select(EvaluatorConfigRow).order_by(EvaluatorConfigRow.created_at.desc())
+        if active_only:
+            stmt = stmt.where(EvaluatorConfigRow.is_active.is_(True))
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def update_evaluator_config(
+        self, eid: uuid.UUID, **updates: Any,
+    ) -> EvaluatorConfigRow | None:
+        row = await self.get_evaluator_config(eid)
+        if row is None:
+            return None
+        for k, v in updates.items():
+            if hasattr(row, k) and k != "id":
+                setattr(row, k, v)
+        row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    async def delete_evaluator_config(self, eid: uuid.UUID) -> bool:
+        row = await self.get_evaluator_config(eid)
+        if row is None:
+            return False
+        await self.session.delete(row)
+        await self.session.flush()
+        return True

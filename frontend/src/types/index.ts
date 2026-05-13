@@ -334,13 +334,14 @@ export interface CapacityInfo {
 // ─── Evaluation (Langfuse-backed) ───
 
 export interface EvalAgentConfig {
-  type: 'openai' | 'sse'
+  type: 'openai' | 'sse' | 'sse_generic'
   url: string
   api_key?: string
   model?: string
   headers?: Record<string, string>
   payload_template?: Record<string, unknown>
   timeout?: number
+  language?: string
 }
 
 export interface EvaluatorConfig {
@@ -348,17 +349,61 @@ export interface EvaluatorConfig {
   params?: Record<string, unknown>
 }
 
+export interface EvaluatorInstance {
+  id: string
+  name: string
+  evaluator_type: string
+  description: string | null
+  params: Record<string, unknown>
+  is_active: boolean
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface CreateEvaluatorRequest {
+  name: string
+  evaluator_type: string
+  description?: string | null
+  params?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface UpdateEvaluatorRequest {
+  name?: string
+  description?: string | null
+  params?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface UploadCasesResponse {
+  source_id: string
+  name: string
+  count: number
+  preview: Array<Record<string, unknown>>
+}
+
+export interface EvalCaseSourceSummary {
+  id: string
+  name: string
+  source_kind: string
+  file_format: string | null
+  count: number
+  created_at: string | null
+}
+
 export interface StartEvalRequest {
   benchmark_version_id?: string | null
   project_id?: string | null
+  case_source_id?: string | null
   case_ids?: string[] | null
   filter_tags?: string[] | null
   filter_category_id?: string | null
   limit?: number | null
   agent: EvalAgentConfig
-  evaluators: EvaluatorConfig[]
+  evaluator_ids: string[]
   concurrency?: number
   run_name?: string | null
+  langsmith_project?: string | null
 }
 
 export interface StartEvalResponse {

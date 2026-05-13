@@ -15,6 +15,7 @@ import ProjectsPage from '@/pages/ProjectsPage'
 import BenchmarkPage from '@/pages/BenchmarkPage'
 import EvaluationPage from '@/pages/EvaluationPage'
 import EvaluationRunDetailPage from '@/pages/EvaluationRunDetailPage'
+import EvaluatorsPage from '@/pages/EvaluatorsPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -46,6 +47,7 @@ export default function App() {
           <Route path="traces" element={<TracesPage />} />
           <Route path="evaluation" element={<EvaluationPage />} />
           <Route path="evaluation/runs/:runId" element={<EvaluationRunDetailPage />} />
+          <Route path="evaluators" element={<EvaluatorsPage />} />
           <Route path="auto-collect" element={<AutoCollectPage />} />
           <Route path="config" element={<ConfigPage />} />
           <Route path="audit" element={<AuditPage />} />

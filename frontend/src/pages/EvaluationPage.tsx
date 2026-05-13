@@ -11,11 +11,11 @@ import type {
   Project,
 } from '@/services/benchmark'
 import type {
-  BuiltinEvaluator,
   EvalAgentConfig,
   EvalRunSummary,
-  EvaluatorConfig,
+  EvaluatorInstance,
   StartEvalRequest,
+  UploadCasesResponse,
 } from '@/types'
 
 type Tab = 'history' | 'new'
@@ -28,7 +28,7 @@ export default function EvaluationPage() {
       <header className="mb-6">
         <h1 className="text-lg font-light tracking-tight mb-1">评估</h1>
         <p className="text-[10px] text-text-tertiary tracking-widest uppercase">
-          Evaluation runs · Langfuse-backed
+          Evaluation runs · LangSmith trace · local scoring
         </p>
       </header>
 
@@ -73,7 +73,6 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
         .listRuns({ page, page_size: pageSize, status: statusFilter || undefined })
         .then(r => r.data),
     refetchInterval: (q) => {
-      // Poll while any run is active
       const data = q.state.data
       if (!data) return false
       return data.items.some(it => it.status === 'running' || it.status === 'stopping') ? 3000 : false
@@ -114,7 +113,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
             <tr>
               <Th>ID</Th>
               <Th>状态</Th>
-              <Th>模型</Th>
+              <Th>Agent</Th>
               <Th>Run 名</Th>
               <Th>进度 / 总数</Th>
               <Th>通过率</Th>
@@ -182,21 +181,17 @@ function RunRow({ run, onClick }: { run: EvalRunSummary; onClick: () => void }) 
     run.summary_scores?.cost_failure?.avg_latency_ms,
   )
 
+  const agent = run.agent_config as { model?: string; url?: string; type?: string }
+  const agentLabel = agent?.model || agent?.type || '—'
+
   return (
-    <tr
-      onClick={onClick}
-      className="hover:bg-accent-subtle/40 cursor-pointer transition-colors"
-    >
+    <tr onClick={onClick} className="hover:bg-accent-subtle/40 cursor-pointer transition-colors">
       <Td mono>{run.id.slice(0, 8)}</Td>
-      <Td>
-        <StatusBadge status={run.status} />
-      </Td>
-      <Td>{(run.agent_config as { model?: string })?.model ?? '—'}</Td>
+      <Td><StatusBadge status={run.status} /></Td>
+      <Td>{agentLabel}</Td>
       <Td mono>{run.langfuse_run_name ?? '—'}</Td>
       <Td>
-        {run.status === 'running'
-          ? `${completed}/${total || '?'}`
-          : `${total}`}
+        {run.status === 'running' ? `${completed}/${total || '?'}` : `${total}`}
       </Td>
       <Td>{passRate}</Td>
       <Td>{avgLatency != null ? `${Math.round(avgLatency)}ms` : '—'}</Td>
@@ -236,10 +231,15 @@ function StatusBadge({ status }: { status: string }) {
 
 // ─── New run tab ────────────────────────────────────────────────────────────
 
+type CaseSourceTab = 'benchmark' | 'upload'
+
 function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const qc = useQueryClient()
 
-  // Project + cases
+  // Case-source tabs
+  const [sourceTab, setSourceTab] = useState<CaseSourceTab>('benchmark')
+
+  // ── benchmark branch ──
   const projectsQuery = useQuery({
     queryKey: ['projects'],
     queryFn: () => projectsApi.list().then(r => r.data),
@@ -247,63 +247,61 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const [projectId, setProjectId] = useState('')
   const [categoryId, setCategoryId] = useState('')
   const [searchText, setSearchText] = useState('')
+  const [selectionMode, setSelectionMode] = useState<'all' | 'filter' | 'pick'>('all')
+  const [pickedCaseIds, setPickedCaseIds] = useState<Set<string>>(new Set())
+  const [filterTags, setFilterTags] = useState('')
+  const [limit, setLimit] = useState<number | ''>(10)
 
   const categoriesQuery = useQuery({
     queryKey: ['categories', projectId],
     queryFn: () => projectsApi.getCategories(projectId).then(r => r.data),
     enabled: !!projectId,
   })
-
-  // We pull the first 200 cases as the candidate pool; user picks from here.
   const casesQuery = useQuery({
     queryKey: ['bench-cases-for-eval', projectId, categoryId, searchText],
     queryFn: () =>
-      benchmarkApi
-        .listCases(projectId, {
-          category_id: categoryId || undefined,
-          search: searchText || undefined,
-          page: 1,
-          page_size: 200,
-        })
-        .then(r => r.data),
-    enabled: !!projectId,
+      benchmarkApi.listCases(projectId, {
+        category_id: categoryId || undefined,
+        search: searchText || undefined,
+        page: 1, page_size: 200,
+      }).then(r => r.data),
+    enabled: !!projectId && sourceTab === 'benchmark',
   })
-
-  const [selectionMode, setSelectionMode] = useState<'all' | 'filter' | 'pick'>('all')
-  const [pickedCaseIds, setPickedCaseIds] = useState<Set<string>>(new Set())
-  const [filterTags, setFilterTags] = useState('')
-  const [limit, setLimit] = useState<number | ''>(10)
 
   const effectiveCaseCount = useMemo(() => {
     if (!casesQuery.data) return 0
     if (selectionMode === 'pick') return pickedCaseIds.size
-    if (selectionMode === 'all') return casesQuery.data.total
-    // filter mode — can't know exact without backend call; show the current page total as a hint
     return casesQuery.data.total
   }, [casesQuery.data, selectionMode, pickedCaseIds])
 
-  // Agent config
-  const [agentType, setAgentType] = useState<'openai' | 'sse'>('openai')
-  const [agentUrl, setAgentUrl] = useState('https://kiro.aidong-ai.com/v1')
+  // ── upload branch ──
+  const [uploadedSource, setUploadedSource] = useState<UploadCasesResponse | null>(null)
+  const uploadMutation = useMutation({
+    mutationFn: (file: File) => evaluationApi.uploadCases(file).then(r => r.data),
+    onSuccess: (data) => setUploadedSource(data),
+  })
+
+  // ── agent ──
+  const [agentType, setAgentType] = useState<'sse' | 'openai' | 'sse_generic'>('sse')
+  const [agentUrl, setAgentUrl] = useState('http://localhost:18094/api/agent/langgraph')
   const [agentApiKey, setAgentApiKey] = useState('')
-  const [agentModel, setAgentModel] = useState('claude-haiku-4-5')
+  const [agentModel, setAgentModel] = useState('')
+  const [agentLanguage, setAgentLanguage] = useState('请用中文回复')
   const [agentHeadersText, setAgentHeadersText] = useState('')
   const [agentPayloadText, setAgentPayloadText] = useState('')
-  const [agentTimeout, setAgentTimeout] = useState(120)
-
-  // Evaluators
-  const builtinEvalsQuery = useQuery({
-    queryKey: ['builtin-evaluators'],
-    queryFn: () => evaluationApi.listBuiltinEvaluators().then(r => r.data),
-  })
-  const [selectedEvalNames, setSelectedEvalNames] = useState<Set<string>>(
-    new Set(['exact_match', 'llm_judge']),
-  )
-  const [llmJudgePromptOverride, setLlmJudgePromptOverride] = useState('')
-
+  const [agentTimeout, setAgentTimeout] = useState(300)
   const [concurrency, setConcurrency] = useState(3)
   const [runName, setRunName] = useState('')
+  const [langsmithProject, setLangsmithProject] = useState('')
 
+  // ── evaluator instances ──
+  const evaluatorsQuery = useQuery({
+    queryKey: ['evaluator-instances-active'],
+    queryFn: () => evaluationApi.listEvaluators(true).then(r => r.data),
+  })
+  const [selectedEvaluatorIds, setSelectedEvaluatorIds] = useState<Set<string>>(new Set())
+
+  // ── start mutation ──
   const startMutation = useMutation({
     mutationFn: (body: StartEvalRequest) => evaluationApi.startRun(body).then(r => r.data),
     onSuccess: () => {
@@ -312,9 +310,10 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     },
   })
 
+  const hasCaseSource = sourceTab === 'benchmark' ? !!projectId : !!uploadedSource
   const canStart =
-    !!projectId &&
-    selectedEvalNames.size > 0 &&
+    hasCaseSource &&
+    selectedEvaluatorIds.size > 0 &&
     agentUrl.trim().length > 0 &&
     !startMutation.isPending
 
@@ -323,16 +322,10 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     let payloadTpl: Record<string, unknown> | undefined
     try {
       if (agentHeadersText.trim()) headers = JSON.parse(agentHeadersText)
-    } catch {
-      alert('Headers 必须是合法 JSON 对象')
-      return
-    }
+    } catch { alert('Headers 必须是合法 JSON'); return }
     try {
       if (agentPayloadText.trim()) payloadTpl = JSON.parse(agentPayloadText)
-    } catch {
-      alert('Payload template 必须是合法 JSON 对象')
-      return
-    }
+    } catch { alert('Payload template 必须是合法 JSON'); return }
 
     const agent: EvalAgentConfig = {
       type: agentType,
@@ -342,35 +335,32 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       headers,
       payload_template: payloadTpl,
       timeout: agentTimeout,
+      language: agentLanguage,
     }
-
-    const evaluators: EvaluatorConfig[] = Array.from(selectedEvalNames).map(name => {
-      const params: Record<string, unknown> = {}
-      if (name === 'llm_judge' && llmJudgePromptOverride.trim()) {
-        params.user_template = llmJudgePromptOverride.trim()
-      }
-      return { name, params }
-    })
 
     const body: StartEvalRequest = {
-      project_id: projectId,
       agent,
-      evaluators,
+      evaluator_ids: Array.from(selectedEvaluatorIds),
       concurrency,
       run_name: runName.trim() || null,
+      langsmith_project: langsmithProject.trim() || null,
     }
 
-    if (selectionMode === 'pick') {
-      body.case_ids = Array.from(pickedCaseIds)
-    } else if (selectionMode === 'filter') {
-      body.filter_category_id = categoryId || null
-      body.filter_tags = filterTags
-        .split(',').map(t => t.trim()).filter(Boolean) || null
+    if (sourceTab === 'upload' && uploadedSource) {
+      body.case_source_id = uploadedSource.source_id
       body.limit = typeof limit === 'number' ? limit : null
     } else {
-      // all — optionally cap with limit
-      body.filter_category_id = categoryId || null
-      body.limit = typeof limit === 'number' ? limit : null
+      body.project_id = projectId
+      if (selectionMode === 'pick') {
+        body.case_ids = Array.from(pickedCaseIds)
+      } else if (selectionMode === 'filter') {
+        body.filter_category_id = categoryId || null
+        body.filter_tags = filterTags.split(',').map(t => t.trim()).filter(Boolean) || null
+        body.limit = typeof limit === 'number' ? limit : null
+      } else {
+        body.filter_category_id = categoryId || null
+        body.limit = typeof limit === 'number' ? limit : null
+      }
     }
 
     startMutation.mutate(body)
@@ -378,165 +368,205 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
 
   return (
     <div className="flex flex-col gap-5 max-w-[900px]">
-      {/* Step 1: dataset */}
-      <Section title="1. 选数据集">
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="项目">
-            <select
-              value={projectId}
-              onChange={e => {
-                setProjectId(e.target.value)
-                setCategoryId('')
-                setPickedCaseIds(new Set())
-              }}
-              className="input"
+      {/* Step 1: case source */}
+      <Section title="1. 选择样例来源">
+        <div className="flex gap-1 mb-3 border-b border-border">
+          {([
+            { id: 'benchmark', label: '从基准数据集' },
+            { id: 'upload', label: '上传文件' },
+          ] as { id: CaseSourceTab; label: string }[]).map(t => (
+            <button
+              key={t.id}
+              onClick={() => setSourceTab(t.id)}
+              className={`px-3 py-1.5 text-[12px] border-b-2 transition-all ${
+                sourceTab === t.id
+                  ? 'border-accent text-text-primary font-medium'
+                  : 'border-transparent text-text-secondary hover:text-text-primary'
+              }`}
             >
-              <option value="">— 选择项目 —</option>
-              {projectsQuery.data?.map((p: Project) => (
-                <option key={p.id} value={p.id}>{p.name}</option>
-              ))}
-            </select>
-          </Field>
-          <Field label="分类（可选）">
-            <select
-              value={categoryId}
-              onChange={e => setCategoryId(e.target.value)}
-              disabled={!projectId}
-              className="input disabled:opacity-50"
-            >
-              <option value="">全部分类</option>
-              {categoriesQuery.data?.map(c => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
-            </select>
-          </Field>
-        </div>
-      </Section>
-
-      {/* Step 2: selection */}
-      <Section title="2. 选择样例">
-        <div className="flex items-center gap-3 mb-3">
-          {(['all', 'filter', 'pick'] as const).map(m => (
-            <label key={m} className="inline-flex items-center gap-1.5 text-[12px] cursor-pointer">
-              <input
-                type="radio"
-                checked={selectionMode === m}
-                onChange={() => setSelectionMode(m)}
-                className="accent-accent"
-              />
-              {m === 'all' && '整个数据集'}
-              {m === 'filter' && '按条件筛选'}
-              {m === 'pick' && '手动勾选'}
-            </label>
+              {t.label}
+            </button>
           ))}
-          <span className="ml-auto text-[11px] text-text-tertiary">
-            {selectionMode === 'pick'
-              ? `已选 ${pickedCaseIds.size} 条`
-              : `命中约 ${effectiveCaseCount} 条`}
-          </span>
         </div>
 
-        {selectionMode === 'filter' && (
-          <div className="grid grid-cols-2 gap-3 mb-3">
-            <Field label="标签（逗号分隔）">
-              <input
-                type="text"
-                value={filterTags}
-                onChange={e => setFilterTags(e.target.value)}
-                placeholder="e.g. 电池,维修"
-                className="input"
-              />
-            </Field>
-            <Field label="最多跑多少条">
-              <input
-                type="number"
-                min={1}
-                value={limit}
-                onChange={e => setLimit(e.target.value ? Number(e.target.value) : '')}
-                className="input"
-              />
-            </Field>
-          </div>
-        )}
-
-        {selectionMode === 'all' && (
-          <Field label="最多跑多少条（空=全部）">
-            <input
-              type="number"
-              min={1}
-              value={limit}
-              onChange={e => setLimit(e.target.value ? Number(e.target.value) : '')}
-              className="input max-w-[180px]"
-            />
-          </Field>
-        )}
-
-        {selectionMode === 'pick' && (
-          <div>
-            <div className="flex items-center gap-2 mb-2">
-              <input
-                type="text"
-                placeholder="搜索问题文本…"
-                value={searchText}
-                onChange={e => setSearchText(e.target.value)}
-                className="input flex-1"
-              />
-              <button
-                type="button"
-                onClick={() => setPickedCaseIds(new Set())}
-                className="text-[11px] px-2 py-1 border border-border rounded-[4px] hover:border-accent"
-              >
-                清空
-              </button>
+        {sourceTab === 'benchmark' && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="项目">
+                <select
+                  value={projectId}
+                  onChange={e => {
+                    setProjectId(e.target.value)
+                    setCategoryId('')
+                    setPickedCaseIds(new Set())
+                  }}
+                  className="input"
+                >
+                  <option value="">— 选择项目 —</option>
+                  {projectsQuery.data?.map((p: Project) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="分类（可选）">
+                <select
+                  value={categoryId}
+                  onChange={e => setCategoryId(e.target.value)}
+                  disabled={!projectId}
+                  className="input disabled:opacity-50"
+                >
+                  <option value="">全部分类</option>
+                  {categoriesQuery.data?.map(c => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </Field>
             </div>
-            <div className="border border-border rounded-[4px] max-h-[280px] overflow-y-auto divide-y divide-border">
-              {casesQuery.data?.items.map((c: BenchmarkCase) => {
-                const checked = pickedCaseIds.has(c.id)
-                return (
-                  <label
-                    key={c.id}
-                    className="flex items-start gap-2 py-1.5 px-2 hover:bg-accent-subtle/40 cursor-pointer text-[12px]"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={() => {
-                        const s = new Set(pickedCaseIds)
-                        if (s.has(c.id)) s.delete(c.id); else s.add(c.id)
-                        setPickedCaseIds(s)
-                      }}
-                      className="mt-0.5 w-3.5 h-3.5 accent-accent shrink-0"
-                    />
-                    <span className="flex-1 break-all">
-                      {c.question.length > 120 ? c.question.slice(0, 120) + '…' : c.question}
-                    </span>
-                  </label>
-                )
-              })}
-              {casesQuery.data?.items.length === 0 && (
-                <div className="py-6 text-center text-[11px] text-text-tertiary">
-                  {projectId ? '没有匹配的 case' : '先选项目'}
+
+            <div className="flex items-center gap-3 mt-3 mb-2">
+              {(['all', 'filter', 'pick'] as const).map(m => (
+                <label key={m} className="inline-flex items-center gap-1.5 text-[12px] cursor-pointer">
+                  <input type="radio" checked={selectionMode === m} onChange={() => setSelectionMode(m)} className="accent-accent" />
+                  {m === 'all' && '全部'}
+                  {m === 'filter' && '按条件筛选'}
+                  {m === 'pick' && '手动勾选'}
+                </label>
+              ))}
+              <span className="ml-auto text-[11px] text-text-tertiary">
+                {selectionMode === 'pick' ? `已选 ${pickedCaseIds.size} 条` : `命中约 ${effectiveCaseCount} 条`}
+              </span>
+            </div>
+
+            {selectionMode !== 'pick' && (
+              <Field label="最多跑多少条（空=不限制）">
+                <input
+                  type="number" min={1} value={limit}
+                  onChange={e => setLimit(e.target.value ? Number(e.target.value) : '')}
+                  className="input max-w-[180px]"
+                />
+              </Field>
+            )}
+            {selectionMode === 'filter' && (
+              <Field label="标签（逗号分隔）">
+                <input
+                  type="text" value={filterTags}
+                  onChange={e => setFilterTags(e.target.value)}
+                  placeholder="e.g. 电池,维修" className="input"
+                />
+              </Field>
+            )}
+            {selectionMode === 'pick' && (
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <input
+                    type="text" placeholder="搜索问题文本…"
+                    value={searchText} onChange={e => setSearchText(e.target.value)}
+                    className="input flex-1"
+                  />
+                  <button onClick={() => setPickedCaseIds(new Set())}
+                          className="text-[11px] px-2 py-1 border border-border rounded-[4px] hover:border-accent">
+                    清空
+                  </button>
                 </div>
+                <div className="border border-border rounded-[4px] max-h-[280px] overflow-y-auto divide-y divide-border">
+                  {casesQuery.data?.items.map((c: BenchmarkCase) => {
+                    const checked = pickedCaseIds.has(c.id)
+                    return (
+                      <label key={c.id}
+                             className="flex items-start gap-2 py-1.5 px-2 hover:bg-accent-subtle/40 cursor-pointer text-[12px]">
+                        <input
+                          type="checkbox" checked={checked}
+                          onChange={() => {
+                            const s = new Set(pickedCaseIds)
+                            if (s.has(c.id)) s.delete(c.id); else s.add(c.id)
+                            setPickedCaseIds(s)
+                          }}
+                          className="mt-0.5 w-3.5 h-3.5 accent-accent shrink-0"
+                        />
+                        <span className="flex-1 break-all">
+                          {c.question.length > 120 ? c.question.slice(0, 120) + '…' : c.question}
+                        </span>
+                      </label>
+                    )
+                  })}
+                  {casesQuery.data?.items.length === 0 && (
+                    <div className="py-6 text-center text-[11px] text-text-tertiary">
+                      {projectId ? '没有匹配的 case' : '先选项目'}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {sourceTab === 'upload' && (
+          <div>
+            <div className="flex items-center gap-3">
+              <input
+                type="file" accept=".json,.jsonl"
+                onChange={e => {
+                  const f = e.target.files?.[0]
+                  if (f) uploadMutation.mutate(f)
+                }}
+                className="text-[12px]"
+              />
+              {uploadMutation.isPending && <span className="text-[11px] text-text-tertiary">上传解析中…</span>}
+              {uploadedSource && (
+                <span className="text-[11px] text-positive">
+                  已上传 {uploadedSource.count} 条：{uploadedSource.name}
+                </span>
               )}
             </div>
+            <p className="text-[10px] text-text-tertiary mt-2">
+              支持 JSON（含 <code>test_cases</code> 数组或顶层数组）和 JSONL。每条必须有 <code>question</code> 字段。
+              期望答案写在 <code>expected_output</code> 或 <code>reference_answer</code>。
+            </p>
+            {uploadedSource?.preview && uploadedSource.preview.length > 0 && (
+              <div className="mt-3 border border-border rounded-[4px] bg-surface p-2">
+                <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">前 3 条预览</div>
+                {uploadedSource.preview.map((c, i) => {
+                  const q = String((c as { question?: unknown }).question ?? '')
+                  return (
+                    <div key={i} className="text-[11px] py-1 border-b border-border/40 last:border-b-0">
+                      <span className="font-mono text-text-tertiary mr-2">
+                        {String((c as { name?: unknown }).name ?? '')}
+                      </span>
+                      {q.length > 100 ? q.slice(0, 100) + '…' : q}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {uploadedSource && (
+              <Field label="最多跑多少条（空=全部）">
+                <input
+                  type="number" min={1} value={limit}
+                  onChange={e => setLimit(e.target.value ? Number(e.target.value) : '')}
+                  className="input max-w-[180px] mt-3"
+                />
+              </Field>
+            )}
           </div>
         )}
       </Section>
 
-      {/* Step 3: agent */}
-      <Section title="3. 配置 Agent">
+      {/* Step 2: agent */}
+      <Section title="2. 配置 Agent">
         <div className="grid grid-cols-2 gap-3">
           <Field label="类型">
-            <select value={agentType} onChange={e => setAgentType(e.target.value as 'openai' | 'sse')} className="input">
+            <select value={agentType} onChange={e => setAgentType(e.target.value as typeof agentType)} className="input">
+              <option value="sse">SSE (LangGraph v2)</option>
               <option value="openai">OpenAI 兼容</option>
-              <option value="sse">SSE 流</option>
+              <option value="sse_generic">SSE 通用模板</option>
             </select>
           </Field>
-          <Field label="Model">
+          <Field label="Model（可选，展示用）">
             <input type="text" value={agentModel} onChange={e => setAgentModel(e.target.value)} className="input" />
           </Field>
-          <Field label={agentType === 'openai' ? '/chat/completions base URL' : 'SSE URL'}>
-            <input type="text" value={agentUrl} onChange={e => setAgentUrl(e.target.value)} className="input" />
+          <Field label="Agent URL">
+            <input type="text" value={agentUrl} onChange={e => setAgentUrl(e.target.value)}
+                   placeholder="http://localhost:18094/api/agent/langgraph" className="input" />
           </Field>
           <Field label="API Key（可选）">
             <input type="password" value={agentApiKey} onChange={e => setAgentApiKey(e.target.value)} className="input" />
@@ -547,86 +577,74 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
           <Field label="Concurrency">
             <input type="number" min={1} max={20} value={concurrency} onChange={e => setConcurrency(Number(e.target.value))} className="input" />
           </Field>
+          {agentType === 'sse' && (
+            <Field label="language 参数">
+              <input type="text" value={agentLanguage} onChange={e => setAgentLanguage(e.target.value)} className="input" />
+            </Field>
+          )}
+          <Field label="LangSmith Project（用于拉回 trace）">
+            <input type="text" value={langsmithProject} onChange={e => setLangsmithProject(e.target.value)}
+                   placeholder="e.g. ep-agent / ruyi-agent" className="input" />
+          </Field>
         </div>
 
         <details className="mt-3">
           <summary className="text-[11px] text-text-secondary cursor-pointer">高级：自定义 headers / payload</summary>
           <div className="grid grid-cols-2 gap-3 mt-2">
             <Field label="Headers (JSON)">
-              <textarea
-                value={agentHeadersText}
-                onChange={e => setAgentHeadersText(e.target.value)}
-                rows={3}
-                placeholder='{"X-Custom": "value"}'
-                className="input font-mono text-[11px]"
-              />
+              <textarea value={agentHeadersText} onChange={e => setAgentHeadersText(e.target.value)}
+                        rows={3} placeholder='{"X-Custom": "value"}' className="input font-mono text-[11px]" />
             </Field>
-            <Field label="Payload template (JSON, SSE only)">
-              <textarea
-                value={agentPayloadText}
-                onChange={e => setAgentPayloadText(e.target.value)}
-                rows={3}
-                placeholder='{"question": "{input}"}'
-                className="input font-mono text-[11px]"
-              />
+            <Field label="Payload template (JSON, SSE generic 专用)">
+              <textarea value={agentPayloadText} onChange={e => setAgentPayloadText(e.target.value)}
+                        rows={3} placeholder='{"question": "{input}"}' className="input font-mono text-[11px]" />
             </Field>
           </div>
         </details>
       </Section>
 
-      {/* Step 4: evaluators */}
-      <Section title="4. 评估器">
-        {builtinEvalsQuery.data?.length === 0 && (
-          <p className="text-[12px] text-text-tertiary">没有可用的评估器</p>
+      {/* Step 3: evaluators */}
+      <Section title="3. 评估器">
+        {evaluatorsQuery.isLoading && (
+          <p className="text-[12px] text-text-tertiary">加载评估器…</p>
+        )}
+        {!evaluatorsQuery.isLoading && (evaluatorsQuery.data?.length ?? 0) === 0 && (
+          <p className="text-[12px] text-text-tertiary">
+            还没有评估器实例。到左侧菜单「评估器」页面先建一个。
+          </p>
         )}
         <div className="flex flex-col gap-2">
-          {builtinEvalsQuery.data?.map((e: BuiltinEvaluator) => {
-            const checked = selectedEvalNames.has(e.name)
+          {evaluatorsQuery.data?.map((e: EvaluatorInstance) => {
+            const checked = selectedEvaluatorIds.has(e.id)
             return (
-              <div key={e.name} className="border border-border rounded-[4px] p-3">
-                <label className="flex items-start gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={() => {
-                      const s = new Set(selectedEvalNames)
-                      if (s.has(e.name)) s.delete(e.name); else s.add(e.name)
-                      setSelectedEvalNames(s)
-                    }}
-                    className="mt-0.5 w-3.5 h-3.5 accent-accent"
-                  />
-                  <div className="flex-1">
-                    <div className="font-medium text-[12px]">{e.name}</div>
-                    <div className="text-[11px] text-text-tertiary mt-0.5">{e.description}</div>
+              <label key={e.id}
+                     className="flex items-start gap-2 border border-border rounded-[4px] p-3 cursor-pointer">
+                <input
+                  type="checkbox" checked={checked}
+                  onChange={() => {
+                    const s = new Set(selectedEvaluatorIds)
+                    if (s.has(e.id)) s.delete(e.id); else s.add(e.id)
+                    setSelectedEvaluatorIds(s)
+                  }}
+                  className="mt-0.5 w-3.5 h-3.5 accent-accent"
+                />
+                <div className="flex-1">
+                  <div className="font-medium text-[12px]">{e.name}
+                    <span className="ml-2 text-[10px] font-mono text-text-tertiary">{e.evaluator_type}</span>
                   </div>
-                </label>
-                {checked && e.name === 'llm_judge' && (
-                  <div className="mt-2 ml-6">
-                    <Field label="User template (可选，留空用默认)">
-                      <textarea
-                        value={llmJudgePromptOverride}
-                        onChange={ev => setLlmJudgePromptOverride(ev.target.value)}
-                        rows={3}
-                        className="input font-mono text-[11px]"
-                        placeholder="## 用户问题&#10;{question}&#10;&#10;## AI 回答&#10;{answer}&#10;&#10;## 评分维度&#10;{dimensions}"
-                      />
-                    </Field>
-                  </div>
-                )}
-              </div>
+                  <div className="text-[11px] text-text-tertiary mt-0.5">{e.description || '—'}</div>
+                </div>
+              </label>
             )
           })}
         </div>
       </Section>
 
-      {/* Step 5: run name */}
-      <Section title="5. Run 名（可选）">
+      {/* Step 4: run name */}
+      <Section title="4. Run 名（可选）">
         <input
-          type="text"
-          value={runName}
-          onChange={e => setRunName(e.target.value)}
-          placeholder="默认自动按时间戳生成"
-          className="input max-w-[420px]"
+          type="text" value={runName} onChange={e => setRunName(e.target.value)}
+          placeholder="默认自动按时间戳生成" className="input max-w-[420px]"
         />
       </Section>
 
@@ -679,12 +697,7 @@ function firstDefined<T>(...vals: (T | null | undefined)[]): T | null {
 
 function fmtTime(iso: string | null): string {
   if (!iso) return '—'
-  try {
-    const d = new Date(iso)
-    return d.toLocaleString()
-  } catch {
-    return iso
-  }
+  try { return new Date(iso).toLocaleString() } catch { return iso }
 }
 
 function extractError(err: unknown): string {
