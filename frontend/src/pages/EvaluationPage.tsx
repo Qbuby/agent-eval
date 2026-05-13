@@ -64,6 +64,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
   const navigate = useNavigate()
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
   const pageSize = 15
 
   const runsQuery = useQuery({
@@ -80,6 +81,15 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
   })
 
   const totalPages = Math.max(1, Math.ceil((runsQuery.data?.total ?? 0) / pageSize))
+
+  const toggle = (id: string) => {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   return (
     <div>
@@ -99,6 +109,24 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
         <span className="text-[11px] text-text-tertiary">
           共 {runsQuery.data?.total ?? 0} 条
         </span>
+        {selected.size > 0 && (
+          <>
+            <span className="text-[11px] text-text-tertiary">· 已选 {selected.size}</span>
+            <button
+              onClick={() => navigate(`/evaluation/compare?ids=${Array.from(selected).join(',')}`)}
+              disabled={selected.size < 2}
+              className="py-1.5 px-3 text-[11px] font-medium rounded-[6px] border border-accent text-accent disabled:opacity-40 hover:bg-accent-subtle"
+            >
+              对比所选（{selected.size}）
+            </button>
+            <button
+              onClick={() => setSelected(new Set())}
+              className="text-[11px] text-text-tertiary hover:text-text-primary underline"
+            >
+              清空
+            </button>
+          </>
+        )}
         <button
           onClick={onNewRun}
           className="ml-auto inline-flex items-center gap-1.5 py-2 px-3.5 text-[11px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 transition-all"
@@ -111,6 +139,9 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
         <table className="w-full border-collapse">
           <thead>
             <tr>
+              <Th>
+                <span className="sr-only">选择</span>
+              </Th>
               <Th>ID</Th>
               <Th>状态</Th>
               <Th>Agent</Th>
@@ -123,17 +154,23 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
           </thead>
           <tbody>
             {runsQuery.isLoading && (
-              <tr><td colSpan={8} className="py-8 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+              <tr><td colSpan={9} className="py-8 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
             )}
             {runsQuery.data?.items.length === 0 && !runsQuery.isLoading && (
               <tr>
-                <td colSpan={8} className="py-10 text-center text-[12px] text-text-tertiary">
+                <td colSpan={9} className="py-10 text-center text-[12px] text-text-tertiary">
                   还没有评估记录。点右上角「新建评估」启动第一个 run。
                 </td>
               </tr>
             )}
             {runsQuery.data?.items.map(r => (
-              <RunRow key={r.id} run={r} onClick={() => navigate(`/evaluation/runs/${r.id}`)} />
+              <RunRow
+                key={r.id}
+                run={r}
+                selected={selected.has(r.id)}
+                onToggle={() => toggle(r.id)}
+                onClick={() => navigate(`/evaluation/runs/${r.id}`)}
+              />
             ))}
           </tbody>
         </table>
@@ -170,7 +207,12 @@ function Th({ children }: { children: React.ReactNode }) {
   )
 }
 
-function RunRow({ run, onClick }: { run: EvalRunSummary; onClick: () => void }) {
+function RunRow({ run, selected, onToggle, onClick }: {
+  run: EvalRunSummary
+  selected: boolean
+  onToggle: () => void
+  onClick: () => void
+}) {
   const counts = run.summary_scores?.counts
   const total = counts?.total ?? run.progress.total ?? 0
   const completed = run.progress.completed ?? counts?.total ?? 0
@@ -186,6 +228,15 @@ function RunRow({ run, onClick }: { run: EvalRunSummary; onClick: () => void }) 
 
   return (
     <tr onClick={onClick} className="hover:bg-accent-subtle/40 cursor-pointer transition-colors">
+      <Td>
+        <input
+          type="checkbox"
+          checked={selected}
+          onClick={e => e.stopPropagation()}
+          onChange={onToggle}
+          className="accent-accent"
+        />
+      </Td>
       <Td mono>{run.id.slice(0, 8)}</Td>
       <Td><StatusBadge status={run.status} /></Td>
       <Td>{agentLabel}</Td>

@@ -445,6 +445,7 @@ export interface EvalResultRow {
   test_case_id: string | null
   status: string
   actual_output: string | null
+  question?: string | null
   latency_ms: number | null
   total_tokens: number | null
   prompt_tokens: number | null
@@ -452,6 +453,7 @@ export interface EvalResultRow {
   tool_call_count: number | null
   error_message: string | null
   langfuse_trace_id: string | null
+  langsmith_run_id?: string | null
   scores: Record<string, number>
 }
 

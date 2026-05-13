@@ -1,12 +1,15 @@
-import { useState } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useCallback, useRef, useState } from 'react'
+import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { evaluationApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail } from '@/types'
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts'
+import { evaluationApi, tracesApi } from '@/services'
+import type { EvalResultRow, EvalRunDetail, RunDetail } from '@/types'
+import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
 
 export default function EvaluationRunDetailPage() {
   const { runId } = useParams<{ runId: string }>()
   const qc = useQueryClient()
+  const navigate = useNavigate()
 
   const runQuery = useQuery({
     queryKey: ['eval-run', runId],
@@ -53,6 +56,8 @@ export default function EvaluationRunDetailPage() {
   const dimAvg = run.summary_scores?.dimension_averages ?? {}
   const costSuccess = run.summary_scores?.cost_success ?? {}
   const costFailure = run.summary_scores?.cost_failure ?? {}
+  const items = resultsQuery.data?.items ?? []
+  const latencyBars = buildLatencyBuckets(items)
 
   return (
     <div>
@@ -79,6 +84,12 @@ export default function EvaluationRunDetailPage() {
               {run.status === 'stopping' ? '停止中…' : '停止'}
             </button>
           )}
+          <button
+            onClick={() => navigate(`/evaluation/compare?ids=${runId}`)}
+            className="py-1.5 px-3 text-[11px] rounded-[6px] border border-border text-text-secondary hover:border-accent hover:text-accent transition-all"
+          >
+            加入对比
+          </button>
         </div>
       </header>
 
@@ -133,6 +144,28 @@ export default function EvaluationRunDetailPage() {
         </section>
       )}
 
+      {/* Latency distribution */}
+      {latencyBars.length > 0 && (
+        <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
+          <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-3">
+            延迟分布（按样例 · ms）
+          </h3>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={latencyBars} margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
+              <XAxis dataKey="label" tick={{ fontSize: 10 }} interval={0} />
+              <YAxis tick={{ fontSize: 10 }} label={{ value: 'count', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
+              <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
+              <Bar dataKey="count" radius={[3, 3, 0, 0]}>
+                {latencyBars.map((_, i) => (
+                  <Cell key={i} fill={['#93c5fd', '#60a5fa', '#3b82f6', '#6366f1', '#a855f7', '#f87171'][i] || '#3b82f6'} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </section>
+      )}
+
       {/* Cost metrics */}
       <section className="grid grid-cols-2 gap-3 mb-5">
         <CostCard title="成功样例的成本" data={costSuccess} />
@@ -161,6 +194,7 @@ export default function EvaluationRunDetailPage() {
             <thead>
               <tr>
                 <Th>Case</Th>
+                <Th>Question</Th>
                 <Th>状态</Th>
                 <Th>Latency</Th>
                 <Th>Tokens (P/C/T)</Th>
@@ -171,13 +205,13 @@ export default function EvaluationRunDetailPage() {
             </thead>
             <tbody>
               {resultsQuery.isLoading && (
-                <tr><td colSpan={7} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+                <tr><td colSpan={8} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
               )}
-              {resultsQuery.data?.items.map((r: EvalResultRow) => (
+              {items.map((r: EvalResultRow) => (
                 <ResultRow key={r.id} row={r} langfuseHost={langfuseHost} />
               ))}
-              {resultsQuery.data?.items.length === 0 && !resultsQuery.isLoading && (
-                <tr><td colSpan={7} className="py-8 text-center text-[11px] text-text-tertiary">
+              {items.length === 0 && !resultsQuery.isLoading && (
+                <tr><td colSpan={8} className="py-8 text-center text-[11px] text-text-tertiary">
                   {run.status === 'running' ? '还没产出样例结果…' : '没有样例结果'}
                 </td></tr>
               )}
@@ -194,13 +228,58 @@ function ResultRow({ row, langfuseHost }: { row: EvalResultRow; langfuseHost: st
   const [open, setOpen] = useState(false)
   const scoreEntries = Object.entries(row.scores)
 
+  // ─── LangSmith trace lazy-loaded on expand ──────────────────────────────
+  const [nodeCache, setNodeCache] = useState<NodeCache>({})
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const nodeCacheRef = useRef(nodeCache)
+  nodeCacheRef.current = nodeCache
+
+  const traceQuery = useQuery({
+    queryKey: ['eval-result-trace', row.id],
+    queryFn: () => evaluationApi.getResultTrace(row.id).then(r => r.data),
+    enabled: open && !!row.langsmith_run_id,
+    retry: false,
+  })
+
+  const fetchChild = useCallback(async (childId: string) => {
+    setNodeCache(prev => (prev[childId]?.data || prev[childId]?.loading)
+      ? prev : { ...prev, [childId]: { loading: true } })
+    try {
+      const res = await tracesApi.getDetail({ run_id: childId })
+      setNodeCache(prev => ({ ...prev, [childId]: { loading: false, data: res.data } }))
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+      setNodeCache(prev => ({ ...prev, [childId]: { loading: false, error: msg || '加载失败' } }))
+    }
+  }, [])
+
+  const toggleExpand = useCallback((childId: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev)
+      if (next.has(childId)) next.delete(childId)
+      else {
+        next.add(childId)
+        const cached = nodeCacheRef.current[childId]
+        if (!cached?.data && !cached?.loading) fetchChild(childId)
+      }
+      return next
+    })
+  }, [fetchChild])
+
+  const root: RunDetail | undefined = traceQuery.data
+
   return (
     <>
       <tr
         onClick={() => setOpen(v => !v)}
         className="hover:bg-accent-subtle/40 cursor-pointer transition-colors"
       >
-        <Td mono>{row.benchmark_case_id?.slice(0, 8) ?? '—'}</Td>
+        <Td mono>{row.benchmark_case_id?.slice(0, 8) ?? row.id.slice(0, 8)}</Td>
+        <Td>
+          <div className="max-w-[260px] truncate" title={row.question || ''}>
+            {row.question || '—'}
+          </div>
+        </Td>
         <Td><StatusBadge status={row.status} /></Td>
         <Td>{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</Td>
         <Td>
@@ -226,7 +305,9 @@ function ResultRow({ row, langfuseHost }: { row: EvalResultRow; langfuseHost: st
           </div>
         </Td>
         <Td>
-          {row.langfuse_trace_id && langfuseHost ? (
+          {row.langsmith_run_id ? (
+            <span className="text-[11px] font-mono text-accent">{row.langsmith_run_id.slice(0, 8)}</span>
+          ) : row.langfuse_trace_id && langfuseHost ? (
             <a
               href={`${langfuseHost}/trace/${row.langfuse_trace_id}`}
               target="_blank" rel="noreferrer"
@@ -240,21 +321,66 @@ function ResultRow({ row, langfuseHost }: { row: EvalResultRow; langfuseHost: st
       </tr>
       {open && (
         <tr className="bg-accent-subtle/30">
-          <td colSpan={7} className="p-3 text-[11px]">
-            <div className="mb-2">
+          <td colSpan={8} className="p-3 text-[11px]">
+            <div className="mb-3">
               <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">输出</div>
-              <pre className="font-mono text-[11px] bg-white border border-border rounded-[3px] p-2 max-h-[240px] overflow-y-auto whitespace-pre-wrap">
+              <pre className="font-mono text-[11px] bg-white border border-border rounded-[3px] p-2 max-h-[200px] overflow-y-auto whitespace-pre-wrap">
                 {row.actual_output || '（无输出）'}
               </pre>
             </div>
             {row.error_message && (
-              <div>
+              <div className="mb-3">
                 <div className="text-[10px] tracking-widest uppercase text-negative mb-0.5">错误</div>
                 <pre className="font-mono text-[11px] bg-red-50 border border-red-200 rounded-[3px] p-2 whitespace-pre-wrap">
                   {row.error_message}
                 </pre>
               </div>
             )}
+            <div>
+              <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">LangSmith Trace</div>
+              {!row.langsmith_run_id && (
+                <div className="text-[11px] text-text-tertiary border border-dashed border-border rounded-[4px] px-3 py-4 text-center">
+                  暂未回填 langsmith_run_id（反查异步进行，通常 15s 内出现；或 LangSmith 未配置）
+                </div>
+              )}
+              {row.langsmith_run_id && traceQuery.isLoading && (
+                <div className="text-[11px] text-text-tertiary px-3 py-4">加载中…</div>
+              )}
+              {row.langsmith_run_id && traceQuery.isError && (
+                <div className="text-[11px] text-negative px-3 py-2">
+                  加载 trace 失败：{(traceQuery.error as Error)?.message || 'unknown'}
+                </div>
+              )}
+              {root && (
+                <div className="bg-surface border border-border rounded-[6px] p-3">
+                  <RunDetailBody detail={root} compact />
+                  {root.children.length > 0 && (
+                    <div className="mt-3">
+                      <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
+                        Children ({root.children.length})
+                        {root.children_truncated && <span className="ml-2 text-[#b87b00]">已截断</span>}
+                      </div>
+                      <div className="border border-border rounded-[4px] bg-surface">
+                        {root.children.map(c => (
+                          <RunNodeRow
+                            key={c.id}
+                            meta={c}
+                            depth={0}
+                            projectName=""
+                            isOpen={expanded.has(c.id)}
+                            state={nodeCache[c.id]}
+                            nodeCache={nodeCache}
+                            expanded={expanded}
+                            onToggle={toggleExpand}
+                            onRetry={fetchChild}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </td>
         </tr>
       )}
@@ -374,15 +500,34 @@ function fmtDuration(start: string | null, end: string | null): string {
 }
 
 function shortName(n: string): string {
-  // "llm_judge.accuracy" -> "accuracy"
   const i = n.lastIndexOf('.')
   return i >= 0 ? n.slice(i + 1) : n
 }
 
 function deriveLangfuseHost(run: EvalRunDetail | null | undefined): string | null {
-  // The backend stamps langfuse_host into summary_scores when the run
-  // completes, so we can deep-link to the Langfuse UI directly.
   if (!run) return null
   const h = (run.summary_scores as { langfuse_host?: string } | null | undefined)?.langfuse_host
   return h ? h.replace(/\/+$/, '') : null
+}
+
+// Split a set of samples' latency_ms into fixed buckets for a histogram.
+// Buckets are chosen empirically to be useful for 1-60 s agent calls.
+function buildLatencyBuckets(items: EvalResultRow[]): Array<{ label: string; count: number }> {
+  const buckets = [
+    { label: '<1s', max: 1000, count: 0 },
+    { label: '1-3s', max: 3000, count: 0 },
+    { label: '3-5s', max: 5000, count: 0 },
+    { label: '5-10s', max: 10000, count: 0 },
+    { label: '10-30s', max: 30000, count: 0 },
+    { label: '>30s', max: Infinity, count: 0 },
+  ]
+  let any = false
+  for (const r of items) {
+    if (r.latency_ms == null) continue
+    any = true
+    for (const b of buckets) {
+      if (r.latency_ms < b.max) { b.count++; break }
+    }
+  }
+  return any ? buckets : []
 }

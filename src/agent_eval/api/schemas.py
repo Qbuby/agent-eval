@@ -228,6 +228,7 @@ class EvalResultRow(BaseModel):
     test_case_id: str | None = None
     status: str
     actual_output: str | None = None
+    question: str | None = None
     latency_ms: int | None = None
     total_tokens: int | None = None
     prompt_tokens: int | None = None
@@ -235,6 +236,7 @@ class EvalResultRow(BaseModel):
     tool_call_count: int | None = None
     error_message: str | None = None
     langfuse_trace_id: str | None = None
+    langsmith_run_id: str | None = None
     scores: dict[str, float] = {}  # dimension -> score
 
 

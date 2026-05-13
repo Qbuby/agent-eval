@@ -6,9 +6,10 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import select
 
+from agent_eval.api.dependencies import get_extractor
 from agent_eval.api.schemas import (
     BuiltinEvaluator,
     CreateEvaluatorRequest,
@@ -18,10 +19,12 @@ from agent_eval.api.schemas import (
     EvalResultRow,
     EvalResultsPage,
     EvaluatorInstance,
+    RunDetailResponse,
     StartEvalRequest,
     UpdateEvaluatorRequest,
     UploadCasesResponse,
 )
+from agent_eval.data.trace_extractor import TraceExtractor
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import (
@@ -242,6 +245,7 @@ async def get_run_results(
             test_case_id=str(r.test_case_id) if r.test_case_id else None,
             status=r.status,
             actual_output=r.actual_output,
+            question=r.question,
             latency_ms=r.latency_ms,
             total_tokens=r.total_tokens,
             prompt_tokens=r.prompt_tokens,
@@ -249,6 +253,7 @@ async def get_run_results(
             tool_call_count=r.tool_call_count,
             error_message=r.error_message,
             langfuse_trace_id=r.langfuse_trace_id,
+            langsmith_run_id=r.langsmith_run_id,
             scores=score_index.get(r.id, {}),
         ))
     return EvalResultsPage(items=items, total=total, page=page, page_size=page_size)
@@ -260,6 +265,38 @@ async def stop_run(run_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="run not found or already finished")
     return {"run_id": run_id, "status": "stopping"}
+
+
+@router.get("/results/{result_id}/trace", response_model=RunDetailResponse)
+async def get_result_trace(
+    result_id: str,
+    ext: TraceExtractor = Depends(get_extractor),
+):
+    """Fetch the LangSmith trace tree for a single eval result.
+
+    Uses the ``langsmith_run_id`` stamped during backfill. The underlying
+    extractor is shared with ``/api/traces/run_detail`` — it caches by
+    ``(run_id, project)`` for 5 minutes so repeat opens are free.
+    """
+    result_uuid = uuid.UUID(result_id)
+    async with async_session_factory() as session:
+        result = (await session.execute(
+            select(TestResultRow).where(TestResultRow.id == result_uuid)
+        )).scalar_one_or_none()
+        if result is None:
+            raise HTTPException(status_code=404, detail="result not found")
+        if not result.langsmith_run_id:
+            raise HTTPException(
+                status_code=404,
+                detail="no langsmith_run_id — backfill may still be running",
+            )
+        run_row = await Repository(session).get_test_run(result.run_id)
+        project = run_row.langsmith_project if run_row else None
+    try:
+        data = await ext.get_run_detail(result.langsmith_run_id, project_name=project)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LangSmith API error: {e}") from e
+    return RunDetailResponse(**data)
 
 
 # ───────────────────────────────────────────────────────────────────────────

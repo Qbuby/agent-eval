@@ -7,6 +7,7 @@ import type {
   EvalRunDetail,
   EvalRunsPage,
   EvaluatorInstance,
+  RunDetail,
   StartEvalRequest,
   StartEvalResponse,
   UpdateEvaluatorRequest,
@@ -73,6 +74,9 @@ export const evaluationApi = {
   },
   getResults(runId: string, params?: { page?: number; page_size?: number }) {
     return api.get<EvalResultsPage>(`/eval/runs/${runId}/results`, { params })
+  },
+  getResultTrace(resultId: string) {
+    return api.get<RunDetail>(`/eval/results/${resultId}/trace`)
   },
   stopRun(runId: string) {
     return api.post<{ run_id: string; status: string }>(`/eval/runs/${runId}/stop`)
