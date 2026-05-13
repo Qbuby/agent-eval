@@ -163,6 +163,93 @@ class FillModelsResponse(BaseModel):
     missing: list[str] = []
 
 
+# ─── Evaluation (Langfuse-backed) ───
+
+class EvalAgentConfig(BaseModel):
+    """Agent endpoint to evaluate against. Mirrors agent_adapter.py contracts."""
+    type: str  # "openai" | "sse"
+    url: str
+    api_key: str = ""
+    model: str = "default"
+    headers: dict[str, str] = {}
+    payload_template: dict[str, Any] = {}
+    timeout: float = 120.0
+
+
+class EvaluatorConfig(BaseModel):
+    """One evaluator activated for a run."""
+    name: str  # "exact_match" | "llm_judge" | "tool_sequence_match"
+    params: dict[str, Any] = {}  # e.g. llm_judge: {prompt_template, dimensions}
+
+
+class StartEvalRequest(BaseModel):
+    # Source: pick ONE of benchmark_version_id or project_id (project_id covers
+    # the common case where the user hasn't versioned the bench yet — every
+    # benchmark_case is filtered by project_id with version_id IS NULL).
+    benchmark_version_id: str | None = None
+    project_id: str | None = None
+    # Sample selection — one of:
+    #   - all (default): all cases in the version/project
+    #   - case_ids: explicit subset
+    #   - filter: tag/category match
+    case_ids: list[str] | None = None
+    filter_tags: list[str] | None = None
+    filter_category_id: str | None = None
+    limit: int | None = None
+
+    agent: EvalAgentConfig
+    evaluators: list[EvaluatorConfig]
+    concurrency: int = Field(default=3, ge=1, le=20)
+    run_name: str | None = None  # langfuse run name; auto-generated if None
+
+
+class EvalRunSummary(BaseModel):
+    """Row in the run-history list."""
+    id: str
+    benchmark_version_id: str | None = None
+    status: str  # pending | running | completed | failed | stopping | interrupted
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    langfuse_run_name: str | None = None
+    agent_config: dict[str, Any] = {}
+    summary_scores: dict[str, Any] | None = None
+    progress: dict[str, int] = {}  # {total, completed, failed} — populated for running
+    created_at: datetime | None = None
+
+
+class EvalRunDetail(EvalRunSummary):
+    evaluator_configs: list[dict[str, Any]] = []
+
+
+class EvalResultRow(BaseModel):
+    id: str
+    benchmark_case_id: str | None = None
+    test_case_id: str | None = None
+    status: str
+    actual_output: str | None = None
+    latency_ms: int | None = None
+    total_tokens: int | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    tool_call_count: int | None = None
+    error_message: str | None = None
+    langfuse_trace_id: str | None = None
+    scores: dict[str, float] = {}  # dimension -> score
+
+
+class EvalResultsPage(BaseModel):
+    items: list[EvalResultRow]
+    total: int
+    page: int
+    page_size: int
+
+
+class BuiltinEvaluator(BaseModel):
+    name: str
+    description: str
+    params_schema: dict[str, Any] = {}  # JSON-schema-ish for UI to render
+
+
 class RunChildMeta(BaseModel):
     id: str
     name: str

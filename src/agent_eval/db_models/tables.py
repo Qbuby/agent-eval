@@ -75,8 +75,12 @@ class TestRunRow(Base):
     __tablename__ = "test_runs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
-    dataset_version_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dataset_versions.id"), nullable=False
+    dataset_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dataset_versions.id"), nullable=True
+    )
+    benchmark_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("benchmark_versions.id", ondelete="SET NULL"),
+        nullable=True, index=True,
     )
     agent_config: Mapped[dict] = mapped_column(JSONB, nullable=False)
     optimization_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
@@ -85,6 +89,8 @@ class TestRunRow(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     summary_scores: Mapped[dict | None] = mapped_column(JSONB)
+    langfuse_run_name: Mapped[str | None] = mapped_column(Text)
+    evaluator_configs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -95,13 +101,18 @@ class TestResultRow(Base):
     run_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("test_runs.id"), nullable=False, index=True
     )
-    test_case_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("test_cases.id"), nullable=False
+    test_case_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("test_cases.id"), nullable=True
+    )
+    benchmark_case_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("benchmark_cases.id", ondelete="SET NULL"),
+        nullable=True, index=True,
     )
 
     actual_output: Mapped[str | None] = mapped_column(Text)
     actual_tool_calls: Mapped[list | None] = mapped_column(JSONB)
     full_trace: Mapped[dict | None] = mapped_column(JSONB)
+    langfuse_trace_id: Mapped[str | None] = mapped_column(Text)
 
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     total_tokens: Mapped[int | None] = mapped_column(Integer)
