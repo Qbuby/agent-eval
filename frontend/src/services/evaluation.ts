@@ -75,8 +75,17 @@ export const evaluationApi = {
   getResults(runId: string, params?: { page?: number; page_size?: number }) {
     return api.get<EvalResultsPage>(`/eval/runs/${runId}/results`, { params })
   },
-  getResultTrace(resultId: string) {
-    return api.get<RunDetail>(`/eval/results/${resultId}/trace`)
+  getResultTrace(resultId: string, project?: string) {
+    return api.get<RunDetail>(`/eval/results/${resultId}/trace`, {
+      params: project ? { project } : undefined,
+    })
+  },
+  backfillTrace(runId: string, project: string) {
+    return api.post<{ run_id: string; project: string; matched: number; scanned: number }>(
+      `/eval/runs/${runId}/backfill_trace`,
+      null,
+      { params: { project } },
+    )
   },
   stopRun(runId: string) {
     return api.post<{ run_id: string; status: string }>(`/eval/runs/${runId}/stop`)

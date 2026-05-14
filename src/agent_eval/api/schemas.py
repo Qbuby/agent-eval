@@ -212,6 +212,7 @@ class EvalRunSummary(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     langfuse_run_name: str | None = None
+    langsmith_project: str | None = None
     agent_config: dict[str, Any] = {}
     summary_scores: dict[str, Any] | None = None
     progress: dict[str, int] = {}  # {total, completed, failed} — populated for running

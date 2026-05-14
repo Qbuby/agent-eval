@@ -722,6 +722,70 @@ def _run_matches_question(run_obj: Any, question: str) -> bool:
     return isinstance(txt, str) and txt == question
 
 
+async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
+    """Re-execute the LangSmith trace backfill for an existing run.
+
+    Triggered from the detail page when the user supplies a project name —
+    they may want to point at a different LangSmith project than the one
+    bound at start time, or retry after fixing API permissions.
+
+    Rebuilds the in-memory case list from ``test_results``: each row already
+    carries ``thread_id`` (DB join key), ``question`` (LangSmith match key)
+    and ``invoked_at`` (time-window lower bound, derived from started_at /
+    created_at). Rows missing question or invoked_at are skipped.
+
+    Also persists ``project`` to ``test_runs.langsmith_project`` so the row
+    detail page picks up the new value on subsequent loads.
+
+    Returns ``{"matched": int, "scanned": int}``.
+    """
+    from agent_eval.db_models.tables import TestResultRow, TestRunRow
+
+    async with async_session_factory() as session:
+        run_row = (await session.execute(
+            select(TestRunRow).where(TestRunRow.id == uuid.UUID(run_id))
+        )).scalar_one_or_none()
+        if run_row is None:
+            raise ValueError(f"run not found: {run_id}")
+        results = (await session.execute(
+            select(TestResultRow).where(TestResultRow.run_id == uuid.UUID(run_id))
+        )).scalars().all()
+
+        per_case_results: list[dict[str, Any]] = []
+        fallback_invoked_at = run_row.eval_started_at or run_row.started_at or run_row.created_at
+        for r in results:
+            if not r.question:
+                continue
+            invoked_at = r.created_at or fallback_invoked_at
+            if invoked_at is None:
+                continue
+            per_case_results.append({
+                "thread_id": r.thread_id or "",
+                "question": r.question,
+                "invoked_at": invoked_at,
+            })
+
+        # Persist the project switch so the detail page reads it back.
+        run_row.langsmith_project = project
+        await session.commit()
+
+    if not per_case_results:
+        return {"matched": 0, "scanned": 0}
+
+    await _backfill_langsmith_traces(
+        run_id=run_id, project=project, per_case_results=per_case_results,
+    )
+
+    # Count hits by re-reading the rows.
+    async with async_session_factory() as session:
+        hit_rows = (await session.execute(
+            select(TestResultRow)
+            .where(TestResultRow.run_id == uuid.UUID(run_id))
+            .where(TestResultRow.langsmith_run_id.isnot(None))
+        )).scalars().all()
+    return {"matched": len(hit_rows), "scanned": len(per_case_results)}
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Public API
 # ───────────────────────────────────────────────────────────────────────────

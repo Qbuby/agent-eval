@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts'
@@ -39,8 +39,35 @@ export default function EvaluationRunDetailPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['eval-run', runId] }),
   })
 
+  // ─── Trace lookup project ──────────────────────────────────────────────────
+  // Default: project bound at start time. User can override and re-run the
+  // backfill against a different project (e.g. fix permission later, or the
+  // run actually landed in a different bucket).
+  const [projectInput, setProjectInput] = useState('')
+  const [activeProject, setActiveProject] = useState<string | null>(null)
+
+  const backfillMutation = useMutation({
+    mutationFn: (project: string) => evaluationApi.backfillTrace(runId!, project).then(r => r.data),
+    onSuccess: (data) => {
+      setActiveProject(data.project)
+      qc.invalidateQueries({ queryKey: ['eval-results', runId] })
+      qc.invalidateQueries({ queryKey: ['eval-run', runId] })
+    },
+  })
+
   const run = runQuery.data
   const langfuseHost = deriveLangfuseHost(run)
+
+  useEffect(() => {
+    if (!run) return
+    if (activeProject !== null) return
+    const initial = run.langsmith_project || ''
+    if (initial) {
+      setProjectInput(initial)
+      setActiveProject(initial)
+    }
+  }, [run, activeProject])
+
 
   if (!runId) return null
   if (runQuery.isLoading) return <div className="text-[12px] text-text-tertiary">加载中…</div>
@@ -119,6 +146,49 @@ export default function EvaluationRunDetailPage() {
             <JsonBlock label="evaluator_configs" data={run.evaluator_configs} />
           </div>
         </details>
+      </section>
+
+      {/* Trace project lookup */}
+      <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
+        <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-2">调用轨迹（LangSmith Project）</h3>
+        <p className="text-[11px] text-text-secondary mb-3">
+          输入要溯源的 LangSmith project 名称，平台会按 (project, 时间窗口, 问题文本)
+          反查并把每条样例对应的 run 写回。当前已绑定:{' '}
+          <span className="font-mono">{activeProject || '（未绑定）'}</span>
+        </p>
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            value={projectInput}
+            onChange={e => setProjectInput(e.target.value)}
+            placeholder="例如 ruyi-agent"
+            className="flex-1 max-w-[360px] py-1.5 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent font-mono"
+          />
+          <button
+            onClick={() => projectInput.trim() && backfillMutation.mutate(projectInput.trim())}
+            disabled={!projectInput.trim() || backfillMutation.isPending}
+            className="py-1.5 px-3 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent disabled:opacity-40 hover:opacity-90 transition-all"
+          >
+            {backfillMutation.isPending ? '查询中…' : '查询轨迹'}
+          </button>
+        </div>
+        {backfillMutation.data && (
+          <div className="mt-2 text-[11px] text-text-secondary">
+            匹配 <span className="font-mono text-text-primary">{backfillMutation.data.matched}</span> /{' '}
+            <span className="font-mono text-text-primary">{backfillMutation.data.scanned}</span> 条样例。
+            {backfillMutation.data.matched === 0 && (
+              <span className="text-[#b87b00] ml-2">
+                没匹配上：检查 project 拼写、API key 权限，或者样例发起时间是否在 LangSmith 保留期内。
+              </span>
+            )}
+          </div>
+        )}
+        {backfillMutation.isError && (
+          <div className="mt-2 text-[11px] text-negative">
+            {(backfillMutation.error as { response?: { data?: { detail?: string } } })
+              ?.response?.data?.detail || '查询失败'}
+          </div>
+        )}
       </section>
 
       {/* Dimension averages */}
@@ -208,7 +278,7 @@ export default function EvaluationRunDetailPage() {
                 <tr><td colSpan={8} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
               )}
               {items.map((r: EvalResultRow) => (
-                <ResultRow key={r.id} row={r} langfuseHost={langfuseHost} />
+                <ResultRow key={r.id} row={r} langfuseHost={langfuseHost} project={activeProject} />
               ))}
               {items.length === 0 && !resultsQuery.isLoading && (
                 <tr><td colSpan={8} className="py-8 text-center text-[11px] text-text-tertiary">
@@ -224,7 +294,11 @@ export default function EvaluationRunDetailPage() {
 }
 
 
-function ResultRow({ row, langfuseHost }: { row: EvalResultRow; langfuseHost: string | null }) {
+function ResultRow({ row, langfuseHost, project }: {
+  row: EvalResultRow
+  langfuseHost: string | null
+  project: string | null
+}) {
   const [open, setOpen] = useState(false)
   const scoreEntries = Object.entries(row.scores)
 
@@ -235,8 +309,8 @@ function ResultRow({ row, langfuseHost }: { row: EvalResultRow; langfuseHost: st
   nodeCacheRef.current = nodeCache
 
   const traceQuery = useQuery({
-    queryKey: ['eval-result-trace', row.id],
-    queryFn: () => evaluationApi.getResultTrace(row.id).then(r => r.data),
+    queryKey: ['eval-result-trace', row.id, project ?? ''],
+    queryFn: () => evaluationApi.getResultTrace(row.id, project || undefined).then(r => r.data),
     enabled: open && !!row.langsmith_run_id,
     retry: false,
   })
@@ -245,13 +319,16 @@ function ResultRow({ row, langfuseHost }: { row: EvalResultRow; langfuseHost: st
     setNodeCache(prev => (prev[childId]?.data || prev[childId]?.loading)
       ? prev : { ...prev, [childId]: { loading: true } })
     try {
-      const res = await tracesApi.getDetail({ run_id: childId })
+      const res = await tracesApi.getDetail({
+        run_id: childId,
+        project_name: project || undefined,
+      })
       setNodeCache(prev => ({ ...prev, [childId]: { loading: false, data: res.data } }))
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       setNodeCache(prev => ({ ...prev, [childId]: { loading: false, error: msg || '加载失败' } }))
     }
-  }, [])
+  }, [project])
 
   const toggleExpand = useCallback((childId: string) => {
     setExpanded(prev => {
@@ -340,7 +417,9 @@ function ResultRow({ row, langfuseHost }: { row: EvalResultRow; langfuseHost: st
               <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">LangSmith Trace</div>
               {!row.langsmith_run_id && (
                 <div className="text-[11px] text-text-tertiary border border-dashed border-border rounded-[4px] px-3 py-4 text-center">
-                  暂未回填 langsmith_run_id（反查异步进行，通常 15s 内出现；或 LangSmith 未配置）
+                  {project
+                    ? `暂未在 project «${project}» 找到对应 run。点击页面顶部"查询轨迹"重试，或换一个 project。`
+                    : '请在页面顶部输入 LangSmith project 名称并点击"查询轨迹"，平台会按时间窗口和问题文本反查对应 run。'}
                 </div>
               )}
               {row.langsmith_run_id && traceQuery.isLoading && (
@@ -366,7 +445,7 @@ function ResultRow({ row, langfuseHost }: { row: EvalResultRow; langfuseHost: st
                             key={c.id}
                             meta={c}
                             depth={0}
-                            projectName=""
+                            projectName={project || ''}
                             isOpen={expanded.has(c.id)}
                             state={nodeCache[c.id]}
                             nodeCache={nodeCache}

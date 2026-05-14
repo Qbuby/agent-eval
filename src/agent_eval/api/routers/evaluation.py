@@ -36,6 +36,7 @@ from agent_eval.evaluation.langfuse_runner import (
     BUILTIN_EVALUATORS,
     get_run_progress,
     request_stop,
+    rerun_backfill,
     start_run,
 )
 
@@ -172,6 +173,7 @@ def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRun
         started_at=row.started_at,
         finished_at=row.finished_at,
         langfuse_run_name=row.langfuse_run_name,
+        langsmith_project=row.langsmith_project,
         agent_config=row.agent_config or {},
         summary_scores=row.summary_scores,
         progress=progress or {},
@@ -270,6 +272,7 @@ async def stop_run(run_id: str):
 @router.get("/results/{result_id}/trace", response_model=RunDetailResponse)
 async def get_result_trace(
     result_id: str,
+    project: str | None = Query(default=None, description="Override the run's stored langsmith_project"),
     ext: TraceExtractor = Depends(get_extractor),
 ):
     """Fetch the LangSmith trace tree for a single eval result.
@@ -277,6 +280,10 @@ async def get_result_trace(
     Uses the ``langsmith_run_id`` stamped during backfill. The underlying
     extractor is shared with ``/api/traces/run_detail`` — it caches by
     ``(run_id, project)`` for 5 minutes so repeat opens are free.
+
+    The optional ``project`` query parameter lets the detail page point at
+    a different LangSmith project than the one bound at start time, so
+    users can explore a trace that ended up in another project bucket.
     """
     result_uuid = uuid.UUID(result_id)
     async with async_session_factory() as session:
@@ -291,12 +298,34 @@ async def get_result_trace(
                 detail="no langsmith_run_id — backfill may still be running",
             )
         run_row = await Repository(session).get_test_run(result.run_id)
-        project = run_row.langsmith_project if run_row else None
+        run_project = run_row.langsmith_project if run_row else None
+    target_project = project or run_project
     try:
-        data = await ext.get_run_detail(result.langsmith_run_id, project_name=project)
+        data = await ext.get_run_detail(result.langsmith_run_id, project_name=target_project)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LangSmith API error: {e}") from e
     return RunDetailResponse(**data)
+
+
+@router.post("/runs/{run_id}/backfill_trace")
+async def trigger_trace_backfill(
+    run_id: str,
+    project: str = Query(..., min_length=1, description="LangSmith project to query"),
+):
+    """Re-run trace backfill against an arbitrary project.
+
+    Looks up every result row of this run, queries LangSmith by
+    (project, time window, question text) and stamps the matched
+    ``langsmith_run_id`` back to each row. Persists ``project`` to the
+    run so the detail page can read it back.
+    """
+    try:
+        stats = await rerun_backfill(run_id=run_id, project=project)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"backfill failed: {e}") from e
+    return {"run_id": run_id, "project": project, **stats}
 
 
 # ───────────────────────────────────────────────────────────────────────────

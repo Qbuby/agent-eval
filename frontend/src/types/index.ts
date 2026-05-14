@@ -419,6 +419,7 @@ export interface EvalRunSummary {
   started_at: string | null
   finished_at: string | null
   langfuse_run_name: string | null
+  langsmith_project?: string | null
   agent_config: Record<string, unknown>
   summary_scores: {
     counts?: { total?: number; passed?: number; failed?: number }
