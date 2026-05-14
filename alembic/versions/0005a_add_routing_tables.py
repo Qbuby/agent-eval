@@ -1,7 +1,7 @@
 """add routing_rules and routing_logs tables
 
-Revision ID: 0003_add_routing_tables
-Revises: 0002_add_auth_tables
+Revision ID: 0005a_add_routing_tables
+Revises: 0005_add_source_project
 Create Date: 2026-05-06
 """
 
@@ -9,8 +9,8 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
-revision = "0003_add_routing_tables"
-down_revision = "0002_add_auth_tables"
+revision = "0005a_add_routing_tables"
+down_revision = "0005_add_source_project"
 branch_labels = None
 depends_on = None
 

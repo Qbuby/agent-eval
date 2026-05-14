@@ -1,7 +1,7 @@
 """Add benchmark and candidate tables
 
 Revision ID: 0006
-Revises: 0005
+Revises: 0005a_add_routing_tables
 Create Date: 2026-05-08
 """
 from alembic import op
@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY
 
 revision = "0006"
-down_revision = "0005"
+down_revision = "0005a_add_routing_tables"
 branch_labels = None
 depends_on = None
 
