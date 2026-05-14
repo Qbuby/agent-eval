@@ -62,7 +62,29 @@ class OpenAICompatibleAdapter:
 
 
 class SSEStreamAdapter:
-    """Calls an SSE streaming API (like the forklift agent in run_test.py)."""
+    """Calls an SSE streaming agent.
+
+    Two payload+event modes:
+
+    - ``mode="generic"`` (default, legacy): payload is built from
+      ``payload_template`` with ``{input}`` / ``{uuid}`` substitution; events
+      are JSON dicts with a ``payload.response`` text field and a
+      ``payload.type=="done"`` terminator. This is what the old eval flow used.
+
+    - ``mode="langgraph_v2"``: matches the production LangGraph agent that the
+      ``D:/files/EPtestcases/agent_chat_sse_*.py`` scripts target. Payload
+      shape:
+
+          {"question": <text>,
+           "configurable": {"thread_id": <id>, "language": <text>},
+           "stream": True}
+
+      and events follow LangChain's ``astream_events v2`` format, so we read
+      ``data.chunk.kwargs.content`` text items from ``on_chat_model_stream``
+      events. ``on_tool_start``/``on_tool_end`` events are collected into
+      ``tool_calls`` so downstream evaluators can compare against expected
+      tool sequences.
+    """
 
     def __init__(
         self,
@@ -70,9 +92,15 @@ class SSEStreamAdapter:
         headers: dict[str, str] | None = None,
         payload_template: dict[str, Any] | None = None,
         timeout: float = 120,
+        mode: str = "generic",
+        thread_id: str | None = None,
+        language: str = "请用中文回复",
     ):
         self.url = url
         self.timeout = timeout
+        self.mode = mode
+        self.thread_id = thread_id
+        self.language = language
         self.payload_template = payload_template or {}
         req_headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if headers:
@@ -80,6 +108,17 @@ class SSEStreamAdapter:
         self._client = httpx.AsyncClient(headers=req_headers, timeout=timeout)
 
     def _build_payload(self, question: str) -> dict[str, Any]:
+        if self.mode == "langgraph_v2":
+            return {
+                "question": question,
+                "configurable": {
+                    "thread_id": self.thread_id or f"eval_{uuid.uuid4().hex[:12]}",
+                    "language": self.language,
+                },
+                "stream": True,
+            }
+
+        # generic mode (legacy)
         payload = {}
         for key, value in self.payload_template.items():
             if isinstance(value, str) and "{input}" in value:
@@ -106,6 +145,8 @@ class SSEStreamAdapter:
 
         payload = self._build_payload(question)
         full_text: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        active_tools: dict[str, dict[str, Any]] = {}
 
         start = time.perf_counter()
         async with self._client.stream("POST", self.url, json=payload) as resp:
@@ -118,20 +159,72 @@ class SSEStreamAdapter:
                     continue
                 try:
                     obj = json.loads(data)
+                except json.JSONDecodeError:
+                    if self.mode == "generic" and data.strip():
+                        full_text.append(data)
+                    continue
+
+                if self.mode == "langgraph_v2":
+                    self._handle_langgraph_event(obj, full_text, tool_calls, active_tools)
+                else:
                     payload_data = obj.get("payload", {})
                     if payload_data.get("type") == "done":
                         break
                     response_text = payload_data.get("response", "")
                     if isinstance(response_text, str) and response_text:
                         full_text.append(response_text)
-                except json.JSONDecodeError:
-                    if data.strip():
-                        full_text.append(data)
 
         latency_ms = (time.perf_counter() - start) * 1000
         content = "".join(full_text).strip()
+        return AgentResponse(
+            content=content,
+            latency_ms=latency_ms,
+            raw_response={"tool_calls": tool_calls} if tool_calls else None,
+        )
 
-        return AgentResponse(content=content, latency_ms=latency_ms)
+    @staticmethod
+    def _handle_langgraph_event(
+        obj: dict[str, Any],
+        full_text: list[str],
+        tool_calls: list[dict[str, Any]],
+        active_tools: dict[str, dict[str, Any]],
+    ) -> None:
+        """Pull text + tool calls from LangChain ``astream_events v2`` shape."""
+        event = obj.get("event", "")
+        data = obj.get("data") or {}
+
+        if event == "on_chat_model_stream":
+            chunk = data.get("chunk")
+            if isinstance(chunk, dict):
+                kwargs = chunk.get("kwargs") or {}
+                content = kwargs.get("content")
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text = item.get("text", "")
+                            if text:
+                                full_text.append(text)
+                elif isinstance(content, str) and content:
+                    full_text.append(content)
+            return
+
+        if event == "on_tool_start":
+            run_id = obj.get("run_id") or ""
+            name = obj.get("name") or data.get("name") or ""
+            input_arg = data.get("input")
+            active_tools[run_id] = {"name": name, "args": input_arg}
+            return
+
+        if event == "on_tool_end":
+            run_id = obj.get("run_id") or ""
+            name = obj.get("name") or data.get("name") or ""
+            entry = active_tools.pop(run_id, None) or {"name": name, "args": None}
+            output = data.get("output")
+            tool_calls.append({
+                "tool_name": entry.get("name") or name,
+                "args": entry.get("args"),
+                "output": output if isinstance(output, (str, dict, list)) else str(output)[:500],
+            })
 
     async def close(self):
         await self._client.aclose()

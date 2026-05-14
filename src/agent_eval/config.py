@@ -58,6 +58,19 @@ class LangSmithSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LANGSMITH_", env_file=_ENV_FILE, extra="ignore")
 
 
+class LangfuseSettings(BaseSettings):
+    host: str = ""
+    public_key: str = ""
+    secret_key: str = ""
+    remote_write: bool = False  # default off; PR3a moves trace storage to LangSmith
+
+    model_config = SettingsConfigDict(env_prefix="LANGFUSE_", env_file=_ENV_FILE, extra="ignore")
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.host and self.public_key and self.secret_key)
+
+
 class AuthSettings(BaseSettings):
     secret_key: str
     algorithm: str = "HS256"
@@ -94,6 +107,7 @@ class Settings(BaseSettings):
     eval: EvalSettings = EvalSettings()
     loop: LoopSettings = LoopSettings()
     langsmith: LangSmithSettings = LangSmithSettings()
+    langfuse: LangfuseSettings = LangfuseSettings()
     auth: AuthSettings = AuthSettings()
     routing: RoutingSettings = RoutingSettings()
     governance: GovernanceSettings = GovernanceSettings()

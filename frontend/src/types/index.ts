@@ -130,6 +130,7 @@ export interface RunSummary {
   output_preview: string
   model_name: string
   first_token_s: number | null
+  first_tool_call_s: number | null
 }
 
 export interface ExtractRequest {
@@ -203,6 +204,7 @@ export interface FillModelsRequest {
 
 export interface FillModelsResponse {
   models: Record<string, string>
+  first_tool_calls: Record<string, number>
   missing: string[]
 }
 
@@ -327,4 +329,151 @@ export interface CapacityInfo {
   max_count: number
   usage_ratio: number
   warning: boolean
+}
+
+// ─── Evaluation (Langfuse-backed) ───
+
+export interface EvalAgentConfig {
+  type: 'openai' | 'sse' | 'sse_generic'
+  url: string
+  api_key?: string
+  model?: string
+  headers?: Record<string, string>
+  payload_template?: Record<string, unknown>
+  timeout?: number
+  language?: string
+}
+
+export interface EvaluatorConfig {
+  name: string
+  params?: Record<string, unknown>
+}
+
+export interface EvaluatorInstance {
+  id: string
+  name: string
+  evaluator_type: string
+  description: string | null
+  params: Record<string, unknown>
+  is_active: boolean
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface CreateEvaluatorRequest {
+  name: string
+  evaluator_type: string
+  description?: string | null
+  params?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface UpdateEvaluatorRequest {
+  name?: string
+  description?: string | null
+  params?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface UploadCasesResponse {
+  source_id: string
+  name: string
+  count: number
+  preview: Array<Record<string, unknown>>
+}
+
+export interface EvalCaseSourceSummary {
+  id: string
+  name: string
+  source_kind: string
+  file_format: string | null
+  count: number
+  created_at: string | null
+}
+
+export interface StartEvalRequest {
+  benchmark_version_id?: string | null
+  project_id?: string | null
+  case_source_id?: string | null
+  case_ids?: string[] | null
+  filter_tags?: string[] | null
+  filter_category_id?: string | null
+  limit?: number | null
+  agent: EvalAgentConfig
+  evaluator_ids: string[]
+  concurrency?: number
+  run_name?: string | null
+  langsmith_project?: string | null
+}
+
+export interface StartEvalResponse {
+  run_id: string
+  status: string
+  case_count: number
+}
+
+export interface EvalRunSummary {
+  id: string
+  benchmark_version_id: string | null
+  status: string
+  started_at: string | null
+  finished_at: string | null
+  langfuse_run_name: string | null
+  langsmith_project?: string | null
+  agent_config: Record<string, unknown>
+  summary_scores: {
+    counts?: { total?: number; passed?: number; failed?: number }
+    dimension_averages?: Record<string, number>
+    cost_success?: Record<string, number | null>
+    cost_failure?: Record<string, number | null>
+    langfuse_dataset?: string
+    langfuse_run_name?: string
+    langfuse_host?: string
+    error?: string
+    stopped_early?: boolean
+  } | null
+  progress: { total?: number; completed?: number; failed?: number }
+  created_at: string | null
+}
+
+export interface EvalRunDetail extends EvalRunSummary {
+  evaluator_configs: Array<Record<string, unknown>>
+}
+
+export interface EvalResultRow {
+  id: string
+  benchmark_case_id: string | null
+  test_case_id: string | null
+  status: string
+  actual_output: string | null
+  question?: string | null
+  latency_ms: number | null
+  total_tokens: number | null
+  prompt_tokens: number | null
+  completion_tokens: number | null
+  tool_call_count: number | null
+  error_message: string | null
+  langfuse_trace_id: string | null
+  langsmith_run_id?: string | null
+  scores: Record<string, number>
+}
+
+export interface EvalResultsPage {
+  items: EvalResultRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface EvalRunsPage {
+  items: EvalRunSummary[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface BuiltinEvaluator {
+  name: string
+  description: string
+  params_schema: Record<string, unknown>
 }
