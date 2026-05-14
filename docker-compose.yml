@@ -1,4 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────
+# Agent Eval · Docker Compose
+# ─────────────────────────────────────────────────────────────────────
+#
+# 整套部署包含 4 个服务，按依赖关系顺序启动：
+#   1. postgres   ─ 数据库（持久化在 volume pgdata）
+#   2. migrate    ─ 一次性任务：建表/升表后退出（依赖 postgres healthy）
+#   3. backend    ─ FastAPI 后端（依赖 migrate 完成）
+#   4. frontend   ─ Nginx 静态资源 + /api 反代到 backend
+#
+# 启动方式：
+#   docker compose up -d --build
+#
+# 访问入口：
+#   前端 UI:  http://localhost
+#   后端 API: http://localhost:8000
+#
+# 环境变量来源：
+#   - .env 文件被 backend 服务通过 env_file 加载（含 LLM/LangSmith key）
+#   - DB_HOST/DB_PORT 在 environment: 段被强制覆盖为容器内地址
+#   - 修改 PG 密码后需要 `docker compose down -v` 清掉 volume 才能生效
+# ─────────────────────────────────────────────────────────────────────
+
 services:
+  # ─────────────────────────────────────────────────────────────────
+  # PostgreSQL：业务主存储
+  #   - 用例 / Trace / 评分 / 优化记录 / 闭环日志全部落这里
+  #   - healthcheck 用 pg_isready 判断「能接受连接」，避免上层服务
+  #     在 PG 还在启动时就尝试连接而失败
+  # ─────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: agent-eval-postgres
@@ -17,6 +46,35 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ─────────────────────────────────────────────────────────────────
+  # migrate：数据库结构迁移（一次性任务）
+  #
+  # 为什么需要这个服务？
+  #   后端代码里有 SQLAlchemy ORM 模型（src/agent_eval/db_models/tables.py），
+  #   定义了 dataset_versions / test_cases / test_runs / test_results /
+  #   evaluation_scores / optimizations / loop_control_log / users /
+  #   projects / candidate_cases / benchmark_cases / audit_logs / ... 等 22 张表。
+  #
+  #   这些表必须存在于 PG 中后端才能工作。alembic 是「数据库版本控制」工具，
+  #   通过 alembic/versions/ 下的迁移脚本（0001 → 0008）按顺序执行，
+  #   把空数据库一步步建成当前 schema。
+  #
+  # 这个服务做什么？
+  #   1. 用和 backend 完全相同的镜像（包含 alembic 和迁移脚本）
+  #   2. 连上 postgres，对比当前 DB 版本和 alembic/versions/ 下的最高版本
+  #   3. 执行差量升级（缺哪些迁移补哪些），全新库会从 0001 一路升到 head
+  #   4. 升级完成后容器退出（restart: "no"）
+  #
+  # 为什么独立成一个服务而不是在 backend 启动时跑？
+  #   - 多副本时只需迁移一次，不会让多个 backend 实例并发 ALTER TABLE 死锁
+  #   - 失败可单独重跑：docker compose run --rm migrate
+  #   - backend 通过 service_completed_successfully 等它退出码 0 后再启动，
+  #     保证 schema 就位之前不接流量
+  #
+  # 同步驱动注意：
+  #   alembic 是同步框架，env.py 已强制把 +asyncpg 替换成 +psycopg2。
+  #   后端镜像里也额外装了 psycopg2-binary 给 alembic 用（不影响应用层 asyncpg）。
+  # ─────────────────────────────────────────────────────────────────
   migrate:
     build:
       context: .
@@ -35,6 +93,15 @@ services:
     command: ["alembic", "upgrade", "head"]
     restart: "no"
 
+  # ─────────────────────────────────────────────────────────────────
+  # backend：FastAPI + uvicorn
+  #   - env_file 加载 .env 里的 LLM_API_KEY / LANGSMITH_API_KEY 等
+  #   - environment 段覆盖 DB_HOST/DB_PORT，把 .env 里的 localhost 改成
+  #     compose 内部 DNS 名 postgres
+  #   - depends_on:
+  #       postgres healthy   → PG 可连
+  #       migrate completed  → schema 就位
+  # ─────────────────────────────────────────────────────────────────
   backend:
     build:
       context: .
@@ -54,6 +121,11 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # ─────────────────────────────────────────────────────────────────
+  # frontend：Nginx 提供静态资源 + /api 反代到 backend
+  #   - 镜像内置 nginx.conf，已配置 SPA fallback、长缓存、SSE 透传
+  #   - 通过 docker 内部 DNS 访问 backend:8000，不依赖宿主机端口
+  # ─────────────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
@@ -65,5 +137,9 @@ services:
       - backend
     restart: unless-stopped
 
+# ─────────────────────────────────────────────────────────────────────
+# 命名 volume：PG 数据持久化
+#   docker compose down 不会删，docker compose down -v 才会清空
+# ─────────────────────────────────────────────────────────────────────
 volumes:
   pgdata:

@@ -16,8 +16,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 
 RUN pip install --upgrade pip && \
-    pip install -e . && \
-    pip install psycopg2-binary
+    pip install -e .
 
 COPY alembic.ini ./
 COPY alembic ./alembic
