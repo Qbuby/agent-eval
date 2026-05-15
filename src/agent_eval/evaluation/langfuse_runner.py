@@ -625,6 +625,20 @@ async def _execute_run(
                 )
             )
 
+        # Fire-and-forget Langfuse score sync. Off by default — flip
+        # LANGFUSE_REMOTE_WRITE=true (or set langfuse.remote_write in /config)
+        # to push every evaluator score into the Langfuse UI as a fresh trace
+        # per case. Doesn't depend on LangSmith.
+        if settings.langfuse.remote_write and settings.langfuse.configured and per_case_results:
+            from agent_eval.evaluation.langfuse_sync import sync_run_scores_to_langfuse
+            asyncio.create_task(
+                sync_run_scores_to_langfuse(
+                    run_id=run_id,
+                    run_name=run_name,
+                    per_case_results=per_case_results,
+                )
+            )
+
         _RUN_REGISTRY.pop(run_id, None)
 
 
