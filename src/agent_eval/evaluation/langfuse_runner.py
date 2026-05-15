@@ -659,14 +659,19 @@ async def _backfill_langsmith_traces(
 
     try:
         from langsmith import Client
-        api_key = settings.langsmith.api_key
-        api_url = settings.langsmith.api_url
-        if not api_key:
-            logger.info("backfill: no LANGSMITH_API_KEY, skipping")
+        # Same precedence as TraceExtractor uses (see api/dependencies.py):
+        # config_service (DB-backed, set via /config UI) wins over .env.
+        # Without this, the eval backfill silently used the stale .env key
+        # while the Traces page used the working DB key — same project,
+        # different verdict. Fixed by going through the shared helper.
+        from agent_eval.api.dependencies import _get_langsmith_kwargs
+        kwargs = await _get_langsmith_kwargs()
+        if not kwargs.get("api_key"):
+            logger.info("backfill: no LangSmith API key configured (DB or .env), skipping")
             diagnostics["error_kind"] = "client_init"
-            diagnostics["error_message"] = "LANGSMITH_API_KEY not configured"
+            diagnostics["error_message"] = "LangSmith API key not configured (set via /config or LANGSMITH_API_KEY)"
             return diagnostics
-        client = Client(api_key=api_key, api_url=api_url)
+        client = Client(**kwargs)
     except Exception as e:
         logger.warning("backfill: langsmith client init failed: %s", e)
         diagnostics["error_kind"] = "client_init"
