@@ -422,7 +422,7 @@ export interface EvalRunSummary {
   langsmith_project?: string | null
   agent_config: Record<string, unknown>
   summary_scores: {
-    counts?: { total?: number; passed?: number; failed?: number }
+    counts?: { total?: number; passed?: number; failed?: number; unreachable?: number }
     dimension_averages?: Record<string, number>
     cost_success?: Record<string, number | null>
     cost_failure?: Record<string, number | null>
@@ -430,6 +430,7 @@ export interface EvalRunSummary {
     langfuse_run_name?: string
     langfuse_host?: string
     error?: string
+    runtime_error?: string
     stopped_early?: boolean
   } | null
   progress: { total?: number; completed?: number; failed?: number }

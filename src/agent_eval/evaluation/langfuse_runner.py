@@ -372,6 +372,68 @@ def _extract_usage(resp: AgentResponse) -> dict[str, int | None]:
     return out
 
 
+# ─── Agent invocation guards ──────────────────────────────────────────────
+# The dev agent on host:18094 likes to fall asleep between runs and answer
+# 502 to the very first call after wake-up. Without these guards, every
+# eval started cold would land 3-N samples on "All connection attempts
+# failed" and the user would think the platform was broken. Two layers:
+#
+#   1. _classify_agent_error: turn a raw exception into a stable category
+#      (agent_unreachable / agent_timeout / agent_5xx / parse_error /
+#      unknown) so the UI can render it differently than a plain "error".
+#   2. _invoke_with_retry: 1 immediate retry after 5s when the first
+#      attempt fails with a connection / 5xx / timeout class — that's the
+#      window the agent typically needs to spin back up.
+
+_TRANSIENT_HINTS = (
+    "all connection attempts failed",
+    "connection refused", "connection reset", "connection error",
+    "bad gateway", "service unavailable", "gateway timeout",
+    "502", "503", "504",
+    "timed out", "timeout",
+)
+
+
+def _classify_agent_error(err: Exception) -> str:
+    """Map a raised agent error to a stable category surfaced to the UI."""
+    s = str(err).lower()
+    if "502" in s or "bad gateway" in s or "503" in s or "service unavailable" in s:
+        return "agent_unreachable"
+    if "all connection attempts failed" in s or "connection refused" in s or "connection reset" in s:
+        return "agent_unreachable"
+    if "504" in s or "timed out" in s or "timeout" in s or "gateway timeout" in s:
+        return "agent_timeout"
+    if "5" in s and "client error" in s:
+        return "agent_5xx"
+    if "parse" in s or "json" in s or "decode" in s:
+        return "parse_error"
+    return "unknown"
+
+
+def _is_transient(err: Exception) -> bool:
+    s = str(err).lower()
+    return any(hint in s for hint in _TRANSIENT_HINTS)
+
+
+async def _invoke_with_retry(adapter: Any, messages: list[dict]) -> Any:
+    """Call adapter.invoke once; retry once after 5s on transient errors.
+
+    The agent often returns 502 on the first cold-start request. By the
+    time we get to the retry, the upstream is typically warm. If the second
+    attempt also fails the original exception class propagates, the caller
+    classifies it and the sample lands as agent_unreachable.
+    """
+    try:
+        return await adapter.invoke(messages)
+    except Exception as first:
+        if not _is_transient(first):
+            raise
+        logger.info("agent transient err on attempt 1 (%s); retrying after 5s",
+                    type(first).__name__)
+        await asyncio.sleep(5)
+        return await adapter.invoke(messages)
+
+
 async def _run_one_case(
     *,
     case: dict[str, Any],
@@ -409,7 +471,7 @@ async def _run_one_case(
 
     try:
         try:
-            resp = await adapter.invoke(messages)
+            resp = await _invoke_with_retry(adapter, messages)
             output_text = resp.content
             latency_ms = int(resp.latency_ms)
             usage = _extract_usage(resp)
@@ -423,8 +485,9 @@ async def _run_one_case(
                 actual_tool_calls = _extract_tool_calls_from_response(resp)
         except Exception as e:
             error_msg = str(e)
-            error_type = type(e).__name__
-            logger.warning("agent invoke failed for case %s: %s", case.get("id"), e)
+            error_type = _classify_agent_error(e)
+            logger.warning("agent invoke failed for case %s [%s]: %s",
+                           case.get("id"), error_type, e)
     finally:
         try:
             await adapter.close()
@@ -463,7 +526,13 @@ async def _run_one_case(
     # status: pass if all evaluator scores >= 0.5 and no error
     status = "pass"
     if error_msg:
-        status = "error"
+        # Surface infrastructure failures separately from "agent answered
+        # but answered wrong". UI then renders agent_unreachable as a
+        # neutral grey instead of red, and the run summary can flag it.
+        if error_type in ("agent_unreachable", "agent_timeout"):
+            status = error_type
+        else:
+            status = "error"
     elif scores and any(v < 0.5 for v in scores.values()):
         status = "fail"
 
@@ -586,12 +655,28 @@ async def _execute_run(
                 "total": len(per_case_results),
                 "passed": len(succ),
                 "failed": len(fail),
+                "unreachable": sum(
+                    1 for r in per_case_results
+                    if r["status"] in ("agent_unreachable", "agent_timeout")
+                ),
             },
             "dimension_averages": dim_avg,
             "cost_success": _aggregate_cost(succ),
             "cost_failure": _aggregate_cost(fail),
             "run_name": run_name,
         }
+        # If most samples couldn't reach the agent, surface that on the run
+        # so the detail page can render a banner instead of leaving the user
+        # to scan 30 rows of "All connection attempts failed".
+        if per_case_results:
+            unreach_ratio = summary["counts"]["unreachable"] / len(per_case_results)
+            if unreach_ratio >= 0.5:
+                agent_url = (agent_cfg or {}).get("url", "")
+                summary["runtime_error"] = (
+                    f"{summary['counts']['unreachable']}/{len(per_case_results)} 样例无法连到被测 agent "
+                    f"({agent_url})。请确认 agent 服务在线、网络可达；如在容器内访问宿主机请用 host.docker.internal "
+                    "或宿主机 LAN IP 而非 localhost。"
+                )
         if langsmith_project:
             summary["langsmith_project"] = langsmith_project
             # LangSmith web root; the UI uses it to deep-link.

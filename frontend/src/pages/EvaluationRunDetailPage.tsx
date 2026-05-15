@@ -120,6 +120,23 @@ export default function EvaluationRunDetailPage() {
         </div>
       </header>
 
+      {/* Runtime error banner — most samples couldn't reach the agent */}
+      {run.summary_scores?.runtime_error && (
+        <section className="mb-5 border border-amber-300 bg-amber-50 rounded-[6px] px-4 py-3">
+          <div className="flex items-start gap-2">
+            <span className="text-amber-700 text-[14px] mt-0.5">⚠</span>
+            <div className="flex-1">
+              <div className="text-[12px] font-medium text-amber-900 mb-1">
+                Agent 不可达
+              </div>
+              <div className="text-[11px] text-amber-800 leading-relaxed">
+                {run.summary_scores.runtime_error}
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* Meta grid */}
       <section className="grid grid-cols-4 gap-3 mb-5">
         <MetaCard label="总数" value={counts.total ?? run.progress.total ?? '—'} />
@@ -587,14 +604,23 @@ function StatusBadge({ status }: { status: string }) {
     pass: 'bg-green-100 text-green-700 border-green-300',
     fail: 'bg-red-100 text-red-700 border-red-300',
     error: 'bg-red-200 text-red-800 border-red-400',
+    // Infrastructure failure — render neutral grey-orange to distinguish
+    // "agent didn't respond" from "agent answered wrong".
+    agent_unreachable: 'bg-amber-100 text-amber-800 border-amber-300',
+    agent_timeout: 'bg-amber-100 text-amber-800 border-amber-300',
+  }
+  const labels: Record<string, string> = {
+    agent_unreachable: 'agent unreachable',
+    agent_timeout: 'agent timeout',
   }
   const cls = styles[status] ?? 'bg-gray-100 text-gray-600 border-gray-300'
+  const label = labels[status] ?? status
   return (
     <span className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border ${cls}`}>
       {status === 'running' && (
         <span className="inline-block w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
       )}
-      {status}
+      {label}
     </span>
   )
 }

@@ -253,3 +253,36 @@ def test_classify_network_errors():
 
 def test_classify_unknown_falls_back():
     assert _classify_langsmith_error(Exception("something weird")) == "unknown"
+
+
+# ─── _classify_agent_error / _is_transient (cold-start guards) ───────────
+
+def test_classify_agent_unreachable_502():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    e = Exception("Server error '502 Bad Gateway' for url 'http://...'")
+    assert _classify_agent_error(e) == "agent_unreachable"
+
+
+def test_classify_agent_unreachable_connection():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    assert _classify_agent_error(Exception("All connection attempts failed")) == "agent_unreachable"
+    assert _classify_agent_error(Exception("Connection refused")) == "agent_unreachable"
+
+
+def test_classify_agent_timeout():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    assert _classify_agent_error(Exception("read timed out")) == "agent_timeout"
+    assert _classify_agent_error(Exception("504 Gateway Timeout")) == "agent_timeout"
+
+
+def test_classify_parse_error():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    assert _classify_agent_error(Exception("JSON decode error at line 1")) == "parse_error"
+
+
+def test_is_transient_known_signals():
+    from agent_eval.evaluation.langfuse_runner import _is_transient
+    assert _is_transient(Exception("Connection refused"))
+    assert _is_transient(Exception("502 Bad Gateway"))
+    assert _is_transient(Exception("timed out"))
+    assert not _is_transient(Exception("invalid json"))
