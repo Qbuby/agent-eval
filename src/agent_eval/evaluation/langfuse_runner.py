@@ -633,37 +633,58 @@ async def _backfill_langsmith_traces(
     run_id: str,
     project: str,
     per_case_results: list[dict[str, Any]],
-) -> None:
+) -> dict[str, Any]:
     """Try to match each local result with a LangSmith root run by
     (start_time >= invoked_at - 1min) AND inputs.messages[0].content == question.
 
-    One LangSmith query per case keeps the call pattern simple. Cache hits on
-    subsequent reconciliations are handled upstream if we ever add one.
+    One LangSmith query per case keeps the call pattern simple.
+
+    Returns a small diagnostics dict so the API layer can surface *why* zero
+    matched. Previously this function silently swallowed every exception and
+    returned None, which made permission errors look identical to "the
+    project is correct, just no run yet". The new shape:
+
+        {
+          "errors": int,            # how many per-case searches raised
+          "error_kind": str | None, # one of: forbidden, unauthorized,
+                                    # network, client_init, unknown, None
+          "error_message": str | None,  # first error string, truncated
+        }
     """
+    diagnostics: dict[str, Any] = {
+        "errors": 0,
+        "error_kind": None,
+        "error_message": None,
+    }
+
     try:
         from langsmith import Client
         api_key = settings.langsmith.api_key
         api_url = settings.langsmith.api_url
         if not api_key:
             logger.info("backfill: no LANGSMITH_API_KEY, skipping")
-            return
+            diagnostics["error_kind"] = "client_init"
+            diagnostics["error_message"] = "LANGSMITH_API_KEY not configured"
+            return diagnostics
         client = Client(api_key=api_key, api_url=api_url)
     except Exception as e:
         logger.warning("backfill: langsmith client init failed: %s", e)
-        return
+        diagnostics["error_kind"] = "client_init"
+        diagnostics["error_message"] = str(e)[:300]
+        return diagnostics
 
     loop = asyncio.get_event_loop()
 
-    async def _find_one(res: dict[str, Any]) -> tuple[str, str | None]:
+    async def _find_one(res: dict[str, Any]) -> tuple[str, str | None, Exception | None]:
         question = res.get("question") or ""
         invoked_at = res.get("invoked_at")
         if not question or not invoked_at:
-            return (res.get("thread_id") or "", None)
+            return (res.get("thread_id") or "", None, None)
         # 1-minute safety window before invoked_at, generous upper bound.
         from datetime import timedelta
         lower = invoked_at - timedelta(minutes=1)
 
-        def _search():
+        def _search() -> tuple[str | None, Exception | None]:
             try:
                 runs = list(client.list_runs(
                     project_name=project,
@@ -673,19 +694,30 @@ async def _backfill_langsmith_traces(
                 ))
                 for r in runs:
                     if _run_matches_question(r, question):
-                        return str(r.id)
-            except Exception as e:
+                        return str(r.id), None
+                return None, None
+            except Exception as e:  # noqa: BLE001 — we want any LangSmith error
                 logger.warning("backfill search err: %s", e)
-            return None
+                return None, e
 
-        found = await loop.run_in_executor(None, _search)
-        return (res.get("thread_id") or "", found)
+        found, err = await loop.run_in_executor(None, _search)
+        return (res.get("thread_id") or "", found, err)
 
-    pairs = await asyncio.gather(*[_find_one(r) for r in per_case_results])
+    triples = await asyncio.gather(*[_find_one(r) for r in per_case_results])
+
+    # Collect first error (if any) for diagnostics.
+    for _, _, err in triples:
+        if err is None:
+            continue
+        diagnostics["errors"] += 1
+        if diagnostics["error_kind"] is None:
+            diagnostics["error_kind"] = _classify_langsmith_error(err)
+            diagnostics["error_message"] = str(err)[:300]
+
     hits = 0
     async with async_session_factory() as session:
         from agent_eval.db_models.tables import TestResultRow
-        for thread_id, lsrun in pairs:
+        for thread_id, lsrun, _err in triples:
             if not lsrun or not thread_id:
                 continue
             rows = (await session.execute(
@@ -698,9 +730,29 @@ async def _backfill_langsmith_traces(
                 hits += 1
         await session.commit()
     logger.info(
-        "backfill: project=%s run=%s matched %d/%d cases",
+        "backfill: project=%s run=%s matched %d/%d cases (errors=%d kind=%s)",
         project, run_id, hits, len(per_case_results),
+        diagnostics["errors"], diagnostics["error_kind"],
     )
+    return diagnostics
+
+
+def _classify_langsmith_error(err: Exception) -> str:
+    """Map a raised LangSmith client error to a stable banner category.
+
+    The langsmith-sdk wraps httpx errors in its own LangSmithError subclasses;
+    we sniff the stringified form rather than depend on private types.
+    """
+    s = str(err).lower()
+    if "403" in s or "forbidden" in s:
+        return "forbidden"
+    if "401" in s or "unauthorized" in s:
+        return "unauthorized"
+    if "404" in s or "not found" in s:
+        return "not_found"
+    if any(t in s for t in ("connection", "timeout", "timed out", "dns")):
+        return "network"
+    return "unknown"
 
 
 def _run_matches_question(run_obj: Any, question: str) -> bool:
@@ -722,7 +774,7 @@ def _run_matches_question(run_obj: Any, question: str) -> bool:
     return isinstance(txt, str) and txt == question
 
 
-async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
+async def rerun_backfill(*, run_id: str, project: str) -> dict[str, Any]:
     """Re-execute the LangSmith trace backfill for an existing run.
 
     Triggered from the detail page when the user supplies a project name —
@@ -737,7 +789,11 @@ async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
     Also persists ``project`` to ``test_runs.langsmith_project`` so the row
     detail page picks up the new value on subsequent loads.
 
-    Returns ``{"matched": int, "scanned": int}``.
+    Returns ``{"matched": int, "scanned": int, "errors": int,
+    "error_kind": str | None, "error_message": str | None}``. ``error_kind``
+    is the stable category surfaced to the frontend banner so users can tell
+    "API key forbidden on this project" apart from "0 matches, project is
+    fine but no run yet".
     """
     from agent_eval.db_models.tables import TestResultRow, TestRunRow
 
@@ -770,9 +826,12 @@ async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
         await session.commit()
 
     if not per_case_results:
-        return {"matched": 0, "scanned": 0}
+        return {
+            "matched": 0, "scanned": 0,
+            "errors": 0, "error_kind": None, "error_message": None,
+        }
 
-    await _backfill_langsmith_traces(
+    diagnostics = await _backfill_langsmith_traces(
         run_id=run_id, project=project, per_case_results=per_case_results,
     )
 
@@ -783,7 +842,13 @@ async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
             .where(TestResultRow.run_id == uuid.UUID(run_id))
             .where(TestResultRow.langsmith_run_id.isnot(None))
         )).scalars().all()
-    return {"matched": len(hit_rows), "scanned": len(per_case_results)}
+    return {
+        "matched": len(hit_rows),
+        "scanned": len(per_case_results),
+        "errors": diagnostics["errors"],
+        "error_kind": diagnostics["error_kind"],
+        "error_message": diagnostics["error_message"],
+    }
 
 
 # ───────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,16 @@
+{
+  "test_cases": [
+    {
+      "name": "case-1",
+      "question": "RPL201 锂电池 BMS 检查方法?"
+    },
+    {
+      "name": "case-2",
+      "question": "RPL201 锂电池过放电检查?"
+    },
+    {
+      "name": "case-3",
+      "question": "RPL201 电芯电压判断?"
+    }
+  ]
+}

@@ -172,17 +172,50 @@ export default function EvaluationRunDetailPage() {
             {backfillMutation.isPending ? '查询中…' : '查询轨迹'}
           </button>
         </div>
-        {backfillMutation.data && (
-          <div className="mt-2 text-[11px] text-text-secondary">
-            匹配 <span className="font-mono text-text-primary">{backfillMutation.data.matched}</span> /{' '}
-            <span className="font-mono text-text-primary">{backfillMutation.data.scanned}</span> 条样例。
-            {backfillMutation.data.matched === 0 && (
-              <span className="text-[#b87b00] ml-2">
-                没匹配上：检查 project 拼写、API key 权限，或者样例发起时间是否在 LangSmith 保留期内。
-              </span>
-            )}
-          </div>
-        )}
+        {backfillMutation.data && (() => {
+          const d = backfillMutation.data
+          // Three-state banner: matched > 0 (success), error_kind set
+          // (real failure with a known cause), or zero matches with no
+          // error (project name probably wrong / outside retention).
+          if (d.matched > 0) {
+            return (
+              <div className="mt-2 text-[11px] text-positive">
+                匹配 <span className="font-mono">{d.matched}</span> /{' '}
+                <span className="font-mono">{d.scanned}</span> 条样例。展开下方任一样例查看 trace。
+              </div>
+            )
+          }
+          if (d.error_kind) {
+            const kindMsg: Record<string, string> = {
+              forbidden: 'LangSmith API key 对此 project 没有读权限（403）。请换一把有 read 权限的 key，或确认 project 归属。',
+              unauthorized: 'LangSmith API key 无效（401）。请检查后端 LANGSMITH_API_KEY 配置。',
+              not_found: `LangSmith 上找不到名为 "${d.project}" 的 project（404）。请检查拼写。`,
+              network: 'LangSmith API 网络不可达（连接超时 / DNS 失败）。请检查后端的网络出口。',
+              client_init: 'LangSmith 客户端未初始化。后端可能未配置 LANGSMITH_API_KEY。',
+              unknown: 'LangSmith API 返回未知错误。',
+            }
+            return (
+              <div className="mt-2 text-[11px] text-negative">
+                <div>查询失败 · {kindMsg[d.error_kind] || kindMsg.unknown}</div>
+                {d.error_message && (
+                  <div className="mt-1 font-mono text-[10px] text-text-tertiary break-all">
+                    详情：{d.error_message}
+                  </div>
+                )}
+                <div className="mt-1 text-text-secondary">
+                  本次扫描了 {d.scanned} 条样例，{d.errors} 次请求失败。
+                </div>
+              </div>
+            )
+          }
+          return (
+            <div className="mt-2 text-[11px] text-[#b87b00]">
+              匹配 0 / {d.scanned} 条样例。LangSmith 能查通，但 project 「{d.project}」
+              里没有时间窗口内、问题文本一致的 root run。请检查 project 名称是否正确，
+              或样例发起时间是否在 LangSmith 数据保留期内。
+            </div>
+          )
+        })()}
         {backfillMutation.isError && (
           <div className="mt-2 text-[11px] text-negative">
             {(backfillMutation.error as { response?: { data?: { detail?: string } } })

@@ -81,7 +81,15 @@ export const evaluationApi = {
     })
   },
   backfillTrace(runId: string, project: string) {
-    return api.post<{ run_id: string; project: string; matched: number; scanned: number }>(
+    return api.post<{
+      run_id: string
+      project: string
+      matched: number
+      scanned: number
+      errors: number
+      error_kind: 'forbidden' | 'unauthorized' | 'not_found' | 'network' | 'client_init' | 'unknown' | null
+      error_message: string | null
+    }>(
       `/eval/runs/${runId}/backfill_trace`,
       null,
       { params: { project } },

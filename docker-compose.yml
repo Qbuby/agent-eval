@@ -114,6 +114,12 @@ services:
       DB_PORT: 5432
     ports:
       - "8000:8000"
+    # 让容器内代码能访问宿主机服务（被测 agent 通常跑在宿主机上，
+    # 例如 http://localhost:18096）。前端 UI 配置 agent URL 时用
+    # http://host.docker.internal:<port>/... 替代 http://localhost:<port>/...
+    # Linux 上 Docker Engine ≥ 20.10 也能解析 host-gateway。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

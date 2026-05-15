@@ -10,6 +10,7 @@ import pytest
 from agent_eval.evaluation.langfuse_runner import (
     _aggregate_cost,
     _bench_case_to_dataset_input,
+    _classify_langsmith_error,
     _evaluator_exact_match,
     _evaluator_tool_sequence,
     _extract_tool_calls_from_response,
@@ -227,3 +228,28 @@ def test_run_matches_handles_missing_inputs():
     assert _run_matches_question(_FakeRun({}), "x") is False
     # messages list exists but last entry isn't a dict
     assert _run_matches_question(_FakeRun({"messages": ["stray"]}), "x") is False
+
+
+# ─── _classify_langsmith_error (banner category mapping) ─────────────────
+
+def test_classify_403_forbidden():
+    e = Exception("Failed to GET /sessions in LangSmith API. HTTPError('403 Client Error: Forbidden for url: ...')")
+    assert _classify_langsmith_error(e) == "forbidden"
+
+
+def test_classify_401_unauthorized():
+    assert _classify_langsmith_error(Exception("401 Unauthorized")) == "unauthorized"
+
+
+def test_classify_404_not_found():
+    assert _classify_langsmith_error(Exception("404 Not Found: project missing")) == "not_found"
+
+
+def test_classify_network_errors():
+    assert _classify_langsmith_error(Exception("connection refused")) == "network"
+    assert _classify_langsmith_error(Exception("read timed out")) == "network"
+    assert _classify_langsmith_error(Exception("DNS lookup failed")) == "network"
+
+
+def test_classify_unknown_falls_back():
+    assert _classify_langsmith_error(Exception("something weird")) == "unknown"
