@@ -328,6 +328,77 @@ async def trigger_trace_backfill(
     return {"run_id": run_id, "project": project, **stats}
 
 
+@router.post("/runs/{run_id}/sync_langfuse_scores")
+async def trigger_langfuse_score_sync(
+    run_id: str,
+    push: bool = Query(default=True, description="Re-push our local scores+traces to Langfuse first"),
+    pull_attempts: int = Query(default=3, ge=1, le=10),
+    pull_interval: int = Query(default=20, ge=5, le=120),
+):
+    """Manual trigger for the Langfuse score round-trip.
+
+    1. (optional) Re-push our local evaluator scores + traces to Langfuse
+    2. Poll ``/api/public/scores`` for ``source=EVAL`` entries (i.e. scores
+       produced by Langfuse-configured evaluators) and stamp them back into
+       ``evaluation_scores`` with ``dimension="langfuse:<name>"``.
+
+    The post-run pipeline already does this fire-and-forget. Use this
+    endpoint when you need to re-pull (e.g. you re-saved the Langfuse
+    evaluator config) or sync an older run that ran before remote_write
+    was enabled.
+    """
+    from agent_eval.evaluation.langfuse_sync import (
+        pull_evaluator_scores_for_run, sync_run_scores_to_langfuse,
+    )
+    from sqlalchemy import select
+    from agent_eval.db_models.tables import EvaluationScoreRow
+
+    push_stats = None
+    if push:
+        # Rebuild per_case_results from DB so we don't have to keep the
+        # in-memory list around past run completion.
+        async with async_session_factory() as session:
+            results = (await session.execute(
+                select(TestResultRow).where(TestResultRow.run_id == uuid.UUID(run_id))
+            )).scalars().all()
+            score_rows = []
+            if results:
+                score_rows = (await session.execute(
+                    select(EvaluationScoreRow).where(
+                        EvaluationScoreRow.result_id.in_([r.id for r in results])
+                    )
+                )).scalars().all()
+            scores_by_rid: dict[uuid.UUID, dict[str, float]] = {}
+            for s in score_rows:
+                # Skip langfuse:* — those came FROM Langfuse, no need to re-push.
+                if s.dimension.startswith("langfuse:"):
+                    continue
+                scores_by_rid.setdefault(s.result_id, {})[s.dimension] = float(s.score)
+            run = await Repository(session).get_test_run(uuid.UUID(run_id))
+        per_case = []
+        for r in results:
+            per_case.append({
+                "case_id": str(r.benchmark_case_id) if r.benchmark_case_id else None,
+                "case_name": (r.question or "case")[:50],
+                "question": r.question or "",
+                "actual_output": r.actual_output or "",
+                "thread_id": r.thread_id,
+                "status": r.status,
+                "latency_ms": r.latency_ms,
+                "langsmith_run_id": r.langsmith_run_id,
+                "scores": scores_by_rid.get(r.id) or {},
+            })
+        push_stats = await sync_run_scores_to_langfuse(
+            run_id=run_id, run_name=run.langfuse_run_name if run else None,
+            per_case_results=per_case,
+        )
+
+    pull_stats = await pull_evaluator_scores_for_run(
+        run_id=run_id, max_attempts=pull_attempts, interval_seconds=pull_interval,
+    )
+    return {"run_id": run_id, "push": push_stats, "pull": pull_stats}
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Evaluator instance CRUD
 # ───────────────────────────────────────────────────────────────────────────

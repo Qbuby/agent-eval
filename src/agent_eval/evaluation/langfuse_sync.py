@@ -77,6 +77,11 @@ async def sync_run_scores_to_langfuse(
     Each evaluator dimension becomes one ``score_trace`` call attached to
     that trace.
 
+    Side effects:
+        - Persists the new Langfuse trace_id back to ``test_results.langfuse_trace_id``
+          (matched by thread_id) so the detail page and the post-run pull-back
+          can find it without a second API roundtrip.
+
     Skips silently when LANGFUSE_REMOTE_WRITE is off or Langfuse isn't
     configured. Returns ``{traces: int, scores: int, errors: int}``.
     """
@@ -100,19 +105,22 @@ async def sync_run_scores_to_langfuse(
 
     loop = asyncio.get_event_loop()
 
-    def _push_one(res: dict[str, Any]) -> tuple[int, int, int]:
-        """Run in a thread — the SDK is blocking. Returns (traces, scores, errors)."""
+    def _push_one(res: dict[str, Any]) -> tuple[int, int, int, str | None]:
+        """Run in a thread — the SDK is blocking.
+        Returns (traces, scores, errors, trace_id_or_none).
+        """
         traces = scores = errors = 0
         scores_dict: dict[str, float] = res.get("scores") or {}
         if not scores_dict:
-            return (0, 0, 0)
+            return (0, 0, 0, None)
 
         # Make sure score-configs exist before writing scores against them.
         for name in scores_dict.keys():
             _ensure_score_config_sync(client, name)
 
-        # New trace per case. Trace id is opaque to Langfuse — pick a stable
-        # form so re-syncs are idempotent (same case → same trace).
+        # New trace per case. Trace id is opaque to Langfuse — we generate
+        # one per case and stash it back in the DB so we can later pull
+        # evaluator scores by trace_id.
         trace_id = uuid.uuid4().hex[:32]
         case_name = res.get("case_name") or res.get("case_id") or "case"
         try:
@@ -152,17 +160,36 @@ async def sync_run_scores_to_langfuse(
         except Exception as e:  # noqa: BLE001
             logger.warning("langfuse-sync trace push %s: %s", case_name, str(e)[:200])
             errors += 1
-        return (traces, scores, errors)
+            return (traces, scores, errors, None)
+        return (traces, scores, errors, trace_id)
 
     # Run pushes in parallel via the executor — Langfuse SDK is blocking, but
     # it batches under the hood and the network legs can overlap.
     results = await asyncio.gather(*[
         loop.run_in_executor(None, _push_one, r) for r in per_case_results
     ])
-    for t, s, e in results:
-        stats["traces"] += t
-        stats["scores"] += s
-        stats["errors"] += e
+
+    # Persist trace_ids back so /api/eval/results/{id} reads them.
+    from sqlalchemy import select, update
+    from agent_eval.db import async_session_factory
+    from agent_eval.db_models.tables import TestResultRow
+    async with async_session_factory() as session:
+        for res, (t, s, e, trace_id) in zip(per_case_results, results):
+            stats["traces"] += t
+            stats["scores"] += s
+            stats["errors"] += e
+            if not trace_id:
+                continue
+            thread_id = res.get("thread_id")
+            if not thread_id:
+                continue
+            await session.execute(
+                update(TestResultRow)
+                .where(TestResultRow.run_id == uuid.UUID(run_id))
+                .where(TestResultRow.thread_id == thread_id)
+                .values(langfuse_trace_id=trace_id)
+            )
+        await session.commit()
 
     # Flush the SDK's internal queue so traces / scores actually leave the
     # process before this function returns. Without it, a short-lived task
@@ -177,3 +204,137 @@ async def sync_run_scores_to_langfuse(
         run_id, stats["traces"], stats["scores"], stats["errors"],
     )
     return stats
+
+
+# ─── Pull-back: read Langfuse evaluator scores back into our DB ──────────
+
+
+async def pull_evaluator_scores_for_run(
+    *, run_id: str, max_attempts: int = 10, interval_seconds: int = 30,
+) -> dict[str, int]:
+    """Poll Langfuse for evaluator-produced scores and stamp them onto our
+    eval results.
+
+    Langfuse worker latency is typically 1-5 minutes for a freshly synced
+    trace. We poll up to ``max_attempts × interval_seconds`` (default
+    5 minutes) and exit early once the count of new EVAL-source scores
+    stops growing for two consecutive polls.
+
+    Each Langfuse score with ``source == "EVAL"`` (i.e. produced by a
+    Langfuse-configured evaluator) is written to ``evaluation_scores``
+    with ``dimension = "langfuse:<score_name>"`` so the detail page can
+    show them next to our locally computed scores without a name clash.
+
+    Returns ``{polls: int, pulled: int}`` — how many EVAL-source scores
+    were imported in total.
+    """
+    out = {"polls": 0, "pulled": 0}
+    if not settings.langfuse.configured:
+        return out
+
+    import httpx
+    import base64
+    from sqlalchemy import select
+    from agent_eval.db import async_session_factory
+    from agent_eval.db_models.tables import (
+        TestResultRow, EvaluationScoreRow,
+    )
+
+    auth = base64.b64encode(
+        f"{settings.langfuse.public_key}:{settings.langfuse.secret_key}".encode()
+    ).decode()
+    headers = {"Authorization": f"Basic {auth}"}
+    base = settings.langfuse.host.rstrip("/")
+
+    seen_keys: set[tuple[uuid.UUID, str]] = set()
+    last_pulled = 0
+    stale_polls = 0
+
+    for attempt in range(1, max_attempts + 1):
+        out["polls"] = attempt
+
+        # 1. Get all results for this run that have a langfuse_trace_id
+        async with async_session_factory() as session:
+            results = (await session.execute(
+                select(TestResultRow)
+                .where(TestResultRow.run_id == uuid.UUID(run_id))
+                .where(TestResultRow.langfuse_trace_id.isnot(None))
+            )).scalars().all()
+
+            if not results:
+                logger.info("langfuse-pull: no traces synced yet for run %s, skipping", run_id)
+                return out
+
+            trace_to_result: dict[str, uuid.UUID] = {
+                r.langfuse_trace_id: r.id for r in results if r.langfuse_trace_id
+            }
+
+        # 2. For each trace_id, query Langfuse scores
+        async with httpx.AsyncClient(timeout=15.0, headers=headers) as http:
+            for trace_id, result_id in trace_to_result.items():
+                try:
+                    r = await http.get(
+                        f"{base}/api/public/scores",
+                        params={"traceId": trace_id, "limit": 50},
+                    )
+                    r.raise_for_status()
+                    items = r.json().get("data") or []
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("langfuse-pull score query for %s: %s",
+                                   trace_id, str(e)[:200])
+                    continue
+
+                for s in items:
+                    if s.get("source") != "EVAL":
+                        continue  # skip our own API-source pushes
+                    name = s.get("name") or ""
+                    value = s.get("value")
+                    if value is None:
+                        continue
+                    key = (result_id, f"langfuse:{name}")
+                    if key in seen_keys:
+                        continue
+
+                    # 3. Upsert into evaluation_scores
+                    async with async_session_factory() as session2:
+                        existing = (await session2.execute(
+                            select(EvaluationScoreRow)
+                            .where(EvaluationScoreRow.result_id == result_id)
+                            .where(EvaluationScoreRow.dimension == f"langfuse:{name}")
+                        )).scalar_one_or_none()
+                        if existing is None:
+                            session2.add(EvaluationScoreRow(
+                                result_id=result_id,
+                                dimension=f"langfuse:{name}",
+                                score=float(value),
+                                weight=1.0,
+                                weighted_score=float(value),
+                                scoring_method="langfuse-eval",
+                                details={"comment": s.get("comment") or "",
+                                         "source": "EVAL",
+                                         "trace_id": trace_id},
+                            ))
+                        else:
+                            existing.score = float(value)
+                            existing.weighted_score = float(value)
+                        await session2.commit()
+                    seen_keys.add(key)
+                    out["pulled"] += 1
+
+        # 4. Early exit if no new scores landed in this poll
+        if out["pulled"] == last_pulled:
+            stale_polls += 1
+            if stale_polls >= 2 and out["pulled"] > 0:
+                logger.info("langfuse-pull: stable at %d, stopping after poll %d",
+                            out["pulled"], attempt)
+                break
+        else:
+            stale_polls = 0
+        last_pulled = out["pulled"]
+
+        if attempt < max_attempts:
+            await asyncio.sleep(interval_seconds)
+
+    logger.info("langfuse-pull: run=%s polls=%d pulled=%d",
+                run_id, out["polls"], out["pulled"])
+    return out

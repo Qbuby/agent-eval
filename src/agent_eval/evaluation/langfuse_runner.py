@@ -630,14 +630,24 @@ async def _execute_run(
         # to push every evaluator score into the Langfuse UI as a fresh trace
         # per case. Doesn't depend on LangSmith.
         if settings.langfuse.remote_write and settings.langfuse.configured and per_case_results:
-            from agent_eval.evaluation.langfuse_sync import sync_run_scores_to_langfuse
-            asyncio.create_task(
-                sync_run_scores_to_langfuse(
+            from agent_eval.evaluation.langfuse_sync import (
+                pull_evaluator_scores_for_run, sync_run_scores_to_langfuse,
+            )
+
+            async def _sync_then_pull():
+                # Step 1: push our local scores + traces to Langfuse, persist
+                # the new langfuse_trace_id back to test_results.
+                await sync_run_scores_to_langfuse(
                     run_id=run_id,
                     run_name=run_name,
                     per_case_results=per_case_results,
                 )
-            )
+                # Step 2: poll Langfuse for evaluator-produced scores and
+                # stamp them back into evaluation_scores. Worker latency is
+                # 1-5min, so we poll up to 5 minutes total.
+                await pull_evaluator_scores_for_run(run_id=run_id)
+
+            asyncio.create_task(_sync_then_pull())
 
         _RUN_REGISTRY.pop(run_id, None)
 
