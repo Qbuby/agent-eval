@@ -678,51 +678,79 @@ async def _backfill_langsmith_traces(
         diagnostics["error_message"] = str(e)[:300]
         return diagnostics
 
+    # ── Build a window covering all cases ─────────────────────────────────
+    # Previous version did one client.list_runs per case (each pulling 50
+    # rows). With a busy ruyi-agent project that's 10 cases × 5-10s = a
+    # full minute of LangSmith traffic per backfill — clients time out and
+    # the work gets retried over and over. Replace with a single window
+    # query covering the earliest case to the latest, then hash by
+    # question text locally.
     loop = asyncio.get_event_loop()
+    from datetime import timedelta
+    invoked_times = [r["invoked_at"] for r in per_case_results if r.get("invoked_at")]
+    if not invoked_times:
+        return diagnostics
+    window_lower = min(invoked_times) - timedelta(minutes=1)
+    window_upper = max(invoked_times) + timedelta(minutes=10)
 
-    async def _find_one(res: dict[str, Any]) -> tuple[str, str | None, Exception | None]:
+    # Bounded fetch — LangSmith caps list_runs at limit=100. If the project
+    # is so busy this isn't enough, the user can narrow the time window by
+    # re-running with fewer cases (or paginate later if real demand shows).
+    PAGE_LIMIT = 100
+    by_question: dict[str, str] = {}  # question text → run id
+
+    def _fetch_window() -> Exception | None:
+        try:
+            runs = client.list_runs(
+                project_name=project,
+                is_root=True,
+                start_time=window_lower,
+                end_time=window_upper,
+                limit=PAGE_LIMIT,
+            )
+            for r in runs:
+                inp = getattr(r, "inputs", None)
+                if not isinstance(inp, dict):
+                    continue
+                msgs = inp.get("messages")
+                if isinstance(msgs, list) and msgs:
+                    last = msgs[-1] if isinstance(msgs[-1], dict) else None
+                    txt = (last or {}).get("content", "")
+                else:
+                    txt = inp.get("question") or ""
+                if isinstance(txt, str) and txt:
+                    # Latest wins on duplicate questions — but the time
+                    # window already prunes most dupes, so this is rare.
+                    by_question.setdefault(txt, str(r.id))
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("backfill window fetch err: %s", e)
+            return e
+
+    err = await loop.run_in_executor(None, _fetch_window)
+    if err is not None:
+        diagnostics["errors"] = len(per_case_results)
+        diagnostics["error_kind"] = _classify_langsmith_error(err)
+        diagnostics["error_message"] = str(err)[:300]
+        return diagnostics
+
+    logger.info(
+        "backfill: project=%s window=%s..%s fetched=%d unique-questions",
+        project, window_lower.isoformat(), window_upper.isoformat(),
+        len(by_question),
+    )
+
+    # ── Match local cases against the in-memory map ───────────────────────
+    triples: list[tuple[str, str | None]] = []
+    for res in per_case_results:
+        thread_id = res.get("thread_id") or ""
         question = res.get("question") or ""
-        invoked_at = res.get("invoked_at")
-        if not question or not invoked_at:
-            return (res.get("thread_id") or "", None, None)
-        # 1-minute safety window before invoked_at, generous upper bound.
-        from datetime import timedelta
-        lower = invoked_at - timedelta(minutes=1)
-
-        def _search() -> tuple[str | None, Exception | None]:
-            try:
-                runs = list(client.list_runs(
-                    project_name=project,
-                    is_root=True,
-                    start_time=lower,
-                    limit=50,
-                ))
-                for r in runs:
-                    if _run_matches_question(r, question):
-                        return str(r.id), None
-                return None, None
-            except Exception as e:  # noqa: BLE001 — we want any LangSmith error
-                logger.warning("backfill search err: %s", e)
-                return None, e
-
-        found, err = await loop.run_in_executor(None, _search)
-        return (res.get("thread_id") or "", found, err)
-
-    triples = await asyncio.gather(*[_find_one(r) for r in per_case_results])
-
-    # Collect first error (if any) for diagnostics.
-    for _, _, err in triples:
-        if err is None:
-            continue
-        diagnostics["errors"] += 1
-        if diagnostics["error_kind"] is None:
-            diagnostics["error_kind"] = _classify_langsmith_error(err)
-            diagnostics["error_message"] = str(err)[:300]
+        triples.append((thread_id, by_question.get(question)))
 
     hits = 0
     async with async_session_factory() as session:
         from agent_eval.db_models.tables import TestResultRow
-        for thread_id, lsrun, _err in triples:
+        for thread_id, lsrun in triples:
             if not lsrun or not thread_id:
                 continue
             rows = (await session.execute(
