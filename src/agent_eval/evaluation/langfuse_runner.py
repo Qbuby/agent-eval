@@ -185,11 +185,18 @@ def _aggregate_cost(rows: list[dict[str, Any]]) -> dict[str, Any]:
     prompt = _avg("prompt_tokens")
     cache_create = _avg("cache_creation_tokens")
     cache_read = _avg("cache_read_tokens")
+    # cache_hit_rate = avg(cache_read) / avg(prompt_tokens).
+    #
+    # On LangChain Anthropic models, prompt_tokens already INCLUDES both
+    # cache_creation and cache_read tokens (they are subcategories of
+    # "input the model saw on this call"). So `prompt - cache_create` is
+    # approximately `cache_read + non_cached`, which made the previous
+    # formula `cache_read / (prompt - cache_create)` always come out near
+    # 100%. The right denominator is just prompt_tokens — i.e. "of every
+    # input token the model saw, how many came from cache?".
     cache_hit_rate = None
-    if prompt is not None and cache_read is not None:
-        denom = (prompt or 0) - (cache_create or 0)
-        if denom > 0:
-            cache_hit_rate = round((cache_read or 0) / denom, 3)
+    if prompt is not None and prompt > 0 and cache_read is not None:
+        cache_hit_rate = round((cache_read or 0) / prompt, 3)
 
     return {
         "count": n,

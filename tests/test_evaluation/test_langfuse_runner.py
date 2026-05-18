@@ -104,8 +104,10 @@ def test_aggregate_cost_basic_averages_and_cache():
     assert out["avg_tool_calls"] == 1.5
     assert out["avg_messages"] == 3.5
     assert out["avg_latency_ms"] == 750.0
-    # cache_hit_rate = avg(read) / (avg(prompt) - avg(creation)) = 45 / (150 - 30) = 0.375
-    assert abs(out["cache_hit_rate"] - 0.375) < 1e-6
+    # cache_hit_rate = avg(cache_read) / avg(prompt_tokens) = 45 / 150 = 0.300
+    # (cache_read and cache_creation are subcategories of prompt_tokens —
+    # the right denominator is the total prompt input the model saw.)
+    assert abs(out["cache_hit_rate"] - 0.300) < 1e-6
 
 
 def test_aggregate_cost_skips_none():
