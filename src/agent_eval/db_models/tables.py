@@ -133,7 +133,7 @@ class TestResultRow(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     error_type: Mapped[str | None] = mapped_column(String(64))
 
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
