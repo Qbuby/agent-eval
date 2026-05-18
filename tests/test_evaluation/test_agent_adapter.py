@@ -74,6 +74,80 @@ def test_unknown_events_are_ignored():
     ])
 
 
+# ─── usage_metadata accumulation across multiple model_end events ─────────
+
+
+def test_usage_acc_multi_step_anthropic_shape():
+    """Tool-calling agents emit on_chat_model_end per step. We sum them.
+
+    Shape mirrors LangChain Anthropic models: input_tokens / output_tokens
+    + input_token_details.{cache_read, cache_creation}.
+    """
+    full_text: list[str] = []
+    tool_calls: list[dict] = []
+    active: dict[str, dict] = {}
+    usage = {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_tokens": 0, "cache_creation_tokens": 0}
+    seen = []
+    for ev in [
+        {"event": "on_chat_model_end", "data": {"output": {"kwargs": {
+            "usage_metadata": {
+                "input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
+                "input_token_details": {"cache_read": 30, "cache_creation": 20},
+            }}}}},
+        {"event": "on_chat_model_end", "data": {"output": {"kwargs": {
+            "usage_metadata": {
+                "input_tokens": 200, "output_tokens": 80, "total_tokens": 280,
+                "input_token_details": {"cache_read": 60, "cache_creation": 0},
+            }}}}},
+    ]:
+        seen.append(SSEStreamAdapter._handle_langgraph_event(
+            ev, full_text, tool_calls, active, usage,
+        ))
+    assert seen == [True, True]
+    assert usage == {
+        "input_tokens": 300, "output_tokens": 130,
+        "cache_read_tokens": 90, "cache_creation_tokens": 20,
+    }
+
+
+def test_usage_acc_handles_missing_details():
+    full_text: list[str] = []
+    tool_calls: list[dict] = []
+    active: dict[str, dict] = {}
+    usage = {"input_tokens": 0, "output_tokens": 0,
+             "cache_read_tokens": 0, "cache_creation_tokens": 0}
+    res = SSEStreamAdapter._handle_langgraph_event(
+        {"event": "on_chat_model_end", "data": {"output": {"kwargs": {
+            "usage_metadata": {"input_tokens": 5, "output_tokens": 7},
+        }}}},
+        full_text, tool_calls, active, usage,
+    )
+    assert res is True
+    assert usage["input_tokens"] == 5 and usage["output_tokens"] == 7
+    assert usage["cache_read_tokens"] == 0 and usage["cache_creation_tokens"] == 0
+
+
+def test_usage_acc_no_metadata_returns_false():
+    """Some events have data but no usage_metadata — must not flip the flag."""
+    res = SSEStreamAdapter._handle_langgraph_event(
+        {"event": "on_chat_model_end", "data": {"output": {"kwargs": {}}}},
+        [], [], {}, {"input_tokens": 0, "output_tokens": 0,
+                     "cache_read_tokens": 0, "cache_creation_tokens": 0},
+    )
+    assert res is False
+
+
+def test_handler_compat_without_usage_acc():
+    """Old callers that don't pass usage_acc must still work."""
+    full_text: list[str] = []
+    SSEStreamAdapter._handle_langgraph_event(
+        {"event": "on_chat_model_stream", "data": {"chunk": {"kwargs": {"content": "hi"}}}},
+        full_text, [], {},
+    )
+    assert full_text == ["hi"]
+
+
 def test_build_payload_langgraph_shape():
     ad = SSEStreamAdapter(url="http://x", mode="langgraph_v2", thread_id="TC-1", language="en")
     payload = ad._build_payload("hello?")

@@ -252,6 +252,8 @@ async def get_run_results(
             total_tokens=r.total_tokens,
             prompt_tokens=r.prompt_tokens,
             completion_tokens=r.completion_tokens,
+            cache_creation_tokens=r.cache_creation_tokens,
+            cache_read_tokens=r.cache_read_tokens,
             tool_call_count=r.tool_call_count,
             error_message=r.error_message,
             langfuse_trace_id=r.langfuse_trace_id,

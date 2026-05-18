@@ -234,6 +234,8 @@ class EvalResultRow(BaseModel):
     total_tokens: int | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    cache_read_tokens: int | None = None
     tool_call_count: int | None = None
     error_message: str | None = None
     langfuse_trace_id: str | None = None

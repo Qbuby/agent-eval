@@ -623,6 +623,8 @@ async def _execute_run(
                         total_tokens=res["total_tokens"],
                         prompt_tokens=res["prompt_tokens"],
                         completion_tokens=res["completion_tokens"],
+                        cache_creation_tokens=res.get("cache_creation_tokens"),
+                        cache_read_tokens=res.get("cache_read_tokens"),
                         tool_call_count=res["tool_call_count"],
                         error_message=res["error_message"],
                         error_type=res["error_type"],

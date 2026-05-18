@@ -128,6 +128,13 @@ class TestResultRow(Base):
     total_tokens: Mapped[int | None] = mapped_column(Integer)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer)
     completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    # Anthropic-style prompt-cache breakdown. cache_creation_tokens are
+    # paid-once tokens that seeded the cache; cache_read_tokens are tokens
+    # served from cache on the same request (i.e. cache hits, the cheap
+    # ones). Sample-level surface so the detail page can show per-case
+    # cache yield, not just the run-level avg.
+    cache_creation_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
     tool_call_count: Mapped[int | None] = mapped_column(Integer)
 
     error_message: Mapped[str | None] = mapped_column(Text)

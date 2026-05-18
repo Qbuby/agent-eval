@@ -317,7 +317,9 @@ export default function EvaluationRunDetailPage() {
                 <Th>Question</Th>
                 <Th>状态</Th>
                 <Th>Latency</Th>
-                <Th>Tokens (P/C/T)</Th>
+                <Th>输入 token</Th>
+                <Th>输出 token</Th>
+                <Th>缓存命中</Th>
                 <Th>Tools</Th>
                 <Th>Scores</Th>
                 <Th>Trace</Th>
@@ -325,13 +327,13 @@ export default function EvaluationRunDetailPage() {
             </thead>
             <tbody>
               {resultsQuery.isLoading && (
-                <tr><td colSpan={8} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+                <tr><td colSpan={10} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
               )}
               {items.map((r: EvalResultRow) => (
                 <ResultRow key={r.id} row={r} langfuseHost={langfuseHost} project={activeProject} />
               ))}
               {items.length === 0 && !resultsQuery.isLoading && (
-                <tr><td colSpan={8} className="py-8 text-center text-[11px] text-text-tertiary">
+                <tr><td colSpan={10} className="py-8 text-center text-[11px] text-text-tertiary">
                   {run.status === 'running' ? '还没产出样例结果…' : '没有样例结果'}
                 </td></tr>
               )}
@@ -409,9 +411,16 @@ function ResultRow({ row, langfuseHost, project }: {
         </Td>
         <Td><StatusBadge status={row.status} /></Td>
         <Td>{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</Td>
+        <Td>{row.prompt_tokens ?? '—'}</Td>
+        <Td>{row.completion_tokens ?? '—'}</Td>
         <Td>
-          {row.prompt_tokens != null || row.completion_tokens != null
-            ? `${row.prompt_tokens ?? '?'}/${row.completion_tokens ?? '?'}/${row.total_tokens ?? '?'}`
+          {row.cache_read_tokens != null
+            ? <span title={`命中: ${row.cache_read_tokens}, 创建: ${row.cache_creation_tokens ?? 0}`}>
+                {row.cache_read_tokens}
+                {row.cache_creation_tokens != null && row.cache_creation_tokens > 0 && (
+                  <span className="text-text-tertiary ml-1">/+{row.cache_creation_tokens}</span>
+                )}
+              </span>
             : '—'}
         </Td>
         <Td>{row.tool_call_count ?? 0}</Td>
@@ -448,7 +457,7 @@ function ResultRow({ row, langfuseHost, project }: {
       </tr>
       {open && (
         <tr className="bg-accent-subtle/30">
-          <td colSpan={8} className="p-3 text-[11px]">
+          <td colSpan={10} className="p-3 text-[11px]">
             <div className="mb-3">
               <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">输出</div>
               <pre className="font-mono text-[11px] bg-white border border-border rounded-[3px] p-2 max-h-[200px] overflow-y-auto whitespace-pre-wrap">

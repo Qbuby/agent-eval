@@ -452,6 +452,8 @@ export interface EvalResultRow {
   total_tokens: number | null
   prompt_tokens: number | null
   completion_tokens: number | null
+  cache_creation_tokens?: number | null
+  cache_read_tokens?: number | null
   tool_call_count: number | null
   error_message: string | null
   langfuse_trace_id: string | null
