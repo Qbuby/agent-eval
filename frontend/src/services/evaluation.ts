@@ -64,10 +64,18 @@ export const evaluationApi = {
   listRuns(params?: {
     benchmark_version_id?: string
     status?: string
+    started_after?: string  // ISO timestamp
+    started_before?: string
+    q?: string  // text search over run name / agent model+url / project
+    min_pass_rate?: number  // 0..1
+    include_deleted?: boolean
     page?: number
     page_size?: number
   }) {
     return api.get<EvalRunsPage>('/eval/runs', { params })
+  },
+  deleteRun(runId: string) {
+    return api.delete<{ run_id: string; deleted: boolean }>(`/eval/runs/${runId}`)
   },
   getRun(runId: string) {
     return api.get<EvalRunDetail>(`/eval/runs/${runId}`)

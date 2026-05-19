@@ -352,7 +352,8 @@ export interface EvaluatorConfig {
 export interface EvaluatorInstance {
   id: string
   name: string
-  evaluator_type: string
+  tag: string
+  evaluator_type: string | null
   description: string | null
   params: Record<string, unknown>
   is_active: boolean
@@ -362,7 +363,8 @@ export interface EvaluatorInstance {
 
 export interface CreateEvaluatorRequest {
   name: string
-  evaluator_type: string
+  tag?: string | null
+  evaluator_type?: string | null
   description?: string | null
   params?: Record<string, unknown>
   is_active?: boolean
@@ -370,6 +372,7 @@ export interface CreateEvaluatorRequest {
 
 export interface UpdateEvaluatorRequest {
   name?: string
+  tag?: string
   description?: string | null
   params?: Record<string, unknown>
   is_active?: boolean

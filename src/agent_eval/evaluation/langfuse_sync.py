@@ -67,8 +67,14 @@ async def sync_run_scores_to_langfuse(
     run_id: str,
     run_name: str | None,
     per_case_results: list[dict[str, Any]],
+    extra_tags: list[str] | None = None,
 ) -> dict[str, int]:
     """Push every (case → score) pair from a finished run to Langfuse.
+
+    ``extra_tags`` are stamped onto every trace alongside the standard
+    ['agent-eval', 'run:<id>'] tags. The runner uses this to forward each
+    selected evaluator's tag (e.g. 'agent-eval-correctness') so that
+    Langfuse-side evaluators bound to those tags pick the trace up.
 
     Each case becomes a fresh Langfuse trace with:
         - input  = {"question": ...}
@@ -142,7 +148,7 @@ async def sync_run_scores_to_langfuse(
                         "agent_eval.thread_id": res.get("thread_id"),
                         "agent_eval.langsmith_run_id": res.get("langsmith_run_id"),
                     },
-                    tags=["agent-eval", f"run:{run_id[:8]}"],
+                    tags=["agent-eval", f"run:{run_id[:8]}", *(extra_tags or [])],
                 )
                 traces += 1
                 for dim_name, value in scores_dict.items():

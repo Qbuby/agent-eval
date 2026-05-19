@@ -505,10 +505,17 @@ async def _run_one_case(
     scores: dict[str, float] = {}
     if not error_msg:
         for spec in evaluator_specs:
-            etype = spec["evaluator_type"]
+            etype = spec.get("evaluator_type")
+            # In tag-only mode (post-2026-05-19) evaluators don't define a
+            # local scoring function — they're just template tags forwarded
+            # to Langfuse. Skip the local-scoring loop for them; their
+            # contribution shows up later via the Langfuse pull-back.
+            if not etype:
+                continue
             ev_def = BUILTIN_EVALUATORS.get(etype)
             if ev_def is None:
-                logger.warning("unknown evaluator_type: %s", etype)
+                # Unknown legacy type — silently skip so old runs don't
+                # crash the pipeline.
                 continue
             fn = ev_def["fn"]
             label = spec.get("label") or etype
@@ -730,11 +737,22 @@ async def _execute_run(
 
             async def _sync_then_pull():
                 # Step 1: push our local scores + traces to Langfuse, persist
-                # the new langfuse_trace_id back to test_results.
+                # the new langfuse_trace_id back to test_results. Also stamp
+                # each selected evaluator's tag onto every trace so Langfuse
+                # evaluators bound to those tags pick the trace up.
+                eval_tags = [
+                    spec.get("tag") or spec.get("label")
+                    for spec in evaluator_specs
+                    if spec.get("tag") or spec.get("label")
+                ]
+                # de-dup while preserving order
+                seen: set[str] = set()
+                eval_tags = [t for t in eval_tags if t not in seen and not seen.add(t)]
                 await sync_run_scores_to_langfuse(
                     run_id=run_id,
                     run_name=run_name,
                     per_case_results=per_case_results,
+                    extra_tags=eval_tags,
                 )
                 # Step 2: poll Langfuse for evaluator-produced scores and
                 # stamp them back into evaluation_scores. Worker latency is

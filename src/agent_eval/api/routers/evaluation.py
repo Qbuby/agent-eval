@@ -143,6 +143,7 @@ async def start_eval(req: StartEvalRequest):
             evaluator_specs.append({
                 "id": str(row.id),
                 "label": row.name,
+                "tag": row.tag or row.name,
                 "evaluator_type": row.evaluator_type,
                 "params": row.params or {},
             })
@@ -185,14 +186,36 @@ def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRun
 async def list_runs(
     benchmark_version_id: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    started_after: str | None = Query(default=None, description="ISO timestamp lower bound (inclusive)"),
+    started_before: str | None = Query(default=None, description="ISO timestamp upper bound (inclusive)"),
+    q: str | None = Query(default=None, description="search run name / model / url / project"),
+    min_pass_rate: float | None = Query(default=None, ge=0.0, le=1.0,
+                                        description="filter to runs with pass rate >= this fraction"),
+    include_deleted: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
+    from datetime import datetime as _dt
     bv_uuid = uuid.UUID(benchmark_version_id) if benchmark_version_id else None
+
+    def _parse_ts(s: str | None):
+        if not s:
+            return None
+        try:
+            # accept both 'Z' suffix and offset-aware ISO strings
+            return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"invalid ISO timestamp: {s}") from e
+
     async with async_session_factory() as session:
         repo = Repository(session)
         rows, total = await repo.list_test_runs(
             benchmark_version_id=bv_uuid, status=status,
+            started_after=_parse_ts(started_after),
+            started_before=_parse_ts(started_before),
+            text_query=q,
+            min_pass_rate=min_pass_rate,
+            include_deleted=include_deleted,
             page=page, page_size=page_size,
         )
     items = []
@@ -200,6 +223,20 @@ async def list_runs(
         prog = get_run_progress(str(r.id)) if r.status == "running" else {}
         items.append(_row_to_summary(r, prog))
     return {"items": [it.model_dump(mode="json") for it in items], "total": total, "page": page, "page_size": page_size}
+
+
+@router.delete("/runs/{run_id}")
+async def delete_run(run_id: str):
+    """Soft-delete: stamps deleted_at. Row stays in DB so historical
+    Langfuse / LangSmith deep-links keep working; default list view hides it."""
+    run_uuid = uuid.UUID(run_id)
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        ok = await repo.soft_delete_test_run(run_uuid)
+        if not ok:
+            raise HTTPException(status_code=404, detail="run not found or already deleted")
+        await session.commit()
+    return {"run_id": run_id, "deleted": True}
 
 
 @router.get("/runs/{run_id}", response_model=EvalRunDetail)
@@ -393,6 +430,12 @@ async def trigger_langfuse_score_sync(
         push_stats = await sync_run_scores_to_langfuse(
             run_id=run_id, run_name=run.langfuse_run_name if run else None,
             per_case_results=per_case,
+            # Pull tags out of the run's stored evaluator_configs snapshot
+            # so re-syncs preserve the same tag set the run had originally.
+            extra_tags=[
+                cfg.get("tag") or cfg.get("label")
+                for cfg in (run.evaluator_configs or []) if (cfg.get("tag") or cfg.get("label"))
+            ] if run else None,
         )
 
     pull_stats = await pull_evaluator_scores_for_run(
@@ -410,6 +453,7 @@ def _row_to_instance(row) -> EvaluatorInstance:
     return EvaluatorInstance(
         id=str(row.id),
         name=row.name,
+        tag=row.tag or row.name,
         evaluator_type=row.evaluator_type,
         description=row.description,
         params=row.params or {},
@@ -429,16 +473,16 @@ async def list_evaluator_instances(active_only: bool = Query(default=False)):
 
 @router.post("/evaluators", response_model=EvaluatorInstance)
 async def create_evaluator_instance(req: CreateEvaluatorRequest):
-    if req.evaluator_type not in BUILTIN_EVALUATORS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"evaluator_type must be one of {list(BUILTIN_EVALUATORS.keys())}",
-        )
+    # tag-only mode: any string is a valid tag. evaluator_type is kept as
+    # an optional free-text label so old runs that referenced it still
+    # display sensibly, but it's no longer validated against a registry.
     async with async_session_factory() as session:
         repo = Repository(session)
         try:
             row = await repo.create_evaluator_config(
-                name=req.name, evaluator_type=req.evaluator_type,
+                name=req.name,
+                tag=req.tag or req.name,
+                evaluator_type=req.evaluator_type,
                 description=req.description, params=req.params,
                 is_active=req.is_active,
             )

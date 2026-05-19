@@ -261,7 +261,13 @@ class BuiltinEvaluator(BaseModel):
 class EvaluatorInstance(BaseModel):
     id: str
     name: str
-    evaluator_type: str  # one of BUILTIN_EVALUATORS keys
+    # The literal string we stamp onto every sample's Langfuse trace.
+    # Defaults to name when not specified, but the user can override
+    # (e.g. name="goal accuracy v2" + tag="agent-eval-correctness").
+    tag: str = ""
+    # Kept for back-compat with historical runs that referenced one of
+    # the old built-in scoring functions. New evaluators don't need it.
+    evaluator_type: str | None = None
     description: str | None = None
     params: dict[str, Any] = {}
     is_active: bool = True
@@ -271,7 +277,8 @@ class EvaluatorInstance(BaseModel):
 
 class CreateEvaluatorRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    evaluator_type: str
+    tag: str | None = Field(default=None, max_length=128)
+    evaluator_type: str | None = None
     description: str | None = None
     params: dict[str, Any] = {}
     is_active: bool = True
@@ -279,6 +286,7 @@ class CreateEvaluatorRequest(BaseModel):
 
 class UpdateEvaluatorRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
+    tag: str | None = Field(default=None, min_length=1, max_length=128)
     description: str | None = None
     params: dict[str, Any] | None = None
     is_active: bool | None = None
