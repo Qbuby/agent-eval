@@ -42,15 +42,15 @@ export default function EvaluatorsPage() {
         <table className="w-full border-collapse">
           <thead>
             <tr>
-              <Th>名称</Th><Th>Tag (写到 trace)</Th><Th>描述</Th><Th>状态</Th><Th>创建时间</Th><Th>操作</Th>
+              <Th>名称</Th><Th>Tag (写到 trace)</Th><Th>状态</Th><Th>创建时间</Th><Th>操作</Th>
             </tr>
           </thead>
           <tbody>
             {listQuery.isLoading && (
-              <tr><td colSpan={6} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+              <tr><td colSpan={5} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
             )}
             {listQuery.data?.length === 0 && !listQuery.isLoading && (
-              <tr><td colSpan={6} className="py-10 text-center text-[12px] text-text-tertiary">
+              <tr><td colSpan={5} className="py-10 text-center text-[12px] text-text-tertiary">
                 还没有评估器。新建一个：填好 tag 后，运行评估时勾选它，
                 平台会把这个 tag 加到每条样例的 Langfuse trace 上。
               </td></tr>
@@ -63,7 +63,6 @@ export default function EvaluatorsPage() {
                     {e.tag || e.name}
                   </span>
                 </Td>
-                <Td>{e.description || '—'}</Td>
                 <Td>
                   <span className={`text-[10px] px-1.5 py-0.5 rounded-full border ${
                     e.is_active ? 'border-green-300 bg-green-50 text-green-700' : 'border-gray-300 bg-gray-50 text-gray-600'
@@ -117,7 +116,6 @@ function EvaluatorEditor({
   const [name, setName] = useState(editing?.name || '')
   // Default tag = name on create. Editing: keep whatever the row has.
   const [tag, setTag] = useState(editing?.tag || '')
-  const [description, setDescription] = useState(editing?.description || '')
   const [isActive, setIsActive] = useState(editing ? editing.is_active : true)
 
   const saveMutation = useMutation({
@@ -125,11 +123,11 @@ function EvaluatorEditor({
       const effectiveTag = tag.trim() || name.trim()
       if (editing) {
         return evaluationApi.updateEvaluator(editing.id, {
-          name, tag: effectiveTag, description, is_active: isActive,
+          name, tag: effectiveTag, is_active: isActive,
         }).then(r => r.data)
       }
       const body: CreateEvaluatorRequest = {
-        name, tag: effectiveTag, description, is_active: isActive,
+        name, tag: effectiveTag, is_active: isActive,
       }
       return evaluationApi.createEvaluator(body).then(r => r.data)
     },
@@ -174,15 +172,6 @@ function EvaluatorEditor({
               evaluator 会被触发；你也可以多个评估器用相同 tag 让它们共用一份
               Langfuse 配置。
             </div>
-          </Field>
-
-          <Field label="描述（可选）">
-            <input
-              type="text" value={description}
-              onChange={e => setDescription(e.target.value)}
-              placeholder="e.g. 整体回答正确性，由 Langfuse 上的 LLM-judge 给分"
-              className="input"
-            />
           </Field>
 
           <label className="inline-flex items-center gap-1.5 text-[12px]">
