@@ -76,12 +76,20 @@ async def sync_run_scores_to_langfuse(
     selected evaluator's tag (e.g. 'agent-eval-correctness') so that
     Langfuse-side evaluators bound to those tags pick the trace up.
 
-    Each case becomes a fresh Langfuse trace with:
-        - input  = {"question": ...}
-        - output = actual_output text
-        - metadata = {run_id, case_id, status, latency_ms, langsmith_run_id, ...}
-    Each evaluator dimension becomes one ``score_trace`` call attached to
-    that trace.
+    Each case becomes a fresh Langfuse trace whose only payload-bearing
+    child is a single SPAN. All three evaluator variables are read off
+    that span (Run on = Observations, target type = SPAN):
+
+        - span.input    = {"question": ...}             → query        = input + "question"
+        - span.output   = {"answer": ...}               → generation   = output + "answer"
+        - span.metadata = {"expected_output": ...,
+                           "expected_tool_calls": [...],
+                           ... bookkeeping ...}         → ground_truth = metadata + "expected_output"
+
+    The trace itself only carries name + tags so list views and filters
+    keep working; we no longer mirror output/metadata onto the trace.
+    Each locally computed evaluator dimension becomes one ``score_trace``
+    call attached to that trace.
 
     Side effects:
         - Persists the new Langfuse trace_id back to ``test_results.langfuse_trace_id``
@@ -114,10 +122,18 @@ async def sync_run_scores_to_langfuse(
     def _push_one(res: dict[str, Any]) -> tuple[int, int, int, str | None]:
         """Run in a thread — the SDK is blocking.
         Returns (traces, scores, errors, trace_id_or_none).
+
+        We always push a trace when at least one of:
+          - the case carries local scores (legacy mode), OR
+          - the runner forwarded any extra_tags (tag-only mode — the
+            whole point IS to stamp the tag onto the trace).
+        Otherwise we'd have nothing for Langfuse-side evaluators to
+        latch onto, and ``traces=0 scores=0`` would silently mask the
+        skipped sync.
         """
         traces = scores = errors = 0
         scores_dict: dict[str, float] = res.get("scores") or {}
-        if not scores_dict:
+        if not scores_dict and not extra_tags:
             return (0, 0, 0, None)
 
         # Make sure score-configs exist before writing scores against them.
@@ -129,25 +145,42 @@ async def sync_run_scores_to_langfuse(
         # evaluator scores by trace_id.
         trace_id = uuid.uuid4().hex[:32]
         case_name = res.get("case_name") or res.get("case_id") or "case"
+        # We only run Observation-level evaluators now, so all three variables
+        # the evaluator reads (query / generation / ground_truth) come from
+        # the span itself. The trace just carries the name + tags so filters
+        # and UI deep-links still work.
+        #
+        # Variable mapping in the Langfuse evaluator config:
+        #   query        → Input    + field "question"
+        #   generation   → Output   + field "answer"
+        #   ground_truth → Metadata + field "expected_output"
+        expected_output = res.get("expected_output") or ""
+        expected_tool_calls = res.get("expected_tool_calls") or []
+        actual_output = res.get("actual_output") or ""
         try:
             with client.start_as_current_span(
                 name=f"eval/{case_name}",
                 trace_context={"trace_id": trace_id},
                 input={"question": res.get("question", "")},
             ) as span:
+                span.update(
+                    output={"answer": actual_output},
+                    metadata={
+                        "expected_output": expected_output,
+                        "expected_tool_calls": expected_tool_calls,
+                        "run_id": run_id,
+                        "run_name": run_name,
+                        "case_id": res.get("case_id"),
+                        "case_name": case_name,
+                        "status": res.get("status"),
+                        "latency_ms": res.get("latency_ms"),
+                        "thread_id": res.get("thread_id"),
+                        "langsmith_run_id": res.get("langsmith_run_id"),
+                    },
+                )
+                # Trace gets only what's needed for filtering and listing.
                 span.update_trace(
                     name=f"eval/{run_name or run_id[:8]}/{case_name}",
-                    output=res.get("actual_output") or "",
-                    metadata={
-                        "agent_eval.run_id": run_id,
-                        "agent_eval.run_name": run_name,
-                        "agent_eval.case_id": res.get("case_id"),
-                        "agent_eval.case_name": case_name,
-                        "agent_eval.status": res.get("status"),
-                        "agent_eval.latency_ms": res.get("latency_ms"),
-                        "agent_eval.thread_id": res.get("thread_id"),
-                        "agent_eval.langsmith_run_id": res.get("langsmith_run_id"),
-                    },
                     tags=["agent-eval", f"run:{run_id[:8]}", *(extra_tags or [])],
                 )
                 traces += 1
@@ -240,6 +273,7 @@ async def pull_evaluator_scores_for_run(
 
     import httpx
     import base64
+    from collections import defaultdict
     from sqlalchemy import select
     from agent_eval.db import async_session_factory
     from agent_eval.db_models.tables import (
@@ -252,7 +286,6 @@ async def pull_evaluator_scores_for_run(
     headers = {"Authorization": f"Basic {auth}"}
     base = settings.langfuse.host.rstrip("/")
 
-    seen_keys: set[tuple[uuid.UUID, str]] = set()
     last_pulled = 0
     stale_polls = 0
 
@@ -275,57 +308,105 @@ async def pull_evaluator_scores_for_run(
                 r.langfuse_trace_id: r.id for r in results if r.langfuse_trace_id
             }
 
-        # 2. For each trace_id, query Langfuse scores
+        # 2. Pull scores for the whole project, paginated. The Langfuse build
+        #    we target IGNORES the server-side `traceId` filter, so we filter
+        #    client-side by `s.traceId` against the trace_ids we care about.
+        trace_ids = set(trace_to_result.keys())
+        # (trace_id, dim) → list of observation-level score values
+        buckets: dict[tuple[str, str], list[float]] = defaultdict(list)
+        # Most recent comment per bucket (for the details JSON)
+        bucket_meta: dict[tuple[str, str], dict[str, Any]] = {}
+
         async with httpx.AsyncClient(timeout=15.0, headers=headers) as http:
-            for trace_id, result_id in trace_to_result.items():
+            page = 1
+            while True:
                 try:
                     r = await http.get(
                         f"{base}/api/public/scores",
-                        params={"traceId": trace_id, "limit": 50},
+                        params={"limit": 100, "page": page},
                     )
                     r.raise_for_status()
-                    items = r.json().get("data") or []
+                    body = r.json()
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("langfuse-pull score query for %s: %s",
-                                   trace_id, str(e)[:200])
-                    continue
-
+                    logger.warning("langfuse-pull list page=%d: %s", page, str(e)[:200])
+                    break
+                items = body.get("data") or []
+                if not items:
+                    break
                 for s in items:
-                    if s.get("source") != "EVAL":
-                        continue  # skip our own API-source pushes
+                    tid = s.get("traceId")
+                    if tid not in trace_ids:
+                        continue
+                    # Observation-level only — trace-level scores were judged
+                    # against an empty trace.output and aren't useful.
+                    obs_id = s.get("observationId")
+                    if not obs_id:
+                        continue
+                    src = s.get("source") or ""
+                    comment = s.get("comment") or ""
+                    # Skip our own outbound score_trace pushes.
+                    if src == "API" and comment.startswith("agent-eval run"):
+                        continue
                     name = s.get("name") or ""
                     value = s.get("value")
-                    if value is None:
+                    if name == "" or value is None:
                         continue
-                    key = (result_id, f"langfuse:{name}")
-                    if key in seen_keys:
-                        continue
+                    key = (tid, name)
+                    buckets[key].append(float(value))
+                    bucket_meta[key] = {
+                        "comment": comment,
+                        "source": src,
+                        "observation_id": obs_id,
+                    }
+                meta = body.get("meta") or {}
+                total_pages = meta.get("totalPages") or 1
+                if page >= total_pages:
+                    break
+                page += 1
 
-                    # 3. Upsert into evaluation_scores
-                    async with async_session_factory() as session2:
-                        existing = (await session2.execute(
-                            select(EvaluationScoreRow)
-                            .where(EvaluationScoreRow.result_id == result_id)
-                            .where(EvaluationScoreRow.dimension == f"langfuse:{name}")
-                        )).scalar_one_or_none()
-                        if existing is None:
-                            session2.add(EvaluationScoreRow(
-                                result_id=result_id,
-                                dimension=f"langfuse:{name}",
-                                score=float(value),
-                                weight=1.0,
-                                weighted_score=float(value),
-                                scoring_method="langfuse-eval",
-                                details={"comment": s.get("comment") or "",
-                                         "source": "EVAL",
-                                         "trace_id": trace_id},
-                            ))
-                        else:
-                            existing.score = float(value)
-                            existing.weighted_score = float(value)
-                        await session2.commit()
-                    seen_keys.add(key)
-                    out["pulled"] += 1
+        # 3. Upsert: one row per (case, dimension), value = mean of all
+        #    observation-level scores in that bucket.
+        if buckets:
+            logger.info(
+                "langfuse-pull: run=%s buckets=%d sample=%s",
+                run_id, len(buckets),
+                {f"{k[0][:8]}/{k[1]}": (round(sum(v) / len(v), 3), len(v))
+                 for k, v in list(buckets.items())[:6]},
+            )
+            async with async_session_factory() as session2:
+                for (trace_id, name), values in buckets.items():
+                    result_id = trace_to_result.get(trace_id)
+                    if result_id is None:
+                        continue
+                    avg = sum(values) / len(values)
+                    details = {
+                        "mean": avg,
+                        "count": len(values),
+                        "values": values,
+                        "trace_id": trace_id,
+                        **bucket_meta.get((trace_id, name), {}),
+                    }
+                    existing = (await session2.execute(
+                        select(EvaluationScoreRow)
+                        .where(EvaluationScoreRow.result_id == result_id)
+                        .where(EvaluationScoreRow.dimension == f"langfuse:{name}")
+                    )).scalar_one_or_none()
+                    if existing is None:
+                        session2.add(EvaluationScoreRow(
+                            result_id=result_id,
+                            dimension=f"langfuse:{name}",
+                            score=avg,
+                            weight=1.0,
+                            weighted_score=avg,
+                            scoring_method="langfuse-eval",
+                            details=details,
+                        ))
+                        out["pulled"] += 1
+                    else:
+                        existing.score = avg
+                        existing.weighted_score = avg
+                        existing.details = details
+                await session2.commit()
 
         # 4. Early exit if no new scores landed in this poll
         if out["pulled"] == last_pulled:

@@ -55,6 +55,20 @@ export default function EvaluationRunDetailPage() {
     },
   })
 
+  // Manual re-pull of Langfuse evaluator scores. Traces are already pushed
+  // by the run, so we skip push and only pull. One quick attempt is enough
+  // for an on-demand refresh — the user clicks again if Langfuse hasn't
+  // finished judging yet.
+  const langfusePullMutation = useMutation({
+    mutationFn: () => evaluationApi
+      .syncLangfuseScores(runId!, { push: false, pull_attempts: 1 })
+      .then(r => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['eval-results', runId] })
+      qc.invalidateQueries({ queryKey: ['eval-run', runId] })
+    },
+  })
+
   const run = runQuery.data
   const langfuseHost = deriveLangfuseHost(run)
 
@@ -117,8 +131,30 @@ export default function EvaluationRunDetailPage() {
           >
             加入对比
           </button>
+          <button
+            onClick={() => langfusePullMutation.mutate()}
+            disabled={langfusePullMutation.isPending}
+            title="向 Langfuse 拉一次 observation 级评估器分数（已推送的 trace 不再重复推）"
+            className="py-1.5 px-3 text-[11px] rounded-[6px] border border-border text-text-secondary hover:border-accent hover:text-accent disabled:opacity-40 transition-all"
+          >
+            {langfusePullMutation.isPending ? '拉取中…' : '重拉 Langfuse 分数'}
+          </button>
         </div>
       </header>
+
+      {/* Langfuse pull-back result banner */}
+      {langfusePullMutation.data && (
+        <div className="mb-3 text-[11px] text-text-secondary border border-border bg-accent-subtle/40 rounded-[6px] px-3 py-2">
+          已从 Langfuse 拉回 <span className="font-mono">{langfusePullMutation.data.pull.pulled}</span> 条新分数
+          （poll {langfusePullMutation.data.pull.polls} 次）。如果是 0，可能 Langfuse 评估器还没算完，等几十秒后再点一次。
+        </div>
+      )}
+      {langfusePullMutation.isError && (
+        <div className="mb-3 text-[11px] text-negative border border-red-200 bg-red-50 rounded-[6px] px-3 py-2">
+          拉取失败：{(langfusePullMutation.error as { response?: { data?: { detail?: string } } })
+            ?.response?.data?.detail || (langfusePullMutation.error as Error)?.message || 'unknown'}
+        </div>
+      )}
 
       {/* Runtime error banner — most samples couldn't reach the agent */}
       {run.summary_scores?.runtime_error && (

@@ -556,6 +556,8 @@ async def _run_one_case(
         "case_source": case.get("source"),
         "thread_id": thread_id,
         "question": question,
+        "expected_output": expected,
+        "expected_tool_calls": expected_tool_calls,
         "invoked_at": invoked_at,
         "status": status,
         "actual_output": output_text,

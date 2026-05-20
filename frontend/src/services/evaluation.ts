@@ -106,4 +106,20 @@ export const evaluationApi = {
   stopRun(runId: string) {
     return api.post<{ run_id: string; status: string }>(`/eval/runs/${runId}/stop`)
   },
+  syncLangfuseScores(
+    runId: string,
+    opts?: { push?: boolean; pull_attempts?: number; pull_interval?: number },
+  ) {
+    return api.post<{
+      run_id: string
+      push: { traces: number; scores: number; errors: number } | null
+      pull: { polls: number; pulled: number }
+    }>(`/eval/runs/${runId}/sync_langfuse_scores`, null, {
+      params: {
+        push: opts?.push ?? false,
+        pull_attempts: opts?.pull_attempts ?? 1,
+        pull_interval: opts?.pull_interval ?? 5,
+      },
+    })
+  },
 }
