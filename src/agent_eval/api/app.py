@@ -1,29 +1,25 @@
 from contextlib import asynccontextmanager
 import logging
+import traceback
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
     auth, benchmark, candidates, cases, config, datasets, evaluation, generate,
     governance, projects, routing, scheduler, traces,
 )
+from agent_eval.config import settings
+from agent_eval.logging_config import setup_logging
 
+setup_logging(settings.logging.level, settings.logging.format)
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Make sure agent_eval.* INFO logs land in stdout. uvicorn's default config
-    # leaves the root logger at WARNING; without this, our diagnostics get swallowed.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        force=True,
-    )
-    logging.getLogger("agent_eval").setLevel(logging.INFO)
-
     from agent_eval.config_service import config_service
     from agent_eval.db import close_db
     from agent_eval.evaluation.langfuse_runner import sweep_orphaned_runs
@@ -57,6 +53,13 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Middleware execution order is "last registered, first executed" — CORS
+    # must be the outermost layer to handle OPTIONS preflight, so register the
+    # request context middleware first (it ends up *inside* CORS at runtime).
+    app.add_middleware(
+        RequestContextMiddleware,
+        log_request_body=settings.logging.request_body,
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -67,10 +70,23 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
-        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+        rid = getattr(request.state, "request_id", "-")
+        logger.exception(
+            "unhandled error: method=%s path=%s request_id=%s",
+            request.method, request.url.path, rid,
+        )
+        body: dict = {
+            "detail": f"Internal server error: {type(exc).__name__}",
+            "request_id": rid,
+        }
+        if settings.logging.debug:
+            body["error_type"] = type(exc).__name__
+            body["error_message"] = str(exc)
+            body["traceback"] = traceback.format_exc()
         return JSONResponse(
             status_code=500,
-            content={"detail": f"Internal server error: {type(exc).__name__}: {exc}"},
+            content=body,
+            headers={"X-Request-ID": rid},
         )
 
     app.include_router(auth.router)

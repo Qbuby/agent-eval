@@ -101,6 +101,15 @@ class GovernanceSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GOV_", env_file=_ENV_FILE, extra="ignore")
 
 
+class LoggingSettings(BaseSettings):
+    level: str = "INFO"          # DEBUG | INFO | WARNING | ERROR
+    format: str = "plain"        # plain | json
+    debug: bool = False          # expose traceback to clients on 5xx
+    request_body: bool = False   # log request body on 4xx/5xx (sensitive!)
+
+    model_config = SettingsConfigDict(env_prefix="LOG_", env_file=_ENV_FILE, extra="ignore")
+
+
 class Settings(BaseSettings):
     db: DatabaseSettings = DatabaseSettings()
     llm: LLMSettings = LLMSettings()
@@ -111,6 +120,7 @@ class Settings(BaseSettings):
     auth: AuthSettings = AuthSettings()
     routing: RoutingSettings = RoutingSettings()
     governance: GovernanceSettings = GovernanceSettings()
+    logging: LoggingSettings = LoggingSettings()
 
 
 settings = Settings()
