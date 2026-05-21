@@ -26,13 +26,19 @@ async def list_runs(
     ext: TraceExtractor = Depends(get_extractor),
 ):
     try:
+        # A3: only fetch what we'll show. The frontend keeps "load more"
+        # which goes through pagination via end_time, so capping the LangSmith
+        # call at one page's worth is safe and lets us cut wire-time linearly.
+        ls_limit = max(req.page_size, min(req.limit, req.page_size * req.page))
         runs = await ext.list_runs(
             req.project_name,
             start_time=req.start_time,
             end_time=req.end_time,
             status=req.status,
             tags=req.tags,
-            limit=req.limit,
+            limit=ls_limit,
+            enrich_models=req.enrich_models,
+            with_io=req.with_io,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LangSmith API error: {e}") from e

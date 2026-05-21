@@ -151,9 +151,9 @@ export default function TracesPage() {
     try {
       const req: ListRunsRequest = {
         project_name: projectName,
-        limit: 100,
+        limit: 50,
         page: 1,
-        page_size: 100,
+        page_size: 50,
         status: 'success',
       }
       if (mode === 'more' && allRuns.length > 0) {
@@ -181,7 +181,7 @@ export default function TracesPage() {
           return merged
         })
       }
-      setHasMore(newItems.length >= 100)
+      setHasMore(newItems.length >= 50)
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       setError(msg || '查询失败')
@@ -473,8 +473,8 @@ export default function TracesPage() {
   return (
     <div>
       <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">Traces</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">Execution runs &middot; performance metrics</p>
+        <h1 className="text-lg font-light tracking-tight mb-1">调用轨迹</h1>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">EXECUTION RUNS · PERFORMANCE METRICS</p>
       </header>
 
       <form onSubmit={handleSearch} className="flex gap-2.5 items-center mb-4">
@@ -924,7 +924,7 @@ export default function TracesPage() {
                     <span className="inline-block w-3 h-3 border border-accent/40 border-t-accent rounded-full animate-spin" />
                     加载中
                   </>
-                ) : '加载更早 100 条'}
+                ) : '加载更早 50 条'}
               </button>
             )}
           </div>

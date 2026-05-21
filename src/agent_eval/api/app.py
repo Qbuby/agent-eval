@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from agent_eval.config_service import config_service
+    from agent_eval.data.traces_warmer import get_warmer
     from agent_eval.db import close_db
     from agent_eval.evaluation.langfuse_runner import sweep_orphaned_runs
     from agent_eval.scheduler.service import SchedulerService
@@ -39,8 +40,12 @@ async def lifespan(app: FastAPI):
     scheduler.set_scheduler(svc)
     await svc.start()
 
+    warmer = get_warmer()
+    await warmer.start()
+
     yield
 
+    await warmer.stop()
     await svc.stop()
     await close_db()
 

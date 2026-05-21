@@ -80,11 +80,10 @@ export interface AddCasesRequest {
 
 export interface GenerateScenarioRequest {
   dataset: string
-  scenario: string
+  test_scenario: string
+  case_category?: string
   count?: number
   context?: string
-  tags?: string[]
-  split?: string
   dry_run?: boolean
 }
 
@@ -108,6 +107,8 @@ export interface ListRunsRequest {
   limit?: number
   page?: number
   page_size?: number
+  enrich_models?: boolean
+  with_io?: boolean
 }
 
 export interface PaginatedRuns {
@@ -427,6 +428,11 @@ export interface EvalRunSummary {
   summary_scores: {
     counts?: { total?: number; passed?: number; failed?: number; unreachable?: number }
     dimension_averages?: Record<string, number>
+    score_distribution?: {
+      buckets: string[]
+      by_dimension: Record<string, number[]>
+    }
+    tool_usage?: Array<{ name: string; calls: number; errors: number; cases: number }>
     cost_success?: Record<string, number | null>
     cost_failure?: Record<string, number | null>
     langfuse_dataset?: string
@@ -458,6 +464,7 @@ export interface EvalResultRow {
   cache_creation_tokens?: number | null
   cache_read_tokens?: number | null
   tool_call_count: number | null
+  actual_tool_calls?: Array<Record<string, unknown>> | null
   error_message: string | null
   langfuse_trace_id: string | null
   langsmith_run_id?: string | null
