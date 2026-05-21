@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Float, Text, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_eval.db_models.tables import (
@@ -110,23 +110,84 @@ class Repository:
         *,
         benchmark_version_id: uuid.UUID | None = None,
         status: str | None = None,
+        started_after: datetime | None = None,
+        started_before: datetime | None = None,
+        text_query: str | None = None,
+        min_pass_rate: float | None = None,  # 0..1
+        include_deleted: bool = False,
         page: int = 1,
         page_size: int = 20,
     ) -> tuple[list[TestRunRow], int]:
-        from sqlalchemy import func
+        """List test runs with the filters the history page exposes.
+
+        text_query searches over run_name + agent_config.model + agent_config.url +
+        langsmith_project (case-insensitive ILIKE).
+
+        min_pass_rate is computed from summary_scores.counts.passed/total —
+        runs missing those keys are excluded when this filter is set
+        (pre-completion runs simply don't have a pass rate yet).
+        """
+        from sqlalchemy import func, or_, cast
+        from sqlalchemy.dialects.postgresql import JSONB
         base = select(TestRunRow).order_by(TestRunRow.created_at.desc())
         count_stmt = select(func.count(TestRunRow.id))
-        if benchmark_version_id is not None:
-            base = base.where(TestRunRow.benchmark_version_id == benchmark_version_id)
-            count_stmt = count_stmt.where(TestRunRow.benchmark_version_id == benchmark_version_id)
-        if status is not None:
-            base = base.where(TestRunRow.status == status)
-            count_stmt = count_stmt.where(TestRunRow.status == status)
+
+        def _apply(q):
+            if not include_deleted:
+                q = q.where(TestRunRow.deleted_at.is_(None))
+            if benchmark_version_id is not None:
+                q = q.where(TestRunRow.benchmark_version_id == benchmark_version_id)
+            if status is not None:
+                q = q.where(TestRunRow.status == status)
+            if started_after is not None:
+                q = q.where(TestRunRow.started_at >= started_after)
+            if started_before is not None:
+                q = q.where(TestRunRow.started_at <= started_before)
+            if text_query:
+                pattern = f"%{text_query}%"
+                # JSONB ->> returns text; cast a few fields and match.
+                # We index agent_config.model / agent_config.url / langfuse_run_name /
+                # langsmith_project, which is what users have to search by.
+                q = q.where(or_(
+                    TestRunRow.langfuse_run_name.ilike(pattern),
+                    TestRunRow.langsmith_project.ilike(pattern),
+                    cast(TestRunRow.agent_config["model"], Text).ilike(pattern),
+                    cast(TestRunRow.agent_config["url"], Text).ilike(pattern),
+                ))
+            if min_pass_rate is not None:
+                # summary_scores.counts.passed / counts.total >= min_pass_rate
+                # In SQL we approximate with a check that requires both keys
+                # to exist; rows missing them are filtered out.
+                # Postgres syntax: cast jsonb numbers via ::float.
+                q = q.where(
+                    (TestRunRow.summary_scores["counts"]["total"].astext.cast(Float) > 0)
+                    & (
+                        (TestRunRow.summary_scores["counts"]["passed"].astext.cast(Float)
+                         / TestRunRow.summary_scores["counts"]["total"].astext.cast(Float))
+                        >= min_pass_rate
+                    )
+                )
+            return q
+
+        base = _apply(base)
+        count_stmt = _apply(count_stmt)
         total = (await self.session.execute(count_stmt)).scalar_one()
         rows = (await self.session.execute(
             base.offset((page - 1) * page_size).limit(page_size)
         )).scalars().all()
         return list(rows), int(total)
+
+    async def soft_delete_test_run(self, run_id: uuid.UUID) -> bool:
+        """Mark a run as deleted (soft delete). Returns False if not found
+        or already deleted; True on first delete."""
+        from sqlalchemy import update
+        result = await self.session.execute(
+            update(TestRunRow)
+            .where(TestRunRow.id == run_id)
+            .where(TestRunRow.deleted_at.is_(None))
+            .values(deleted_at=datetime.now(timezone.utc))
+        )
+        return result.rowcount > 0
 
     # ---- Test Results ----
 
@@ -362,13 +423,18 @@ class Repository:
     # ---- Evaluator configs ----
 
     async def create_evaluator_config(
-        self, *, name: str, evaluator_type: str,
+        self, *, name: str, tag: str | None = None,
+        evaluator_type: str | None = None,
         description: str | None = None, params: dict | None = None,
         is_active: bool = True,
     ) -> EvaluatorConfigRow:
         row = EvaluatorConfigRow(
-            name=name, evaluator_type=evaluator_type, description=description,
-            params=params or {}, is_active=is_active,
+            name=name,
+            tag=tag or name,  # default tag to name when caller didn't specify
+            evaluator_type=evaluator_type,
+            description=description,
+            params=params or {},
+            is_active=is_active,
         )
         self.session.add(row)
         await self.session.flush()

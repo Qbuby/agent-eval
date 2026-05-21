@@ -14,9 +14,10 @@ logger = logging.getLogger(__name__)
 SCENARIO_GEN_PROMPT = """\
 You are a test case generator for an AI agent evaluation system.
 
-Given the following scenario description, generate {count} diverse test cases
+Given the following scenario description, generate {count} NEW test cases
 that thoroughly test the described capability.
 
+{seed_block}
 ## Scenario
 {scenario}
 
@@ -32,6 +33,9 @@ Return a JSON array. Each element must have:
 - "tags": list of relevant tags
 
 Cover: happy path, edge cases, error conditions, multi-turn if applicable.
+The generated cases should match the SAME DOMAIN, LANGUAGE and STYLE as the seed examples
+above (if any), but vary the question content / parameters / phrasing — do not
+copy the seed questions verbatim.
 Return ONLY the JSON array, no other text.
 """
 
@@ -105,11 +109,36 @@ class CaseGenerator:
         count: int = 5,
         context: str = "",
         tags: list[str] | None = None,
+        seed_cases: list[TestCase] | None = None,
     ) -> list[TestCase]:
+        seed_block = ""
+        if seed_cases:
+            # Pick up to 5 cases as seed/few-shot — enough to anchor the
+            # domain and style without dominating the prompt window.
+            sample = seed_cases[:5]
+            lines = ["## Seed Examples (existing cases in this dataset — generalize from these, do not duplicate)"]
+            for i, c in enumerate(sample, 1):
+                user_msg = ""
+                for m in (c.input_messages or []):
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        user_msg = str(m.get("content", "")).strip()
+                        break
+                if not user_msg:
+                    continue
+                # Keep each example compact
+                user_msg = user_msg if len(user_msg) <= 400 else user_msg[:400] + "…"
+                lines.append(f"{i}. {user_msg}")
+                if c.expected_output:
+                    eo = c.expected_output if len(c.expected_output) <= 200 else c.expected_output[:200] + "…"
+                    lines.append(f"   Expected: {eo}")
+            lines.append("")
+            seed_block = "\n".join(lines) + "\n"
+
         prompt = SCENARIO_GEN_PROMPT.format(
             count=count,
             scenario=scenario,
             context=context or "None provided",
+            seed_block=seed_block,
         )
         response = await self.llm.ainvoke(prompt)
         cases = self._parse_cases(response.content, source="auto_generated")

@@ -80,11 +80,10 @@ export interface AddCasesRequest {
 
 export interface GenerateScenarioRequest {
   dataset: string
-  scenario: string
+  test_scenario: string
+  case_category?: string
   count?: number
   context?: string
-  tags?: string[]
-  split?: string
   dry_run?: boolean
 }
 
@@ -108,6 +107,8 @@ export interface ListRunsRequest {
   limit?: number
   page?: number
   page_size?: number
+  enrich_models?: boolean
+  with_io?: boolean
 }
 
 export interface PaginatedRuns {
@@ -352,7 +353,8 @@ export interface EvaluatorConfig {
 export interface EvaluatorInstance {
   id: string
   name: string
-  evaluator_type: string
+  tag: string
+  evaluator_type: string | null
   description: string | null
   params: Record<string, unknown>
   is_active: boolean
@@ -362,7 +364,8 @@ export interface EvaluatorInstance {
 
 export interface CreateEvaluatorRequest {
   name: string
-  evaluator_type: string
+  tag?: string | null
+  evaluator_type?: string | null
   description?: string | null
   params?: Record<string, unknown>
   is_active?: boolean
@@ -370,6 +373,7 @@ export interface CreateEvaluatorRequest {
 
 export interface UpdateEvaluatorRequest {
   name?: string
+  tag?: string
   description?: string | null
   params?: Record<string, unknown>
   is_active?: boolean
@@ -422,14 +426,20 @@ export interface EvalRunSummary {
   langsmith_project?: string | null
   agent_config: Record<string, unknown>
   summary_scores: {
-    counts?: { total?: number; passed?: number; failed?: number }
+    counts?: { total?: number; passed?: number; failed?: number; unreachable?: number }
     dimension_averages?: Record<string, number>
+    score_distribution?: {
+      buckets: string[]
+      by_dimension: Record<string, number[]>
+    }
+    tool_usage?: Array<{ name: string; calls: number; errors: number; cases: number }>
     cost_success?: Record<string, number | null>
     cost_failure?: Record<string, number | null>
     langfuse_dataset?: string
     langfuse_run_name?: string
     langfuse_host?: string
     error?: string
+    runtime_error?: string
     stopped_early?: boolean
   } | null
   progress: { total?: number; completed?: number; failed?: number }
@@ -451,7 +461,10 @@ export interface EvalResultRow {
   total_tokens: number | null
   prompt_tokens: number | null
   completion_tokens: number | null
+  cache_creation_tokens?: number | null
+  cache_read_tokens?: number | null
   tool_call_count: number | null
+  actual_tool_calls?: Array<Record<string, unknown>> | null
   error_message: string | null
   langfuse_trace_id: string | null
   langsmith_run_id?: string | null

@@ -62,17 +62,36 @@ export default function EvaluationPage() {
 
 function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
   const navigate = useNavigate()
+  const qc = useQueryClient()
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('')
+  const [searchText, setSearchText] = useState('')
+  const [startedAfter, setStartedAfter] = useState('')   // YYYY-MM-DD
+  const [startedBefore, setStartedBefore] = useState('') // YYYY-MM-DD
+  const [minPassRate, setMinPassRate] = useState<string>('')  // percent string
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const pageSize = 15
 
+  // Convert calendar values to ISO. Empty input → undefined (param dropped).
+  const toIsoStart = (d: string) => d ? new Date(d + 'T00:00:00').toISOString() : undefined
+  const toIsoEnd = (d: string) => d ? new Date(d + 'T23:59:59.999').toISOString() : undefined
+  const passRateNum = (() => {
+    const v = Number(minPassRate)
+    if (!minPassRate || Number.isNaN(v)) return undefined
+    return Math.max(0, Math.min(100, v)) / 100
+  })()
+
   const runsQuery = useQuery({
-    queryKey: ['eval-runs', page, statusFilter],
+    queryKey: ['eval-runs', page, statusFilter, searchText, startedAfter, startedBefore, minPassRate],
     queryFn: () =>
-      evaluationApi
-        .listRuns({ page, page_size: pageSize, status: statusFilter || undefined })
-        .then(r => r.data),
+      evaluationApi.listRuns({
+        page, page_size: pageSize,
+        status: statusFilter || undefined,
+        q: searchText.trim() || undefined,
+        started_after: toIsoStart(startedAfter),
+        started_before: toIsoEnd(startedBefore),
+        min_pass_rate: passRateNum,
+      }).then(r => r.data),
     refetchInterval: (q) => {
       const data = q.state.data
       if (!data) return false
@@ -91,9 +110,19 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
     })
   }
 
+  const clearFilters = () => {
+    setStatusFilter('')
+    setSearchText('')
+    setStartedAfter('')
+    setStartedBefore('')
+    setMinPassRate('')
+    setPage(1)
+  }
+  const filtersActive = !!(statusFilter || searchText || startedAfter || startedBefore || minPassRate)
+
   return (
     <div>
-      <div className="flex items-center gap-2 mb-3">
+      <div className="flex flex-wrap items-center gap-2 mb-3">
         <select
           value={statusFilter}
           onChange={e => { setStatusFilter(e.target.value); setPage(1) }}
@@ -106,6 +135,39 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
           <option value="interrupted">已中断</option>
           <option value="stopping">停止中</option>
         </select>
+        <input
+          type="text" value={searchText}
+          onChange={e => { setSearchText(e.target.value); setPage(1) }}
+          placeholder="搜 run 名 / model / url / project"
+          className="py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent w-[220px]"
+        />
+        <span className="text-[10px] text-text-tertiary tracking-wider">起</span>
+        <input
+          type="date" value={startedAfter}
+          onChange={e => { setStartedAfter(e.target.value); setPage(1) }}
+          className="py-1 px-1.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent"
+        />
+        <span className="text-[10px] text-text-tertiary tracking-wider">至</span>
+        <input
+          type="date" value={startedBefore}
+          onChange={e => { setStartedBefore(e.target.value); setPage(1) }}
+          className="py-1 px-1.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent"
+        />
+        <input
+          type="number" min={0} max={100} step={5}
+          value={minPassRate}
+          onChange={e => { setMinPassRate(e.target.value); setPage(1) }}
+          placeholder="通过率 ≥ %"
+          className="py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent w-[110px]"
+        />
+        {filtersActive && (
+          <button
+            onClick={clearFilters}
+            className="text-[11px] text-text-tertiary hover:text-text-primary underline"
+          >
+            清除筛选
+          </button>
+        )}
         <span className="text-[11px] text-text-tertiary">
           共 {runsQuery.data?.total ?? 0} 条
         </span>
@@ -150,16 +212,19 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
               <Th>通过率</Th>
               <Th>平均 Latency</Th>
               <Th>启动时间</Th>
+              <Th>操作</Th>
             </tr>
           </thead>
           <tbody>
             {runsQuery.isLoading && (
-              <tr><td colSpan={9} className="py-8 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+              <tr><td colSpan={10} className="py-8 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
             )}
             {runsQuery.data?.items.length === 0 && !runsQuery.isLoading && (
               <tr>
-                <td colSpan={9} className="py-10 text-center text-[12px] text-text-tertiary">
-                  还没有评估记录。点右上角「新建评估」启动第一个 run。
+                <td colSpan={10} className="py-10 text-center text-[12px] text-text-tertiary">
+                  {filtersActive
+                    ? '没有匹配筛选的评估记录。'
+                    : '还没有评估记录。点右上角「新建评估」启动第一个 run。'}
                 </td>
               </tr>
             )}
@@ -170,6 +235,16 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
                 selected={selected.has(r.id)}
                 onToggle={() => toggle(r.id)}
                 onClick={() => navigate(`/evaluation/runs/${r.id}`)}
+                onDelete={async () => {
+                  if (!confirm(`删除评估 ${r.id.slice(0, 8)}？\n（软删除，可在 DB 直接恢复 deleted_at 字段）`)) return
+                  await evaluationApi.deleteRun(r.id)
+                  setSelected(prev => {
+                    const next = new Set(prev)
+                    next.delete(r.id)
+                    return next
+                  })
+                  qc.invalidateQueries({ queryKey: ['eval-runs'] })
+                }}
               />
             ))}
           </tbody>
@@ -207,11 +282,12 @@ function Th({ children }: { children: React.ReactNode }) {
   )
 }
 
-function RunRow({ run, selected, onToggle, onClick }: {
+function RunRow({ run, selected, onToggle, onClick, onDelete }: {
   run: EvalRunSummary
   selected: boolean
   onToggle: () => void
   onClick: () => void
+  onDelete: () => void
 }) {
   const counts = run.summary_scores?.counts
   const total = counts?.total ?? run.progress.total ?? 0
@@ -247,6 +323,15 @@ function RunRow({ run, selected, onToggle, onClick }: {
       <Td>{passRate}</Td>
       <Td>{avgLatency != null ? `${Math.round(avgLatency)}ms` : '—'}</Td>
       <Td>{fmtTime(run.started_at)}</Td>
+      <Td>
+        <button
+          onClick={e => { e.stopPropagation(); onDelete() }}
+          className="text-[11px] text-negative hover:underline"
+          title="软删除：行隐藏但 DB 保留 deleted_at"
+        >
+          删除
+        </button>
+      </Td>
     </tr>
   )
 }
@@ -314,7 +399,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       benchmarkApi.listCases(projectId, {
         category_id: categoryId || undefined,
         search: searchText || undefined,
-        page: 1, page_size: 200,
+        page: 1, page_size: 100,
       }).then(r => r.data),
     enabled: !!projectId && sourceTab === 'benchmark',
   })
@@ -324,6 +409,15 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     if (selectionMode === 'pick') return pickedCaseIds.size
     return casesQuery.data.total
   }, [casesQuery.data, selectionMode, pickedCaseIds])
+
+  // 真正会跑的样例数 = 命中数和 limit 取小（pick 模式不受 limit 影响）
+  const willRunCount = useMemo(() => {
+    if (selectionMode === 'pick') return pickedCaseIds.size
+    if (typeof limit === 'number' && limit > 0) {
+      return Math.min(effectiveCaseCount, limit)
+    }
+    return effectiveCaseCount
+  }, [selectionMode, pickedCaseIds, effectiveCaseCount, limit])
 
   // ── upload branch ──
   const [uploadedSource, setUploadedSource] = useState<UploadCasesResponse | null>(null)
@@ -362,11 +456,13 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   })
 
   const hasCaseSource = sourceTab === 'benchmark' ? !!projectId : !!uploadedSource
-  const canStart =
-    hasCaseSource &&
-    selectedEvaluatorIds.size > 0 &&
-    agentUrl.trim().length > 0 &&
-    !startMutation.isPending
+  const startBlockers: string[] = []
+  if (!hasCaseSource) {
+    startBlockers.push(sourceTab === 'benchmark' ? '选择基准项目' : '上传一个样例文件')
+  }
+  if (selectedEvaluatorIds.size === 0) startBlockers.push('勾选至少 1 个评估器')
+  if (agentUrl.trim().length === 0) startBlockers.push('填写 Agent URL')
+  const canStart = startBlockers.length === 0 && !startMutation.isPending
 
   const handleStart = () => {
     let headers: Record<string, string> | undefined
@@ -483,10 +579,34 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                   {m === 'pick' && '手动勾选'}
                 </label>
               ))}
-              <span className="ml-auto text-[11px] text-text-tertiary">
-                {selectionMode === 'pick' ? `已选 ${pickedCaseIds.size} 条` : `命中约 ${effectiveCaseCount} 条`}
-              </span>
             </div>
+
+            {/* Selection summary banner — 让用户一眼看到这次会跑多少条 */}
+            {projectId && (
+              <div className={`flex items-center gap-2 mb-3 px-3 py-2 rounded-[6px] border text-[12px] ${
+                willRunCount === 0
+                  ? 'border-amber-300 bg-amber-50 text-amber-800'
+                  : 'border-accent/30 bg-accent-subtle/40 text-text-primary'
+              }`}>
+                <span className="text-[14px]">{willRunCount === 0 ? '⚠' : '✓'}</span>
+                <span>
+                  本次将运行 <span className="font-mono font-medium">{willRunCount}</span> 条样例
+                  {selectionMode === 'pick' && pickedCaseIds.size > 0 && (
+                    <span className="text-text-tertiary ml-1.5">（手动勾选）</span>
+                  )}
+                  {selectionMode !== 'pick' && (
+                    <>
+                      <span className="text-text-tertiary ml-1.5">
+                        （命中 {effectiveCaseCount} 条
+                        {typeof limit === 'number' && limit > 0 && limit < effectiveCaseCount && `，受 limit ${limit} 限制`}
+                        ）
+                      </span>
+                    </>
+                  )}
+                </span>
+                {casesQuery.isLoading && <span className="text-text-tertiary ml-auto text-[11px]">载入中…</span>}
+              </div>
+            )}
 
             {selectionMode !== 'pick' && (
               <Field label="最多跑多少条（空=不限制）">
@@ -681,7 +801,9 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                 />
                 <div className="flex-1">
                   <div className="font-medium text-[12px]">{e.name}
-                    <span className="ml-2 text-[10px] font-mono text-text-tertiary">{e.evaluator_type}</span>
+                    <span className="ml-2 text-[10px] font-mono text-blue-700 bg-blue-50 px-1 py-0.5 rounded border border-blue-200" title="写到 Langfuse trace 的 tag">
+                      {e.tag || e.name}
+                    </span>
                   </div>
                   <div className="text-[11px] text-text-tertiary mt-0.5">{e.description || '—'}</div>
                 </div>
@@ -704,10 +826,25 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
         <button
           disabled={!canStart}
           onClick={handleStart}
+          title={
+            startBlockers.length > 0
+              ? `还差：${startBlockers.map((b, i) => `${i + 1}) ${b}`).join('  ')}`
+              : '启动评估'
+          }
           className="inline-flex items-center gap-1.5 py-2.5 px-5 text-[12px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 active:scale-[0.97] disabled:opacity-40 transition-all"
         >
           {startMutation.isPending ? '启动中…' : '启动评估'}
         </button>
+        {startBlockers.length > 0 && !startMutation.isPending && (
+          <span className="text-[11px] text-text-tertiary">
+            还差：{startBlockers.map((b, i) => (
+              <span key={i} className="ml-2">
+                <span className="inline-block min-w-[1em] text-center text-text-tertiary mr-0.5">{i + 1})</span>
+                {b}
+              </span>
+            ))}
+          </span>
+        )}
         {startMutation.isError && (
           <span className="text-[11px] text-negative">
             启动失败：{extractError(startMutation.error)}

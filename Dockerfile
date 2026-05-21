@@ -20,6 +20,8 @@ RUN pip install --upgrade pip && \
 
 COPY alembic.ini ./
 COPY alembic ./alembic
+RUN find /app/alembic -type d -name __pycache__ -prune -exec rm -rf {} + && \
+    find /app/alembic -type f -name '*.pyc' -delete
 
 EXPOSE 8000
 

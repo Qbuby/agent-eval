@@ -31,9 +31,11 @@ from agent_eval.db_models.tables import (
     BenchmarkCaseRow,
     EvaluationScoreRow,
     TestResultRow,
+    TestRunRow,
 )
 from agent_eval.evaluation.langfuse_runner import (
     BUILTIN_EVALUATORS,
+    _aggregate_cost,
     get_run_progress,
     request_stop,
     rerun_backfill,
@@ -143,6 +145,7 @@ async def start_eval(req: StartEvalRequest):
             evaluator_specs.append({
                 "id": str(row.id),
                 "label": row.name,
+                "tag": row.tag or row.name,
                 "evaluator_type": row.evaluator_type,
                 "params": row.params or {},
             })
@@ -185,14 +188,36 @@ def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRun
 async def list_runs(
     benchmark_version_id: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    started_after: str | None = Query(default=None, description="ISO timestamp lower bound (inclusive)"),
+    started_before: str | None = Query(default=None, description="ISO timestamp upper bound (inclusive)"),
+    q: str | None = Query(default=None, description="search run name / model / url / project"),
+    min_pass_rate: float | None = Query(default=None, ge=0.0, le=1.0,
+                                        description="filter to runs with pass rate >= this fraction"),
+    include_deleted: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
+    from datetime import datetime as _dt
     bv_uuid = uuid.UUID(benchmark_version_id) if benchmark_version_id else None
+
+    def _parse_ts(s: str | None):
+        if not s:
+            return None
+        try:
+            # accept both 'Z' suffix and offset-aware ISO strings
+            return _dt.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"invalid ISO timestamp: {s}") from e
+
     async with async_session_factory() as session:
         repo = Repository(session)
         rows, total = await repo.list_test_runs(
             benchmark_version_id=bv_uuid, status=status,
+            started_after=_parse_ts(started_after),
+            started_before=_parse_ts(started_before),
+            text_query=q,
+            min_pass_rate=min_pass_rate,
+            include_deleted=include_deleted,
             page=page, page_size=page_size,
         )
     items = []
@@ -200,6 +225,20 @@ async def list_runs(
         prog = get_run_progress(str(r.id)) if r.status == "running" else {}
         items.append(_row_to_summary(r, prog))
     return {"items": [it.model_dump(mode="json") for it in items], "total": total, "page": page, "page_size": page_size}
+
+
+@router.delete("/runs/{run_id}")
+async def delete_run(run_id: str):
+    """Soft-delete: stamps deleted_at. Row stays in DB so historical
+    Langfuse / LangSmith deep-links keep working; default list view hides it."""
+    run_uuid = uuid.UUID(run_id)
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        ok = await repo.soft_delete_test_run(run_uuid)
+        if not ok:
+            raise HTTPException(status_code=404, detail="run not found or already deleted")
+        await session.commit()
+    return {"run_id": run_id, "deleted": True}
 
 
 @router.get("/runs/{run_id}", response_model=EvalRunDetail)
@@ -252,7 +291,10 @@ async def get_run_results(
             total_tokens=r.total_tokens,
             prompt_tokens=r.prompt_tokens,
             completion_tokens=r.completion_tokens,
+            cache_creation_tokens=r.cache_creation_tokens,
+            cache_read_tokens=r.cache_read_tokens,
             tool_call_count=r.tool_call_count,
+            actual_tool_calls=r.actual_tool_calls,
             error_message=r.error_message,
             langfuse_trace_id=r.langfuse_trace_id,
             langsmith_run_id=r.langsmith_run_id,
@@ -267,6 +309,132 @@ async def stop_run(run_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="run not found or already finished")
     return {"run_id": run_id, "status": "stopping"}
+
+
+@router.post("/runs/{run_id}/reaggregate")
+async def reaggregate_run(run_id: str):
+    """Recompute summary_scores from existing test_results + evaluation_scores.
+
+    For old runs that finished before we started writing
+    ``tool_usage`` / ``score_distribution`` / ``dimension_averages`` into
+    ``summary_scores``. Reads what's already in the DB, recomputes the
+    aggregates the same way the runner does at finish time, merges them
+    into the existing summary_scores so we don't clobber other fields
+    (runtime_error, langsmith_project, etc.), and writes back.
+    """
+    run_uuid = uuid.UUID(run_id)
+    async with async_session_factory() as session:
+        run_row = (await session.execute(
+            select(TestRunRow).where(TestRunRow.id == run_uuid)
+        )).scalar_one_or_none()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="run not found")
+
+        results = (await session.execute(
+            select(TestResultRow).where(TestResultRow.run_id == run_uuid)
+        )).scalars().all()
+        score_rows = (await session.execute(
+            select(EvaluationScoreRow).where(
+                EvaluationScoreRow.result_id.in_([r.id for r in results])
+            )
+        )).scalars().all() if results else []
+
+        # Build per-result score dict
+        scores_by_result: dict[uuid.UUID, dict[str, float]] = {}
+        for s in score_rows:
+            scores_by_result.setdefault(s.result_id, {})[s.dimension] = float(s.score)
+
+        # dimension_averages — mean across all cases that have that dim
+        all_scores: dict[str, list[float]] = {}
+        for r in results:
+            for k, v in scores_by_result.get(r.id, {}).items():
+                all_scores.setdefault(k, []).append(v)
+        dim_avg = {k: round(sum(vs) / len(vs), 3) for k, vs in all_scores.items() if vs}
+
+        # score_distribution — same buckets the runner uses
+        bucket_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0001]
+        bucket_labels = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1"]
+        score_distribution: dict[str, list[int]] = {}
+        for dim, vs in all_scores.items():
+            counts = [0] * (len(bucket_edges) - 1)
+            for v in vs:
+                for i in range(len(counts)):
+                    if bucket_edges[i] <= v < bucket_edges[i + 1]:
+                        counts[i] += 1
+                        break
+            score_distribution[dim] = counts
+
+        # tool_usage — from actual_tool_calls JSON column
+        tool_stats: dict[str, dict[str, Any]] = {}
+        for r in results:
+            calls = r.actual_tool_calls or []
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("tool_name") or call.get("name") or "unknown"
+                slot = tool_stats.setdefault(name, {
+                    "name": name, "calls": 0, "errors": 0, "cases": 0,
+                })
+                slot["calls"] += 1
+                out = call.get("output")
+                if isinstance(out, dict) and (out.get("error") or out.get("isError")):
+                    slot["errors"] += 1
+                elif isinstance(out, str) and out.lower().startswith("error"):
+                    slot["errors"] += 1
+            seen_in_case = {
+                (c.get("tool_name") or c.get("name") or "unknown")
+                for c in calls if isinstance(c, dict)
+            }
+            for nm in seen_in_case:
+                tool_stats.setdefault(nm, {"name": nm, "calls": 0, "errors": 0, "cases": 0})
+                tool_stats[nm]["cases"] += 1
+        tool_usage = sorted(tool_stats.values(), key=lambda x: (-x["calls"], x["name"]))
+
+        # cost (success/failure split) — build minimal dicts that
+        # _aggregate_cost knows how to read.
+        def _cost_row(r):
+            return {
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "total_tokens": r.total_tokens,
+                "tool_call_count": r.tool_call_count,
+                "message_count": None,  # not persisted on test_results
+                "cache_creation_tokens": r.cache_creation_tokens,
+                "cache_read_tokens": r.cache_read_tokens,
+                "latency_ms": r.latency_ms,
+            }
+
+        succ = [_cost_row(r) for r in results if r.status == "pass"]
+        fail = [_cost_row(r) for r in results if r.status != "pass"]
+
+        merged = dict(run_row.summary_scores or {})
+        merged["dimension_averages"] = dim_avg
+        merged["score_distribution"] = {
+            "buckets": bucket_labels,
+            "by_dimension": score_distribution,
+        }
+        merged["tool_usage"] = tool_usage
+        merged["cost_success"] = _aggregate_cost(succ)
+        merged["cost_failure"] = _aggregate_cost(fail)
+        merged["counts"] = {
+            "total": len(results),
+            "passed": len(succ),
+            "failed": len(fail),
+            "unreachable": sum(
+                1 for r in results
+                if r.status in ("agent_unreachable", "agent_timeout")
+            ),
+        }
+
+        run_row.summary_scores = merged
+        await session.commit()
+
+    return {
+        "run_id": run_id,
+        "dimensions": list(dim_avg.keys()),
+        "tool_usage_count": len(tool_usage),
+        "case_count": len(results),
+    }
 
 
 @router.get("/results/{result_id}/trace", response_model=RunDetailResponse)
@@ -328,6 +496,83 @@ async def trigger_trace_backfill(
     return {"run_id": run_id, "project": project, **stats}
 
 
+@router.post("/runs/{run_id}/sync_langfuse_scores")
+async def trigger_langfuse_score_sync(
+    run_id: str,
+    push: bool = Query(default=True, description="Re-push our local scores+traces to Langfuse first"),
+    pull_attempts: int = Query(default=3, ge=1, le=10),
+    pull_interval: int = Query(default=20, ge=5, le=120),
+):
+    """Manual trigger for the Langfuse score round-trip.
+
+    1. (optional) Re-push our local evaluator scores + traces to Langfuse
+    2. Poll ``/api/public/scores`` for ``source=EVAL`` entries (i.e. scores
+       produced by Langfuse-configured evaluators) and stamp them back into
+       ``evaluation_scores`` with ``dimension="langfuse:<name>"``.
+
+    The post-run pipeline already does this fire-and-forget. Use this
+    endpoint when you need to re-pull (e.g. you re-saved the Langfuse
+    evaluator config) or sync an older run that ran before remote_write
+    was enabled.
+    """
+    from agent_eval.evaluation.langfuse_sync import (
+        pull_evaluator_scores_for_run, sync_run_scores_to_langfuse,
+    )
+    from sqlalchemy import select
+    from agent_eval.db_models.tables import EvaluationScoreRow
+
+    push_stats = None
+    if push:
+        # Rebuild per_case_results from DB so we don't have to keep the
+        # in-memory list around past run completion.
+        async with async_session_factory() as session:
+            results = (await session.execute(
+                select(TestResultRow).where(TestResultRow.run_id == uuid.UUID(run_id))
+            )).scalars().all()
+            score_rows = []
+            if results:
+                score_rows = (await session.execute(
+                    select(EvaluationScoreRow).where(
+                        EvaluationScoreRow.result_id.in_([r.id for r in results])
+                    )
+                )).scalars().all()
+            scores_by_rid: dict[uuid.UUID, dict[str, float]] = {}
+            for s in score_rows:
+                # Skip langfuse:* — those came FROM Langfuse, no need to re-push.
+                if s.dimension.startswith("langfuse:"):
+                    continue
+                scores_by_rid.setdefault(s.result_id, {})[s.dimension] = float(s.score)
+            run = await Repository(session).get_test_run(uuid.UUID(run_id))
+        per_case = []
+        for r in results:
+            per_case.append({
+                "case_id": str(r.benchmark_case_id) if r.benchmark_case_id else None,
+                "case_name": (r.question or "case")[:50],
+                "question": r.question or "",
+                "actual_output": r.actual_output or "",
+                "thread_id": r.thread_id,
+                "status": r.status,
+                "latency_ms": r.latency_ms,
+                "langsmith_run_id": r.langsmith_run_id,
+                "scores": scores_by_rid.get(r.id) or {},
+            })
+        push_stats = await sync_run_scores_to_langfuse(
+            run_id=run_id, run_name=run.langfuse_run_name if run else None,
+            per_case_results=per_case,
+            # Pull tags out of the run's stored evaluator_configs snapshot
+            # so re-syncs preserve the same tag set the run had originally.
+            extra_tags=[
+                cfg.get("tag") or cfg.get("label")
+                for cfg in (run.evaluator_configs or []) if (cfg.get("tag") or cfg.get("label"))
+            ] if run else None,
+        )
+
+    pull_stats = await pull_evaluator_scores_for_run(
+        run_id=run_id, max_attempts=pull_attempts, interval_seconds=pull_interval,
+    )
+    return {"run_id": run_id, "push": push_stats, "pull": pull_stats}
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Evaluator instance CRUD
 # ───────────────────────────────────────────────────────────────────────────
@@ -337,6 +582,7 @@ def _row_to_instance(row) -> EvaluatorInstance:
     return EvaluatorInstance(
         id=str(row.id),
         name=row.name,
+        tag=row.tag or row.name,
         evaluator_type=row.evaluator_type,
         description=row.description,
         params=row.params or {},
@@ -356,16 +602,16 @@ async def list_evaluator_instances(active_only: bool = Query(default=False)):
 
 @router.post("/evaluators", response_model=EvaluatorInstance)
 async def create_evaluator_instance(req: CreateEvaluatorRequest):
-    if req.evaluator_type not in BUILTIN_EVALUATORS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"evaluator_type must be one of {list(BUILTIN_EVALUATORS.keys())}",
-        )
+    # tag-only mode: any string is a valid tag. evaluator_type is kept as
+    # an optional free-text label so old runs that referenced it still
+    # display sensibly, but it's no longer validated against a registry.
     async with async_session_factory() as session:
         repo = Repository(session)
         try:
             row = await repo.create_evaluator_config(
-                name=req.name, evaluator_type=req.evaluator_type,
+                name=req.name,
+                tag=req.tag or req.name,
+                evaluator_type=req.evaluator_type,
                 description=req.description, params=req.params,
                 is_active=req.is_active,
             )

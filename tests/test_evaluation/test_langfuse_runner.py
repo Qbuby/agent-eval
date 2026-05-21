@@ -10,6 +10,7 @@ import pytest
 from agent_eval.evaluation.langfuse_runner import (
     _aggregate_cost,
     _bench_case_to_dataset_input,
+    _classify_langsmith_error,
     _evaluator_exact_match,
     _evaluator_tool_sequence,
     _extract_tool_calls_from_response,
@@ -103,8 +104,10 @@ def test_aggregate_cost_basic_averages_and_cache():
     assert out["avg_tool_calls"] == 1.5
     assert out["avg_messages"] == 3.5
     assert out["avg_latency_ms"] == 750.0
-    # cache_hit_rate = avg(read) / (avg(prompt) - avg(creation)) = 45 / (150 - 30) = 0.375
-    assert abs(out["cache_hit_rate"] - 0.375) < 1e-6
+    # cache_hit_rate = avg(cache_read) / avg(prompt_tokens) = 45 / 150 = 0.300
+    # (cache_read and cache_creation are subcategories of prompt_tokens —
+    # the right denominator is the total prompt input the model saw.)
+    assert abs(out["cache_hit_rate"] - 0.300) < 1e-6
 
 
 def test_aggregate_cost_skips_none():
@@ -227,3 +230,61 @@ def test_run_matches_handles_missing_inputs():
     assert _run_matches_question(_FakeRun({}), "x") is False
     # messages list exists but last entry isn't a dict
     assert _run_matches_question(_FakeRun({"messages": ["stray"]}), "x") is False
+
+
+# ─── _classify_langsmith_error (banner category mapping) ─────────────────
+
+def test_classify_403_forbidden():
+    e = Exception("Failed to GET /sessions in LangSmith API. HTTPError('403 Client Error: Forbidden for url: ...')")
+    assert _classify_langsmith_error(e) == "forbidden"
+
+
+def test_classify_401_unauthorized():
+    assert _classify_langsmith_error(Exception("401 Unauthorized")) == "unauthorized"
+
+
+def test_classify_404_not_found():
+    assert _classify_langsmith_error(Exception("404 Not Found: project missing")) == "not_found"
+
+
+def test_classify_network_errors():
+    assert _classify_langsmith_error(Exception("connection refused")) == "network"
+    assert _classify_langsmith_error(Exception("read timed out")) == "network"
+    assert _classify_langsmith_error(Exception("DNS lookup failed")) == "network"
+
+
+def test_classify_unknown_falls_back():
+    assert _classify_langsmith_error(Exception("something weird")) == "unknown"
+
+
+# ─── _classify_agent_error / _is_transient (cold-start guards) ───────────
+
+def test_classify_agent_unreachable_502():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    e = Exception("Server error '502 Bad Gateway' for url 'http://...'")
+    assert _classify_agent_error(e) == "agent_unreachable"
+
+
+def test_classify_agent_unreachable_connection():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    assert _classify_agent_error(Exception("All connection attempts failed")) == "agent_unreachable"
+    assert _classify_agent_error(Exception("Connection refused")) == "agent_unreachable"
+
+
+def test_classify_agent_timeout():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    assert _classify_agent_error(Exception("read timed out")) == "agent_timeout"
+    assert _classify_agent_error(Exception("504 Gateway Timeout")) == "agent_timeout"
+
+
+def test_classify_parse_error():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    assert _classify_agent_error(Exception("JSON decode error at line 1")) == "parse_error"
+
+
+def test_is_transient_known_signals():
+    from agent_eval.evaluation.langfuse_runner import _is_transient
+    assert _is_transient(Exception("Connection refused"))
+    assert _is_transient(Exception("502 Bad Gateway"))
+    assert _is_transient(Exception("timed out"))
+    assert not _is_transient(Exception("invalid json"))

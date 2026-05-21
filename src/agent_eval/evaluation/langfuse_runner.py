@@ -185,11 +185,18 @@ def _aggregate_cost(rows: list[dict[str, Any]]) -> dict[str, Any]:
     prompt = _avg("prompt_tokens")
     cache_create = _avg("cache_creation_tokens")
     cache_read = _avg("cache_read_tokens")
+    # cache_hit_rate = avg(cache_read) / avg(prompt_tokens).
+    #
+    # On LangChain Anthropic models, prompt_tokens already INCLUDES both
+    # cache_creation and cache_read tokens (they are subcategories of
+    # "input the model saw on this call"). So `prompt - cache_create` is
+    # approximately `cache_read + non_cached`, which made the previous
+    # formula `cache_read / (prompt - cache_create)` always come out near
+    # 100%. The right denominator is just prompt_tokens — i.e. "of every
+    # input token the model saw, how many came from cache?".
     cache_hit_rate = None
-    if prompt is not None and cache_read is not None:
-        denom = (prompt or 0) - (cache_create or 0)
-        if denom > 0:
-            cache_hit_rate = round((cache_read or 0) / denom, 3)
+    if prompt is not None and prompt > 0 and cache_read is not None:
+        cache_hit_rate = round((cache_read or 0) / prompt, 3)
 
     return {
         "count": n,
@@ -372,6 +379,68 @@ def _extract_usage(resp: AgentResponse) -> dict[str, int | None]:
     return out
 
 
+# ─── Agent invocation guards ──────────────────────────────────────────────
+# The dev agent on host:18094 likes to fall asleep between runs and answer
+# 502 to the very first call after wake-up. Without these guards, every
+# eval started cold would land 3-N samples on "All connection attempts
+# failed" and the user would think the platform was broken. Two layers:
+#
+#   1. _classify_agent_error: turn a raw exception into a stable category
+#      (agent_unreachable / agent_timeout / agent_5xx / parse_error /
+#      unknown) so the UI can render it differently than a plain "error".
+#   2. _invoke_with_retry: 1 immediate retry after 5s when the first
+#      attempt fails with a connection / 5xx / timeout class — that's the
+#      window the agent typically needs to spin back up.
+
+_TRANSIENT_HINTS = (
+    "all connection attempts failed",
+    "connection refused", "connection reset", "connection error",
+    "bad gateway", "service unavailable", "gateway timeout",
+    "502", "503", "504",
+    "timed out", "timeout",
+)
+
+
+def _classify_agent_error(err: Exception) -> str:
+    """Map a raised agent error to a stable category surfaced to the UI."""
+    s = str(err).lower()
+    if "502" in s or "bad gateway" in s or "503" in s or "service unavailable" in s:
+        return "agent_unreachable"
+    if "all connection attempts failed" in s or "connection refused" in s or "connection reset" in s:
+        return "agent_unreachable"
+    if "504" in s or "timed out" in s or "timeout" in s or "gateway timeout" in s:
+        return "agent_timeout"
+    if "5" in s and "client error" in s:
+        return "agent_5xx"
+    if "parse" in s or "json" in s or "decode" in s:
+        return "parse_error"
+    return "unknown"
+
+
+def _is_transient(err: Exception) -> bool:
+    s = str(err).lower()
+    return any(hint in s for hint in _TRANSIENT_HINTS)
+
+
+async def _invoke_with_retry(adapter: Any, messages: list[dict]) -> Any:
+    """Call adapter.invoke once; retry once after 5s on transient errors.
+
+    The agent often returns 502 on the first cold-start request. By the
+    time we get to the retry, the upstream is typically warm. If the second
+    attempt also fails the original exception class propagates, the caller
+    classifies it and the sample lands as agent_unreachable.
+    """
+    try:
+        return await adapter.invoke(messages)
+    except Exception as first:
+        if not _is_transient(first):
+            raise
+        logger.info("agent transient err on attempt 1 (%s); retrying after 5s",
+                    type(first).__name__)
+        await asyncio.sleep(5)
+        return await adapter.invoke(messages)
+
+
 async def _run_one_case(
     *,
     case: dict[str, Any],
@@ -409,7 +478,7 @@ async def _run_one_case(
 
     try:
         try:
-            resp = await adapter.invoke(messages)
+            resp = await _invoke_with_retry(adapter, messages)
             output_text = resp.content
             latency_ms = int(resp.latency_ms)
             usage = _extract_usage(resp)
@@ -423,8 +492,9 @@ async def _run_one_case(
                 actual_tool_calls = _extract_tool_calls_from_response(resp)
         except Exception as e:
             error_msg = str(e)
-            error_type = type(e).__name__
-            logger.warning("agent invoke failed for case %s: %s", case.get("id"), e)
+            error_type = _classify_agent_error(e)
+            logger.warning("agent invoke failed for case %s [%s]: %s",
+                           case.get("id"), error_type, e)
     finally:
         try:
             await adapter.close()
@@ -435,10 +505,17 @@ async def _run_one_case(
     scores: dict[str, float] = {}
     if not error_msg:
         for spec in evaluator_specs:
-            etype = spec["evaluator_type"]
+            etype = spec.get("evaluator_type")
+            # In tag-only mode (post-2026-05-19) evaluators don't define a
+            # local scoring function — they're just template tags forwarded
+            # to Langfuse. Skip the local-scoring loop for them; their
+            # contribution shows up later via the Langfuse pull-back.
+            if not etype:
+                continue
             ev_def = BUILTIN_EVALUATORS.get(etype)
             if ev_def is None:
-                logger.warning("unknown evaluator_type: %s", etype)
+                # Unknown legacy type — silently skip so old runs don't
+                # crash the pipeline.
                 continue
             fn = ev_def["fn"]
             label = spec.get("label") or etype
@@ -463,7 +540,13 @@ async def _run_one_case(
     # status: pass if all evaluator scores >= 0.5 and no error
     status = "pass"
     if error_msg:
-        status = "error"
+        # Surface infrastructure failures separately from "agent answered
+        # but answered wrong". UI then renders agent_unreachable as a
+        # neutral grey instead of red, and the run summary can flag it.
+        if error_type in ("agent_unreachable", "agent_timeout"):
+            status = error_type
+        else:
+            status = "error"
     elif scores and any(v < 0.5 for v in scores.values()):
         status = "fail"
 
@@ -473,6 +556,8 @@ async def _run_one_case(
         "case_source": case.get("source"),
         "thread_id": thread_id,
         "question": question,
+        "expected_output": expected,
+        "expected_tool_calls": expected_tool_calls,
         "invoked_at": invoked_at,
         "status": status,
         "actual_output": output_text,
@@ -554,6 +639,8 @@ async def _execute_run(
                         total_tokens=res["total_tokens"],
                         prompt_tokens=res["prompt_tokens"],
                         completion_tokens=res["completion_tokens"],
+                        cache_creation_tokens=res.get("cache_creation_tokens"),
+                        cache_read_tokens=res.get("cache_read_tokens"),
                         tool_call_count=res["tool_call_count"],
                         error_message=res["error_message"],
                         error_type=res["error_type"],
@@ -581,17 +668,86 @@ async def _execute_run(
                 all_scores.setdefault(k, []).append(v)
         dim_avg = {k: round(sum(vs) / len(vs), 3) for k, vs in all_scores.items() if vs}
 
+        # Per-dimension histogram in fixed buckets so the UI can render a
+        # quick distribution chart without re-aggregating in the browser.
+        # Buckets are half-open intervals on [0,1].
+        bucket_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0001]
+        bucket_labels = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1"]
+        score_distribution: dict[str, list[int]] = {}
+        for dim, vs in all_scores.items():
+            counts = [0] * (len(bucket_edges) - 1)
+            for v in vs:
+                for i in range(len(counts)):
+                    if bucket_edges[i] <= v < bucket_edges[i + 1]:
+                        counts[i] += 1
+                        break
+            score_distribution[dim] = counts
+
+        # Tool usage: per-tool aggregate over ALL cases (success + failure).
+        # Each entry of per_case_results['actual_tool_calls'] is a list of
+        # {tool_name, args, output} dicts. We count invocations and flag
+        # likely failures by looking for an "error" key or non-empty
+        # error string in the output.
+        tool_stats: dict[str, dict[str, Any]] = {}
+        for r in per_case_results:
+            for call in (r.get("actual_tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("tool_name") or call.get("name") or "unknown"
+                slot = tool_stats.setdefault(name, {
+                    "name": name, "calls": 0, "errors": 0, "cases": 0,
+                })
+                slot["calls"] += 1
+                out = call.get("output")
+                if isinstance(out, dict) and (out.get("error") or out.get("isError")):
+                    slot["errors"] += 1
+                elif isinstance(out, str) and out.lower().startswith("error"):
+                    slot["errors"] += 1
+            seen_in_case = {
+                (c.get("tool_name") or c.get("name") or "unknown")
+                for c in (r.get("actual_tool_calls") or [])
+                if isinstance(c, dict)
+            }
+            for nm in seen_in_case:
+                tool_stats.setdefault(nm, {"name": nm, "calls": 0, "errors": 0, "cases": 0})
+                tool_stats[nm]["cases"] += 1
+        tool_usage = sorted(
+            tool_stats.values(),
+            key=lambda x: (-x["calls"], x["name"]),
+        )
+
         summary: dict[str, Any] = {
             "counts": {
                 "total": len(per_case_results),
                 "passed": len(succ),
                 "failed": len(fail),
+                "unreachable": sum(
+                    1 for r in per_case_results
+                    if r["status"] in ("agent_unreachable", "agent_timeout")
+                ),
             },
             "dimension_averages": dim_avg,
+            "score_distribution": {
+                "buckets": bucket_labels,
+                "by_dimension": score_distribution,
+            },
+            "tool_usage": tool_usage,
             "cost_success": _aggregate_cost(succ),
             "cost_failure": _aggregate_cost(fail),
             "run_name": run_name,
         }
+        # If most samples couldn't reach the agent, surface that on the run
+        # so the detail page can render a banner instead of leaving the user
+        # to scan 30 rows of "All connection attempts failed".
+        if per_case_results:
+            unreach_ratio = summary["counts"]["unreachable"] / len(per_case_results)
+            if unreach_ratio >= 0.5:
+                agent_url = (agent_cfg or {}).get("url", "")
+                summary["runtime_error"] = (
+                    f"{summary['counts']['unreachable']}/{len(per_case_results)} 样例无法连到被测 agent "
+                    f"({agent_url})。请确认 agent 服务在线、网络可达；如在容器内访问宿主机请用 host.docker.internal "
+                    "或宿主机 LAN IP 而非 localhost。"
+                )
         if langsmith_project:
             summary["langsmith_project"] = langsmith_project
             # LangSmith web root; the UI uses it to deep-link.
@@ -625,6 +781,41 @@ async def _execute_run(
                 )
             )
 
+        # Fire-and-forget Langfuse score sync. Off by default — flip
+        # LANGFUSE_REMOTE_WRITE=true (or set langfuse.remote_write in /config)
+        # to push every evaluator score into the Langfuse UI as a fresh trace
+        # per case. Doesn't depend on LangSmith.
+        if settings.langfuse.remote_write and settings.langfuse.configured and per_case_results:
+            from agent_eval.evaluation.langfuse_sync import (
+                pull_evaluator_scores_for_run, sync_run_scores_to_langfuse,
+            )
+
+            async def _sync_then_pull():
+                # Step 1: push our local scores + traces to Langfuse, persist
+                # the new langfuse_trace_id back to test_results. Also stamp
+                # each selected evaluator's tag onto every trace so Langfuse
+                # evaluators bound to those tags pick the trace up.
+                eval_tags = [
+                    spec.get("tag") or spec.get("label")
+                    for spec in evaluator_specs
+                    if spec.get("tag") or spec.get("label")
+                ]
+                # de-dup while preserving order
+                seen: set[str] = set()
+                eval_tags = [t for t in eval_tags if t not in seen and not seen.add(t)]
+                await sync_run_scores_to_langfuse(
+                    run_id=run_id,
+                    run_name=run_name,
+                    per_case_results=per_case_results,
+                    extra_tags=eval_tags,
+                )
+                # Step 2: poll Langfuse for evaluator-produced scores and
+                # stamp them back into evaluation_scores. Worker latency is
+                # 1-5min, so we poll up to 5 minutes total.
+                await pull_evaluator_scores_for_run(run_id=run_id)
+
+            asyncio.create_task(_sync_then_pull())
+
         _RUN_REGISTRY.pop(run_id, None)
 
 
@@ -633,59 +824,124 @@ async def _backfill_langsmith_traces(
     run_id: str,
     project: str,
     per_case_results: list[dict[str, Any]],
-) -> None:
+) -> dict[str, Any]:
     """Try to match each local result with a LangSmith root run by
     (start_time >= invoked_at - 1min) AND inputs.messages[0].content == question.
 
-    One LangSmith query per case keeps the call pattern simple. Cache hits on
-    subsequent reconciliations are handled upstream if we ever add one.
+    One LangSmith query per case keeps the call pattern simple.
+
+    Returns a small diagnostics dict so the API layer can surface *why* zero
+    matched. Previously this function silently swallowed every exception and
+    returned None, which made permission errors look identical to "the
+    project is correct, just no run yet". The new shape:
+
+        {
+          "errors": int,            # how many per-case searches raised
+          "error_kind": str | None, # one of: forbidden, unauthorized,
+                                    # network, client_init, unknown, None
+          "error_message": str | None,  # first error string, truncated
+        }
     """
+    diagnostics: dict[str, Any] = {
+        "errors": 0,
+        "error_kind": None,
+        "error_message": None,
+    }
+
     try:
         from langsmith import Client
-        api_key = settings.langsmith.api_key
-        api_url = settings.langsmith.api_url
-        if not api_key:
-            logger.info("backfill: no LANGSMITH_API_KEY, skipping")
-            return
-        client = Client(api_key=api_key, api_url=api_url)
+        # Same precedence as TraceExtractor uses (see api/dependencies.py):
+        # config_service (DB-backed, set via /config UI) wins over .env.
+        # Without this, the eval backfill silently used the stale .env key
+        # while the Traces page used the working DB key — same project,
+        # different verdict. Fixed by going through the shared helper.
+        from agent_eval.api.dependencies import _get_langsmith_kwargs
+        kwargs = await _get_langsmith_kwargs()
+        if not kwargs.get("api_key"):
+            logger.info("backfill: no LangSmith API key configured (DB or .env), skipping")
+            diagnostics["error_kind"] = "client_init"
+            diagnostics["error_message"] = "LangSmith API key not configured (set via /config or LANGSMITH_API_KEY)"
+            return diagnostics
+        client = Client(**kwargs)
     except Exception as e:
         logger.warning("backfill: langsmith client init failed: %s", e)
-        return
+        diagnostics["error_kind"] = "client_init"
+        diagnostics["error_message"] = str(e)[:300]
+        return diagnostics
 
+    # ── Build a window covering all cases ─────────────────────────────────
+    # Previous version did one client.list_runs per case (each pulling 50
+    # rows). With a busy ruyi-agent project that's 10 cases × 5-10s = a
+    # full minute of LangSmith traffic per backfill — clients time out and
+    # the work gets retried over and over. Replace with a single window
+    # query covering the earliest case to the latest, then hash by
+    # question text locally.
     loop = asyncio.get_event_loop()
+    from datetime import timedelta
+    invoked_times = [r["invoked_at"] for r in per_case_results if r.get("invoked_at")]
+    if not invoked_times:
+        return diagnostics
+    window_lower = min(invoked_times) - timedelta(minutes=1)
+    window_upper = max(invoked_times) + timedelta(minutes=10)
 
-    async def _find_one(res: dict[str, Any]) -> tuple[str, str | None]:
-        question = res.get("question") or ""
-        invoked_at = res.get("invoked_at")
-        if not question or not invoked_at:
-            return (res.get("thread_id") or "", None)
-        # 1-minute safety window before invoked_at, generous upper bound.
-        from datetime import timedelta
-        lower = invoked_at - timedelta(minutes=1)
+    # Bounded fetch — LangSmith caps list_runs at limit=100. If the project
+    # is so busy this isn't enough, the user can narrow the time window by
+    # re-running with fewer cases (or paginate later if real demand shows).
+    PAGE_LIMIT = 100
+    by_question: dict[str, str] = {}  # question text → run id
 
-        def _search():
-            try:
-                runs = list(client.list_runs(
-                    project_name=project,
-                    is_root=True,
-                    start_time=lower,
-                    limit=50,
-                ))
-                for r in runs:
-                    if _run_matches_question(r, question):
-                        return str(r.id)
-            except Exception as e:
-                logger.warning("backfill search err: %s", e)
+    def _fetch_window() -> Exception | None:
+        try:
+            runs = client.list_runs(
+                project_name=project,
+                is_root=True,
+                start_time=window_lower,
+                end_time=window_upper,
+                limit=PAGE_LIMIT,
+            )
+            for r in runs:
+                inp = getattr(r, "inputs", None)
+                if not isinstance(inp, dict):
+                    continue
+                msgs = inp.get("messages")
+                if isinstance(msgs, list) and msgs:
+                    last = msgs[-1] if isinstance(msgs[-1], dict) else None
+                    txt = (last or {}).get("content", "")
+                else:
+                    txt = inp.get("question") or ""
+                if isinstance(txt, str) and txt:
+                    # Latest wins on duplicate questions — but the time
+                    # window already prunes most dupes, so this is rare.
+                    by_question.setdefault(txt, str(r.id))
             return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("backfill window fetch err: %s", e)
+            return e
 
-        found = await loop.run_in_executor(None, _search)
-        return (res.get("thread_id") or "", found)
+    err = await loop.run_in_executor(None, _fetch_window)
+    if err is not None:
+        diagnostics["errors"] = len(per_case_results)
+        diagnostics["error_kind"] = _classify_langsmith_error(err)
+        diagnostics["error_message"] = str(err)[:300]
+        return diagnostics
 
-    pairs = await asyncio.gather(*[_find_one(r) for r in per_case_results])
+    logger.info(
+        "backfill: project=%s window=%s..%s fetched=%d unique-questions",
+        project, window_lower.isoformat(), window_upper.isoformat(),
+        len(by_question),
+    )
+
+    # ── Match local cases against the in-memory map ───────────────────────
+    triples: list[tuple[str, str | None]] = []
+    for res in per_case_results:
+        thread_id = res.get("thread_id") or ""
+        question = res.get("question") or ""
+        triples.append((thread_id, by_question.get(question)))
+
     hits = 0
     async with async_session_factory() as session:
         from agent_eval.db_models.tables import TestResultRow
-        for thread_id, lsrun in pairs:
+        for thread_id, lsrun in triples:
             if not lsrun or not thread_id:
                 continue
             rows = (await session.execute(
@@ -698,9 +954,29 @@ async def _backfill_langsmith_traces(
                 hits += 1
         await session.commit()
     logger.info(
-        "backfill: project=%s run=%s matched %d/%d cases",
+        "backfill: project=%s run=%s matched %d/%d cases (errors=%d kind=%s)",
         project, run_id, hits, len(per_case_results),
+        diagnostics["errors"], diagnostics["error_kind"],
     )
+    return diagnostics
+
+
+def _classify_langsmith_error(err: Exception) -> str:
+    """Map a raised LangSmith client error to a stable banner category.
+
+    The langsmith-sdk wraps httpx errors in its own LangSmithError subclasses;
+    we sniff the stringified form rather than depend on private types.
+    """
+    s = str(err).lower()
+    if "403" in s or "forbidden" in s:
+        return "forbidden"
+    if "401" in s or "unauthorized" in s:
+        return "unauthorized"
+    if "404" in s or "not found" in s:
+        return "not_found"
+    if any(t in s for t in ("connection", "timeout", "timed out", "dns")):
+        return "network"
+    return "unknown"
 
 
 def _run_matches_question(run_obj: Any, question: str) -> bool:
@@ -722,7 +998,7 @@ def _run_matches_question(run_obj: Any, question: str) -> bool:
     return isinstance(txt, str) and txt == question
 
 
-async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
+async def rerun_backfill(*, run_id: str, project: str) -> dict[str, Any]:
     """Re-execute the LangSmith trace backfill for an existing run.
 
     Triggered from the detail page when the user supplies a project name —
@@ -737,7 +1013,11 @@ async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
     Also persists ``project`` to ``test_runs.langsmith_project`` so the row
     detail page picks up the new value on subsequent loads.
 
-    Returns ``{"matched": int, "scanned": int}``.
+    Returns ``{"matched": int, "scanned": int, "errors": int,
+    "error_kind": str | None, "error_message": str | None}``. ``error_kind``
+    is the stable category surfaced to the frontend banner so users can tell
+    "API key forbidden on this project" apart from "0 matches, project is
+    fine but no run yet".
     """
     from agent_eval.db_models.tables import TestResultRow, TestRunRow
 
@@ -770,9 +1050,12 @@ async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
         await session.commit()
 
     if not per_case_results:
-        return {"matched": 0, "scanned": 0}
+        return {
+            "matched": 0, "scanned": 0,
+            "errors": 0, "error_kind": None, "error_message": None,
+        }
 
-    await _backfill_langsmith_traces(
+    diagnostics = await _backfill_langsmith_traces(
         run_id=run_id, project=project, per_case_results=per_case_results,
     )
 
@@ -783,7 +1066,13 @@ async def rerun_backfill(*, run_id: str, project: str) -> dict[str, int]:
             .where(TestResultRow.run_id == uuid.UUID(run_id))
             .where(TestResultRow.langsmith_run_id.isnot(None))
         )).scalars().all()
-    return {"matched": len(hit_rows), "scanned": len(per_case_results)}
+    return {
+        "matched": len(hit_rows),
+        "scanned": len(per_case_results),
+        "errors": diagnostics["errors"],
+        "error_kind": diagnostics["error_kind"],
+        "error_message": diagnostics["error_message"],
+    }
 
 
 # ───────────────────────────────────────────────────────────────────────────

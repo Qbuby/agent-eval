@@ -64,10 +64,18 @@ export const evaluationApi = {
   listRuns(params?: {
     benchmark_version_id?: string
     status?: string
+    started_after?: string  // ISO timestamp
+    started_before?: string
+    q?: string  // text search over run name / agent model+url / project
+    min_pass_rate?: number  // 0..1
+    include_deleted?: boolean
     page?: number
     page_size?: number
   }) {
     return api.get<EvalRunsPage>('/eval/runs', { params })
+  },
+  deleteRun(runId: string) {
+    return api.delete<{ run_id: string; deleted: boolean }>(`/eval/runs/${runId}`)
   },
   getRun(runId: string) {
     return api.get<EvalRunDetail>(`/eval/runs/${runId}`)
@@ -81,7 +89,15 @@ export const evaluationApi = {
     })
   },
   backfillTrace(runId: string, project: string) {
-    return api.post<{ run_id: string; project: string; matched: number; scanned: number }>(
+    return api.post<{
+      run_id: string
+      project: string
+      matched: number
+      scanned: number
+      errors: number
+      error_kind: 'forbidden' | 'unauthorized' | 'not_found' | 'network' | 'client_init' | 'unknown' | null
+      error_message: string | null
+    }>(
       `/eval/runs/${runId}/backfill_trace`,
       null,
       { params: { project } },
@@ -89,5 +105,29 @@ export const evaluationApi = {
   },
   stopRun(runId: string) {
     return api.post<{ run_id: string; status: string }>(`/eval/runs/${runId}/stop`)
+  },
+  syncLangfuseScores(
+    runId: string,
+    opts?: { push?: boolean; pull_attempts?: number; pull_interval?: number },
+  ) {
+    return api.post<{
+      run_id: string
+      push: { traces: number; scores: number; errors: number } | null
+      pull: { polls: number; pulled: number }
+    }>(`/eval/runs/${runId}/sync_langfuse_scores`, null, {
+      params: {
+        push: opts?.push ?? false,
+        pull_attempts: opts?.pull_attempts ?? 1,
+        pull_interval: opts?.pull_interval ?? 5,
+      },
+    })
+  },
+  reaggregateRun(runId: string) {
+    return api.post<{
+      run_id: string
+      dimensions: string[]
+      tool_usage_count: number
+      case_count: number
+    }>(`/eval/runs/${runId}/reaggregate`)
   },
 }

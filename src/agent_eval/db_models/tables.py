@@ -98,6 +98,9 @@ class TestRunRow(Base):
     langsmith_project: Mapped[str | None] = mapped_column(Text)
     evaluator_configs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # Soft-delete: list endpoints filter out non-null deleted_at by default;
+    # the row stays in DB so historical reports / langfuse links still work.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class TestResultRow(Base):
@@ -128,12 +131,19 @@ class TestResultRow(Base):
     total_tokens: Mapped[int | None] = mapped_column(Integer)
     prompt_tokens: Mapped[int | None] = mapped_column(Integer)
     completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    # Anthropic-style prompt-cache breakdown. cache_creation_tokens are
+    # paid-once tokens that seeded the cache; cache_read_tokens are tokens
+    # served from cache on the same request (i.e. cache hits, the cheap
+    # ones). Sample-level surface so the detail page can show per-case
+    # cache yield, not just the run-level avg.
+    cache_creation_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
     tool_call_count: Mapped[int | None] = mapped_column(Integer)
 
     error_message: Mapped[str | None] = mapped_column(Text)
     error_type: Mapped[str | None] = mapped_column(String(64))
 
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -466,16 +476,23 @@ class EvalCaseSourceRow(Base):
 class EvaluatorConfigRow(Base):
     """Named reusable evaluator instances.
 
-    Each row is one evaluator (e.g. ``name='strict LLM judge'``,
-    ``evaluator_type='llm_judge'``, ``params={...custom prompt...}``).
-    Evaluation runs pick from these by id; raw evaluator_type never leaks into
-    the run config, which keeps runs immutable against future template edits.
+    Originally each row carried evaluator_type + params and ran a local
+    scoring function. After the 2026-05-19 simplification, evaluators are
+    pure tag templates: the user picks one or more, and at run time we
+    stamp each row's `tag` onto every sample's Langfuse trace. Langfuse-
+    side evaluators (configured in the Langfuse UI) then key off those
+    tags. evaluator_type and params remain on the row for backward
+    compatibility with historical runs but are no longer required.
     """
     __tablename__ = "evaluator_configs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
     name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
-    evaluator_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # tag = the literal string we attach to every Langfuse trace this
+    # evaluator runs against. Defaults to the row's name; user can override
+    # so they can have e.g. name="goal accuracy v2", tag="agent-eval-correctness".
+    tag: Mapped[str] = mapped_column(String(128), nullable=False)
+    evaluator_type: Mapped[str | None] = mapped_column(String(32))
     description: Mapped[str | None] = mapped_column(Text)
     params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

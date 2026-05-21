@@ -147,6 +147,16 @@ class SSEStreamAdapter:
         full_text: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         active_tools: dict[str, dict[str, Any]] = {}
+        # LangGraph emits one on_chat_model_end per LLM step; for multi-step
+        # agents (which is the common case here) we accumulate token counts
+        # across all steps so the run summary matches the agent's true cost.
+        usage_acc = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+        }
+        usage_seen = False
 
         start = time.perf_counter()
         async with self._client.stream("POST", self.url, json=payload) as resp:
@@ -165,7 +175,10 @@ class SSEStreamAdapter:
                     continue
 
                 if self.mode == "langgraph_v2":
-                    self._handle_langgraph_event(obj, full_text, tool_calls, active_tools)
+                    if self._handle_langgraph_event(
+                        obj, full_text, tool_calls, active_tools, usage_acc,
+                    ):
+                        usage_seen = True
                 else:
                     payload_data = obj.get("payload", {})
                     if payload_data.get("type") == "done":
@@ -176,10 +189,29 @@ class SSEStreamAdapter:
 
         latency_ms = (time.perf_counter() - start) * 1000
         content = "".join(full_text).strip()
+        # Build raw_response carrying both tool_calls and an OpenAI-shaped
+        # usage block so _extract_usage in the runner picks it up.
+        raw: dict[str, Any] = {}
+        if tool_calls:
+            raw["tool_calls"] = tool_calls
+        if usage_seen:
+            usage = {
+                "input_tokens": usage_acc["input_tokens"],
+                "output_tokens": usage_acc["output_tokens"],
+                "total_tokens": usage_acc["input_tokens"] + usage_acc["output_tokens"],
+            }
+            details = {}
+            if usage_acc["cache_read_tokens"]:
+                details["cache_read"] = usage_acc["cache_read_tokens"]
+            if usage_acc["cache_creation_tokens"]:
+                details["cache_creation"] = usage_acc["cache_creation_tokens"]
+            if details:
+                usage["input_token_details"] = details
+            raw["usage"] = usage
         return AgentResponse(
             content=content,
             latency_ms=latency_ms,
-            raw_response={"tool_calls": tool_calls} if tool_calls else None,
+            raw_response=raw or None,
         )
 
     @staticmethod
@@ -188,8 +220,15 @@ class SSEStreamAdapter:
         full_text: list[str],
         tool_calls: list[dict[str, Any]],
         active_tools: dict[str, dict[str, Any]],
-    ) -> None:
-        """Pull text + tool calls from LangChain ``astream_events v2`` shape."""
+        usage_acc: dict[str, int] | None = None,
+    ) -> bool:
+        """Pull text, tool calls, and (when ``usage_acc`` is provided) token
+        usage out of LangChain's ``astream_events v2`` shape.
+
+        Returns True iff this event contributed token counts — the caller
+        flips a "have any usage" flag, so we don't write a fake zero usage
+        block when the agent simply doesn't report tokens.
+        """
         event = obj.get("event", "")
         data = obj.get("data") or {}
 
@@ -206,14 +245,14 @@ class SSEStreamAdapter:
                                 full_text.append(text)
                 elif isinstance(content, str) and content:
                     full_text.append(content)
-            return
+            return False
 
         if event == "on_tool_start":
             run_id = obj.get("run_id") or ""
             name = obj.get("name") or data.get("name") or ""
             input_arg = data.get("input")
             active_tools[run_id] = {"name": name, "args": input_arg}
-            return
+            return False
 
         if event == "on_tool_end":
             run_id = obj.get("run_id") or ""
@@ -225,6 +264,39 @@ class SSEStreamAdapter:
                 "args": entry.get("args"),
                 "output": output if isinstance(output, (str, dict, list)) else str(output)[:500],
             })
+            return False
+
+        if event == "on_chat_model_end" and usage_acc is not None:
+            # Per LangChain ChatModel convention, the LLM emits usage_metadata
+            # on its final chunk under output.usage_metadata. Common shapes:
+            #   {input_tokens, output_tokens, total_tokens,
+            #    input_token_details: {cache_read?, cache_creation?, audio?}}
+            # We accumulate across all model_end events because tool-calling
+            # agents emit one per LLM step.
+            output = data.get("output") or {}
+            kwargs = output.get("kwargs") if isinstance(output, dict) else None
+            if isinstance(kwargs, dict):
+                meta = kwargs.get("usage_metadata") or {}
+                if isinstance(meta, dict):
+                    inp = meta.get("input_tokens")
+                    outp = meta.get("output_tokens")
+                    if isinstance(inp, int):
+                        usage_acc["input_tokens"] += inp
+                    if isinstance(outp, int):
+                        usage_acc["output_tokens"] += outp
+                    details = meta.get("input_token_details") or {}
+                    if isinstance(details, dict):
+                        cr = details.get("cache_read")
+                        cc = details.get("cache_creation")
+                        if isinstance(cr, int):
+                            usage_acc["cache_read_tokens"] += cr
+                        if isinstance(cc, int):
+                            usage_acc["cache_creation_tokens"] += cc
+                    if inp or outp:
+                        return True
+            return False
+
+        return False
 
     async def close(self):
         await self._client.aclose()

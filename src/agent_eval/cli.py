@@ -1235,7 +1235,8 @@ def bench_bfcl(
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    from agent_eval.config import settings
+    from agent_eval.logging_config import setup_logging
+
+    setup_logging(settings.logging.level, settings.logging.format)
     app()

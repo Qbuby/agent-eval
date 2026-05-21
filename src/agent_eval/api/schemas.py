@@ -98,6 +98,16 @@ class ListRunsRequest(BaseModel):
     limit: int = Field(default=50, le=100)
     page: int = 1
     page_size: int = 20
+    # Whether to fetch LLM child runs to populate `model_name` on each row.
+    # False by default because the extra LangSmith query roughly doubles cold
+    # latency (50-80s on large projects). The dedicated /fill_models endpoint
+    # exists for that, and the frontend already exposes a "补齐信息" button.
+    enrich_models: bool = False
+    # Whether to ask LangSmith for inputs/outputs at all. True by default
+    # because LangSmith projects often don't populate inputs_preview/
+    # outputs_preview, so leaving it false yields an empty preview column.
+    # Set false for warm-up calls or scenarios that don't need previews.
+    with_io: bool = True
 
 
 class RunSummaryResponse(BaseModel):
@@ -234,7 +244,13 @@ class EvalResultRow(BaseModel):
     total_tokens: int | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    cache_read_tokens: int | None = None
     tool_call_count: int | None = None
+    # List of {tool_name, args, output} captured during the agent call.
+    # Surfaced so the UI can render per-case tool-call detail without a
+    # second round-trip to LangSmith.
+    actual_tool_calls: list[dict[str, Any]] | None = None
     error_message: str | None = None
     langfuse_trace_id: str | None = None
     langsmith_run_id: str | None = None
@@ -259,7 +275,13 @@ class BuiltinEvaluator(BaseModel):
 class EvaluatorInstance(BaseModel):
     id: str
     name: str
-    evaluator_type: str  # one of BUILTIN_EVALUATORS keys
+    # The literal string we stamp onto every sample's Langfuse trace.
+    # Defaults to name when not specified, but the user can override
+    # (e.g. name="goal accuracy v2" + tag="agent-eval-correctness").
+    tag: str = ""
+    # Kept for back-compat with historical runs that referenced one of
+    # the old built-in scoring functions. New evaluators don't need it.
+    evaluator_type: str | None = None
     description: str | None = None
     params: dict[str, Any] = {}
     is_active: bool = True
@@ -269,7 +291,8 @@ class EvaluatorInstance(BaseModel):
 
 class CreateEvaluatorRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    evaluator_type: str
+    tag: str | None = Field(default=None, max_length=128)
+    evaluator_type: str | None = None
     description: str | None = None
     params: dict[str, Any] = {}
     is_active: bool = True
@@ -277,6 +300,7 @@ class CreateEvaluatorRequest(BaseModel):
 
 class UpdateEvaluatorRequest(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
+    tag: str | None = Field(default=None, min_length=1, max_length=128)
     description: str | None = None
     params: dict[str, Any] | None = None
     is_active: bool | None = None

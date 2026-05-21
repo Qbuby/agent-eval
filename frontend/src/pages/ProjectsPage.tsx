@@ -28,7 +28,7 @@ export default function ProjectsPage() {
     <div>
       <header className="mb-8">
         <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">management</div>
-        <h1 className="text-xl font-medium tracking-tight">项目</h1>
+        <h1 className="text-xl font-medium tracking-tight">基准测试集</h1>
       </header>
 
       <div className="flex items-center gap-3 mb-6">

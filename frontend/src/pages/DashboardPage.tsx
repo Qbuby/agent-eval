@@ -40,7 +40,7 @@ export default function DashboardPage() {
     <div>
       <header className="mb-8">
         <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">overview</div>
-        <h1 className="text-xl font-medium tracking-tight">Dashboard</h1>
+        <h1 className="text-xl font-medium tracking-tight">仪表盘</h1>
       </header>
 
       {/* 统计卡片 */}
