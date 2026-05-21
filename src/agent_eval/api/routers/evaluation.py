@@ -31,9 +31,11 @@ from agent_eval.db_models.tables import (
     BenchmarkCaseRow,
     EvaluationScoreRow,
     TestResultRow,
+    TestRunRow,
 )
 from agent_eval.evaluation.langfuse_runner import (
     BUILTIN_EVALUATORS,
+    _aggregate_cost,
     get_run_progress,
     request_stop,
     rerun_backfill,
@@ -292,6 +294,7 @@ async def get_run_results(
             cache_creation_tokens=r.cache_creation_tokens,
             cache_read_tokens=r.cache_read_tokens,
             tool_call_count=r.tool_call_count,
+            actual_tool_calls=r.actual_tool_calls,
             error_message=r.error_message,
             langfuse_trace_id=r.langfuse_trace_id,
             langsmith_run_id=r.langsmith_run_id,
@@ -306,6 +309,132 @@ async def stop_run(run_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="run not found or already finished")
     return {"run_id": run_id, "status": "stopping"}
+
+
+@router.post("/runs/{run_id}/reaggregate")
+async def reaggregate_run(run_id: str):
+    """Recompute summary_scores from existing test_results + evaluation_scores.
+
+    For old runs that finished before we started writing
+    ``tool_usage`` / ``score_distribution`` / ``dimension_averages`` into
+    ``summary_scores``. Reads what's already in the DB, recomputes the
+    aggregates the same way the runner does at finish time, merges them
+    into the existing summary_scores so we don't clobber other fields
+    (runtime_error, langsmith_project, etc.), and writes back.
+    """
+    run_uuid = uuid.UUID(run_id)
+    async with async_session_factory() as session:
+        run_row = (await session.execute(
+            select(TestRunRow).where(TestRunRow.id == run_uuid)
+        )).scalar_one_or_none()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="run not found")
+
+        results = (await session.execute(
+            select(TestResultRow).where(TestResultRow.run_id == run_uuid)
+        )).scalars().all()
+        score_rows = (await session.execute(
+            select(EvaluationScoreRow).where(
+                EvaluationScoreRow.result_id.in_([r.id for r in results])
+            )
+        )).scalars().all() if results else []
+
+        # Build per-result score dict
+        scores_by_result: dict[uuid.UUID, dict[str, float]] = {}
+        for s in score_rows:
+            scores_by_result.setdefault(s.result_id, {})[s.dimension] = float(s.score)
+
+        # dimension_averages — mean across all cases that have that dim
+        all_scores: dict[str, list[float]] = {}
+        for r in results:
+            for k, v in scores_by_result.get(r.id, {}).items():
+                all_scores.setdefault(k, []).append(v)
+        dim_avg = {k: round(sum(vs) / len(vs), 3) for k, vs in all_scores.items() if vs}
+
+        # score_distribution — same buckets the runner uses
+        bucket_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0001]
+        bucket_labels = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1"]
+        score_distribution: dict[str, list[int]] = {}
+        for dim, vs in all_scores.items():
+            counts = [0] * (len(bucket_edges) - 1)
+            for v in vs:
+                for i in range(len(counts)):
+                    if bucket_edges[i] <= v < bucket_edges[i + 1]:
+                        counts[i] += 1
+                        break
+            score_distribution[dim] = counts
+
+        # tool_usage — from actual_tool_calls JSON column
+        tool_stats: dict[str, dict[str, Any]] = {}
+        for r in results:
+            calls = r.actual_tool_calls or []
+            for call in calls:
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("tool_name") or call.get("name") or "unknown"
+                slot = tool_stats.setdefault(name, {
+                    "name": name, "calls": 0, "errors": 0, "cases": 0,
+                })
+                slot["calls"] += 1
+                out = call.get("output")
+                if isinstance(out, dict) and (out.get("error") or out.get("isError")):
+                    slot["errors"] += 1
+                elif isinstance(out, str) and out.lower().startswith("error"):
+                    slot["errors"] += 1
+            seen_in_case = {
+                (c.get("tool_name") or c.get("name") or "unknown")
+                for c in calls if isinstance(c, dict)
+            }
+            for nm in seen_in_case:
+                tool_stats.setdefault(nm, {"name": nm, "calls": 0, "errors": 0, "cases": 0})
+                tool_stats[nm]["cases"] += 1
+        tool_usage = sorted(tool_stats.values(), key=lambda x: (-x["calls"], x["name"]))
+
+        # cost (success/failure split) — build minimal dicts that
+        # _aggregate_cost knows how to read.
+        def _cost_row(r):
+            return {
+                "prompt_tokens": r.prompt_tokens,
+                "completion_tokens": r.completion_tokens,
+                "total_tokens": r.total_tokens,
+                "tool_call_count": r.tool_call_count,
+                "message_count": None,  # not persisted on test_results
+                "cache_creation_tokens": r.cache_creation_tokens,
+                "cache_read_tokens": r.cache_read_tokens,
+                "latency_ms": r.latency_ms,
+            }
+
+        succ = [_cost_row(r) for r in results if r.status == "pass"]
+        fail = [_cost_row(r) for r in results if r.status != "pass"]
+
+        merged = dict(run_row.summary_scores or {})
+        merged["dimension_averages"] = dim_avg
+        merged["score_distribution"] = {
+            "buckets": bucket_labels,
+            "by_dimension": score_distribution,
+        }
+        merged["tool_usage"] = tool_usage
+        merged["cost_success"] = _aggregate_cost(succ)
+        merged["cost_failure"] = _aggregate_cost(fail)
+        merged["counts"] = {
+            "total": len(results),
+            "passed": len(succ),
+            "failed": len(fail),
+            "unreachable": sum(
+                1 for r in results
+                if r.status in ("agent_unreachable", "agent_timeout")
+            ),
+        }
+
+        run_row.summary_scores = merged
+        await session.commit()
+
+    return {
+        "run_id": run_id,
+        "dimensions": list(dim_avg.keys()),
+        "tool_usage_count": len(tool_usage),
+        "case_count": len(results),
+    }
 
 
 @router.get("/results/{result_id}/trace", response_model=RunDetailResponse)

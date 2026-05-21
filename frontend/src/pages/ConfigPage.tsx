@@ -109,8 +109,8 @@ export default function ConfigPage() {
   return (
     <div>
       <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">Configuration</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">System parameters &middot; runtime settings</p>
+        <h1 className="text-lg font-light tracking-tight mb-1">配置</h1>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">SYSTEM PARAMETERS · RUNTIME SETTINGS</p>
       </header>
 
       <div className="space-y-8 max-w-[560px]">

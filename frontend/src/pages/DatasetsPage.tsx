@@ -48,7 +48,7 @@ export default function DatasetsPage() {
   return (
     <div>
       <header className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight mb-1">Dataset Management</h1>
+        <h1 className="text-xl font-semibold tracking-tight mb-1">备选数据集</h1>
         <p className="text-[13px] text-text-secondary">管理评测数据集、样本和质量指标</p>
       </header>
 

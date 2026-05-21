@@ -668,6 +668,54 @@ async def _execute_run(
                 all_scores.setdefault(k, []).append(v)
         dim_avg = {k: round(sum(vs) / len(vs), 3) for k, vs in all_scores.items() if vs}
 
+        # Per-dimension histogram in fixed buckets so the UI can render a
+        # quick distribution chart without re-aggregating in the browser.
+        # Buckets are half-open intervals on [0,1].
+        bucket_edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0001]
+        bucket_labels = ["0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1"]
+        score_distribution: dict[str, list[int]] = {}
+        for dim, vs in all_scores.items():
+            counts = [0] * (len(bucket_edges) - 1)
+            for v in vs:
+                for i in range(len(counts)):
+                    if bucket_edges[i] <= v < bucket_edges[i + 1]:
+                        counts[i] += 1
+                        break
+            score_distribution[dim] = counts
+
+        # Tool usage: per-tool aggregate over ALL cases (success + failure).
+        # Each entry of per_case_results['actual_tool_calls'] is a list of
+        # {tool_name, args, output} dicts. We count invocations and flag
+        # likely failures by looking for an "error" key or non-empty
+        # error string in the output.
+        tool_stats: dict[str, dict[str, Any]] = {}
+        for r in per_case_results:
+            for call in (r.get("actual_tool_calls") or []):
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("tool_name") or call.get("name") or "unknown"
+                slot = tool_stats.setdefault(name, {
+                    "name": name, "calls": 0, "errors": 0, "cases": 0,
+                })
+                slot["calls"] += 1
+                out = call.get("output")
+                if isinstance(out, dict) and (out.get("error") or out.get("isError")):
+                    slot["errors"] += 1
+                elif isinstance(out, str) and out.lower().startswith("error"):
+                    slot["errors"] += 1
+            seen_in_case = {
+                (c.get("tool_name") or c.get("name") or "unknown")
+                for c in (r.get("actual_tool_calls") or [])
+                if isinstance(c, dict)
+            }
+            for nm in seen_in_case:
+                tool_stats.setdefault(nm, {"name": nm, "calls": 0, "errors": 0, "cases": 0})
+                tool_stats[nm]["cases"] += 1
+        tool_usage = sorted(
+            tool_stats.values(),
+            key=lambda x: (-x["calls"], x["name"]),
+        )
+
         summary: dict[str, Any] = {
             "counts": {
                 "total": len(per_case_results),
@@ -679,6 +727,11 @@ async def _execute_run(
                 ),
             },
             "dimension_averages": dim_avg,
+            "score_distribution": {
+                "buckets": bucket_labels,
+                "by_dimension": score_distribution,
+            },
+            "tool_usage": tool_usage,
             "cost_success": _aggregate_cost(succ),
             "cost_failure": _aggregate_cost(fail),
             "run_name": run_name,

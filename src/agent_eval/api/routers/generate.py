@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from agent_eval.api.dependencies import get_generator, get_manager
@@ -19,9 +21,25 @@ async def generate_from_scenario(
     scenario = f"Test scenario: {req.test_scenario}\nCase category: {req.case_category}"
     tags = [f"scenario:{req.test_scenario}", f"category:{req.case_category}"]
 
+    # Pull a few existing cases from the dataset as seed examples so the LLM
+    # generalizes within the same domain/style instead of inventing random
+    # questions. We try a small random sample so consecutive calls don't
+    # always anchor on the first 5 rows.
+    seed_cases = []
+    try:
+        all_cases = await mgr.load_cases(req.dataset, limit=200)
+        if all_cases:
+            sample_n = min(5, len(all_cases))
+            seed_cases = random.sample(all_cases, sample_n)
+    except Exception:
+        # If the dataset doesn't exist yet, generate without seeds rather
+        # than blocking the user — the response will still be domain-free
+        # but at least it won't error out.
+        seed_cases = []
+
     cases = await gen.generate_from_scenario(
         scenario, count=req.count, context=req.context,
-        tags=tags,
+        tags=tags, seed_cases=seed_cases or None,
     )
     if not cases:
         raise HTTPException(status_code=422, detail="LLM returned no valid cases")
@@ -31,7 +49,12 @@ async def generate_from_scenario(
     if not req.dry_run:
         await mgr.add_cases_batch(req.dataset, cases)
 
-    return {"generated": len(cases), "saved": not req.dry_run, "cases": result}
+    return {
+        "generated": len(cases),
+        "saved": not req.dry_run,
+        "cases": result,
+        "seed_count": len(seed_cases),
+    }
 
 
 @router.post("/mutate")

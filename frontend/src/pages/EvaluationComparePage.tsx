@@ -47,7 +47,7 @@ export default function EvaluationComparePage() {
         <div className="flex items-center gap-2 mb-1">
           <Link to="/evaluation" className="text-[11px] text-text-tertiary hover:text-accent">← 评估列表</Link>
         </div>
-        <h1 className="text-lg font-light tracking-tight mb-1">Runs 对比</h1>
+        <h1 className="text-lg font-light tracking-tight mb-1">运行对比</h1>
         <p className="text-[10px] text-text-tertiary tracking-widest uppercase">
           {ids.length} runs · 维度分 · 成本 · 通过率
         </p>

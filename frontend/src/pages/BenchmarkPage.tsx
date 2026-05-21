@@ -1,4 +1,4 @@
-import { useState, useRef, useMemo } from 'react'
+import { Fragment, useState, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn } from '@/services/benchmark'
@@ -14,6 +14,7 @@ export default function BenchmarkPage() {
   const [showImport, setShowImport] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
   const [editCase, setEditCase] = useState<BenchmarkCase | null>(null)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
   const [importCategoryId, setImportCategoryId] = useState('')
   const [newQuestion, setNewQuestion] = useState('')
   const [newAnswer, setNewAnswer] = useState('')
@@ -231,9 +232,21 @@ export default function BenchmarkPage() {
             </tr>
           </thead>
           <tbody>
-            {cases.map(c => (
-              <tr key={c.id} className="hover:bg-accent-subtle group">
-                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-primary max-w-[400px] truncate">{c.question}</td>
+            {cases.map(c => {
+              const isOpen = expandedId === c.id
+              const colSpan = 3 + (categoryFilter ? 0 : 1) + extraColumns.length
+              const expectedTools = (c.extra_fields?.expected_tool_calls ?? []) as Array<Record<string, unknown>>
+              return (
+              <Fragment key={c.id}>
+              <tr
+                className="hover:bg-accent-subtle group cursor-pointer"
+                onClick={() => setExpandedId(isOpen ? null : c.id)}
+                title="点击展开 / 收起 参考答案与期望工具调用"
+              >
+                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-primary max-w-[400px]">
+                  <span className="inline-block w-3 mr-1 text-text-tertiary">{isOpen ? '▾' : '▸'}</span>
+                  <span className="truncate inline-block max-w-[370px] align-middle">{c.question}</span>
+                </td>
                 {!categoryFilter && <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-tertiary">{getCategoryName(c.category_id)}</td>}
                 {extraColumns.map((col: SchemaColumn) => (
                   <td key={col.name} className="py-2.5 px-3 border-b border-border text-[11px] text-text-tertiary max-w-[180px] truncate">
@@ -246,14 +259,83 @@ export default function BenchmarkPage() {
                   </span>
                 </td>
                 <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-tertiary">{c.source}</td>
-                <td className="py-2.5 px-3 border-b border-border text-right">
+                <td className="py-2.5 px-3 border-b border-border text-right" onClick={e => e.stopPropagation()}>
                   <div className="flex gap-2 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
                     <button onClick={() => setEditCase(c)} className="text-[10px] text-text-secondary hover:text-accent">编辑</button>
                     <button onClick={() => { if (confirm('确定删除？')) deleteMutation.mutate(c.id) }} className="text-[10px] text-text-secondary hover:text-negative">删除</button>
                   </div>
                 </td>
               </tr>
-            ))}
+              {isOpen && (
+                <tr className="bg-accent-subtle/30">
+                  <td colSpan={colSpan} className="px-3 py-3 border-b border-border">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">参考答案</div>
+                        {c.reference_answer ? (
+                          <pre className="font-mono text-[11px] bg-white border border-border rounded-[3px] p-2 max-h-[260px] overflow-y-auto whitespace-pre-wrap">{c.reference_answer}</pre>
+                        ) : (
+                          <div className="text-[11px] text-text-tertiary italic">未填写</div>
+                        )}
+                        {(c.key_points?.length || c.negative_points?.length) ? (
+                          <div className="mt-2 text-[11px] space-y-1">
+                            {c.key_points?.length ? (
+                              <div>
+                                <span className="text-text-tertiary mr-1">关键点：</span>
+                                <span className="text-positive">{c.key_points.join('、')}</span>
+                              </div>
+                            ) : null}
+                            {c.negative_points?.length ? (
+                              <div>
+                                <span className="text-text-tertiary mr-1">反向点：</span>
+                                <span className="text-negative">{c.negative_points.join('、')}</span>
+                              </div>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div>
+                        <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
+                          期望工具调用 {expectedTools.length > 0 && <span className="text-text-tertiary">({expectedTools.length})</span>}
+                        </div>
+                        {expectedTools.length > 0 ? (
+                          <div className="border border-border rounded-[3px] bg-white">
+                            <table className="w-full text-[11px]">
+                              <thead>
+                                <tr className="bg-accent-subtle/60">
+                                  <th className="text-[9px] tracking-widest uppercase text-text-tertiary text-left py-1 px-2 font-normal">#</th>
+                                  <th className="text-[9px] tracking-widest uppercase text-text-tertiary text-left py-1 px-2 font-normal">工具</th>
+                                  <th className="text-[9px] tracking-widest uppercase text-text-tertiary text-left py-1 px-2 font-normal">参数 / 备注</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {expectedTools.map((t, i) => {
+                                  const name = (t.tool_name || t.name || '?') as string
+                                  const args = t.args ?? t.arguments
+                                  return (
+                                    <tr key={i} className="border-t border-border/40">
+                                      <td className="py-1 px-2 text-text-tertiary tabular-nums">{i + 1}</td>
+                                      <td className="py-1 px-2 font-mono">{name}</td>
+                                      <td className="py-1 px-2 text-text-tertiary">
+                                        {args == null ? '—' : (typeof args === 'string' ? args : JSON.stringify(args))}
+                                      </td>
+                                    </tr>
+                                  )
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-text-tertiary italic">未指定</div>
+                        )}
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              )}
+              </Fragment>
+              )
+            })}
           </tbody>
         </table>
         {cases.length === 0 && !isLoading && (

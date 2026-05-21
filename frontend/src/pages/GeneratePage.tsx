@@ -29,6 +29,25 @@ const CATEGORIES: { value: Category; label: string }[] = [
   { value: 'edge_case', label: 'Edge Case' },
 ]
 
+// FastAPI 校验失败时 detail 是数组，直接 setError(detail) 会让 React 渲染崩溃
+// (error #31: Objects are not valid as a React child)。统一在这里转成字符串。
+function extractErrorMessage(err: unknown): string {
+  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d: unknown) => {
+        if (typeof d === 'string') return d
+        const o = d as { loc?: unknown[]; msg?: string }
+        const loc = Array.isArray(o.loc) ? o.loc.slice(1).join('.') : ''
+        return loc ? `${loc}: ${o.msg ?? '校验失败'}` : (o.msg ?? '校验失败')
+      })
+      .join('；')
+  }
+  if (detail && typeof detail === 'object') return JSON.stringify(detail)
+  return (err as Error)?.message ?? ''
+}
+
 export default function GeneratePage() {
   const [form, setForm] = useState<GenerateForm>({
     dataset: '',
@@ -51,10 +70,10 @@ export default function GeneratePage() {
     mutationFn: () =>
       generateApi.scenario({
         dataset: form.dataset,
-        scenario: form.scenario,
+        test_scenario: form.scenario,
+        case_category: form.category || 'normal',
         count: form.count,
         context: form.context || undefined,
-        tags: form.category ? [form.category] : undefined,
         dry_run: true,
       }),
     onSuccess: (res) => {
@@ -64,8 +83,7 @@ export default function GeneratePage() {
       setError('')
     },
     onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setError(msg || '生成失败')
+      setError(extractErrorMessage(err) || '生成失败')
     },
   })
 
@@ -78,8 +96,7 @@ export default function GeneratePage() {
       setError('')
     },
     onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setError(msg || '保存失败')
+      setError(extractErrorMessage(err) || '保存失败')
     },
   })
 
@@ -101,8 +118,8 @@ export default function GeneratePage() {
   return (
     <div>
       <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">Generate</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">Scenario generation &middot; test case creation</p>
+        <h1 className="text-lg font-light tracking-tight mb-1">样例生成</h1>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">SCENARIO GENERATION · TEST CASE CREATION</p>
       </header>
 
       {phase === 'form' && (

@@ -21,8 +21,8 @@ export default function AuditPage() {
   return (
     <div>
       <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">Audit Log</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">System activity &middot; change history</p>
+        <h1 className="text-lg font-light tracking-tight mb-1">审计日志</h1>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">SYSTEM ACTIVITY · CHANGE HISTORY</p>
       </header>
 
       <div className="flex gap-3 items-center mb-5 flex-wrap">

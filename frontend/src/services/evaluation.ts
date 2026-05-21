@@ -122,4 +122,12 @@ export const evaluationApi = {
       },
     })
   },
+  reaggregateRun(runId: string) {
+    return api.post<{
+      run_id: string
+      dimensions: string[]
+      tool_usage_count: number
+      case_count: number
+    }>(`/eval/runs/${runId}/reaggregate`)
+  },
 }

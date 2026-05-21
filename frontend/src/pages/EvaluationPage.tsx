@@ -399,7 +399,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       benchmarkApi.listCases(projectId, {
         category_id: categoryId || undefined,
         search: searchText || undefined,
-        page: 1, page_size: 200,
+        page: 1, page_size: 100,
       }).then(r => r.data),
     enabled: !!projectId && sourceTab === 'benchmark',
   })
@@ -409,6 +409,15 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     if (selectionMode === 'pick') return pickedCaseIds.size
     return casesQuery.data.total
   }, [casesQuery.data, selectionMode, pickedCaseIds])
+
+  // 真正会跑的样例数 = 命中数和 limit 取小（pick 模式不受 limit 影响）
+  const willRunCount = useMemo(() => {
+    if (selectionMode === 'pick') return pickedCaseIds.size
+    if (typeof limit === 'number' && limit > 0) {
+      return Math.min(effectiveCaseCount, limit)
+    }
+    return effectiveCaseCount
+  }, [selectionMode, pickedCaseIds, effectiveCaseCount, limit])
 
   // ── upload branch ──
   const [uploadedSource, setUploadedSource] = useState<UploadCasesResponse | null>(null)
@@ -447,11 +456,13 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   })
 
   const hasCaseSource = sourceTab === 'benchmark' ? !!projectId : !!uploadedSource
-  const canStart =
-    hasCaseSource &&
-    selectedEvaluatorIds.size > 0 &&
-    agentUrl.trim().length > 0 &&
-    !startMutation.isPending
+  const startBlockers: string[] = []
+  if (!hasCaseSource) {
+    startBlockers.push(sourceTab === 'benchmark' ? '选择基准项目' : '上传一个样例文件')
+  }
+  if (selectedEvaluatorIds.size === 0) startBlockers.push('勾选至少 1 个评估器')
+  if (agentUrl.trim().length === 0) startBlockers.push('填写 Agent URL')
+  const canStart = startBlockers.length === 0 && !startMutation.isPending
 
   const handleStart = () => {
     let headers: Record<string, string> | undefined
@@ -568,10 +579,34 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                   {m === 'pick' && '手动勾选'}
                 </label>
               ))}
-              <span className="ml-auto text-[11px] text-text-tertiary">
-                {selectionMode === 'pick' ? `已选 ${pickedCaseIds.size} 条` : `命中约 ${effectiveCaseCount} 条`}
-              </span>
             </div>
+
+            {/* Selection summary banner — 让用户一眼看到这次会跑多少条 */}
+            {projectId && (
+              <div className={`flex items-center gap-2 mb-3 px-3 py-2 rounded-[6px] border text-[12px] ${
+                willRunCount === 0
+                  ? 'border-amber-300 bg-amber-50 text-amber-800'
+                  : 'border-accent/30 bg-accent-subtle/40 text-text-primary'
+              }`}>
+                <span className="text-[14px]">{willRunCount === 0 ? '⚠' : '✓'}</span>
+                <span>
+                  本次将运行 <span className="font-mono font-medium">{willRunCount}</span> 条样例
+                  {selectionMode === 'pick' && pickedCaseIds.size > 0 && (
+                    <span className="text-text-tertiary ml-1.5">（手动勾选）</span>
+                  )}
+                  {selectionMode !== 'pick' && (
+                    <>
+                      <span className="text-text-tertiary ml-1.5">
+                        （命中 {effectiveCaseCount} 条
+                        {typeof limit === 'number' && limit > 0 && limit < effectiveCaseCount && `，受 limit ${limit} 限制`}
+                        ）
+                      </span>
+                    </>
+                  )}
+                </span>
+                {casesQuery.isLoading && <span className="text-text-tertiary ml-auto text-[11px]">载入中…</span>}
+              </div>
+            )}
 
             {selectionMode !== 'pick' && (
               <Field label="最多跑多少条（空=不限制）">
@@ -791,10 +826,25 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
         <button
           disabled={!canStart}
           onClick={handleStart}
+          title={
+            startBlockers.length > 0
+              ? `还差：${startBlockers.map((b, i) => `${i + 1}) ${b}`).join('  ')}`
+              : '启动评估'
+          }
           className="inline-flex items-center gap-1.5 py-2.5 px-5 text-[12px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 active:scale-[0.97] disabled:opacity-40 transition-all"
         >
           {startMutation.isPending ? '启动中…' : '启动评估'}
         </button>
+        {startBlockers.length > 0 && !startMutation.isPending && (
+          <span className="text-[11px] text-text-tertiary">
+            还差：{startBlockers.map((b, i) => (
+              <span key={i} className="ml-2">
+                <span className="inline-block min-w-[1em] text-center text-text-tertiary mr-0.5">{i + 1})</span>
+                {b}
+              </span>
+            ))}
+          </span>
+        )}
         {startMutation.isError && (
           <span className="text-[11px] text-negative">
             启动失败：{extractError(startMutation.error)}

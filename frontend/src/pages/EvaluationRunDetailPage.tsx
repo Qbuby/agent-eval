@@ -1,10 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts'
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
+  RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
+} from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
 import type { EvalResultRow, EvalRunDetail, RunDetail } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
+import {
+  getScoreMeta, isPassing, directionMark, tone,
+} from '@/lib/scoreSemantics'
 
 export default function EvaluationRunDetailPage() {
   const { runId } = useParams<{ runId: string }>()
@@ -69,6 +75,15 @@ export default function EvaluationRunDetailPage() {
     },
   })
 
+  // Re-aggregate summary_scores from existing per-case scores. Useful for
+  // runs that finished before we started writing tool_usage / score_distribution.
+  const reaggregateMutation = useMutation({
+    mutationFn: () => evaluationApi.reaggregateRun(runId!).then(r => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['eval-run', runId] })
+    },
+  })
+
   const run = runQuery.data
   const langfuseHost = deriveLangfuseHost(run)
 
@@ -97,8 +112,15 @@ export default function EvaluationRunDetailPage() {
   const dimAvg = run.summary_scores?.dimension_averages ?? {}
   const costSuccess = run.summary_scores?.cost_success ?? {}
   const costFailure = run.summary_scores?.cost_failure ?? {}
+  const toolUsage = (run.summary_scores?.tool_usage ?? []) as Array<{
+    name: string; calls: number; errors: number; cases: number
+  }>
+  const scoreDistribution = (run.summary_scores?.score_distribution ?? null) as null | {
+    buckets: string[]; by_dimension: Record<string, number[]>
+  }
   const items = resultsQuery.data?.items ?? []
   const latencyBars = buildLatencyBuckets(items)
+  const radarData = buildRadarData(dimAvg)
 
   return (
     <div>
@@ -139,6 +161,14 @@ export default function EvaluationRunDetailPage() {
           >
             {langfusePullMutation.isPending ? '拉取中…' : '重拉 Langfuse 分数'}
           </button>
+          <button
+            onClick={() => reaggregateMutation.mutate()}
+            disabled={reaggregateMutation.isPending}
+            title="从样例分数重新计算维度平均、工具调用统计、分数分布。老 run 跑这一下能补出综合报告区。"
+            className="py-1.5 px-3 text-[11px] rounded-[6px] border border-border text-text-secondary hover:border-accent hover:text-accent disabled:opacity-40 transition-all"
+          >
+            {reaggregateMutation.isPending ? '重算中…' : '重算汇总'}
+          </button>
         </div>
       </header>
 
@@ -153,6 +183,22 @@ export default function EvaluationRunDetailPage() {
         <div className="mb-3 text-[11px] text-negative border border-red-200 bg-red-50 rounded-[6px] px-3 py-2">
           拉取失败：{(langfusePullMutation.error as { response?: { data?: { detail?: string } } })
             ?.response?.data?.detail || (langfusePullMutation.error as Error)?.message || 'unknown'}
+        </div>
+      )}
+
+      {/* Reaggregate result banner */}
+      {reaggregateMutation.data && (
+        <div className="mb-3 text-[11px] text-text-secondary border border-border bg-accent-subtle/40 rounded-[6px] px-3 py-2">
+          已重算：{reaggregateMutation.data.case_count} 条样例，
+          维度 {reaggregateMutation.data.dimensions.length} 个
+          ({reaggregateMutation.data.dimensions.join(', ') || '无'})，
+          工具 {reaggregateMutation.data.tool_usage_count} 种
+        </div>
+      )}
+      {reaggregateMutation.isError && (
+        <div className="mb-3 text-[11px] text-negative border border-red-200 bg-red-50 rounded-[6px] px-3 py-2">
+          重算失败：{(reaggregateMutation.error as { response?: { data?: { detail?: string } } })
+            ?.response?.data?.detail || (reaggregateMutation.error as Error)?.message || 'unknown'}
         </div>
       )}
 
@@ -281,21 +327,51 @@ export default function EvaluationRunDetailPage() {
       {Object.keys(dimAvg).length > 0 && (
         <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
           <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-3">维度平均分（0-1）</h3>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-            {Object.entries(dimAvg).map(([name, val]) => (
-              <div key={name}>
-                <div className="text-[10px] text-text-tertiary mb-0.5">{name}</div>
-                <div className="flex items-center gap-2">
-                  <div className="flex-1 h-1.5 bg-accent-subtle rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-accent rounded-full transition-all"
-                      style={{ width: `${Math.max(0, Math.min(1, val)) * 100}%` }}
-                    />
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+            {Object.entries(dimAvg).map(([name, val]) => {
+              const meta = getScoreMeta(name)
+              const passing = isPassing(name, val)
+              const pct = Math.max(0, Math.min(1, val)) * 100
+              const threshPct = Math.max(0, Math.min(1, meta.threshold)) * 100
+              return (
+                <div key={name} title={meta.description}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[11px] text-text-secondary">
+                      {meta.label}
+                    </span>
+                    <span className={`text-[9px] tracking-widest uppercase ${
+                      meta.direction === 'higher_better' ? 'text-text-tertiary' : 'text-amber-700'
+                    }`}>
+                      {directionMark(meta)}
+                    </span>
                   </div>
-                  <span className="font-mono text-[12px] min-w-[40px] text-right">{val.toFixed(2)}</span>
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 relative h-2 bg-accent-subtle rounded-full overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all ${
+                          passing ? 'bg-green-500' : 'bg-red-400'
+                        }`}
+                        style={{ width: `${pct}%` }}
+                      />
+                      {/* Threshold marker */}
+                      <div
+                        className="absolute top-0 bottom-0 w-px bg-text-tertiary/70"
+                        style={{ left: `${threshPct}%` }}
+                        title={`合格线 ${meta.threshold}`}
+                      />
+                    </div>
+                    <span className={`font-mono text-[12px] min-w-[40px] text-right ${
+                      passing ? 'text-green-700' : 'text-red-700'
+                    }`}>
+                      {val.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-text-tertiary mt-0.5">
+                    合格线 {meta.threshold} · {passing ? '达标' : '未达标'}
+                  </div>
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </section>
       )}
@@ -321,6 +397,15 @@ export default function EvaluationRunDetailPage() {
           </ResponsiveContainer>
         </section>
       )}
+
+      {/* Comprehensive visualization report */}
+      <ReportSection
+        dimAvg={dimAvg}
+        radarData={radarData}
+        scoreDistribution={scoreDistribution}
+        toolUsage={toolUsage}
+        counts={counts}
+      />
 
       {/* Cost metrics */}
       <section className="grid grid-cols-2 gap-3 mb-5">
@@ -463,17 +548,22 @@ function ResultRow({ row, langfuseHost, project }: {
         <Td>
           <div className="flex flex-wrap gap-1">
             {scoreEntries.length === 0 && <span className="text-text-tertiary">—</span>}
-            {scoreEntries.map(([n, v]) => (
-              <span
-                key={n}
-                className={`text-[10px] px-1.5 py-0.5 rounded border ${
-                  v >= 0.5 ? 'border-green-300 bg-green-50 text-green-800' : 'border-red-300 bg-red-50 text-red-800'
-                }`}
-                title={n}
-              >
-                {shortName(n)}: {v.toFixed(2)}
-              </span>
-            ))}
+            {scoreEntries.map(([n, v]) => {
+              const meta = getScoreMeta(n)
+              const t = tone(n, v)
+              const cls = t === 'good'
+                ? 'border-green-300 bg-green-50 text-green-800'
+                : 'border-red-300 bg-red-50 text-red-800'
+              return (
+                <span
+                  key={n}
+                  className={`text-[10px] px-1.5 py-0.5 rounded border ${cls}`}
+                  title={`${meta.label} · ${directionMark(meta)} · 合格线 ${meta.threshold}\n${meta.description}`}
+                >
+                  {meta.label}: {v.toFixed(2)}
+                </span>
+              )
+            })}
           </div>
         </Td>
         <Td>
@@ -506,6 +596,15 @@ function ResultRow({ row, langfuseHost, project }: {
                 <pre className="font-mono text-[11px] bg-red-50 border border-red-200 rounded-[3px] p-2 whitespace-pre-wrap">
                   {row.error_message}
                 </pre>
+              </div>
+            )}
+            {/* Tool calls captured during agent invocation */}
+            {Array.isArray(row.actual_tool_calls) && row.actual_tool_calls.length > 0 && (
+              <div className="mb-3">
+                <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
+                  工具调用 ({row.actual_tool_calls.length})
+                </div>
+                <ToolCallsTable calls={row.actual_tool_calls as Array<Record<string, unknown>>} />
               </div>
             )}
             <div>
@@ -682,16 +781,211 @@ function fmtDuration(start: string | null, end: string | null): string {
   return `${m}m${r}s`
 }
 
-function shortName(n: string): string {
-  const i = n.lastIndexOf('.')
-  return i >= 0 ? n.slice(i + 1) : n
-}
-
 function deriveLangfuseHost(run: EvalRunDetail | null | undefined): string | null {
   if (!run) return null
   const h = (run.summary_scores as { langfuse_host?: string } | null | undefined)?.langfuse_host
   return h ? h.replace(/\/+$/, '') : null
 }
+
+// ─── Comprehensive Report Section ─────────────────────────────────────────
+
+function ReportSection({
+  dimAvg, radarData, scoreDistribution, toolUsage, counts,
+}: {
+  dimAvg: Record<string, number>
+  radarData: Array<{ dimension: string; score: number; fullMark: number }>
+  scoreDistribution: { buckets: string[]; by_dimension: Record<string, number[]> } | null
+  toolUsage: Array<{ name: string; calls: number; errors: number; cases: number }>
+  counts: Record<string, number>
+}) {
+  const hasDims = Object.keys(dimAvg).length > 0
+  const hasTools = toolUsage.length > 0
+  if (!hasDims && !hasTools) return null
+
+  const passRate = counts.total
+    ? ((counts.passed ?? 0) / counts.total * 100).toFixed(1)
+    : '—'
+
+  return (
+    <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
+      <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-4">综合报告</h3>
+
+      {/* Pass rate funnel */}
+      <div className="flex items-center gap-4 mb-5 pb-4 border-b border-border/50">
+        <div className="text-center">
+          <div className="text-[28px] font-light tabular-nums">{passRate}%</div>
+          <div className="text-[10px] text-text-tertiary">合格率</div>
+        </div>
+        <div className="flex-1 grid grid-cols-3 gap-2 text-center text-[11px]">
+          <div>
+            <div className="font-mono text-[14px]">{counts.total ?? 0}</div>
+            <div className="text-text-tertiary">总样例</div>
+          </div>
+          <div>
+            <div className="font-mono text-[14px] text-green-700">{counts.passed ?? 0}</div>
+            <div className="text-text-tertiary">通过</div>
+          </div>
+          <div>
+            <div className="font-mono text-[14px] text-red-700">{counts.failed ?? 0}</div>
+            <div className="text-text-tertiary">失败</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        {/* Radar chart */}
+        {radarData.length >= 3 && (
+          <div>
+            <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-2">维度雷达图</div>
+            <ResponsiveContainer width="100%" height={240}>
+              <RadarChart data={radarData} cx="50%" cy="50%" outerRadius="70%">
+                <PolarGrid stroke="var(--color-border, #e5e5e5)" />
+                <PolarAngleAxis dataKey="dimension" tick={{ fontSize: 10 }} />
+                <PolarRadiusAxis angle={90} domain={[0, 1]} tick={{ fontSize: 9 }} tickCount={6} />
+                <Radar name="得分" dataKey="score" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.25} />
+                <Legend wrapperStyle={{ fontSize: 10 }} />
+              </RadarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+
+        {/* Score distribution histogram */}
+        {scoreDistribution && Object.keys(scoreDistribution.by_dimension).length > 0 && (
+          <div>
+            <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-2">分数分布</div>
+            <div className="space-y-3 max-h-[240px] overflow-y-auto">
+              {Object.entries(scoreDistribution.by_dimension).map(([dim, bucketCounts]) => {
+                const meta = getScoreMeta(dim)
+                const max = Math.max(...bucketCounts, 1)
+                return (
+                  <div key={dim}>
+                    <div className="text-[10px] text-text-secondary mb-1">{meta.label}</div>
+                    <div className="flex items-end gap-0.5 h-[32px]">
+                      {bucketCounts.map((c, i) => (
+                        <div
+                          key={i}
+                          className="flex-1 bg-blue-400 rounded-t-sm transition-all"
+                          style={{ height: `${(c / max) * 100}%`, minHeight: c > 0 ? 2 : 0 }}
+                          title={`${scoreDistribution.buckets[i]}: ${c} 条`}
+                        />
+                      ))}
+                    </div>
+                    <div className="flex justify-between text-[8px] text-text-tertiary mt-0.5">
+                      <span>0</span><span>1</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Tool usage top-N */}
+        {hasTools && (
+          <div className={radarData.length < 3 && !scoreDistribution ? 'md:col-span-2' : ''}>
+            <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-2">
+              工具调用统计 (Top {Math.min(toolUsage.length, 10)})
+            </div>
+            <ResponsiveContainer width="100%" height={Math.min(toolUsage.length, 10) * 28 + 30}>
+              <BarChart
+                data={toolUsage.slice(0, 10)}
+                layout="vertical"
+                margin={{ top: 5, right: 30, left: 80, bottom: 5 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
+                <XAxis type="number" tick={{ fontSize: 10 }} />
+                <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={75} />
+                <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
+                <Bar dataKey="calls" name="调用次数" fill="#60a5fa" radius={[0, 3, 3, 0]} />
+                <Bar dataKey="errors" name="失败次数" fill="#f87171" radius={[0, 3, 3, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+            <div className="mt-2 text-[10px] text-text-tertiary">
+              共 {toolUsage.reduce((s, t) => s + t.calls, 0)} 次调用，
+              {toolUsage.reduce((s, t) => s + t.errors, 0)} 次失败，
+              涉及 {toolUsage.length} 种工具
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+
+// ─── Per-case tool calls table ────────────────────────────────────────────
+
+function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
+  // Group by tool_name for a compact summary
+  const grouped: Record<string, { count: number; errors: number }> = {}
+  for (const c of calls) {
+    const name = (c.tool_name || c.name || 'unknown') as string
+    const slot = grouped[name] ?? (grouped[name] = { count: 0, errors: 0 })
+    slot.count++
+    const out = c.output
+    if (typeof out === 'object' && out && (('error' in out) || ('isError' in out))) {
+      slot.errors++
+    } else if (typeof out === 'string' && out.toLowerCase().startsWith('error')) {
+      slot.errors++
+    }
+  }
+  const entries = Object.entries(grouped).sort((a, b) => b[1].count - a[1].count)
+
+  return (
+    <div className="border border-border rounded-[3px] overflow-hidden">
+      <table className="w-full border-collapse text-[11px]">
+        <thead>
+          <tr className="bg-accent-subtle/60">
+            <th className="text-left py-1 px-2 font-normal text-text-tertiary">工具</th>
+            <th className="text-right py-1 px-2 font-normal text-text-tertiary">次数</th>
+            <th className="text-right py-1 px-2 font-normal text-text-tertiary">失败</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map(([name, { count, errors }]) => (
+            <tr key={name} className="border-t border-border/40">
+              <td className="py-1 px-2 font-mono">{name}</td>
+              <td className="py-1 px-2 text-right tabular-nums">{count}</td>
+              <td className={`py-1 px-2 text-right tabular-nums ${errors > 0 ? 'text-red-700' : ''}`}>
+                {errors || '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {calls.length > 5 && (
+        <details className="px-2 py-1 border-t border-border/40">
+          <summary className="text-[10px] text-text-tertiary cursor-pointer">展开全部调用详情</summary>
+          <div className="mt-1 max-h-[200px] overflow-y-auto">
+            {calls.map((c, i) => (
+              <div key={i} className="flex gap-2 py-0.5 border-b border-border/20 last:border-0">
+                <span className="text-[10px] text-text-tertiary w-4 text-right">{i + 1}</span>
+                <span className="font-mono text-[10px]">{(c.tool_name || c.name || '?') as string}</span>
+                {c.args != null && (
+                  <span className="text-[10px] text-text-tertiary truncate max-w-[200px]">
+                    {typeof c.args === 'string' ? c.args : JSON.stringify(c.args).slice(0, 80)}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  )
+}
+
+
+// ─── Radar data builder ───────────────────────────────────────────────────
+
+function buildRadarData(dimAvg: Record<string, number>) {
+  return Object.entries(dimAvg).map(([name, val]) => ({
+    dimension: getScoreMeta(name).label,
+    score: val,
+    fullMark: 1,
+  }))
+}
+
 
 // Split a set of samples' latency_ms into fixed buckets for a histogram.
 // Buckets are chosen empirically to be useful for 1-60 s agent calls.
