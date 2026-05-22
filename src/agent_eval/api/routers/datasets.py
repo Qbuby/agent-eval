@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.schemas import (
@@ -15,7 +15,7 @@ from agent_eval.api.schemas import (
 )
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.db import async_session_factory
-from agent_eval.db_models.tables import DatasetMetadataRow
+from agent_eval.db_models.tables import CandidateCaseRow, DatasetMetadataRow
 from agent_eval.governance.helpers import log_audit
 
 router = APIRouter(prefix="/api/datasets", tags=["datasets"])
@@ -30,6 +30,24 @@ async def _get_source_project(dataset_name: str) -> str | None:
         )
         row = result.scalar_one_or_none()
         return row
+
+
+async def _candidate_counts(dataset_names: list[str]) -> dict[str, int]:
+    """Count candidate_cases per dataset_name. Returns {} for empty input."""
+    if not dataset_names:
+        return {}
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(CandidateCaseRow.dataset_name, func.count(CandidateCaseRow.id))
+            .where(CandidateCaseRow.dataset_name.in_(dataset_names))
+            .group_by(CandidateCaseRow.dataset_name)
+        )
+        return {name: count for name, count in result.all()}
+
+
+async def _candidate_count(dataset_name: str) -> int:
+    counts = await _candidate_counts([dataset_name])
+    return counts.get(dataset_name, 0)
 
 
 async def _set_source_project(dataset_name: str, source_project: str | None) -> None:
@@ -70,12 +88,13 @@ async def list_datasets(
     mgr: DatasetManager = Depends(get_manager),
 ):
     datasets = await mgr.list_datasets(filter)
+    counts = await _candidate_counts([ds.name for ds in datasets])
     results = []
     for ds in datasets:
         sp = await _get_source_project(ds.name)
         results.append(DatasetResponse(
             id=ds.id, name=ds.name, description=ds.description,
-            example_count=ds.example_count, created_at=ds.created_at,
+            example_count=counts.get(ds.name, 0), created_at=ds.created_at,
             metadata=ds.metadata, source_project=sp,
         ))
     return results
@@ -91,9 +110,10 @@ async def get_dataset(
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Dataset '{name}' not found") from e
     sp = await _get_source_project(name)
+    count = await _candidate_count(name)
     return DatasetResponse(
         id=ds.id, name=ds.name, description=ds.description,
-        example_count=ds.example_count, created_at=ds.created_at,
+        example_count=count, created_at=ds.created_at,
         metadata=ds.metadata, source_project=sp,
     )
 

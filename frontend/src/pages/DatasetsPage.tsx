@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
+import { useNavigate } from 'react-router-dom'
 import { datasetsApi } from '@/services'
 import type { CreateDatasetRequest } from '@/types'
 
 export default function DatasetsPage() {
   const queryClient = useQueryClient()
+  const navigate = useNavigate()
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState<CreateDatasetRequest>({ name: '', description: '', source_project: '' })
 
@@ -121,13 +122,22 @@ export default function DatasetsPage() {
         {datasets?.map((ds, i) => (
           <div
             key={ds.id}
-            className="bg-surface border border-border rounded-md p-5 hover:-translate-y-0.5 hover:shadow-md hover:border-accent/20 transition-all duration-200 animate-fade-in"
+            role="link"
+            tabIndex={0}
+            onClick={() => navigate(`/datasets/${ds.name}`)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                navigate(`/datasets/${ds.name}`)
+              }
+            }}
+            className="block bg-surface border border-border rounded-md p-5 cursor-pointer hover:-translate-y-0.5 hover:shadow-md hover:border-accent/20 transition-all duration-200 animate-fade-in focus:outline-none focus:ring-2 focus:ring-accent/30"
             style={{ animationDelay: `${i * 40}ms` }}
           >
             <div className="flex justify-between items-start mb-3">
-              <Link to={`/datasets/${ds.name}`} className="text-[14px] font-semibold text-text-primary no-underline hover:text-accent transition-colors">
+              <span className="text-[14px] font-semibold text-text-primary">
                 {ds.name}
-              </Link>
+              </span>
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-[#ecfdf5] text-positive">
                 Active
               </span>
@@ -143,7 +153,9 @@ export default function DatasetsPage() {
               </div>
             </div>
             <button
-              onClick={() => {
+              onClick={(e) => {
+                e.preventDefault()
+                e.stopPropagation()
                 if (confirm(`确定删除数据集 "${ds.name}"？`)) deleteMutation.mutate(ds.name)
               }}
               className="text-[10px] text-text-tertiary hover:text-negative active:scale-95 transition-all tracking-wide"
