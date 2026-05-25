@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useConfirm, useToast } from '@/components/ui'
 import { evaluationApi } from '@/services'
 import type {
   CreateEvaluatorRequest, EvaluatorInstance,
@@ -12,6 +13,9 @@ import type {
 // which we pull back into evaluation_scores. No more local scoring fns.
 export default function EvaluatorsPage() {
   const qc = useQueryClient()
+  const confirm = useConfirm()
+  const toast = useToast()
+  const [deletingId, setDeletingId] = useState<string | null>(null)
 
   const listQuery = useQuery({
     queryKey: ['evaluator-instances'],
@@ -80,13 +84,30 @@ export default function EvaluatorsPage() {
                   </button>
                   <button
                     onClick={async () => {
-                      if (!confirm(`删除评估器「${e.name}」？`)) return
-                      await evaluationApi.deleteEvaluator(e.id)
-                      qc.invalidateQueries({ queryKey: ['evaluator-instances'] })
+                      const ok = await confirm({
+                        title: '删除评估器',
+                        description: `删除评估器「${e.name}」？`,
+                        confirmText: '删除',
+                        danger: true,
+                      })
+                      if (!ok) return
+                      setDeletingId(e.id)
+                      try {
+                        await evaluationApi.deleteEvaluator(e.id)
+                        qc.invalidateQueries({ queryKey: ['evaluator-instances'] })
+                        toast.success('评估器已删除')
+                      } catch (err) {
+                        const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
+                          || (err as Error)?.message || '未知错误'
+                        toast.error(msg, '删除失败')
+                      } finally {
+                        setDeletingId(null)
+                      }
                     }}
-                    className="text-[11px] text-negative hover:underline"
+                    disabled={deletingId === e.id}
+                    className="text-[11px] text-negative hover:underline disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed"
                   >
-                    删除
+                    {deletingId === e.id ? '删除中…' : '删除'}
                   </button>
                 </Td>
               </tr>
@@ -156,7 +177,7 @@ function EvaluatorEditor({
           <Field label="名称（唯一，UI 展示用）">
             <input
               type="text" value={name} onChange={e => setName(e.target.value)}
-              placeholder="e.g. 正确性 / Goal Accuracy"
+              placeholder="例如：正确性 / Goal Accuracy"
               className="input"
             />
           </Field>
@@ -164,7 +185,7 @@ function EvaluatorEditor({
           <Field label="Tag（写到 Langfuse trace 的字符串，留空则用名称）">
             <input
               type="text" value={tag} onChange={e => setTag(e.target.value)}
-              placeholder="e.g. agent-eval-correctness"
+              placeholder="例如：agent-eval-correctness"
               className="input font-mono text-[11px]"
             />
             <div className="mt-1 text-[10px] text-text-tertiary">

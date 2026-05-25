@@ -138,6 +138,18 @@ async def update_candidate(case_id: str, req: CandidateUpdate):
     return {"updated": case_id, "status": row.status}
 
 
+@router.delete("/{case_id}")
+async def delete_candidate(case_id: str):
+    async with async_session_factory() as session:
+        result = await session.execute(select(CandidateCaseRow).where(CandidateCaseRow.id == case_id))
+        row = result.scalar_one_or_none()
+        if not row:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        await session.delete(row)
+        await session.commit()
+    return {"deleted": case_id}
+
+
 @router.post("/batch-review")
 async def batch_review(req: BatchReviewRequest):
     if req.action not in ("approve", "reject"):

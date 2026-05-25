@@ -39,7 +39,7 @@ export default function DashboardPage() {
   return (
     <div>
       <header className="mb-8">
-        <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">overview</div>
+        <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">概览</div>
         <h1 className="text-xl font-medium tracking-tight">仪表盘</h1>
       </header>
 
@@ -63,7 +63,7 @@ export default function DashboardPage() {
         <Link to="/auto-collect" className="p-4 border border-border rounded-lg bg-surface hover:-translate-y-0.5 hover:shadow-sm transition-all no-underline">
           <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">自动采集</div>
           <div className={`text-2xl font-medium tracking-tight ${isRunning ? 'text-positive' : 'text-negative'}`}>
-            {isRunning ? 'ON' : 'OFF'}
+            {isRunning ? '开启' : '关闭'}
           </div>
           <div className="text-[11px] text-text-tertiary mt-1">{activeWatches} 监听 · {activeRules} 规则</div>
         </Link>
@@ -81,7 +81,7 @@ export default function DashboardPage() {
           <div className="text-[10px] text-text-tertiary mt-1">管理评测基准</div>
         </Link>
         <Link to="/traces" className="p-4 bg-surface border border-border rounded-lg text-center no-underline hover:-translate-y-0.5 hover:shadow-sm hover:border-accent/20 transition-all">
-          <div className="text-[12px] font-medium text-text-primary">导入 Traces</div>
+          <div className="text-[12px] font-medium text-text-primary">导入调用轨迹</div>
           <div className="text-[10px] text-text-tertiary mt-1">从 LangSmith 拉取</div>
         </Link>
         <Link to="/auto-collect" className="p-4 bg-surface border border-border rounded-lg text-center no-underline hover:-translate-y-0.5 hover:shadow-sm hover:border-accent/20 transition-all">

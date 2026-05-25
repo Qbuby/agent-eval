@@ -39,6 +39,25 @@ export default {
           from: { opacity: '0', transform: 'translateX(12px)' },
           to: { opacity: '1', transform: 'translateX(0)' },
         },
+        drawerIn: {
+          from: { transform: 'translateX(100%)' },
+          to: { transform: 'translateX(0)' },
+        },
+        overlayIn: {
+          from: { opacity: '0' },
+          to: { opacity: '1' },
+        },
+        dialogIn: {
+          from: { opacity: '0', transform: 'translateY(8px) scale(0.96)' },
+          to: { opacity: '1', transform: 'translateY(0) scale(1)' },
+        },
+        toastIn: {
+          from: { opacity: '0', transform: 'translateY(-8px) scale(0.96)' },
+          to: { opacity: '1', transform: 'translateY(0) scale(1)' },
+        },
+        spin: {
+          to: { transform: 'rotate(360deg)' },
+        },
         pulse: {
           '0%, 100%': { opacity: '1' },
           '50%': { opacity: '0.4' },
@@ -51,6 +70,11 @@ export default {
       animation: {
         'fade-in': 'fadeIn 0.25s ease-out forwards',
         'slide-in': 'slideIn 0.2s ease-out forwards',
+        'drawer-in': 'drawerIn 0.28s cubic-bezier(0.22, 1, 0.36, 1) forwards',
+        'overlay-in': 'overlayIn 0.2s ease-out forwards',
+        'dialog-in': 'dialogIn 0.2s cubic-bezier(0.22, 1, 0.36, 1) forwards',
+        'toast-in': 'toastIn 0.22s cubic-bezier(0.22, 1, 0.36, 1) forwards',
+        spin: 'spin 0.8s linear infinite',
         pulse: 'pulse 1.5s ease-in-out infinite',
         shimmer: 'shimmer 1.5s ease-in-out infinite',
       },

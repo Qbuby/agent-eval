@@ -24,8 +24,8 @@ export default function RoutingPage() {
   return (
     <div>
       <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">Routes</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">Routing rules &middot; traffic distribution</p>
+        <h1 className="text-lg font-light tracking-tight mb-1">路由规则</h1>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">路由规则 · 流量分发</p>
       </header>
 
       {stats && stats.length > 0 && (
@@ -33,31 +33,31 @@ export default function RoutingPage() {
           {stats.map((s, i) => (
             <div key={i} className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
               <div className="text-[9px] tracking-[0.12em] uppercase text-text-tertiary mb-2">
-                {s.rule_id?.slice(0, 8) || 'Global'}
+                {s.rule_id?.slice(0, 8) || '全局'}
               </div>
               <div className="text-[24px] font-light tracking-tight">{s.total}</div>
               <div className="flex gap-2.5 mt-1.5">
-                <span className="text-[10px] text-positive">{s.routed} routed</span>
-                <span className="text-[10px] text-negative">{s.failed} failed</span>
+                <span className="text-[10px] text-positive">{s.routed} 已路由</span>
+                <span className="text-[10px] text-negative">{s.failed} 失败</span>
               </div>
             </div>
           ))}
         </div>
       )}
 
-      <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary mb-4 pb-2 border-b border-border">
-        Active Rules
+      <div className="text-[10px] tracking-wider text-text-tertiary mb-4 pb-2 border-b border-border">
+        启用中的规则
       </div>
 
       <div className="border border-border rounded-[3px] overflow-hidden bg-surface">
         <table className="w-full border-collapse">
           <thead>
             <tr>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Name</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Source</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Target</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Priority</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Status</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">名称</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">来源</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">目标</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">优先级</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">状态</th>
             </tr>
           </thead>
           <tbody>

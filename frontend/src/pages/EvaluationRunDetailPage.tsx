@@ -6,8 +6,9 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
 } from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail, RunDetail } from '@/types'
+import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
+import { Drawer } from '@/components/ui'
 import {
   getScoreMeta, isPassing, directionMark, tone,
 } from '@/lib/scoreSemantics'
@@ -87,6 +88,9 @@ export default function EvaluationRunDetailPage() {
   const run = runQuery.data
   const langfuseHost = deriveLangfuseHost(run)
 
+  // ─── Selected sample for the detail drawer ─────────────────────────────────
+  const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
+
   useEffect(() => {
     if (!run) return
     if (activeProject !== null) return
@@ -121,6 +125,9 @@ export default function EvaluationRunDetailPage() {
   const items = resultsQuery.data?.items ?? []
   const latencyBars = buildLatencyBuckets(items)
   const radarData = buildRadarData(dimAvg)
+  const selectedRow = selectedRowId
+    ? items.find((r: EvalResultRow) => r.id === selectedRowId) ?? null
+    : null
 
   return (
     <div>
@@ -426,7 +433,7 @@ export default function EvaluationRunDetailPage() {
               target="_blank" rel="noreferrer"
               className="ml-auto text-[11px] text-accent hover:underline"
             >
-              Langfuse UI ↗
+              Langfuse 界面 ↗
             </a>
           )}
         </div>
@@ -434,16 +441,16 @@ export default function EvaluationRunDetailPage() {
           <table className="w-full border-collapse">
             <thead>
               <tr>
-                <Th>Case</Th>
-                <Th>Question</Th>
+                <Th>样例</Th>
+                <Th>问题</Th>
                 <Th>状态</Th>
-                <Th>Latency</Th>
+                <Th>时延</Th>
                 <Th>输入 token</Th>
                 <Th>输出 token</Th>
                 <Th>缓存命中</Th>
-                <Th>Tools</Th>
-                <Th>Scores</Th>
-                <Th>Trace</Th>
+                <Th>工具</Th>
+                <Th>分数</Th>
+                <Th>追踪</Th>
               </tr>
             </thead>
             <tbody>
@@ -451,7 +458,13 @@ export default function EvaluationRunDetailPage() {
                 <tr><td colSpan={10} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
               )}
               {items.map((r: EvalResultRow) => (
-                <ResultRow key={r.id} row={r} langfuseHost={langfuseHost} project={activeProject} />
+                <ResultRow
+                  key={r.id}
+                  row={r}
+                  langfuseHost={langfuseHost}
+                  selected={r.id === selectedRowId}
+                  onSelect={() => setSelectedRowId(r.id)}
+                />
               ))}
               {items.length === 0 && !resultsQuery.isLoading && (
                 <tr><td colSpan={10} className="py-8 text-center text-[11px] text-text-tertiary">
@@ -462,20 +475,111 @@ export default function EvaluationRunDetailPage() {
           </table>
         </div>
       </section>
+
+      <Drawer
+        open={!!selectedRow}
+        onClose={() => setSelectedRowId(null)}
+        width="wide"
+        title={selectedRow ? (selectedRow.question || '样例详情') : '样例详情'}
+        subtitle={
+          selectedRow
+            ? `样例 ${selectedRow.benchmark_case_id?.slice(0, 8) ?? selectedRow.id.slice(0, 8)}`
+            : undefined
+        }
+      >
+        {selectedRow && (
+          <ResultDetailPanel
+            row={selectedRow}
+            langfuseHost={langfuseHost}
+            project={activeProject}
+          />
+        )}
+      </Drawer>
     </div>
   )
 }
 
 
-function ResultRow({ row, langfuseHost, project }: {
+function ResultRow({ row, langfuseHost, selected, onSelect }: {
+  row: EvalResultRow
+  langfuseHost: string | null
+  selected: boolean
+  onSelect: () => void
+}) {
+  const scoreEntries = Object.entries(row.scores)
+
+  return (
+    <tr
+      onClick={onSelect}
+      className={`cursor-pointer transition-colors ${
+        selected ? 'bg-accent-subtle' : 'hover:bg-accent-subtle/40'
+      }`}
+    >
+      <Td mono>{row.benchmark_case_id?.slice(0, 8) ?? row.id.slice(0, 8)}</Td>
+      <Td>
+        <div className="max-w-[260px] truncate" title={row.question || ''}>
+          {row.question || '—'}
+        </div>
+      </Td>
+      <Td><StatusBadge status={row.status} /></Td>
+      <Td>{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</Td>
+      <Td>{row.prompt_tokens ?? '—'}</Td>
+      <Td>{row.completion_tokens ?? '—'}</Td>
+      <Td>
+        {row.cache_read_tokens != null
+          ? <span title={`命中: ${row.cache_read_tokens}, 创建: ${row.cache_creation_tokens ?? 0}`}>
+              {row.cache_read_tokens}
+              {row.cache_creation_tokens != null && row.cache_creation_tokens > 0 && (
+                <span className="text-text-tertiary ml-1">/+{row.cache_creation_tokens}</span>
+              )}
+            </span>
+          : '—'}
+      </Td>
+      <Td>{row.tool_call_count ?? 0}</Td>
+      <Td>
+        <div className="flex flex-wrap gap-1">
+          {scoreEntries.length === 0 && <span className="text-text-tertiary">—</span>}
+          {scoreEntries.map(([n, v]) => {
+            const meta = getScoreMeta(n)
+            const t = tone(n, v)
+            const cls = t === 'good'
+              ? 'border-green-300 bg-green-50 text-green-800'
+              : 'border-red-300 bg-red-50 text-red-800'
+            return (
+              <span
+                key={n}
+                className={`text-[10px] px-1.5 py-0.5 rounded border ${cls}`}
+                title={`${meta.label} · ${directionMark(meta)} · 合格线 ${meta.threshold}\n${meta.description}`}
+              >
+                {meta.label}: {v.toFixed(2)}
+              </span>
+            )
+          })}
+        </div>
+      </Td>
+      <Td>
+        {row.langsmith_run_id ? (
+          <span className="text-[11px] font-mono text-accent">{row.langsmith_run_id.slice(0, 8)}</span>
+        ) : row.langfuse_trace_id && langfuseHost ? (
+          <a
+            href={`${langfuseHost}/trace/${row.langfuse_trace_id}`}
+            target="_blank" rel="noreferrer"
+            onClick={e => e.stopPropagation()}
+            className="text-[11px] text-accent hover:underline font-mono"
+          >
+            {row.langfuse_trace_id.slice(0, 8)} ↗
+          </a>
+        ) : '—'}
+      </Td>
+    </tr>
+  )
+}
+
+function ResultDetailPanel({ row, langfuseHost, project }: {
   row: EvalResultRow
   langfuseHost: string | null
   project: string | null
 }) {
-  const [open, setOpen] = useState(false)
-  const scoreEntries = Object.entries(row.scores)
-
-  // ─── LangSmith trace lazy-loaded on expand ──────────────────────────────
   const [nodeCache, setNodeCache] = useState<NodeCache>({})
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const nodeCacheRef = useRef(nodeCache)
@@ -484,7 +588,7 @@ function ResultRow({ row, langfuseHost, project }: {
   const traceQuery = useQuery({
     queryKey: ['eval-result-trace', row.id, project ?? ''],
     queryFn: () => evaluationApi.getResultTrace(row.id, project || undefined).then(r => r.data),
-    enabled: open && !!row.langsmith_run_id,
+    enabled: !!row.langsmith_run_id,
     retry: false,
   })
 
@@ -517,37 +621,31 @@ function ResultRow({ row, langfuseHost, project }: {
   }, [fetchChild])
 
   const root: RunDetail | undefined = traceQuery.data
+  const scoreEntries = Object.entries(row.scores)
 
   return (
-    <>
-      <tr
-        onClick={() => setOpen(v => !v)}
-        className="hover:bg-accent-subtle/40 cursor-pointer transition-colors"
-      >
-        <Td mono>{row.benchmark_case_id?.slice(0, 8) ?? row.id.slice(0, 8)}</Td>
-        <Td>
-          <div className="max-w-[260px] truncate" title={row.question || ''}>
-            {row.question || '—'}
+    <div className="text-[11px]">
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <div>
+          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">状态</div>
+          <StatusBadge status={row.status} />
+        </div>
+        <div>
+          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">时延</div>
+          <div className="font-mono text-[12px]">{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</div>
+        </div>
+        <div>
+          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">Tokens (in / out)</div>
+          <div className="font-mono text-[12px]">
+            {row.prompt_tokens ?? '—'} / {row.completion_tokens ?? '—'}
           </div>
-        </Td>
-        <Td><StatusBadge status={row.status} /></Td>
-        <Td>{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</Td>
-        <Td>{row.prompt_tokens ?? '—'}</Td>
-        <Td>{row.completion_tokens ?? '—'}</Td>
-        <Td>
-          {row.cache_read_tokens != null
-            ? <span title={`命中: ${row.cache_read_tokens}, 创建: ${row.cache_creation_tokens ?? 0}`}>
-                {row.cache_read_tokens}
-                {row.cache_creation_tokens != null && row.cache_creation_tokens > 0 && (
-                  <span className="text-text-tertiary ml-1">/+{row.cache_creation_tokens}</span>
-                )}
-              </span>
-            : '—'}
-        </Td>
-        <Td>{row.tool_call_count ?? 0}</Td>
-        <Td>
+        </div>
+      </div>
+
+      {scoreEntries.length > 0 && (
+        <div className="mb-4">
+          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">评分</div>
           <div className="flex flex-wrap gap-1">
-            {scoreEntries.length === 0 && <span className="text-text-tertiary">—</span>}
             {scoreEntries.map(([n, v]) => {
               const meta = getScoreMeta(n)
               const t = tone(n, v)
@@ -565,99 +663,103 @@ function ResultRow({ row, langfuseHost, project }: {
               )
             })}
           </div>
-        </Td>
-        <Td>
-          {row.langsmith_run_id ? (
-            <span className="text-[11px] font-mono text-accent">{row.langsmith_run_id.slice(0, 8)}</span>
-          ) : row.langfuse_trace_id && langfuseHost ? (
-            <a
-              href={`${langfuseHost}/trace/${row.langfuse_trace_id}`}
-              target="_blank" rel="noreferrer"
-              onClick={e => e.stopPropagation()}
-              className="text-[11px] text-accent hover:underline font-mono"
-            >
-              {row.langfuse_trace_id.slice(0, 8)} ↗
-            </a>
-          ) : '—'}
-        </Td>
-      </tr>
-      {open && (
-        <tr className="bg-accent-subtle/30">
-          <td colSpan={10} className="p-3 text-[11px]">
-            <div className="mb-3">
-              <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">输出</div>
-              <pre className="font-mono text-[11px] bg-white border border-border rounded-[3px] p-2 max-h-[200px] overflow-y-auto whitespace-pre-wrap">
-                {row.actual_output || '（无输出）'}
-              </pre>
-            </div>
-            {row.error_message && (
-              <div className="mb-3">
-                <div className="text-[10px] tracking-widest uppercase text-negative mb-0.5">错误</div>
-                <pre className="font-mono text-[11px] bg-red-50 border border-red-200 rounded-[3px] p-2 whitespace-pre-wrap">
-                  {row.error_message}
-                </pre>
-              </div>
-            )}
-            {/* Tool calls captured during agent invocation */}
-            {Array.isArray(row.actual_tool_calls) && row.actual_tool_calls.length > 0 && (
-              <div className="mb-3">
-                <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
-                  工具调用 ({row.actual_tool_calls.length})
-                </div>
-                <ToolCallsTable calls={row.actual_tool_calls as Array<Record<string, unknown>>} />
-              </div>
-            )}
-            <div>
-              <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">LangSmith Trace</div>
-              {!row.langsmith_run_id && (
-                <div className="text-[11px] text-text-tertiary border border-dashed border-border rounded-[4px] px-3 py-4 text-center">
-                  {project
-                    ? `暂未在 project «${project}» 找到对应 run。点击页面顶部"查询轨迹"重试，或换一个 project。`
-                    : '请在页面顶部输入 LangSmith project 名称并点击"查询轨迹"，平台会按时间窗口和问题文本反查对应 run。'}
-                </div>
-              )}
-              {row.langsmith_run_id && traceQuery.isLoading && (
-                <div className="text-[11px] text-text-tertiary px-3 py-4">加载中…</div>
-              )}
-              {row.langsmith_run_id && traceQuery.isError && (
-                <div className="text-[11px] text-negative px-3 py-2">
-                  加载 trace 失败：{(traceQuery.error as Error)?.message || 'unknown'}
-                </div>
-              )}
-              {root && (
-                <div className="bg-surface border border-border rounded-[6px] p-3">
-                  <RunDetailBody detail={root} compact />
-                  {root.children.length > 0 && (
-                    <div className="mt-3">
-                      <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
-                        Children ({root.children.length})
-                        {root.children_truncated && <span className="ml-2 text-[#b87b00]">已截断</span>}
-                      </div>
-                      <div className="border border-border rounded-[4px] bg-surface">
-                        {root.children.map(c => (
-                          <RunNodeRow
-                            key={c.id}
-                            meta={c}
-                            depth={0}
-                            projectName={project || ''}
-                            isOpen={expanded.has(c.id)}
-                            state={nodeCache[c.id]}
-                            nodeCache={nodeCache}
-                            expanded={expanded}
-                            onToggle={toggleExpand}
-                            onRetry={fetchChild}
-                          />
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </td>
-        </tr>
+        </div>
       )}
-    </>
+
+      <div className="mb-3">
+        <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">输出</div>
+        <pre className="font-mono text-[11px] bg-white border border-border rounded-[3px] p-2 max-h-[240px] overflow-y-auto whitespace-pre-wrap">
+          {row.actual_output || '（无输出）'}
+        </pre>
+      </div>
+
+      {row.error_message && (
+        <div className="mb-3">
+          <div className="text-[10px] tracking-widest uppercase text-negative mb-0.5">错误</div>
+          <pre className="font-mono text-[11px] bg-red-50 border border-red-200 rounded-[3px] p-2 whitespace-pre-wrap">
+            {row.error_message}
+          </pre>
+        </div>
+      )}
+
+      {Array.isArray(row.full_trace?.steps) && row.full_trace!.steps!.length > 0 && (
+        <div className="mb-3">
+          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
+            思维链 ({row.full_trace!.steps!.length} 步)
+          </div>
+          <CotTimeline steps={row.full_trace!.steps!} />
+        </div>
+      )}
+
+      {Array.isArray(row.actual_tool_calls) && row.actual_tool_calls.length > 0 && (
+        <div className="mb-3">
+          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
+            工具调用 ({row.actual_tool_calls.length})
+          </div>
+          <ToolCallsTable calls={row.actual_tool_calls as Array<Record<string, unknown>>} />
+        </div>
+      )}
+
+      {row.langfuse_trace_id && langfuseHost && (
+        <div className="mb-3">
+          <a
+            href={`${langfuseHost}/trace/${row.langfuse_trace_id}`}
+            target="_blank" rel="noreferrer"
+            className="text-[11px] text-accent hover:underline font-mono"
+          >
+            在 Langfuse 中查看 trace ↗
+          </a>
+        </div>
+      )}
+
+      <div>
+        <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">LangSmith 追踪</div>
+        {!row.langsmith_run_id && (
+          <div className="text-[11px] text-text-tertiary border border-dashed border-border rounded-[4px] px-3 py-4 text-center">
+            {project
+              ? `暂未在 project «${project}» 找到对应 run。点击页面顶部"查询轨迹"重试，或换一个 project。`
+              : '请在页面顶部输入 LangSmith project 名称并点击"查询轨迹"，平台会按时间窗口和问题文本反查对应 run。'}
+          </div>
+        )}
+        {row.langsmith_run_id && traceQuery.isLoading && (
+          <div className="text-[11px] text-text-tertiary px-3 py-4">加载中…</div>
+        )}
+        {row.langsmith_run_id && traceQuery.isError && (
+          <div className="text-[11px] text-negative px-3 py-2">
+            加载 trace 失败：{(traceQuery.error as Error)?.message || 'unknown'}
+          </div>
+        )}
+        {root && (
+          <div className="bg-surface border border-border rounded-[6px] p-3">
+            <RunDetailBody detail={root} compact />
+            {root.children.length > 0 && (
+              <div className="mt-3">
+                <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
+                  Children ({root.children.length})
+                  {root.children_truncated && <span className="ml-2 text-[#b87b00]">已截断</span>}
+                </div>
+                <div className="border border-border rounded-[4px] bg-surface">
+                  {root.children.map(c => (
+                    <RunNodeRow
+                      key={c.id}
+                      meta={c}
+                      depth={0}
+                      projectName={project || ''}
+                      isOpen={expanded.has(c.id)}
+                      state={nodeCache[c.id]}
+                      nodeCache={nodeCache}
+                      expanded={expanded}
+                      onToggle={toggleExpand}
+                      onRetry={fetchChild}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -909,6 +1011,92 @@ function ReportSection({
         )}
       </div>
     </section>
+  )
+}
+
+
+// ─── Per-case CoT timeline ────────────────────────────────────────────────
+
+function CotTimeline({ steps }: { steps: CotStep[] }) {
+  return (
+    <div className="border border-border rounded-[4px] bg-white overflow-hidden">
+      {steps.map((step, i) => (
+        <CotStepRow key={i} step={step} index={i} last={i === steps.length - 1} />
+      ))}
+    </div>
+  )
+}
+
+function CotStepRow({ step, index, last }: { step: CotStep; index: number; last: boolean }) {
+  const [open, setOpen] = useState(step.type !== 'thought')
+  const dur = step.duration_ms != null ? `${step.duration_ms}ms` : null
+  const border = last ? '' : 'border-b border-border/40'
+
+  if (step.type === 'thought' || step.type === 'answer') {
+    const isAnswer = step.type === 'answer'
+    const tagBg = isAnswer ? 'bg-emerald-100 text-emerald-800' : 'bg-zinc-100 text-zinc-600'
+    const tagLabel = isAnswer ? '答复' : '思考'
+    const text = step.content || ''
+    const long = text.length > 200
+    const preview = long && !open ? `${text.slice(0, 200)}…` : text
+    return (
+      <div className={`px-3 py-2 ${border} ${isAnswer ? 'bg-emerald-50/40' : ''}`}>
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-[10px] text-text-tertiary tabular-nums w-5 text-right">{index + 1}</span>
+          <span className={`text-[10px] px-1.5 py-0.5 rounded ${tagBg}`}>{tagLabel}</span>
+          {dur && <span className="text-[10px] text-text-tertiary tabular-nums">{dur}</span>}
+          {long && (
+            <button
+              type="button"
+              onClick={() => setOpen(o => !o)}
+              className="ml-auto text-[10px] text-accent hover:underline"
+            >
+              {open ? '收起' : '展开'}
+            </button>
+          )}
+        </div>
+        <pre className="font-mono text-[11px] whitespace-pre-wrap text-text-primary">{preview || '（空）'}</pre>
+      </div>
+    )
+  }
+
+  // tool_call
+  const argsStr =
+    step.args == null ? '' : typeof step.args === 'string' ? step.args : JSON.stringify(step.args, null, 2)
+  const outStr =
+    step.output == null ? '' : typeof step.output === 'string' ? step.output : JSON.stringify(step.output, null, 2)
+  return (
+    <div className={`px-3 py-2 bg-amber-50/50 ${border}`}>
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-[10px] text-text-tertiary tabular-nums w-5 text-right">{index + 1}</span>
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-200 text-amber-900">工具</span>
+        <span className="text-[11px] font-mono">{step.tool_name || '?'}</span>
+        {dur && <span className="text-[10px] text-text-tertiary tabular-nums">{dur}</span>}
+        <button
+          type="button"
+          onClick={() => setOpen(o => !o)}
+          className="ml-auto text-[10px] text-accent hover:underline"
+        >
+          {open ? '收起' : '展开'}
+        </button>
+      </div>
+      {open && (
+        <div className="space-y-1.5 pl-7">
+          {argsStr && (
+            <div>
+              <div className="text-[10px] text-text-tertiary mb-0.5">参数</div>
+              <pre className="font-mono text-[10px] bg-white border border-border/60 rounded-[3px] p-1.5 max-h-[140px] overflow-auto whitespace-pre-wrap">{argsStr}</pre>
+            </div>
+          )}
+          {outStr && (
+            <div>
+              <div className="text-[10px] text-text-tertiary mb-0.5">输出</div>
+              <pre className="font-mono text-[10px] bg-white border border-border/60 rounded-[3px] p-1.5 max-h-[160px] overflow-auto whitespace-pre-wrap">{outStr}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
 

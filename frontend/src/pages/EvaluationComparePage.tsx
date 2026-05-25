@@ -35,7 +35,7 @@ export default function EvaluationComparePage() {
   if (ids.length === 0) {
     return (
       <div className="text-[12px] text-text-tertiary">
-        请先在评估历史页勾选至少两个 run，再点「对比所选」。
+        请先在评估历史页勾选至少两个运行，再点「对比所选」。
         <Link to="/evaluation" className="ml-2 underline text-accent">返回历史</Link>
       </div>
     )
@@ -49,14 +49,14 @@ export default function EvaluationComparePage() {
         </div>
         <h1 className="text-lg font-light tracking-tight mb-1">运行对比</h1>
         <p className="text-[10px] text-text-tertiary tracking-widest uppercase">
-          {ids.length} runs · 维度分 · 成本 · 通过率
+          {ids.length} 个运行 · 维度分 · 成本 · 通过率
         </p>
       </header>
 
       {loading && <div className="text-[12px] text-text-tertiary py-10 text-center">加载中…</div>}
       {anyError && !loading && (
         <div className="text-[12px] text-negative py-4">
-          部分 run 加载失败：{(anyError.error as Error)?.message || 'unknown'}
+          部分运行加载失败：{(anyError.error as Error)?.message || '未知错误'}
         </div>
       )}
 
@@ -67,13 +67,13 @@ export default function EvaluationComparePage() {
             <table className="w-full text-[11px] border-collapse">
               <thead>
                 <tr className="text-text-tertiary">
-                  <th className="text-left py-1.5 px-2 font-normal">Run</th>
-                  <th className="text-left py-1.5 px-2 font-normal">Agent Model</th>
+                  <th className="text-left py-1.5 px-2 font-normal">运行</th>
+                  <th className="text-left py-1.5 px-2 font-normal">智能体模型</th>
                   <th className="text-right py-1.5 px-2 font-normal">样例数</th>
                   <th className="text-right py-1.5 px-2 font-normal">通过率</th>
-                  <th className="text-right py-1.5 px-2 font-normal">成功·Latency</th>
-                  <th className="text-right py-1.5 px-2 font-normal">成功·Tokens</th>
-                  <th className="text-right py-1.5 px-2 font-normal">成功·Tool Calls</th>
+                  <th className="text-right py-1.5 px-2 font-normal">成功·时延</th>
+                  <th className="text-right py-1.5 px-2 font-normal">成功·token</th>
+                  <th className="text-right py-1.5 px-2 font-normal">成功·工具调用</th>
                 </tr>
               </thead>
               <tbody>
@@ -120,7 +120,7 @@ export default function EvaluationComparePage() {
                   <XAxis dataKey="run" tick={{ fontSize: 10 }} />
                   <YAxis tick={{ fontSize: 10 }} domain={[0, 100]} label={{ value: '%', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
                   <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
-                  <Bar dataKey="passRate" name="Pass rate (%)" fill="#10b981" radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="passRate" name="通过率 (%)" fill="#10b981" radius={[3, 3, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             </section>
@@ -160,7 +160,7 @@ export default function EvaluationComparePage() {
                 </BarChart>
               </ResponsiveContainer>
               <p className="mt-2 text-[10px] text-text-tertiary">
-                Latency 与 tokens 量纲不同，图表用于相对比较，数值请看上方表格。
+                时延与 token 量纲不同，图表用于相对比较，数值请看上方表格。
               </p>
             </section>
           )}
@@ -215,11 +215,11 @@ function buildCostChart(runs: EvalRunDetail[]): {
   runKeys: string[]
 } {
   const metrics: Array<{ key: string; label: string }> = [
-    { key: 'avg_latency_ms', label: 'Latency (ms)' },
-    { key: 'avg_total_tokens', label: 'Total tokens' },
-    { key: 'avg_prompt_tokens', label: 'Prompt tokens' },
-    { key: 'avg_completion_tokens', label: 'Completion tokens' },
-    { key: 'avg_tool_calls', label: 'Tool calls' },
+    { key: 'avg_latency_ms', label: '时延 (ms)' },
+    { key: 'avg_total_tokens', label: '总 token' },
+    { key: 'avg_prompt_tokens', label: '输入 token' },
+    { key: 'avg_completion_tokens', label: '输出 token' },
+    { key: 'avg_tool_calls', label: '工具调用' },
   ]
   const runKeys: string[] = []
   const data = metrics.map(m => {

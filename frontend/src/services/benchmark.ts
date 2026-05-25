@@ -143,6 +143,9 @@ export const candidatesApi = {
   update(caseId: string, data: Partial<CandidateCase>) {
     return api.put<{ updated: string; status: string }>(`/candidates/${caseId}`, data)
   },
+  delete(caseId: string) {
+    return api.delete<{ deleted: string }>(`/candidates/${caseId}`)
+  },
   batchReview(ids: string[], action: 'approve' | 'reject') {
     return api.post('/candidates/batch-review', { ids, action })
   },

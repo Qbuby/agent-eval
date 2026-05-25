@@ -22,37 +22,37 @@ export default function AuditPage() {
     <div>
       <header className="mb-8">
         <h1 className="text-lg font-light tracking-tight mb-1">审计日志</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">SYSTEM ACTIVITY · CHANGE HISTORY</p>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">系统活动 · 变更历史</p>
       </header>
 
       <div className="flex gap-3 items-center mb-5 flex-wrap">
         <div className="flex items-center gap-1.5">
-          <span className="text-[9px] tracking-[0.08em] uppercase text-text-tertiary">Type</span>
+          <span className="text-[10px] tracking-wider text-text-tertiary">实体类型</span>
           <select
             value={entityType}
             onChange={(e) => setEntityType(e.target.value)}
             className="py-1.5 px-2 text-[11px] border border-border rounded-[3px] bg-surface text-text-secondary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
             aria-label="实体类型筛选"
           >
-            <option value="">All</option>
-            <option value="dataset">Dataset</option>
-            <option value="example">Example</option>
-            <option value="rule">Rule</option>
+            <option value="">全部</option>
+            <option value="dataset">数据集</option>
+            <option value="example">样例</option>
+            <option value="rule">规则</option>
           </select>
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="text-[9px] tracking-[0.08em] uppercase text-text-tertiary">Action</span>
+          <span className="text-[10px] tracking-wider text-text-tertiary">操作</span>
           <select
             value={action}
             onChange={(e) => setAction(e.target.value)}
             className="py-1.5 px-2 text-[11px] border border-border rounded-[3px] bg-surface text-text-secondary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
             aria-label="操作类型筛选"
           >
-            <option value="">All</option>
-            <option value="create">Create</option>
-            <option value="update">Update</option>
-            <option value="delete">Delete</option>
-            <option value="import">Import</option>
+            <option value="">全部</option>
+            <option value="create">创建</option>
+            <option value="update">更新</option>
+            <option value="delete">删除</option>
+            <option value="import">导入</option>
           </select>
         </div>
       </div>

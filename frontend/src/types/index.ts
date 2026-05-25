@@ -450,6 +450,16 @@ export interface EvalRunDetail extends EvalRunSummary {
   evaluator_configs: Array<Record<string, unknown>>
 }
 
+export interface CotStep {
+  type: 'thought' | 'tool_call' | 'answer'
+  content?: string
+  tool_name?: string
+  args?: unknown
+  output?: unknown
+  started_at?: number | null
+  duration_ms?: number | null
+}
+
 export interface EvalResultRow {
   id: string
   benchmark_case_id: string | null
@@ -465,6 +475,7 @@ export interface EvalResultRow {
   cache_read_tokens?: number | null
   tool_call_count: number | null
   actual_tool_calls?: Array<Record<string, unknown>> | null
+  full_trace?: { steps?: CotStep[] } | null
   error_message: string | null
   langfuse_trace_id: string | null
   langsmith_run_id?: string | null

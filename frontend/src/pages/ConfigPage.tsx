@@ -110,7 +110,7 @@ export default function ConfigPage() {
     <div>
       <header className="mb-8">
         <h1 className="text-lg font-light tracking-tight mb-1">配置</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">SYSTEM PARAMETERS · RUNTIME SETTINGS</p>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">系统参数 · 运行时设置</p>
       </header>
 
       <div className="space-y-8 max-w-[560px]">

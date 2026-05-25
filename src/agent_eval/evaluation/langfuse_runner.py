@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -183,7 +182,6 @@ def _aggregate_cost(rows: list[dict[str, Any]]) -> dict[str, Any]:
         return round(sum(vals) / len(vals), 2) if vals else None
 
     prompt = _avg("prompt_tokens")
-    cache_create = _avg("cache_creation_tokens")
     cache_read = _avg("cache_read_tokens")
     # cache_hit_rate = avg(cache_read) / avg(prompt_tokens).
     #
@@ -469,6 +467,7 @@ async def _run_one_case(
     error_msg: str | None = None
     error_type: str | None = None
     actual_tool_calls: list[dict] = []
+    cot_steps: list[dict] = []
     latency_ms: int | None = None
     usage = {
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
@@ -488,6 +487,9 @@ async def _run_one_case(
                 tcs = raw.get("tool_calls")
                 if isinstance(tcs, list):
                     actual_tool_calls = tcs
+                steps_raw = raw.get("steps")
+                if isinstance(steps_raw, list):
+                    cot_steps = steps_raw
             if not actual_tool_calls:
                 actual_tool_calls = _extract_tool_calls_from_response(resp)
         except Exception as e:
@@ -562,6 +564,7 @@ async def _run_one_case(
         "status": status,
         "actual_output": output_text,
         "actual_tool_calls": actual_tool_calls,
+        "cot_steps": cot_steps,
         "latency_ms": latency_ms,
         "error_message": error_msg,
         "error_type": error_type,
@@ -635,6 +638,7 @@ async def _execute_run(
                         thread_id=res["thread_id"],
                         actual_output=res["actual_output"],
                         actual_tool_calls=res["actual_tool_calls"] or None,
+                        full_trace=({"steps": res["cot_steps"]} if res.get("cot_steps") else None),
                         latency_ms=res["latency_ms"],
                         total_tokens=res["total_tokens"],
                         prompt_tokens=res["prompt_tokens"],

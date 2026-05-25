@@ -119,7 +119,7 @@ export default function GeneratePage() {
     <div>
       <header className="mb-8">
         <h1 className="text-lg font-light tracking-tight mb-1">样例生成</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">SCENARIO GENERATION · TEST CASE CREATION</p>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">场景生成 · 测试用例创建</p>
       </header>
 
       {phase === 'form' && (

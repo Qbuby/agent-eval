@@ -1,11 +1,14 @@
 import { Fragment, useState, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useConfirm, useToast } from '@/components/ui'
 import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn } from '@/services/benchmark'
 
 export default function BenchmarkPage() {
   const { projectId } = useParams<{ projectId: string }>()
   const queryClient = useQueryClient()
+  const confirm = useConfirm()
+  const toast = useToast()
   const fileRef = useRef<HTMLInputElement>(null)
 
   const [page, setPage] = useState(1)
@@ -66,7 +69,10 @@ export default function BenchmarkPage() {
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })
       setShowImport(false)
-      alert(`导入完成：${res.data.imported_to_benchmark} 条入库，${res.data.pending_in_staging} 条进入暂存区`)
+      toast.success(
+        `${res.data.imported_to_benchmark} 条入库，${res.data.pending_in_staging} 条进入暂存区`,
+        '导入完成',
+      )
     },
   })
 
@@ -125,7 +131,7 @@ export default function BenchmarkPage() {
       if (categoryFilter === deleteCategoryMutation.variables) setCategoryFilter('')
     },
     onError: (err: any) => {
-      alert(err?.response?.data?.detail || '删除失败')
+      toast.error(err?.response?.data?.detail || '删除失败')
     },
   })
 
@@ -181,10 +187,14 @@ export default function BenchmarkPage() {
               重命名
             </button>
             <button
-              onClick={() => {
-                if (confirm('确定删除该类别？仅当类别下无样例时可删除。')) {
-                  deleteCategoryMutation.mutate(categoryFilter)
-                }
+              onClick={async () => {
+                const ok = await confirm({
+                  title: '删除类别',
+                  description: '确定删除该类别？仅当类别下无样例时可删除。',
+                  confirmText: '删除',
+                  danger: true,
+                })
+                if (ok) deleteCategoryMutation.mutate(categoryFilter)
               }}
               className="py-1.5 px-2 text-[10px] text-text-secondary hover:text-negative transition-all"
               title="删除类别"
@@ -262,7 +272,20 @@ export default function BenchmarkPage() {
                 <td className="py-2.5 px-3 border-b border-border text-right" onClick={e => e.stopPropagation()}>
                   <div className="flex gap-2 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
                     <button onClick={() => setEditCase(c)} className="text-[10px] text-text-secondary hover:text-accent">编辑</button>
-                    <button onClick={() => { if (confirm('确定删除？')) deleteMutation.mutate(c.id) }} className="text-[10px] text-text-secondary hover:text-negative">删除</button>
+                    <button
+                      onClick={async () => {
+                        const ok = await confirm({
+                          title: '删除样例',
+                          description: '确定删除该样例？',
+                          confirmText: '删除',
+                          danger: true,
+                        })
+                        if (ok) deleteMutation.mutate(c.id)
+                      }}
+                      className="text-[10px] text-text-secondary hover:text-negative"
+                    >
+                      删除
+                    </button>
                   </div>
                 </td>
               </tr>
@@ -491,7 +514,7 @@ export default function BenchmarkPage() {
                 <input
                   value={newCategoryName}
                   onChange={e => setNewCategoryName(e.target.value)}
-                  placeholder="e.g. errorcode"
+                  placeholder="例如：errorcode"
                   className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
                 />
               </div>

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useConfirm, useToast } from '@/components/ui'
 import { datasetsApi, candidatesApi, projectsApi } from '@/services'
 import type { CandidateCase } from '@/services/benchmark'
 
@@ -14,6 +15,8 @@ const STATUS_MAP: Record<string, { label: string; color: string }> = {
 export default function DatasetDetailPage() {
   const { name } = useParams<{ name: string }>()
   const queryClient = useQueryClient()
+  const confirm = useConfirm()
+  const toast = useToast()
 
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('')
@@ -28,6 +31,7 @@ export default function DatasetDetailPage() {
   const [showAddModal, setShowAddModal] = useState(false)
   const [addQuestion, setAddQuestion] = useState('')
   const [addAnswer, setAddAnswer] = useState('')
+  const [deletingId, setDeletingId] = useState<string | null>(null)
 
   const pageSize = 20
 
@@ -59,7 +63,7 @@ export default function DatasetDetailPage() {
     mutationFn: () => candidatesApi.importFromLangSmith({ dataset_name: name! }),
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['dataset-candidates'] })
-      alert(`已同步 ${res.data.imported} 条样例`)
+      toast.success(`已同步 ${res.data.imported} 条样例`)
     },
   })
 
@@ -100,7 +104,7 @@ export default function DatasetDetailPage() {
       queryClient.invalidateQueries({ queryKey: ['dataset-candidates'] })
       setSelectedIds(new Set())
       setShowPromote(false)
-      alert(`成功导入 ${res.data.promoted} 条到基准测试集`)
+      toast.success(`成功导入 ${res.data.promoted} 条到基准测试集`)
     },
   })
 
@@ -179,7 +183,14 @@ export default function DatasetDetailPage() {
           + 手动添加
         </button>
         <button
-          onClick={() => { if (confirm(`从 LangSmith 同步 "${name}" 的样例到本地？`)) syncMutation.mutate() }}
+          onClick={async () => {
+            const ok = await confirm({
+              title: '同步样例',
+              description: `从 LangSmith 同步 "${name}" 的样例到本地？`,
+              confirmText: '同步',
+            })
+            if (ok) syncMutation.mutate()
+          }}
           disabled={syncMutation.isPending}
           className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-surface text-text-primary border border-border hover:border-accent active:scale-[0.97] transition-all"
         >
@@ -226,7 +237,7 @@ export default function DatasetDetailPage() {
               <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle w-20">有答案</th>
               <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle w-20">状态</th>
               <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle w-20">来源</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-right py-2 px-3 border-b border-border font-normal bg-accent-subtle w-16">操作</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-right py-2 px-3 border-b border-border font-normal bg-accent-subtle w-24">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -251,7 +262,35 @@ export default function DatasetDetailPage() {
                 </td>
                 <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-tertiary">{c.source}</td>
                 <td className="py-2.5 px-3 border-b border-border text-right">
-                  <button onClick={() => openEdit(c)} className="text-[10px] text-text-secondary hover:text-accent opacity-0 group-hover:opacity-100 transition-all">编辑</button>
+                  <div className="flex gap-2 justify-end opacity-0 group-hover:opacity-100 transition-all">
+                    <button onClick={() => openEdit(c)} className="text-[10px] text-text-secondary hover:text-accent">编辑</button>
+                    <button
+                      onClick={async () => {
+                        const ok = await confirm({
+                          title: '删除样例',
+                          description: `确定删除该样例？此操作不可撤销。`,
+                          confirmText: '删除',
+                          danger: true,
+                        })
+                        if (!ok) return
+                        setDeletingId(c.id)
+                        try {
+                          await candidatesApi.delete(c.id)
+                          queryClient.invalidateQueries({ queryKey: ['dataset-candidates'] })
+                          queryClient.invalidateQueries({ queryKey: ['candidates'] })
+                          toast.success('样例已删除')
+                        } catch (err) {
+                          const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
+                            || (err as Error)?.message || '未知错误'
+                          toast.error(msg, '删除失败')
+                        } finally {
+                          setDeletingId(null)
+                        }
+                      }}
+                      disabled={deletingId === c.id}
+                      className="text-[10px] text-text-secondary hover:text-negative disabled:opacity-50"
+                    >{deletingId === c.id ? '删除中…' : '删除'}</button>
+                  </div>
                 </td>
               </tr>
             ))}

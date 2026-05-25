@@ -1,10 +1,12 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useConfirm } from '@/components/ui'
 import { schedulerApi, routingApi } from '@/services'
 import type { RoutingRule } from '@/types'
 
 export default function AutoCollectPage() {
   const queryClient = useQueryClient()
+  const confirm = useConfirm()
   const [showAddRule, setShowAddRule] = useState(false)
   const [showAddWatch, setShowAddWatch] = useState(false)
   const [watchProject, setWatchProject] = useState('')
@@ -91,7 +93,7 @@ export default function AutoCollectPage() {
   return (
     <div>
       <header className="mb-8">
-        <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">automation</div>
+        <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">自动化</div>
         <h1 className="text-xl font-medium tracking-tight">自动采集</h1>
         <p className="text-[12px] text-text-tertiary mt-0.5">定时轮询 LangSmith 项目，按路由规则自动导入样例</p>
       </header>
@@ -162,7 +164,18 @@ export default function AutoCollectPage() {
                     ) : (
                       <button onClick={() => resumeWatchMutation.mutate(w.project_name)} className="text-[10px] text-text-secondary hover:text-positive">恢复</button>
                     )}
-                    <button onClick={() => { if (confirm(`移除对 "${w.project_name}" 的监听？`)) removeWatchMutation.mutate(w.project_name) }} className="text-[10px] text-text-secondary hover:text-negative">移除</button>
+                    <button
+                      onClick={async () => {
+                        const ok = await confirm({
+                          title: '移除监听',
+                          description: `移除对 "${w.project_name}" 的监听？`,
+                          confirmText: '移除',
+                          danger: true,
+                        })
+                        if (ok) removeWatchMutation.mutate(w.project_name)
+                      }}
+                      className="text-[10px] text-text-secondary hover:text-negative"
+                    >移除</button>
                   </div>
                 </td>
               </tr>
@@ -214,7 +227,15 @@ export default function AutoCollectPage() {
                 </td>
                 <td className="py-2.5 px-3 border-b border-border text-right">
                   <button
-                    onClick={() => { if (confirm(`删除规则 "${rule.name}"？`)) deleteRuleMutation.mutate(rule.id) }}
+                    onClick={async () => {
+                      const ok = await confirm({
+                        title: '删除规则',
+                        description: `删除规则 "${rule.name}"？`,
+                        confirmText: '删除',
+                        danger: true,
+                      })
+                      if (ok) deleteRuleMutation.mutate(rule.id)
+                    }}
                     className="text-[10px] text-text-secondary hover:text-negative opacity-0 group-hover:opacity-100 transition-all"
                   >删除</button>
                 </td>
@@ -241,7 +262,7 @@ export default function AutoCollectPage() {
                 <input
                   value={watchProject}
                   onChange={e => setWatchProject(e.target.value)}
-                  placeholder="e.g. ruyi-agent"
+                  placeholder="例如：ruyi-agent"
                   className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
                 />
               </div>
@@ -269,11 +290,11 @@ export default function AutoCollectPage() {
             <div className="space-y-4">
               <div>
                 <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">规则名称</label>
-                <input value={ruleName} onChange={e => setRuleName(e.target.value)} placeholder="e.g. Production Traces" className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all" />
+                <input value={ruleName} onChange={e => setRuleName(e.target.value)} placeholder="例如：生产环境调用轨迹" className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all" />
               </div>
               <div>
                 <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">来源项目</label>
-                <input value={ruleSource} onChange={e => setRuleSource(e.target.value)} placeholder="LangSmith project name" className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all" />
+                <input value={ruleSource} onChange={e => setRuleSource(e.target.value)} placeholder="LangSmith 项目名" className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all" />
               </div>
               <div>
                 <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">目标数据集</label>

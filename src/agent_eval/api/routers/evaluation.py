@@ -295,6 +295,7 @@ async def get_run_results(
             cache_read_tokens=r.cache_read_tokens,
             tool_call_count=r.tool_call_count,
             actual_tool_calls=r.actual_tool_calls,
+            full_trace=r.full_trace,
             error_message=r.error_message,
             langfuse_trace_id=r.langfuse_trace_id,
             langsmith_run_id=r.langsmith_run_id,

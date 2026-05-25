@@ -32,6 +32,18 @@ async def _get_source_project(dataset_name: str) -> str | None:
         return row
 
 
+async def _get_source_projects(dataset_names: list[str]) -> dict[str, str | None]:
+    """Batch fetch source_project for multiple datasets."""
+    if not dataset_names:
+        return {}
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(DatasetMetadataRow.dataset_name, DatasetMetadataRow.source_project)
+            .where(DatasetMetadataRow.dataset_name.in_(dataset_names))
+        )
+        return {name: sp for name, sp in result.all()}
+
+
 async def _candidate_counts(dataset_names: list[str]) -> dict[str, int]:
     """Count candidate_cases per dataset_name. Returns {} for empty input."""
     if not dataset_names:
@@ -88,16 +100,17 @@ async def list_datasets(
     mgr: DatasetManager = Depends(get_manager),
 ):
     datasets = await mgr.list_datasets(filter)
-    counts = await _candidate_counts([ds.name for ds in datasets])
-    results = []
-    for ds in datasets:
-        sp = await _get_source_project(ds.name)
-        results.append(DatasetResponse(
+    names = [ds.name for ds in datasets]
+    counts = await _candidate_counts(names)
+    sources = await _get_source_projects(names)
+    return [
+        DatasetResponse(
             id=ds.id, name=ds.name, description=ds.description,
             example_count=counts.get(ds.name, 0), created_at=ds.created_at,
-            metadata=ds.metadata, source_project=sp,
-        ))
-    return results
+            metadata=ds.metadata, source_project=sources.get(ds.name),
+        )
+        for ds in datasets
+    ]
 
 
 @router.get("/{name}", response_model=DatasetResponse)

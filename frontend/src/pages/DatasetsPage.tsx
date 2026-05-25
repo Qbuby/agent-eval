@@ -1,18 +1,24 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
+import { useConfirm, useToast } from '@/components/ui'
 import { datasetsApi } from '@/services'
 import type { CreateDatasetRequest } from '@/types'
 
 export default function DatasetsPage() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const confirm = useConfirm()
+  const toast = useToast()
+  const [deletingName, setDeletingName] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState<CreateDatasetRequest>({ name: '', description: '', source_project: '' })
 
-  const { data: datasets, isLoading } = useQuery({
+  const { data: datasets, isLoading, isFetching } = useQuery({
     queryKey: ['datasets'],
     queryFn: () => datasetsApi.list().then((r) => r.data),
+    staleTime: 30_000,
+    placeholderData: (prev) => prev,
   })
 
   const createMutation = useMutation({
@@ -56,14 +62,17 @@ export default function DatasetsPage() {
       <div className="flex gap-3 items-center mb-6">
         <input
           type="text"
-          placeholder="Search datasets..."
+          placeholder="搜索数据集..."
           className="flex-1 max-w-[280px] py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 placeholder:text-text-tertiary transition-all duration-200"
         />
+        {isFetching && !isLoading && (
+          <span className="text-[10px] text-text-tertiary">刷新中…</span>
+        )}
         <button
           onClick={() => setShowCreate(true)}
           className="inline-flex items-center gap-1.5 py-2 px-3.5 text-[11px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent cursor-pointer hover:opacity-90 hover:scale-[1.02] active:scale-[0.97] focus:outline-none focus:ring-2 focus:ring-accent/20 transition-all duration-200"
         >
-          + New Dataset
+          + 新建数据集
         </button>
       </div>
 
@@ -139,28 +148,46 @@ export default function DatasetsPage() {
                 {ds.name}
               </span>
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-[#ecfdf5] text-positive">
-                Active
+                启用中
               </span>
             </div>
             <div className="space-y-1.5 mb-3">
               <div className="flex justify-between items-center">
-                <span className="text-[10px] tracking-widest uppercase text-text-tertiary">Samples</span>
+                <span className="text-[10px] tracking-wider text-text-tertiary">样例数</span>
                 <span className="text-[12px] font-medium">{ds.example_count}</span>
               </div>
               <div className="flex justify-between items-center">
-                <span className="text-[10px] tracking-widest uppercase text-text-tertiary">Description</span>
+                <span className="text-[10px] tracking-wider text-text-tertiary">描述</span>
                 <span className="text-[12px] text-text-secondary truncate max-w-[140px]">{ds.description || '—'}</span>
               </div>
             </div>
             <button
-              onClick={(e) => {
+              onClick={async (e) => {
                 e.preventDefault()
                 e.stopPropagation()
-                if (confirm(`确定删除数据集 "${ds.name}"？`)) deleteMutation.mutate(ds.name)
+                const ok = await confirm({
+                  title: '删除数据集',
+                  description: `确定删除数据集 "${ds.name}"？`,
+                  confirmText: '删除',
+                  danger: true,
+                })
+                if (!ok) return
+                setDeletingName(ds.name)
+                try {
+                  await deleteMutation.mutateAsync(ds.name)
+                  toast.success('数据集已删除')
+                } catch (err) {
+                  const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
+                    || (err as Error)?.message || '未知错误'
+                  toast.error(msg, '删除失败')
+                } finally {
+                  setDeletingName(null)
+                }
               }}
-              className="text-[10px] text-text-tertiary hover:text-negative active:scale-95 transition-all tracking-wide"
+              disabled={deletingName === ds.name}
+              className="text-[10px] text-text-tertiary hover:text-negative active:scale-95 transition-all tracking-wide disabled:opacity-50"
             >
-              删除
+              {deletingName === ds.name ? '删除中…' : '删除'}
             </button>
           </div>
         ))}

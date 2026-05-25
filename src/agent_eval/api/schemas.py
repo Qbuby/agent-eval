@@ -251,6 +251,10 @@ class EvalResultRow(BaseModel):
     # Surfaced so the UI can render per-case tool-call detail without a
     # second round-trip to LangSmith.
     actual_tool_calls: list[dict[str, Any]] | None = None
+    # Ordered CoT timeline captured from the SSE stream:
+    #   {"steps": [{type:"thought"|"tool_call"|"answer", ...}, ...]}
+    # ``None`` for legacy rows or for non-SSE adapters that have no CoT.
+    full_trace: dict[str, Any] | None = None
     error_message: str | None = None
     langfuse_trace_id: str | None = None
     langsmith_run_id: str | None = None

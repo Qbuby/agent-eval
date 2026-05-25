@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useToast, useConfirm } from '@/components/ui'
 import { candidatesApi, projectsApi, type CandidateCase } from '@/services/benchmark'
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
@@ -11,6 +12,8 @@ const STATUS_LABELS: Record<string, { label: string; color: string }> = {
 
 export default function CandidatesPage() {
   const queryClient = useQueryClient()
+  const toast = useToast()
+  const confirm = useConfirm()
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('pending')
   const [search, setSearch] = useState('')
@@ -22,6 +25,7 @@ export default function CandidatesPage() {
   const [showPromote, setShowPromote] = useState(false)
   const [promoteProjectId, setPromoteProjectId] = useState('')
   const [promoteCategoryId, _setPromoteCategoryId] = useState('')
+  const [deletingId, setDeletingId] = useState<string | null>(null)
 
   const pageSize = 20
 
@@ -62,7 +66,7 @@ export default function CandidatesPage() {
       queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })
       setSelectedIds(new Set())
       setShowPromote(false)
-      alert(`成功导入 ${res.data.promoted} 条到基准测试集`)
+      toast.success(`成功导入 ${res.data.promoted} 条到基准测试集`)
     },
   })
 
@@ -81,7 +85,7 @@ export default function CandidatesPage() {
       queryClient.invalidateQueries({ queryKey: ['candidates'] })
       setShowLangSmithImport(false)
       setLsDatasetName('')
-      alert(`成功从 LangSmith 导入 ${res.data.imported} 条样例`)
+      toast.success(`成功从 LangSmith 导入 ${res.data.imported} 条样例`)
     },
   })
 
@@ -189,7 +193,7 @@ export default function CandidatesPage() {
               <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">问题</th>
               <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle w-20">来源</th>
               <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle w-20">状态</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-right py-2 px-3 border-b border-border font-normal bg-accent-subtle w-16">操作</th>
+              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-right py-2 px-3 border-b border-border font-normal bg-accent-subtle w-24">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -209,7 +213,35 @@ export default function CandidatesPage() {
                   </span>
                 </td>
                 <td className="py-2.5 px-3 border-b border-border text-right">
-                  <button onClick={() => startEdit(c)} className="text-[10px] text-text-secondary hover:text-accent opacity-0 group-hover:opacity-100 transition-all">编辑</button>
+                  <div className="flex gap-2 justify-end opacity-0 group-hover:opacity-100 transition-all">
+                    <button onClick={() => startEdit(c)} className="text-[10px] text-text-secondary hover:text-accent">编辑</button>
+                    <button
+                      onClick={async () => {
+                        const ok = await confirm({
+                          title: '删除样例',
+                          description: `确定删除该样例？此操作不可撤销。`,
+                          confirmText: '删除',
+                          danger: true,
+                        })
+                        if (!ok) return
+                        setDeletingId(c.id)
+                        try {
+                          await candidatesApi.delete(c.id)
+                          queryClient.invalidateQueries({ queryKey: ['candidates'] })
+                          queryClient.invalidateQueries({ queryKey: ['dataset-candidates'] })
+                          toast.success('样例已删除')
+                        } catch (err) {
+                          const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
+                            || (err as Error)?.message || '未知错误'
+                          toast.error(msg, '删除失败')
+                        } finally {
+                          setDeletingId(null)
+                        }
+                      }}
+                      disabled={deletingId === c.id}
+                      className="text-[10px] text-text-secondary hover:text-negative disabled:opacity-50"
+                    >{deletingId === c.id ? '删除中…' : '删除'}</button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -324,7 +356,7 @@ export default function CandidatesPage() {
                 <input
                   value={lsDatasetName}
                   onChange={e => setLsDatasetName(e.target.value)}
-                  placeholder="e.g. noble-agent-dataset-test"
+                  placeholder="例如：noble-agent-dataset-test"
                   className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
                 />
               </div>

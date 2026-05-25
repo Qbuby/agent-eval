@@ -27,47 +27,47 @@ export default function SchedulerPage() {
   return (
     <div>
       <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">Scheduler Monitor</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">Real-time polling status</p>
+        <h1 className="text-lg font-light tracking-tight mb-1">调度监控</h1>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">实时轮询状态</p>
       </header>
 
       <div className="grid grid-cols-4 gap-px bg-border border border-border rounded-[3px] overflow-hidden mb-8">
         <div className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
-          <div className="text-[9px] tracking-[0.12em] uppercase text-text-tertiary mb-2">Status</div>
+          <div className="text-[10px] tracking-wider text-text-tertiary mb-2">运行状态</div>
           <div className={`text-[24px] font-light tracking-tight ${status?.running ? 'text-positive' : 'text-negative'}`}>
-            {status?.running ? 'Running' : 'Stopped'}
+            {status?.running ? '运行中' : '已停止'}
           </div>
         </div>
         <div className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
-          <div className="text-[9px] tracking-[0.12em] uppercase text-text-tertiary mb-2">Active</div>
+          <div className="text-[10px] tracking-wider text-text-tertiary mb-2">活跃</div>
           <div className="text-[24px] font-light tracking-tight text-positive">
             {status?.watches?.filter((w) => w.status === 'active').length ?? 0}
           </div>
         </div>
         <div className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
-          <div className="text-[9px] tracking-[0.12em] uppercase text-text-tertiary mb-2">Idle</div>
+          <div className="text-[10px] tracking-wider text-text-tertiary mb-2">空闲</div>
           <div className="text-[24px] font-light tracking-tight text-text-tertiary">
             {status?.watches?.filter((w) => w.status !== 'active').length ?? 0}
           </div>
         </div>
         <div className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
-          <div className="text-[9px] tracking-[0.12em] uppercase text-text-tertiary mb-2">Total</div>
+          <div className="text-[10px] tracking-wider text-text-tertiary mb-2">总数</div>
           <div className="text-[24px] font-light tracking-tight">
             {status?.watches?.length ?? 0}
           </div>
         </div>
       </div>
 
-      <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary mb-4 pb-2 border-b border-border">
-        Project Polling Status
+      <div className="text-[10px] tracking-wider text-text-tertiary mb-4 pb-2 border-b border-border">
+        项目轮询状态
       </div>
 
       <table className="w-full border-collapse">
         <thead>
           <tr>
-            <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">Project</th>
-            <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">Status</th>
-            <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">Last Poll</th>
+            <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">项目</th>
+            <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">状态</th>
+            <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">最近轮询</th>
           </tr>
         </thead>
         <tbody>
@@ -80,7 +80,7 @@ export default function SchedulerPage() {
                     ? 'bg-[#e6f7ed] text-[#1a6]'
                     : 'bg-[#f5f5f5] text-[#999]'
                 }`}>
-                  {w.status === 'active' ? 'Running' : 'Idle'}
+                  {w.status === 'active' ? '运行中' : '空闲'}
                 </span>
               </td>
               <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-secondary">

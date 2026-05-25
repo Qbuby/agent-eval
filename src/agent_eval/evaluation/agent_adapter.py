@@ -147,6 +147,14 @@ class SSEStreamAdapter:
         full_text: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         active_tools: dict[str, dict[str, Any]] = {}
+        # Ordered timeline of CoT steps for the trace detail UI. Each entry is
+        # one of: {type:"thought", content, started_at, duration_ms},
+        # {type:"tool_call", tool_name, args, output, started_at, duration_ms}.
+        # The final thought is renamed to type="answer" after the stream ends.
+        steps: list[dict[str, Any]] = []
+        # Open thought buffer state — set on on_chat_model_start, appended to
+        # on on_chat_model_stream, flushed into ``steps`` on on_chat_model_end.
+        thought_state: dict[str, Any] = {"open": False, "buf": [], "started_at": None}
         # LangGraph emits one on_chat_model_end per LLM step; for multi-step
         # agents (which is the common case here) we accumulate token counts
         # across all steps so the run summary matches the agent's true cost.
@@ -177,6 +185,7 @@ class SSEStreamAdapter:
                 if self.mode == "langgraph_v2":
                     if self._handle_langgraph_event(
                         obj, full_text, tool_calls, active_tools, usage_acc,
+                        steps, thought_state,
                     ):
                         usage_seen = True
                 else:
@@ -188,12 +197,33 @@ class SSEStreamAdapter:
                         full_text.append(response_text)
 
         latency_ms = (time.perf_counter() - start) * 1000
+        # Flush any unterminated thought (rare — server cut the stream early).
+        if thought_state.get("open"):
+            buf_text = "".join(thought_state.get("buf") or []).strip()
+            if buf_text:
+                steps.append({
+                    "type": "thought",
+                    "content": buf_text,
+                    "started_at": thought_state.get("started_at"),
+                    "duration_ms": None,
+                })
+        # Promote the final thought (the one that produced the user-visible
+        # answer) so the UI can style it as the answer rather than chain
+        # reasoning. Heuristic: last step of type "thought" whose content is
+        # non-empty. If there are no tool_calls between it and the end of
+        # stream, this is reliably the answer.
+        for s in reversed(steps):
+            if s.get("type") == "thought" and (s.get("content") or "").strip():
+                s["type"] = "answer"
+                break
         content = "".join(full_text).strip()
-        # Build raw_response carrying both tool_calls and an OpenAI-shaped
-        # usage block so _extract_usage in the runner picks it up.
+        # Build raw_response carrying tool_calls, usage, and the ordered CoT
+        # step list so the runner can persist it into test_results.full_trace.
         raw: dict[str, Any] = {}
         if tool_calls:
             raw["tool_calls"] = tool_calls
+        if steps:
+            raw["steps"] = steps
         if usage_seen:
             usage = {
                 "input_tokens": usage_acc["input_tokens"],
@@ -221,9 +251,14 @@ class SSEStreamAdapter:
         tool_calls: list[dict[str, Any]],
         active_tools: dict[str, dict[str, Any]],
         usage_acc: dict[str, int] | None = None,
+        steps: list[dict[str, Any]] | None = None,
+        thought_state: dict[str, Any] | None = None,
     ) -> bool:
         """Pull text, tool calls, and (when ``usage_acc`` is provided) token
         usage out of LangChain's ``astream_events v2`` shape.
+
+        When ``steps`` and ``thought_state`` are provided, also accumulate an
+        ordered CoT timeline (thought spans interleaved with tool_call spans).
 
         Returns True iff this event contributed token counts — the caller
         flips a "have any usage" flag, so we don't write a fake zero usage
@@ -231,6 +266,13 @@ class SSEStreamAdapter:
         """
         event = obj.get("event", "")
         data = obj.get("data") or {}
+
+        if event == "on_chat_model_start":
+            if thought_state is not None:
+                thought_state["open"] = True
+                thought_state["buf"] = []
+                thought_state["started_at"] = time.time()
+            return False
 
         if event == "on_chat_model_stream":
             chunk = data.get("chunk")
@@ -243,15 +285,21 @@ class SSEStreamAdapter:
                             text = item.get("text", "")
                             if text:
                                 full_text.append(text)
+                                if thought_state is not None and thought_state.get("open"):
+                                    thought_state["buf"].append(text)
                 elif isinstance(content, str) and content:
                     full_text.append(content)
+                    if thought_state is not None and thought_state.get("open"):
+                        thought_state["buf"].append(content)
             return False
 
         if event == "on_tool_start":
             run_id = obj.get("run_id") or ""
             name = obj.get("name") or data.get("name") or ""
             input_arg = data.get("input")
-            active_tools[run_id] = {"name": name, "args": input_arg}
+            active_tools[run_id] = {
+                "name": name, "args": input_arg, "started_at": time.time(),
+            }
             return False
 
         if event == "on_tool_end":
@@ -259,12 +307,47 @@ class SSEStreamAdapter:
             name = obj.get("name") or data.get("name") or ""
             entry = active_tools.pop(run_id, None) or {"name": name, "args": None}
             output = data.get("output")
+            normalized_output = (
+                output if isinstance(output, (str, dict, list)) else str(output)[:500]
+            )
             tool_calls.append({
                 "tool_name": entry.get("name") or name,
                 "args": entry.get("args"),
-                "output": output if isinstance(output, (str, dict, list)) else str(output)[:500],
+                "output": normalized_output,
             })
+            if steps is not None:
+                started = entry.get("started_at")
+                duration_ms = (
+                    int((time.time() - started) * 1000) if started else None
+                )
+                steps.append({
+                    "type": "tool_call",
+                    "tool_name": entry.get("name") or name,
+                    "args": entry.get("args"),
+                    "output": normalized_output,
+                    "started_at": started,
+                    "duration_ms": duration_ms,
+                })
             return False
+
+        if event == "on_chat_model_end":
+            # Close the open thought span first (regardless of usage).
+            if thought_state is not None and thought_state.get("open") and steps is not None:
+                buf_text = "".join(thought_state.get("buf") or []).strip()
+                started = thought_state.get("started_at")
+                duration_ms = (
+                    int((time.time() - started) * 1000) if started else None
+                )
+                if buf_text:
+                    steps.append({
+                        "type": "thought",
+                        "content": buf_text,
+                        "started_at": started,
+                        "duration_ms": duration_ms,
+                    })
+                thought_state["open"] = False
+                thought_state["buf"] = []
+                thought_state["started_at"] = None
 
         if event == "on_chat_model_end" and usage_acc is not None:
             # Per LangChain ChatModel convention, the LLM emits usage_metadata

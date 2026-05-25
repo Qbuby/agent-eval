@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useConfirm, useToast } from '@/components/ui'
 import {
   benchmarkApi,
   evaluationApi,
@@ -28,7 +29,7 @@ export default function EvaluationPage() {
       <header className="mb-6">
         <h1 className="text-lg font-light tracking-tight mb-1">评估</h1>
         <p className="text-[10px] text-text-tertiary tracking-widest uppercase">
-          Evaluation runs · LangSmith trace · local scoring
+          运行管理 · LangSmith 追踪 · 本地评分
         </p>
       </header>
 
@@ -63,6 +64,8 @@ export default function EvaluationPage() {
 function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const confirm = useConfirm()
+  const toast = useToast()
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('')
   const [searchText, setSearchText] = useState('')
@@ -70,6 +73,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
   const [startedBefore, setStartedBefore] = useState('') // YYYY-MM-DD
   const [minPassRate, setMinPassRate] = useState<string>('')  // percent string
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [deletingId, setDeletingId] = useState<string | null>(null)
   const pageSize = 15
 
   // Convert calendar values to ISO. Empty input → undefined (param dropped).
@@ -138,7 +142,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
         <input
           type="text" value={searchText}
           onChange={e => { setSearchText(e.target.value); setPage(1) }}
-          placeholder="搜 run 名 / model / url / project"
+          placeholder="搜运行名 / 模型 / URL / 项目"
           className="py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent w-[220px]"
         />
         <span className="text-[10px] text-text-tertiary tracking-wider">起</span>
@@ -206,11 +210,11 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
               </Th>
               <Th>ID</Th>
               <Th>状态</Th>
-              <Th>Agent</Th>
-              <Th>Run 名</Th>
+              <Th>智能体</Th>
+              <Th>运行名</Th>
               <Th>进度 / 总数</Th>
               <Th>通过率</Th>
-              <Th>平均 Latency</Th>
+              <Th>平均时延</Th>
               <Th>启动时间</Th>
               <Th>操作</Th>
             </tr>
@@ -233,17 +237,32 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
                 key={r.id}
                 run={r}
                 selected={selected.has(r.id)}
+                deleting={deletingId === r.id}
                 onToggle={() => toggle(r.id)}
                 onClick={() => navigate(`/evaluation/runs/${r.id}`)}
                 onDelete={async () => {
-                  if (!confirm(`删除评估 ${r.id.slice(0, 8)}？\n（软删除，可在 DB 直接恢复 deleted_at 字段）`)) return
-                  await evaluationApi.deleteRun(r.id)
-                  setSelected(prev => {
-                    const next = new Set(prev)
-                    next.delete(r.id)
-                    return next
+                  const ok = await confirm({
+                    title: '删除评估',
+                    description: `确定删除评估 ${r.id.slice(0, 8)}？\n这是软删除，可在 DB 恢复 deleted_at 字段。`,
+                    confirmText: '删除',
+                    danger: true,
                   })
-                  qc.invalidateQueries({ queryKey: ['eval-runs'] })
+                  if (!ok) return
+                  setDeletingId(r.id)
+                  try {
+                    await evaluationApi.deleteRun(r.id)
+                    setSelected(prev => {
+                      const next = new Set(prev)
+                      next.delete(r.id)
+                      return next
+                    })
+                    qc.invalidateQueries({ queryKey: ['eval-runs'] })
+                    toast.success('评估已删除')
+                  } catch (err) {
+                    toast.error(extractError(err), '删除失败')
+                  } finally {
+                    setDeletingId(null)
+                  }
                 }}
               />
             ))}
@@ -282,9 +301,10 @@ function Th({ children }: { children: React.ReactNode }) {
   )
 }
 
-function RunRow({ run, selected, onToggle, onClick, onDelete }: {
+function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
   run: EvalRunSummary
   selected: boolean
+  deleting: boolean
   onToggle: () => void
   onClick: () => void
   onDelete: () => void
@@ -326,10 +346,11 @@ function RunRow({ run, selected, onToggle, onClick, onDelete }: {
       <Td>
         <button
           onClick={e => { e.stopPropagation(); onDelete() }}
-          className="text-[11px] text-negative hover:underline"
+          disabled={deleting}
+          className="text-[11px] text-negative hover:underline disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed"
           title="软删除：行隐藏但 DB 保留 deleted_at"
         >
-          删除
+          {deleting ? '删除中…' : '删除'}
         </button>
       </Td>
     </tr>
@@ -371,6 +392,7 @@ type CaseSourceTab = 'benchmark' | 'upload'
 
 function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const qc = useQueryClient()
+  const toast = useToast()
 
   // Case-source tabs
   const [sourceTab, setSourceTab] = useState<CaseSourceTab>('benchmark')
@@ -461,7 +483,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     startBlockers.push(sourceTab === 'benchmark' ? '选择基准项目' : '上传一个样例文件')
   }
   if (selectedEvaluatorIds.size === 0) startBlockers.push('勾选至少 1 个评估器')
-  if (agentUrl.trim().length === 0) startBlockers.push('填写 Agent URL')
+  if (agentUrl.trim().length === 0) startBlockers.push('填写智能体 URL')
   const canStart = startBlockers.length === 0 && !startMutation.isPending
 
   const handleStart = () => {
@@ -469,10 +491,10 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     let payloadTpl: Record<string, unknown> | undefined
     try {
       if (agentHeadersText.trim()) headers = JSON.parse(agentHeadersText)
-    } catch { alert('Headers 必须是合法 JSON'); return }
+    } catch { toast.error('请求头必须是合法 JSON'); return }
     try {
       if (agentPayloadText.trim()) payloadTpl = JSON.parse(agentPayloadText)
-    } catch { alert('Payload template 必须是合法 JSON'); return }
+    } catch { toast.error('请求体模板必须是合法 JSON'); return }
 
     const agent: EvalAgentConfig = {
       type: agentType,
@@ -622,7 +644,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                 <input
                   type="text" value={filterTags}
                   onChange={e => setFilterTags(e.target.value)}
-                  placeholder="e.g. 电池,维修" className="input"
+                  placeholder="例如：电池,维修" className="input"
                 />
               </Field>
             )}
@@ -662,7 +684,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                   })}
                   {casesQuery.data?.items.length === 0 && (
                     <div className="py-6 text-center text-[11px] text-text-tertiary">
-                      {projectId ? '没有匹配的 case' : '先选项目'}
+                      {projectId ? '没有匹配的样例' : '先选项目'}
                     </div>
                   )}
                 </div>
@@ -723,7 +745,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       </Section>
 
       {/* Step 2: agent */}
-      <Section title="2. 配置 Agent">
+      <Section title="2. 配置智能体">
         <div className="grid grid-cols-2 gap-3">
           <Field label="类型">
             <select value={agentType} onChange={e => setAgentType(e.target.value as typeof agentType)} className="input">
@@ -732,20 +754,20 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               <option value="sse_generic">SSE 通用模板</option>
             </select>
           </Field>
-          <Field label="Model（可选，展示用）">
+          <Field label="模型（可选，展示用）">
             <input type="text" value={agentModel} onChange={e => setAgentModel(e.target.value)} className="input" />
           </Field>
-          <Field label="Agent URL">
+          <Field label="智能体 URL">
             <input type="text" value={agentUrl} onChange={e => setAgentUrl(e.target.value)}
                    placeholder="http://localhost:18094/api/agent/langgraph" className="input" />
           </Field>
           <Field label="API Key（可选）">
             <input type="password" value={agentApiKey} onChange={e => setAgentApiKey(e.target.value)} className="input" />
           </Field>
-          <Field label="Timeout（秒）">
+          <Field label="超时（秒）">
             <input type="number" min={10} value={agentTimeout} onChange={e => setAgentTimeout(Number(e.target.value))} className="input" />
           </Field>
-          <Field label="Concurrency">
+          <Field label="并发数">
             <input type="number" min={1} max={20} value={concurrency} onChange={e => setConcurrency(Number(e.target.value))} className="input" />
           </Field>
           {agentType === 'sse' && (
@@ -753,20 +775,20 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               <input type="text" value={agentLanguage} onChange={e => setAgentLanguage(e.target.value)} className="input" />
             </Field>
           )}
-          <Field label="LangSmith Project（用于拉回 trace）">
+          <Field label="LangSmith 项目（用于拉回 trace）">
             <input type="text" value={langsmithProject} onChange={e => setLangsmithProject(e.target.value)}
-                   placeholder="e.g. ep-agent / ruyi-agent" className="input" />
+                   placeholder="例如：ep-agent / ruyi-agent" className="input" />
           </Field>
         </div>
 
         <details className="mt-3">
           <summary className="text-[11px] text-text-secondary cursor-pointer">高级：自定义 headers / payload</summary>
           <div className="grid grid-cols-2 gap-3 mt-2">
-            <Field label="Headers (JSON)">
+            <Field label="请求头 (JSON)">
               <textarea value={agentHeadersText} onChange={e => setAgentHeadersText(e.target.value)}
                         rows={3} placeholder='{"X-Custom": "value"}' className="input font-mono text-[11px]" />
             </Field>
-            <Field label="Payload template (JSON, SSE generic 专用)">
+            <Field label="请求体模板 (JSON, SSE 通用专用)">
               <textarea value={agentPayloadText} onChange={e => setAgentPayloadText(e.target.value)}
                         rows={3} placeholder='{"question": "{input}"}' className="input font-mono text-[11px]" />
             </Field>
@@ -814,7 +836,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       </Section>
 
       {/* Step 4: run name */}
-      <Section title="4. Run 名（可选）">
+      <Section title="4. 运行名（可选）">
         <input
           type="text" value={runName} onChange={e => setRunName(e.target.value)}
           placeholder="默认自动按时间戳生成" className="input max-w-[420px]"

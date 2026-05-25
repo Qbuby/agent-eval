@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef, memo } from 'react'
+import { useToast } from '@/components/ui'
 import { tracesApi, datasetsApi } from '@/services'
 import type { ListRunsRequest, RunSummary, Dataset, RunDetail, RunChildMeta } from '@/types'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
@@ -105,6 +106,7 @@ function computeLatencyStats(
 }
 
 export default function TracesPage() {
+  const toast = useToast()
   const [projectName, setProjectName] = useState('')
   const [allRuns, setAllRuns] = useState<RunSummary[]>([])
   const [page, setPage] = useState(1)
@@ -423,11 +425,11 @@ export default function TracesPage() {
       setSelectedIds(new Set())
       setImportTarget('')
       setNewDatasetName('')
-      alert(`成功导入 ${res.data.imported} 条用例到 ${target}`)
+      toast.success(`成功导入 ${res.data.imported} 条用例到 ${target}`)
       datasetsApi.list().then(r => setDatasets(r.data)).catch(() => {})
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      alert(msg || '导入失败')
+      toast.error(msg || '导入失败')
     } finally {
       setImporting(false)
     }
@@ -474,12 +476,12 @@ export default function TracesPage() {
     <div>
       <header className="mb-8">
         <h1 className="text-lg font-light tracking-tight mb-1">调用轨迹</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">EXECUTION RUNS · PERFORMANCE METRICS</p>
+        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">执行记录 · 性能指标</p>
       </header>
 
       <form onSubmit={handleSearch} className="flex gap-2.5 items-center mb-4">
         <input
-          placeholder="Project name..."
+          placeholder="项目名称..."
           value={projectName}
           onChange={(e) => setProjectName(e.target.value)}
           required
@@ -492,7 +494,7 @@ export default function TracesPage() {
         >
           {loading ? (
             <span className="inline-block w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />
-          ) : 'Query'}
+          ) : '查询'}
         </button>
         {allRuns.length > 0 && (
           <button
@@ -550,8 +552,8 @@ export default function TracesPage() {
             className="py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
           >
             <option value="time">按时间排序</option>
-            <option value="latency_asc">Latency 升序</option>
-            <option value="latency_desc">Latency 降序</option>
+            <option value="latency_asc">时延 ↑</option>
+            <option value="latency_desc">时延 ↓</option>
           </select>
           <button
             onClick={() => setShowChart(v => !v)}
@@ -832,14 +834,14 @@ export default function TracesPage() {
                   className="w-3.5 h-3.5 accent-accent"
                 />
               </th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Name</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Model</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Status</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Input</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Output</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Latency</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Tokens</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Time</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">名称</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">模型</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">状态</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">输入</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">输出</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">时延</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">token</th>
+              <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">时间</th>
             </tr>
           </thead>
           <tbody>
@@ -890,7 +892,7 @@ export default function TracesPage() {
           </tbody>
         </table>
         {pageRuns.length === 0 && !loading && (
-          <div className="text-center py-10 text-text-tertiary text-[12px]">输入项目名称查询 Runs</div>
+          <div className="text-center py-10 text-text-tertiary text-[12px]">输入项目名称查询调用轨迹</div>
         )}
       </div>
 
@@ -1011,7 +1013,7 @@ function RunDetailModal({ rootId, projectName, nodeCache, expanded, onClose, onT
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={onClose}>
       <div className="bg-surface border border-border rounded-lg w-[860px] max-w-[95vw] max-h-[88vh] overflow-y-auto shadow-lg" onClick={e => e.stopPropagation()}>
         <div className="sticky top-0 bg-surface border-b border-border px-6 py-4 flex justify-between items-center z-10">
-          <h3 className="text-[14px] font-medium">Run 详情</h3>
+          <h3 className="text-[14px] font-medium">调用详情</h3>
           <button onClick={onClose} className="text-text-tertiary hover:text-text-primary text-lg">×</button>
         </div>
         <div className="p-6">
@@ -1027,13 +1029,13 @@ function RunDetailModal({ rootId, projectName, nodeCache, expanded, onClose, onT
               <RunDetailBody detail={rootState.data} />
               <div className="mt-6">
                 <div className="flex items-center justify-between mb-2">
-                  <h4 className="text-[12px] font-medium">Children ({rootState.data.children.length})</h4>
+                  <h4 className="text-[12px] font-medium">子节点 ({rootState.data.children.length})</h4>
                   {rootState.data.children_truncated && (
                     <span className="text-[10px] text-[#b87b00] bg-[#fff4d6] px-2 py-0.5 rounded">已截断前 100 个子节点</span>
                   )}
                 </div>
                 {rootState.data.children.length === 0 ? (
-                  <div className="text-[11px] text-text-tertiary">无子 Run</div>
+                  <div className="text-[11px] text-text-tertiary">无子节点</div>
                 ) : (
                   <div className="border border-border rounded-[6px] overflow-hidden">
                     {rootState.data.children.map(c => (
@@ -1095,31 +1097,31 @@ const DistributionChart = memo(function DistributionChart({ title, stats, emptyH
         <BarChart data={stats} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
           <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
           <XAxis dataKey="model" tick={{ fontSize: 10 }} />
-          <YAxis tick={{ fontSize: 10 }} label={{ value: 'seconds', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
+          <YAxis tick={{ fontSize: 10 }} label={{ value: '秒', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
           <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
           <Legend wrapperStyle={{ fontSize: 10 }} />
-          <Bar dataKey="min" name="Min" fill="#93c5fd" radius={[2, 2, 0, 0]} />
-          <Bar dataKey="avg" name="Avg" fill="#3b82f6" radius={[2, 2, 0, 0]} />
-          <Bar dataKey="median" name="Median" fill="#6366f1" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="min" name="最小" fill="#93c5fd" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="avg" name="平均" fill="#3b82f6" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="median" name="中位" fill="#6366f1" radius={[2, 2, 0, 0]} />
           <Bar dataKey="p95" name="P95" fill="#a855f7" radius={[2, 2, 0, 0]} />
-          <Bar dataKey="max" name="Max" fill="#f87171" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="max" name="最大" fill="#f87171" radius={[2, 2, 0, 0]} />
         </BarChart>
       </ResponsiveContainer>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-[11px] border-collapse">
           <thead>
             <tr className="text-text-tertiary">
-              <th className="text-left py-1.5 px-2 font-normal">Model</th>
-              <th className="text-right py-1.5 px-2 font-normal">Runs</th>
+              <th className="text-left py-1.5 px-2 font-normal">模型</th>
+              <th className="text-right py-1.5 px-2 font-normal">样本数</th>
               <th className="text-right py-1.5 px-2 font-normal" title="该模型在选中问题集里覆盖了多少个不同的问题 / 当前选中问题总数">
-                Questions
+                覆盖问题
               </th>
-              <th className="text-right py-1.5 px-2 font-normal">Min</th>
-              <th className="text-right py-1.5 px-2 font-normal">Avg</th>
-              <th className="text-right py-1.5 px-2 font-normal">Median</th>
+              <th className="text-right py-1.5 px-2 font-normal">最小</th>
+              <th className="text-right py-1.5 px-2 font-normal">平均</th>
+              <th className="text-right py-1.5 px-2 font-normal">中位</th>
               <th className="text-right py-1.5 px-2 font-normal">P95</th>
-              <th className="text-right py-1.5 px-2 font-normal">Max</th>
-              <th className="text-right py-1.5 px-2 font-normal">Variance</th>
+              <th className="text-right py-1.5 px-2 font-normal">最大</th>
+              <th className="text-right py-1.5 px-2 font-normal">方差</th>
             </tr>
           </thead>
           <tbody>

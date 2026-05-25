@@ -27,7 +27,7 @@ export default function ProjectsPage() {
   return (
     <div>
       <header className="mb-8">
-        <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">management</div>
+        <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">管理</div>
         <h1 className="text-xl font-medium tracking-tight">基准测试集</h1>
       </header>
 
@@ -81,7 +81,7 @@ export default function ProjectsPage() {
                 <input
                   value={name}
                   onChange={e => setName(e.target.value)}
-                  placeholder="e.g. ep-agent"
+                  placeholder="例如：ep-agent"
                   className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
                 />
               </div>
