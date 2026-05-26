@@ -386,9 +386,12 @@ def _extract_usage(resp: AgentResponse) -> dict[str, int | None]:
 #   1. _classify_agent_error: turn a raw exception into a stable category
 #      (agent_unreachable / agent_timeout / agent_5xx / parse_error /
 #      unknown) so the UI can render it differently than a plain "error".
-#   2. _invoke_with_retry: 1 immediate retry after 5s when the first
-#      attempt fails with a connection / 5xx / timeout class — that's the
-#      window the agent typically needs to spin back up.
+#   2. _invoke_with_retry: configurable retry-with-exponential-backoff over
+#      transient errors (connection / 5xx / timeout). Defaults to 2 retries
+#      (3 total attempts) with 2s → 4s → 8s backoff capped at 30s. Override
+#      per-run via agent_cfg["retry"]={max_retries, initial_backoff_s,
+#      backoff_factor, max_backoff_s}. The backoff sleep wakes early on a
+#      cancel_event so /stop doesn't have to wait out a slow retry.
 
 _TRANSIENT_HINTS = (
     "all connection attempts failed",
@@ -420,23 +423,91 @@ def _is_transient(err: Exception) -> bool:
     return any(hint in s for hint in _TRANSIENT_HINTS)
 
 
-async def _invoke_with_retry(adapter: Any, messages: list[dict]) -> Any:
-    """Call adapter.invoke once; retry once after 5s on transient errors.
+@dataclass
+class _RetryPolicy:
+    max_retries: int = 2
+    initial_backoff_s: float = 2.0
+    backoff_factor: float = 2.0
+    max_backoff_s: float = 30.0
 
-    The agent often returns 502 on the first cold-start request. By the
-    time we get to the retry, the upstream is typically warm. If the second
-    attempt also fails the original exception class propagates, the caller
-    classifies it and the sample lands as agent_unreachable.
-    """
+
+def _retry_policy_from_cfg(agent_cfg: dict) -> _RetryPolicy:
+    raw = (agent_cfg or {}).get("retry") or {}
     try:
-        return await adapter.invoke(messages)
-    except Exception as first:
-        if not _is_transient(first):
-            raise
-        logger.info("agent transient err on attempt 1 (%s); retrying after 5s",
-                    type(first).__name__)
-        await asyncio.sleep(5)
-        return await adapter.invoke(messages)
+        return _RetryPolicy(
+            max_retries=max(0, int(raw.get("max_retries", 2))),
+            initial_backoff_s=max(0.0, float(raw.get("initial_backoff_s", 2.0))),
+            backoff_factor=max(1.0, float(raw.get("backoff_factor", 2.0))),
+            max_backoff_s=max(0.0, float(raw.get("max_backoff_s", 30.0))),
+        )
+    except (TypeError, ValueError):
+        return _RetryPolicy()
+
+
+async def _sleep_with_cancel(seconds: float, cancel_event: asyncio.Event | None) -> bool:
+    """Sleep up to ``seconds`` but wake immediately if ``cancel_event`` fires.
+    Returns True if cancelled, False if the full duration elapsed."""
+    if seconds <= 0:
+        return bool(cancel_event and cancel_event.is_set())
+    if cancel_event is None:
+        await asyncio.sleep(seconds)
+        return False
+    try:
+        await asyncio.wait_for(cancel_event.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _invoke_with_retry(
+    adapter: Any,
+    messages: list[dict],
+    *,
+    policy: _RetryPolicy,
+    cancel_event: asyncio.Event | None = None,
+) -> tuple[Any, int]:
+    """Call ``adapter.invoke`` with up to ``policy.max_retries`` retries on
+    transient errors. Returns ``(response, attempts_made)``; ``attempts_made``
+    is 1-based (1 = succeeded on first try).
+
+    Non-transient errors propagate immediately without retry. On terminal
+    failure, the final exception is annotated with ``_eval_attempts_made``
+    so the caller can record how many attempts were spent before giving up.
+    If ``cancel_event`` fires during a backoff sleep, the loop aborts and
+    the last seen exception propagates with the same annotation.
+    """
+    backoff = policy.initial_backoff_s
+    total_attempts = policy.max_retries + 1
+    for attempt in range(1, total_attempts + 1):
+        try:
+            resp = await adapter.invoke(messages)
+            if attempt > 1:
+                logger.info(
+                    "agent invoke succeeded on attempt %d/%d",
+                    attempt, total_attempts,
+                )
+            return resp, attempt
+        except Exception as e:
+            terminal = attempt >= total_attempts or not _is_transient(e)
+            if terminal:
+                setattr(e, "_eval_attempts_made", attempt)
+                if attempt > 1:
+                    logger.warning(
+                        "agent invoke exhausted retries (%d/%d): %s",
+                        attempt, total_attempts, type(e).__name__,
+                    )
+                raise
+            logger.info(
+                "agent transient err on attempt %d/%d (%s); backing off %.1fs",
+                attempt, total_attempts, type(e).__name__, backoff,
+            )
+            cancelled = await _sleep_with_cancel(backoff, cancel_event)
+            if cancelled:
+                setattr(e, "_eval_attempts_made", attempt)
+                raise
+            backoff = min(backoff * policy.backoff_factor, policy.max_backoff_s)
+    # Unreachable: loop body always returns or raises.
+    raise RuntimeError("retry loop exited without returning or raising")
 
 
 async def _run_one_case(
@@ -445,6 +516,7 @@ async def _run_one_case(
     agent_cfg: dict,
     evaluator_specs: list[dict[str, Any]],
     judge_llm: Any,
+    cancel_event: asyncio.Event | None = None,
 ) -> dict[str, Any]:
     """Execute one case end-to-end. ``case`` is the normalized dict from
     ``_normalize_cases_for_runner``: {id, name, question, expected_output,
@@ -462,6 +534,7 @@ async def _run_one_case(
 
     adapter = _make_adapter(agent_cfg, thread_id=thread_id)
     messages = [{"role": "user", "content": question}]
+    retry_policy = _retry_policy_from_cfg(agent_cfg)
 
     output_text = ""
     error_msg: str | None = None
@@ -469,6 +542,7 @@ async def _run_one_case(
     actual_tool_calls: list[dict] = []
     cot_steps: list[dict] = []
     latency_ms: int | None = None
+    attempts_made = 0
     usage = {
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
         "cache_creation_tokens": None, "cache_read_tokens": None,
@@ -477,7 +551,10 @@ async def _run_one_case(
 
     try:
         try:
-            resp = await _invoke_with_retry(adapter, messages)
+            resp, attempts_made = await _invoke_with_retry(
+                adapter, messages,
+                policy=retry_policy, cancel_event=cancel_event,
+            )
             output_text = resp.content
             latency_ms = int(resp.latency_ms)
             usage = _extract_usage(resp)
@@ -493,10 +570,15 @@ async def _run_one_case(
             if not actual_tool_calls:
                 actual_tool_calls = _extract_tool_calls_from_response(resp)
         except Exception as e:
+            attempts_made = getattr(e, "_eval_attempts_made", attempts_made or 1)
             error_msg = str(e)
+            if attempts_made > 1:
+                error_msg = f"{error_msg} (after {attempts_made} attempts)"
             error_type = _classify_agent_error(e)
-            logger.warning("agent invoke failed for case %s [%s]: %s",
-                           case.get("id"), error_type, e)
+            logger.warning(
+                "agent invoke failed for case %s [%s] after %d attempt(s): %s",
+                case.get("id"), error_type, attempts_made, e,
+            )
     finally:
         try:
             await adapter.close()
@@ -568,6 +650,7 @@ async def _run_one_case(
         "latency_ms": latency_ms,
         "error_message": error_msg,
         "error_type": error_type,
+        "attempts_made": attempts_made,
         "tool_call_count": len(actual_tool_calls),
         "message_count": len(messages),
         "scores": scores,
@@ -607,6 +690,7 @@ async def _execute_run(
                     agent_cfg=agent_cfg,
                     evaluator_specs=evaluator_specs,
                     judge_llm=judge_llm,
+                    cancel_event=cancel_event,
                 )
             except Exception as e:
                 logger.exception("case %s crashed during run: %s", case.get("id"), e)
@@ -649,6 +733,7 @@ async def _execute_run(
                         error_message=res["error_message"],
                         error_type=res["error_type"],
                         status=res["status"],
+                        attempts_made=res.get("attempts_made", 1),
                     )
                     for sname, sval in res["scores"].items():
                         await repo.create_eval_score(
@@ -720,6 +805,18 @@ async def _execute_run(
             key=lambda x: (-x["calls"], x["name"]),
         )
 
+        attempts_list = [int(r.get("attempts_made") or 1) for r in per_case_results]
+        retried = [n for n in attempts_list if n > 1]
+        retry_stats: dict[str, Any] = {
+            "total_cases": len(attempts_list),
+            "cases_with_retries": len(retried),
+            "max_attempts": max(attempts_list) if attempts_list else 0,
+            "avg_attempts": round(
+                sum(attempts_list) / len(attempts_list), 3
+            ) if attempts_list else 0.0,
+            "total_retries": sum(n - 1 for n in attempts_list),
+        }
+
         summary: dict[str, Any] = {
             "counts": {
                 "total": len(per_case_results),
@@ -738,6 +835,7 @@ async def _execute_run(
             "tool_usage": tool_usage,
             "cost_success": _aggregate_cost(succ),
             "cost_failure": _aggregate_cost(fail),
+            "retry_stats": retry_stats,
             "run_name": run_name,
         }
         # If most samples couldn't reach the agent, surface that on the run

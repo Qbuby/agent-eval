@@ -14,6 +14,7 @@ const navItems = [
   { to: '/auto-collect', label: '自动采集', icon: 'route' },
   { to: '/config', label: '配置', icon: 'settings' },
   { to: '/audit', label: '审计日志', icon: 'file' },
+  { to: '/request-log', label: '接口日志', icon: 'pulse' },
 ]
 
 function NavIcon({ name }: { name: string }) {
@@ -79,6 +80,11 @@ function NavIcon({ name }: { name: string }) {
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-4 h-4">
         <path d="M4 2h5l3 3v9H4V2z"/>
         <path d="M9 2v3h3"/>
+      </svg>
+    ),
+    pulse: (
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="w-4 h-4">
+        <path d="M1 8h3l2-4 3 8 2-5 1 1h3"/>
       </svg>
     ),
   }

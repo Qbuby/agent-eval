@@ -18,6 +18,7 @@ import EvaluationPage from '@/pages/EvaluationPage'
 import EvaluationRunDetailPage from '@/pages/EvaluationRunDetailPage'
 import EvaluationComparePage from '@/pages/EvaluationComparePage'
 import EvaluatorsPage from '@/pages/EvaluatorsPage'
+import RequestLogPage from '@/pages/RequestLogPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -56,6 +57,7 @@ export default function App() {
               <Route path="auto-collect" element={<AutoCollectPage />} />
               <Route path="config" element={<ConfigPage />} />
               <Route path="audit" element={<AuditPage />} />
+              <Route path="request-log" element={<RequestLogPage />} />
             </Route>
           </Routes>
         </BrowserRouter>

@@ -299,6 +299,7 @@ async def get_run_results(
             error_message=r.error_message,
             langfuse_trace_id=r.langfuse_trace_id,
             langsmith_run_id=r.langsmith_run_id,
+            attempts_made=getattr(r, "attempts_made", 1) or 1,
             scores=score_index.get(r.id, {}),
         ))
     return EvalResultsPage(items=items, total=total, page=page, page_size=page_size)

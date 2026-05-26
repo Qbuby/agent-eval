@@ -420,6 +420,8 @@ export default function EvaluationRunDetailPage() {
         <CostCard title="失败样例的成本" data={costFailure} />
       </section>
 
+      <RetryStatsCard stats={run.summary_scores?.retry_stats} />
+
       {/* Results table */}
       <section>
         <div className="flex items-center mb-2">
@@ -449,13 +451,14 @@ export default function EvaluationRunDetailPage() {
                 <Th>输出 token</Th>
                 <Th>缓存命中</Th>
                 <Th>工具</Th>
+                <Th>重试</Th>
                 <Th>分数</Th>
                 <Th>追踪</Th>
               </tr>
             </thead>
             <tbody>
               {resultsQuery.isLoading && (
-                <tr><td colSpan={10} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+                <tr><td colSpan={11} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
               )}
               {items.map((r: EvalResultRow) => (
                 <ResultRow
@@ -467,7 +470,7 @@ export default function EvaluationRunDetailPage() {
                 />
               ))}
               {items.length === 0 && !resultsQuery.isLoading && (
-                <tr><td colSpan={10} className="py-8 text-center text-[11px] text-text-tertiary">
+                <tr><td colSpan={11} className="py-8 text-center text-[11px] text-text-tertiary">
                   {run.status === 'running' ? '还没产出样例结果…' : '没有样例结果'}
                 </td></tr>
               )}
@@ -536,6 +539,13 @@ function ResultRow({ row, langfuseHost, selected, onSelect }: {
           : '—'}
       </Td>
       <Td>{row.tool_call_count ?? 0}</Td>
+      <Td>
+        {row.attempts_made && row.attempts_made > 1
+          ? <span className="text-warning" title={`实际尝试 ${row.attempts_made} 次（含重试）`}>
+              {row.attempts_made}×
+            </span>
+          : <span className="text-text-tertiary">1</span>}
+      </Td>
       <Td>
         <div className="flex flex-wrap gap-1">
           {scoreEntries.length === 0 && <span className="text-text-tertiary">—</span>}
@@ -835,6 +845,42 @@ function CostCard({ title, data }: { title: string; data: Record<string, number 
           )
         })}
       </div>
+    </div>
+  )
+}
+
+function RetryStatsCard({
+  stats,
+}: {
+  stats?: {
+    total_cases?: number
+    cases_with_retries?: number
+    max_attempts?: number
+    avg_attempts?: number
+    total_retries?: number
+  }
+}) {
+  if (!stats || !stats.total_cases || (stats.cases_with_retries ?? 0) === 0) return null
+  const ratio = stats.total_cases ? (stats.cases_with_retries ?? 0) / stats.total_cases : 0
+  return (
+    <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
+      <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-2">重试情况</h3>
+      <div className="grid grid-cols-4 gap-4 text-[11px]">
+        <Metric label="重试样例" value={`${stats.cases_with_retries} / ${stats.total_cases}`} hint={`${(ratio * 100).toFixed(1)}%`} />
+        <Metric label="总重试次数" value={String(stats.total_retries ?? 0)} />
+        <Metric label="平均尝试次数" value={(stats.avg_attempts ?? 1).toFixed(2)} />
+        <Metric label="最大尝试次数" value={String(stats.max_attempts ?? 1)} />
+      </div>
+    </section>
+  )
+}
+
+function Metric({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="flex flex-col">
+      <span className="text-[10px] tracking-wider uppercase text-text-tertiary">{label}</span>
+      <span className="font-mono text-[14px] text-text-primary mt-0.5">{value}</span>
+      {hint && <span className="font-mono text-[10px] text-text-tertiary">{hint}</span>}
     </div>
   )
 }

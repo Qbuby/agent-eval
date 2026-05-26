@@ -143,6 +143,10 @@ class TestResultRow(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     error_type: Mapped[str | None] = mapped_column(String(64))
 
+    attempts_made: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 

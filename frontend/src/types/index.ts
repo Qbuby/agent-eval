@@ -435,6 +435,13 @@ export interface EvalRunSummary {
     tool_usage?: Array<{ name: string; calls: number; errors: number; cases: number }>
     cost_success?: Record<string, number | null>
     cost_failure?: Record<string, number | null>
+    retry_stats?: {
+      total_cases?: number
+      cases_with_retries?: number
+      max_attempts?: number
+      avg_attempts?: number
+      total_retries?: number
+    }
     langfuse_dataset?: string
     langfuse_run_name?: string
     langfuse_host?: string
@@ -479,6 +486,7 @@ export interface EvalResultRow {
   error_message: string | null
   langfuse_trace_id: string | null
   langsmith_run_id?: string | null
+  attempts_made?: number
   scores: Record<string, number>
 }
 
@@ -500,4 +508,24 @@ export interface BuiltinEvaluator {
   name: string
   description: string
   params_schema: Record<string, unknown>
+}
+
+export interface RequestLogEntry {
+  timestamp: string
+  method: string
+  path: string
+  status: number
+  latency_ms: number
+  request_id: string
+  query: string
+  client: string
+  error: string | null
+  body_preview: string | null
+  body_truncated: boolean
+}
+
+export interface RequestLogResponse {
+  capacity: number
+  returned: number
+  entries: RequestLogEntry[]
 }

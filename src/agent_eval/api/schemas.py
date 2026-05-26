@@ -258,6 +258,7 @@ class EvalResultRow(BaseModel):
     error_message: str | None = None
     langfuse_trace_id: str | None = None
     langsmith_run_id: str | None = None
+    attempts_made: int = 1
     scores: dict[str, float] = {}  # dimension -> score
 
 
