@@ -44,6 +44,16 @@ const CONFIG_SECTIONS: ConfigSection[] = [
       { key: 'target_agent.headers', label: '自定义请求头', placeholder: '{"Content-Type": "application/json"}', type: 'textarea' },
     ],
   },
+  {
+    title: '评估重试',
+    description: '调用 Agent 出现 5xx / 连接错 / 超时时的退避策略，按 case 生效',
+    fields: [
+      { key: 'eval.retry.max_retries', label: '最大重试次数（不含首次）', placeholder: '2', type: 'text' },
+      { key: 'eval.retry.initial_backoff_s', label: '首次重试前等待（秒）', placeholder: '2.0', type: 'text' },
+      { key: 'eval.retry.backoff_factor', label: '退避乘数', placeholder: '2.0', type: 'text' },
+      { key: 'eval.retry.max_backoff_s', label: '退避上限（秒）', placeholder: '30.0', type: 'text' },
+    ],
+  },
 ]
 
 const ALL_CONFIG_KEYS = CONFIG_SECTIONS.flatMap((s) => s.fields.map((f) => f.key))

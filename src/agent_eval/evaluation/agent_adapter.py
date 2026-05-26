@@ -154,7 +154,12 @@ class SSEStreamAdapter:
         steps: list[dict[str, Any]] = []
         # Open thought buffer state — set on on_chat_model_start, appended to
         # on on_chat_model_stream, flushed into ``steps`` on on_chat_model_end.
-        thought_state: dict[str, Any] = {"open": False, "buf": [], "started_at": None}
+        # ``first_token_ms`` is filled the first time a stream chunk carries
+        # text after the model_start event; it survives the flush as
+        # ``step.first_token_ms`` for the runner to read.
+        thought_state: dict[str, Any] = {
+            "open": False, "buf": [], "started_at": None, "first_token_ms": None,
+        }
         # LangGraph emits one on_chat_model_end per LLM step; for multi-step
         # agents (which is the common case here) we accumulate token counts
         # across all steps so the run summary matches the agent's true cost.
@@ -185,7 +190,7 @@ class SSEStreamAdapter:
                 if self.mode == "langgraph_v2":
                     if self._handle_langgraph_event(
                         obj, full_text, tool_calls, active_tools, usage_acc,
-                        steps, thought_state,
+                        steps, thought_state, start,
                     ):
                         usage_seen = True
                 else:
@@ -206,6 +211,7 @@ class SSEStreamAdapter:
                     "content": buf_text,
                     "started_at": thought_state.get("started_at"),
                     "duration_ms": None,
+                    "first_token_ms": thought_state.get("first_token_ms"),
                 })
         # Promote the final thought (the one that produced the user-visible
         # answer) so the UI can style it as the answer rather than chain
@@ -253,12 +259,18 @@ class SSEStreamAdapter:
         usage_acc: dict[str, int] | None = None,
         steps: list[dict[str, Any]] | None = None,
         thought_state: dict[str, Any] | None = None,
+        t0: float | None = None,
     ) -> bool:
         """Pull text, tool calls, and (when ``usage_acc`` is provided) token
         usage out of LangChain's ``astream_events v2`` shape.
 
         When ``steps`` and ``thought_state`` are provided, also accumulate an
         ordered CoT timeline (thought spans interleaved with tool_call spans).
+        ``t0`` is the ``perf_counter`` snapshot of when the HTTP POST started;
+        passing it lets us record per-step ``first_token_ms`` (the first stream
+        chunk that carried text after the chat_model_start event), which the
+        runner aggregates into the per-case ``first_thinking_token_ms`` and
+        ``first_answer_token_ms`` so the UI can show TTFT.
 
         Returns True iff this event contributed token counts — the caller
         flips a "have any usage" flag, so we don't write a fake zero usage
@@ -272,6 +284,7 @@ class SSEStreamAdapter:
                 thought_state["open"] = True
                 thought_state["buf"] = []
                 thought_state["started_at"] = time.time()
+                thought_state["first_token_ms"] = None
             return False
 
         if event == "on_chat_model_stream":
@@ -279,18 +292,26 @@ class SSEStreamAdapter:
             if isinstance(chunk, dict):
                 kwargs = chunk.get("kwargs") or {}
                 content = kwargs.get("content")
+                got_text = False
                 if isinstance(content, list):
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "text":
                             text = item.get("text", "")
                             if text:
                                 full_text.append(text)
+                                got_text = True
                                 if thought_state is not None and thought_state.get("open"):
                                     thought_state["buf"].append(text)
                 elif isinstance(content, str) and content:
                     full_text.append(content)
+                    got_text = True
                     if thought_state is not None and thought_state.get("open"):
                         thought_state["buf"].append(content)
+                if got_text and thought_state is not None and thought_state.get("open"):
+                    if thought_state.get("first_token_ms") is None and t0 is not None:
+                        thought_state["first_token_ms"] = int(
+                            (time.perf_counter() - t0) * 1000
+                        )
             return False
 
         if event == "on_tool_start":
@@ -344,10 +365,12 @@ class SSEStreamAdapter:
                         "content": buf_text,
                         "started_at": started,
                         "duration_ms": duration_ms,
+                        "first_token_ms": thought_state.get("first_token_ms"),
                     })
                 thought_state["open"] = False
                 thought_state["buf"] = []
                 thought_state["started_at"] = None
+                thought_state["first_token_ms"] = None
 
         if event == "on_chat_model_end" and usage_acc is not None:
             # Per LangChain ChatModel convention, the LLM emits usage_metadata

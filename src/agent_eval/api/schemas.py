@@ -247,6 +247,10 @@ class EvalResultRow(BaseModel):
     cache_creation_tokens: int | None = None
     cache_read_tokens: int | None = None
     tool_call_count: int | None = None
+    # Time-to-first-token, milliseconds since invoke. Both NULL on adapters
+    # that don't expose intermediate stream events (OpenAI non-streaming).
+    first_thinking_token_ms: int | None = None
+    first_answer_token_ms: int | None = None
     # List of {tool_name, args, output} captured during the agent call.
     # Surfaced so the UI can render per-case tool-call detail without a
     # second round-trip to LangSmith.

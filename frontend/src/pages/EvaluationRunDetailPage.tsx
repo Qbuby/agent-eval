@@ -827,6 +827,8 @@ function CostCard({ title, data }: { title: string; data: Record<string, number 
     { k: 'avg_tool_calls', label: 'Tool calls' },
     { k: 'avg_messages', label: 'Messages' },
     { k: 'avg_latency_ms', label: 'Latency (ms)', fmt: (v) => `${Math.round(v)}ms` },
+    { k: 'avg_first_thinking_token_ms', label: '首思考 token (ms)', fmt: (v) => `${Math.round(v)}ms` },
+    { k: 'avg_first_answer_token_ms', label: '首答 token (ms)', fmt: (v) => `${Math.round(v)}ms` },
     { k: 'cache_hit_rate', label: 'Cache hit rate', fmt: (v) => `${(v * 100).toFixed(1)}%` },
   ]
   return (

@@ -76,6 +76,30 @@ DEFAULT_CONFIGS: list[dict[str, Any]] = [
         "category": "target_agent",
         "description": "自定义请求头（JSON 格式）",
     },
+    {
+        "key": "eval.retry.max_retries",
+        "value": {"v": 2},
+        "category": "eval.retry",
+        "description": "评估时单条 case 调 agent 失败后最多重试次数（不含首次）。0 表示不重试。",
+    },
+    {
+        "key": "eval.retry.initial_backoff_s",
+        "value": {"v": 2.0},
+        "category": "eval.retry",
+        "description": "首次重试前的等待秒数（指数退避起点）。",
+    },
+    {
+        "key": "eval.retry.backoff_factor",
+        "value": {"v": 2.0},
+        "category": "eval.retry",
+        "description": "每次重试退避乘数；下次等待 = 上次 × 该值。",
+    },
+    {
+        "key": "eval.retry.max_backoff_s",
+        "value": {"v": 30.0},
+        "category": "eval.retry",
+        "description": "退避秒数上限，避免长尾等待。",
+    },
 ]
 
 
@@ -252,7 +276,10 @@ class ConfigService:
 
     @staticmethod
     def _infer_category(key: str) -> str:
-        prefix = key.split(".")[0]
+        parts = key.split(".")
+        prefix = parts[0]
+        if prefix == "eval" and len(parts) >= 2:
+            return f"eval.{parts[1]}"
         if prefix in ("langsmith", "llm", "target_agent"):
             return prefix
         return "general"

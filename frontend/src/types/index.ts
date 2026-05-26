@@ -465,6 +465,7 @@ export interface CotStep {
   output?: unknown
   started_at?: number | null
   duration_ms?: number | null
+  first_token_ms?: number | null
 }
 
 export interface EvalResultRow {
@@ -481,6 +482,8 @@ export interface EvalResultRow {
   cache_creation_tokens?: number | null
   cache_read_tokens?: number | null
   tool_call_count: number | null
+  first_thinking_token_ms?: number | null
+  first_answer_token_ms?: number | null
   actual_tool_calls?: Array<Record<string, unknown>> | null
   full_trace?: { steps?: CotStep[] } | null
   error_message: string | null

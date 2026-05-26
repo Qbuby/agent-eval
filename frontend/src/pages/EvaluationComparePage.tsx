@@ -72,6 +72,7 @@ export default function EvaluationComparePage() {
                   <th className="text-right py-1.5 px-2 font-normal">样例数</th>
                   <th className="text-right py-1.5 px-2 font-normal">通过率</th>
                   <th className="text-right py-1.5 px-2 font-normal">成功·时延</th>
+                  <th className="text-right py-1.5 px-2 font-normal">成功·首答</th>
                   <th className="text-right py-1.5 px-2 font-normal">成功·token</th>
                   <th className="text-right py-1.5 px-2 font-normal">成功·工具调用</th>
                 </tr>
@@ -97,6 +98,9 @@ export default function EvaluationComparePage() {
                       <td className="py-1.5 px-2 text-right">{total ? `${Math.round((passed / total) * 100)}%` : '—'}</td>
                       <td className="py-1.5 px-2 text-right">
                         {cs.avg_latency_ms != null ? `${Math.round(cs.avg_latency_ms as number)}ms` : '—'}
+                      </td>
+                      <td className="py-1.5 px-2 text-right">
+                        {cs.avg_first_answer_token_ms != null ? `${Math.round(cs.avg_first_answer_token_ms as number)}ms` : '—'}
                       </td>
                       <td className="py-1.5 px-2 text-right">
                         {cs.avg_total_tokens != null ? Math.round(cs.avg_total_tokens as number) : '—'}
@@ -216,6 +220,8 @@ function buildCostChart(runs: EvalRunDetail[]): {
 } {
   const metrics: Array<{ key: string; label: string }> = [
     { key: 'avg_latency_ms', label: '时延 (ms)' },
+    { key: 'avg_first_thinking_token_ms', label: '首思考 token (ms)' },
+    { key: 'avg_first_answer_token_ms', label: '首答 token (ms)' },
     { key: 'avg_total_tokens', label: '总 token' },
     { key: 'avg_prompt_tokens', label: '输入 token' },
     { key: 'avg_completion_tokens', label: '输出 token' },

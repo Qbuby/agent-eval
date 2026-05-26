@@ -140,6 +140,16 @@ class TestResultRow(Base):
     cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
     tool_call_count: Mapped[int | None] = mapped_column(Integer)
 
+    # Time-to-first-token (ms, relative to invoke start). Two flavours:
+    #   first_thinking_token_ms — first text byte from the agent's *first*
+    #     LLM step. For non-tool-using agents, this equals the answer's TTFT;
+    #     for tool-using agents, it's how long until reasoning began streaming.
+    #   first_answer_token_ms   — first text byte of the *final* LLM step
+    #     (the one promoted to type='answer' by SSEStreamAdapter). For agents
+    #     that loop through tools then answer, this is the user-perceived TTFT.
+    first_thinking_token_ms: Mapped[int | None] = mapped_column(Integer)
+    first_answer_token_ms: Mapped[int | None] = mapped_column(Integer)
+
     error_message: Mapped[str | None] = mapped_column(Text)
     error_type: Mapped[str | None] = mapped_column(String(64))
 

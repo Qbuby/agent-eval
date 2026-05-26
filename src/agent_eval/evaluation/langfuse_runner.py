@@ -204,6 +204,8 @@ def _aggregate_cost(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_tool_calls": _avg("tool_call_count"),
         "avg_messages": _avg("message_count"),
         "avg_latency_ms": _avg("latency_ms"),
+        "avg_first_thinking_token_ms": _avg("first_thinking_token_ms"),
+        "avg_first_answer_token_ms": _avg("first_answer_token_ms"),
         "cache_hit_rate": cache_hit_rate,
     }
 
@@ -388,10 +390,17 @@ def _extract_usage(resp: AgentResponse) -> dict[str, int | None]:
 #      unknown) so the UI can render it differently than a plain "error".
 #   2. _invoke_with_retry: configurable retry-with-exponential-backoff over
 #      transient errors (connection / 5xx / timeout). Defaults to 2 retries
-#      (3 total attempts) with 2s → 4s → 8s backoff capped at 30s. Override
-#      per-run via agent_cfg["retry"]={max_retries, initial_backoff_s,
-#      backoff_factor, max_backoff_s}. The backoff sleep wakes early on a
-#      cancel_event so /stop doesn't have to wait out a slow retry.
+#      (3 total attempts) with 2s → 4s → 8s backoff capped at 30s. Three
+#      sources of params, in priority order:
+#         a) per-run override via agent_cfg["retry"]={max_retries,
+#            initial_backoff_s, backoff_factor, max_backoff_s}
+#         b) system_configs rows under category "eval.retry" (Config UI)
+#         c) the hardcoded defaults in _RetryPolicy
+#      Resolution happens once per run inside _execute_run via
+#      _resolve_retry_policy, then the resolved policy is threaded through
+#      to every _run_one_case so we don't hit the DB per sample. The
+#      backoff sleep wakes early on a cancel_event so /stop doesn't have to
+#      wait out a slow retry.
 
 _TRANSIENT_HINTS = (
     "all connection attempts failed",
@@ -442,6 +451,40 @@ def _retry_policy_from_cfg(agent_cfg: dict) -> _RetryPolicy:
         )
     except (TypeError, ValueError):
         return _RetryPolicy()
+
+
+async def _resolve_retry_policy(agent_cfg: dict) -> _RetryPolicy:
+    """Three-tier fallback for retry params, resolved once per run:
+
+      1. ``agent_cfg["retry"]`` — caller passed explicit overrides.
+      2. ``system_configs`` rows under ``eval.retry.*`` (set via Config UI).
+      3. Hardcoded defaults baked into ``_RetryPolicy``.
+
+    The DB lookup is best-effort; any failure (table missing during tests,
+    config_service not initialized) silently falls back to step 3 so the
+    eval pipeline never blocks on configuration plumbing.
+    """
+    raw = dict((agent_cfg or {}).get("retry") or {})
+    if not all(
+        k in raw for k in
+        ("max_retries", "initial_backoff_s", "backoff_factor", "max_backoff_s")
+    ):
+        try:
+            from agent_eval.config_service import config_service
+            for short_key, full_key in (
+                ("max_retries", "eval.retry.max_retries"),
+                ("initial_backoff_s", "eval.retry.initial_backoff_s"),
+                ("backoff_factor", "eval.retry.backoff_factor"),
+                ("max_backoff_s", "eval.retry.max_backoff_s"),
+            ):
+                if short_key in raw:
+                    continue
+                v = await config_service.get(full_key)
+                if v is not None:
+                    raw[short_key] = v
+        except Exception as e:
+            logger.debug("retry policy fallback to defaults: %s", e)
+    return _retry_policy_from_cfg({"retry": raw})
 
 
 async def _sleep_with_cancel(seconds: float, cancel_event: asyncio.Event | None) -> bool:
@@ -517,11 +560,16 @@ async def _run_one_case(
     evaluator_specs: list[dict[str, Any]],
     judge_llm: Any,
     cancel_event: asyncio.Event | None = None,
+    retry_policy: _RetryPolicy | None = None,
 ) -> dict[str, Any]:
     """Execute one case end-to-end. ``case`` is the normalized dict from
     ``_normalize_cases_for_runner``: {id, name, question, expected_output,
     expected_tool_calls, source}. ``evaluator_specs`` are pre-resolved
     {evaluator_type, params, label} dicts (DB lookup already done by caller).
+    ``retry_policy`` is normally resolved once at run start (via
+    ``_resolve_retry_policy``) and threaded through; passing ``None`` falls
+    back to per-call resolution from ``agent_cfg`` only (no DB lookup) for
+    callers/tests that don't go through ``_execute_run``.
     Returns one row's worth of data ready to persist."""
     question = case["question"]
     expected = case.get("expected_output") or ""
@@ -534,7 +582,8 @@ async def _run_one_case(
 
     adapter = _make_adapter(agent_cfg, thread_id=thread_id)
     messages = [{"role": "user", "content": question}]
-    retry_policy = _retry_policy_from_cfg(agent_cfg)
+    if retry_policy is None:
+        retry_policy = _retry_policy_from_cfg(agent_cfg)
 
     output_text = ""
     error_msg: str | None = None
@@ -542,6 +591,8 @@ async def _run_one_case(
     actual_tool_calls: list[dict] = []
     cot_steps: list[dict] = []
     latency_ms: int | None = None
+    first_thinking_token_ms: int | None = None
+    first_answer_token_ms: int | None = None
     attempts_made = 0
     usage = {
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
@@ -569,6 +620,20 @@ async def _run_one_case(
                     cot_steps = steps_raw
             if not actual_tool_calls:
                 actual_tool_calls = _extract_tool_calls_from_response(resp)
+            # Time-to-first-token, derived from per-step first_token_ms that
+            # SSEStreamAdapter stamps on each thought/answer step.
+            #   thinking = first thought-or-answer step that has a value
+            #   answer   = the step whose type='answer' (final LLM step)
+            for s in cot_steps:
+                if not isinstance(s, dict):
+                    continue
+                t = s.get("first_token_ms")
+                if t is None:
+                    continue
+                if s.get("type") in ("thought", "answer") and first_thinking_token_ms is None:
+                    first_thinking_token_ms = int(t)
+                if s.get("type") == "answer":
+                    first_answer_token_ms = int(t)
         except Exception as e:
             attempts_made = getattr(e, "_eval_attempts_made", attempts_made or 1)
             error_msg = str(e)
@@ -648,6 +713,8 @@ async def _run_one_case(
         "actual_tool_calls": actual_tool_calls,
         "cot_steps": cot_steps,
         "latency_ms": latency_ms,
+        "first_thinking_token_ms": first_thinking_token_ms,
+        "first_answer_token_ms": first_answer_token_ms,
         "error_message": error_msg,
         "error_type": error_type,
         "attempts_made": attempts_made,
@@ -674,6 +741,12 @@ async def _execute_run(
     LangSmith backfill (non-blocking)."""
     handle.progress["total"] = len(cases)
     judge_llm = _make_judge_llm()
+    retry_policy = await _resolve_retry_policy(agent_cfg)
+    logger.info(
+        "eval run %s retry policy: max_retries=%d initial=%.1fs factor=%.1f cap=%.1fs",
+        run_id, retry_policy.max_retries, retry_policy.initial_backoff_s,
+        retry_policy.backoff_factor, retry_policy.max_backoff_s,
+    )
 
     sem = asyncio.Semaphore(max(1, concurrency))
     per_case_results: list[dict[str, Any]] = []
@@ -691,6 +764,7 @@ async def _execute_run(
                     evaluator_specs=evaluator_specs,
                     judge_llm=judge_llm,
                     cancel_event=cancel_event,
+                    retry_policy=retry_policy,
                 )
             except Exception as e:
                 logger.exception("case %s crashed during run: %s", case.get("id"), e)
@@ -730,6 +804,8 @@ async def _execute_run(
                         cache_creation_tokens=res.get("cache_creation_tokens"),
                         cache_read_tokens=res.get("cache_read_tokens"),
                         tool_call_count=res["tool_call_count"],
+                        first_thinking_token_ms=res.get("first_thinking_token_ms"),
+                        first_answer_token_ms=res.get("first_answer_token_ms"),
                         error_message=res["error_message"],
                         error_type=res["error_type"],
                         status=res["status"],

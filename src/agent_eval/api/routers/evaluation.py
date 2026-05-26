@@ -294,6 +294,8 @@ async def get_run_results(
             cache_creation_tokens=r.cache_creation_tokens,
             cache_read_tokens=r.cache_read_tokens,
             tool_call_count=r.tool_call_count,
+            first_thinking_token_ms=getattr(r, "first_thinking_token_ms", None),
+            first_answer_token_ms=getattr(r, "first_answer_token_ms", None),
             actual_tool_calls=r.actual_tool_calls,
             full_trace=r.full_trace,
             error_message=r.error_message,
@@ -404,6 +406,8 @@ async def reaggregate_run(run_id: str):
                 "cache_creation_tokens": r.cache_creation_tokens,
                 "cache_read_tokens": r.cache_read_tokens,
                 "latency_ms": r.latency_ms,
+                "first_thinking_token_ms": getattr(r, "first_thinking_token_ms", None),
+                "first_answer_token_ms": getattr(r, "first_answer_token_ms", None),
             }
 
         succ = [_cost_row(r) for r in results if r.status == "pass"]
