@@ -4,12 +4,14 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
 } from 'react'
 import { createPortal } from 'react-dom'
 import { Button } from './Button'
+import { useDialogFocus } from '../../hooks/useDialogFocus'
 
 // ──────────────────────────────────────────────────────────────────────────
 // 通用 Dialog 原语
@@ -43,6 +45,11 @@ export function Dialog({
   closeOnEsc = true,
   width = 420,
 }: DialogProps) {
+  const reactId = useId()
+  const titleId = `dialog-title-${reactId}`
+  const descId = `dialog-desc-${reactId}`
+  const panelRef = useDialogFocus<HTMLDivElement>(open)
+
   useEffect(() => {
     if (!open || !closeOnEsc) return
     const handler = (e: KeyboardEvent) => {
@@ -64,30 +71,37 @@ export function Dialog({
   if (!open) return null
 
   return createPortal(
-    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4" role="dialog" aria-modal="true">
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
       <div
-        className="absolute inset-0 bg-black/35 backdrop-blur-[1px] animate-overlay-in"
+        className="absolute inset-0 bg-black/30 dark:bg-black/55 backdrop-blur-[6px] animate-overlay-in"
         onClick={() => closeOnOverlayClick && onClose()}
+        aria-hidden="true"
       />
       <div
-        className="relative bg-surface rounded-lg shadow-lg border border-border animate-dialog-in"
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title ? titleId : undefined}
+        aria-describedby={description ? descId : undefined}
+        tabIndex={-1}
+        className="relative bg-bg-elevated rounded-2xl shadow-xl border border-border/60 animate-dialog-in outline-none"
         style={{ width: `min(${width}px, calc(100vw - 32px))` }}
       >
         {(title || description) && (
-          <div className="px-5 pt-5 pb-3">
+          <div className="px-6 pt-5 pb-3">
             {title && (
-              <div className="text-base font-semibold text-text-primary">{title}</div>
+              <div id={titleId} className="text-[17px] font-display font-semibold tracking-[-0.4px] text-text-primary">{title}</div>
             )}
             {description && (
-              <div className="mt-1 text-sm text-text-secondary leading-relaxed whitespace-pre-line">
+              <div id={descId} className="mt-1.5 text-[13px] text-text-secondary leading-relaxed whitespace-pre-line">
                 {description}
               </div>
             )}
           </div>
         )}
-        {children && <div className="px-5 pb-3 text-sm text-text-secondary">{children}</div>}
+        {children && <div className="px-6 pb-3 text-[13px] text-text-secondary">{children}</div>}
         {footer && (
-          <div className="flex items-center justify-end gap-2 px-5 pb-5 pt-2">{footer}</div>
+          <div className="flex items-center justify-end gap-2 px-6 pb-5 pt-2">{footer}</div>
         )}
       </div>
     </div>,

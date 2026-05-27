@@ -1,43 +1,427 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+/*
+ * HIG-aligned design tokens.
+ *
+ * Color values follow Apple's published systemColor / systemGray ramps for
+ * light & dark appearances. Tailwind reads these via `rgb(var(--token))` so
+ * components stay theme-agnostic — flipping `.dark` on <html> is the only
+ * thing that switches palettes.
+ *
+ * SF Pro is loaded from /fonts/* (woff2). License notice: SF Pro's EULA
+ * restricts use to Apple platforms; if deployment is broader than internal
+ * tooling, swap the @font-face entries for an open alternative such as Inter.
+ */
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-body {
-  margin: 0;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+/* ─── SF Pro self-hosted (woff2) ────────────────────────────────── */
+
+@font-face {
+  font-family: 'SF Pro Text';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/SF-Pro-Text-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'SF Pro Text';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/SF-Pro-Text-Medium.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'SF Pro Text';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/SF-Pro-Text-Semibold.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'SF Pro Display';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/SF-Pro-Display-Semibold.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'SF Pro Display';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('/fonts/SF-Pro-Display-Bold.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'SF Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/SF-Mono-Regular.woff2') format('woff2');
+}
+
+/* ─── Theme tokens ─────────────────────────────────────────────── */
+
+:root {
+  /* HIG light appearance */
+  --bg: 242 242 247;            /* systemGroupedBackground */
+  --bg-secondary: 255 255 255;  /* secondarySystemGroupedBackground */
+  --bg-tertiary: 247 247 250;
+  --bg-elevated: 255 255 255;
+  --surface: 255 255 255;
+  --surface-hover: 247 247 250;
+
+  --separator: 60 60 67;        /* opaque equivalents below; alpha set in classes */
+  --border: 220 220 224;        /* systemGray5 */
+  --border-strong: 198 198 200; /* systemGray4 */
+
+  --text-primary: 0 0 0;
+  --text-secondary: 60 60 67;   /* alpha 60% in HIG; we apply class-side */
+  --text-tertiary: 60 60 67;    /* alpha 30% */
+  --text-quaternary: 60 60 67;  /* alpha 18% */
+
+  --fill: 120 120 128;          /* alpha applied via class */
+  --fill-secondary: 120 120 128;
+  --fill-tertiary: 118 118 128;
+  --fill-quaternary: 116 116 128;
+
+  --accent: 0 122 255;           /* systemBlue */
+  --accent-hover: 0 100 220;
+  --accent-subtle: 230 240 255;
+  --accent-fg: 255 255 255;
+
+  --positive: 52 199 89;         /* systemGreen */
+  --warning: 255 149 0;           /* systemOrange */
+  --negative: 255 59 48;          /* systemRed */
+  --info: 90 200 250;             /* systemTeal */
+
+  color-scheme: light;
+}
+
+.dark {
+  /* HIG dark appearance */
+  --bg: 0 0 0;
+  --bg-secondary: 28 28 30;
+  --bg-tertiary: 44 44 46;
+  --bg-elevated: 28 28 30;
+  --surface: 28 28 30;
+  --surface-hover: 44 44 46;
+
+  --separator: 84 84 88;
+  --border: 56 56 58;
+  --border-strong: 72 72 74;
+
+  --text-primary: 255 255 255;
+  --text-secondary: 235 235 245;
+  --text-tertiary: 235 235 245;
+  --text-quaternary: 235 235 245;
+
+  --fill: 120 120 128;
+  --fill-secondary: 120 120 128;
+  --fill-tertiary: 118 118 128;
+  --fill-quaternary: 118 118 128;
+
+  --accent: 10 132 255;            /* systemBlue (dark) */
+  --accent-hover: 64 156 255;
+  --accent-subtle: 28 53 99;
+  --accent-fg: 255 255 255;
+
+  --positive: 48 209 88;
+  --warning: 255 159 10;
+  --negative: 255 69 58;
+  --info: 100 210 255;
+
+  color-scheme: dark;
+}
+
+/* ─── Base ─────────────────────────────────────────────────────── */
+
+html {
+  font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, 'Inter',
+    'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: #fafafa;
-  color: #1a1a1a;
-  font-size: 13px;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+  background: rgb(var(--bg));
+  color: rgb(var(--text-primary));
+}
+
+body {
+  margin: 0;
+  font-size: 14px;
   line-height: 1.5;
-  letter-spacing: 0.01em;
+  /* Light haptic-style page background; the inner panels are surface. */
+  background: rgb(var(--bg));
+  color: rgb(var(--text-primary));
 }
 
 @layer base {
+  /* HIG default text colors apply opacity to a near-black fill. We expose
+     three semantic helpers here so component code stays one-liner. */
+  .text-text-secondary { color: rgb(var(--text-secondary) / 0.72); }
+  .text-text-tertiary { color: rgb(var(--text-tertiary) / 0.55); }
+  .text-text-quaternary { color: rgb(var(--text-quaternary) / 0.32); }
+  .dark .text-text-secondary { color: rgb(var(--text-secondary) / 0.72); }
+  .dark .text-text-tertiary { color: rgb(var(--text-tertiary) / 0.45); }
+  .dark .text-text-quaternary { color: rgb(var(--text-quaternary) / 0.28); }
+
+  /* HIG separators are 0.33pt hairlines tinted by alpha. */
+  .border-separator { border-color: rgb(var(--separator) / 0.18); }
+  .dark .border-separator { border-color: rgb(var(--separator) / 0.45); }
+
   input, select, textarea, button {
     font-family: inherit;
+    font-feature-settings: inherit;
   }
 
-  * {
-    transition-property: color, background-color, border-color, box-shadow, transform, opacity;
-    transition-duration: 200ms;
-    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  /* HIG focus ring: 3px halo, accent at 28% — applied via shadow utility */
+  :focus-visible {
+    outline: none;
+  }
+
+  /* Honor user reduced-motion preference (HIG accessibility requirement) */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* Custom scrollbars (WebKit) — slim, subtle, HIG-flavored */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(var(--fill) / 0.22);
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgb(var(--fill) / 0.4);
+    background-clip: padding-box;
   }
 }
 
 @layer components {
+  /* Standard text input — HIG "filled" style, mid-radius, hairline border. */
   .input {
-    @apply w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 placeholder:text-text-tertiary transition-all duration-200;
+    @apply w-full px-3 py-2 text-[13px] leading-5
+           bg-surface text-text-primary
+           border border-border rounded-md
+           outline-none placeholder:text-text-tertiary
+           transition-[border-color,box-shadow,background-color]
+           duration-150 ease-standard
+           focus-visible:border-accent focus-visible:shadow-focus
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  /* Smaller input variant for filter toolbars — 28px tall to align with chips */
+  .input-sm {
+    @apply px-2.5 py-1.5 text-[12px] leading-4
+           bg-surface text-text-primary
+           border border-border rounded-md
+           outline-none placeholder:text-text-tertiary
+           transition-[border-color,box-shadow,background-color]
+           duration-150 ease-standard
+           focus-visible:border-accent focus-visible:shadow-focus
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .select-sm {
+    @apply px-2.5 py-1.5 text-[12px] leading-4
+           bg-surface text-text-primary
+           border border-border rounded-md
+           outline-none transition-[border-color,box-shadow] duration-150 ease-standard
+           focus-visible:border-accent focus-visible:shadow-focus
+           disabled:opacity-50;
+  }
+
+  /* Card — elevated panel; hairline border + soft shadow on light, solid on dark */
+  .card {
+    @apply bg-surface rounded-lg border border-border shadow-sm;
+  }
+
+  /* Section heading helpers — HIG "Subhead" / "Title 3" sizes */
+  .h-title { @apply text-title-3 font-display font-semibold text-text-primary; }
+  .h-section { @apply text-subhead font-semibold text-text-primary; }
+
+  /* Page-level heading kit — used in every list/detail page header */
+  .page-eyebrow {
+    @apply text-[10px] uppercase tracking-[0.12em] text-text-tertiary;
+  }
+  .page-title {
+    @apply text-[22px] font-display font-semibold tracking-[-0.4px] text-text-primary;
+  }
+  .page-subtitle {
+    @apply text-[12px] text-text-tertiary mt-1;
+  }
+
+  /* Section heading row — small caption + optional trailing action, with hairline */
+  .section-row {
+    @apply flex items-center justify-between mb-3 pb-2 border-b border-separator;
+  }
+
+  /* Eyebrow caption used inside forms / small dt labels */
+  .field-label {
+    @apply block text-[10px] uppercase tracking-[0.1em] text-text-tertiary mb-1.5;
+  }
+
+  /* Filter / action toolbar — common pattern at the top of list pages */
+  .toolbar {
+    @apply flex items-center gap-2 flex-wrap mb-4;
+  }
+
+  /* HIG "Sidebar" / grouped table — hairline border, rounded, surface fill */
+  .table-card {
+    @apply bg-surface border border-border rounded-lg overflow-hidden;
+  }
+  .table-base {
+    @apply w-full border-collapse;
+  }
+  .table-base thead tr {
+    @apply bg-fill/5;
+  }
+  .table-base th {
+    @apply text-left py-2 px-3 text-[10px] uppercase tracking-[0.08em] font-medium text-text-tertiary border-b border-separator;
+  }
+  .table-base tbody tr {
+    @apply border-b border-separator transition-colors duration-150 ease-standard;
+  }
+  .table-base tbody tr:last-child { border-bottom: 0; }
+  .table-base tbody tr.row-hover:hover,
+  .table-base tbody tr:hover {
+    @apply bg-fill/5;
+  }
+  .table-base td {
+    @apply py-2.5 px-3 text-[12px] text-text-primary;
+  }
+
+  /* Pagination buttons — HIG capsule */
+  .pager-btn {
+    @apply inline-flex items-center justify-center h-7 px-2.5 text-[11px]
+           rounded-md border border-border bg-surface text-text-secondary
+           hover:border-border-strong hover:text-text-primary
+           disabled:opacity-40 disabled:cursor-not-allowed
+           transition-[color,border-color,background-color] duration-150 ease-standard
+           focus-visible:shadow-focus focus-visible:outline-none;
+  }
+
+  /* Inline text action — used inside tables/rows where a full Button is too heavy.
+     Always pairs with `text-[11px] text-text-secondary` style buttons; this gives
+     them a consistent focus-visible ring + transition without per-call boilerplate. */
+  .text-action {
+    @apply inline-flex items-center text-[11px] text-text-secondary
+           hover:text-accent transition-colors duration-150 ease-standard
+           focus-visible:outline-none focus-visible:shadow-focus
+           focus-visible:rounded-sm focus-visible:text-text-primary
+           disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-secondary;
+  }
+  .text-action-danger {
+    @apply inline-flex items-center text-[11px] text-text-secondary
+           hover:text-negative transition-colors duration-150 ease-standard
+           focus-visible:outline-none focus-visible:shadow-focus
+           focus-visible:rounded-sm focus-visible:text-negative
+           disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-secondary;
+  }
+  .text-action-warning {
+    @apply inline-flex items-center text-[11px] text-text-secondary
+           hover:text-warning transition-colors duration-150 ease-standard
+           focus-visible:outline-none focus-visible:shadow-focus
+           focus-visible:rounded-sm focus-visible:text-warning
+           disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-secondary;
+  }
+  .text-action-positive {
+    @apply inline-flex items-center text-[11px] text-text-secondary
+           hover:text-positive transition-colors duration-150 ease-standard
+           focus-visible:outline-none focus-visible:shadow-focus
+           focus-visible:rounded-sm focus-visible:text-positive
+           disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-secondary;
+  }
+
+  /* Back-link / breadcrumb-style mute action — used in page headers under the eyebrow */
+  .back-link {
+    @apply inline-flex items-center gap-1 text-[11px] text-text-tertiary
+           hover:text-text-primary transition-colors duration-150 ease-standard
+           focus-visible:outline-none focus-visible:shadow-focus focus-visible:rounded-sm
+           focus-visible:text-text-primary no-underline;
+  }
+
+  /* Empty state container — used in tables and grids */
+  .empty-state {
+    @apply text-center py-12 px-6 text-text-tertiary text-[12px];
+  }
+
+  /* Status / tone badges — HIG capsule, semantic tone */
+  .badge { @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium; }
+  .badge-positive { @apply bg-positive/10 text-positive; }
+  .badge-negative { @apply bg-negative/10 text-negative; }
+  .badge-warning  { @apply bg-warning/15 text-warning; }
+  .badge-info     { @apply bg-info/15 text-info; }
+  .badge-accent   { @apply bg-accent/10 text-accent; }
+  .badge-neutral  { @apply bg-fill/10 text-text-secondary; }
+
+  /* Metric card — single number display used in dashboards */
+  .metric-card {
+    @apply bg-surface border border-border rounded-xl px-4 py-3.5
+           transition-[transform,box-shadow,border-color] duration-200 ease-standard
+           hover:shadow-sm hover:border-border-strong;
+  }
+  .metric-eyebrow {
+    @apply text-[10px] uppercase tracking-[0.1em] text-text-tertiary mb-1;
+  }
+  .metric-value {
+    @apply text-[20px] font-display font-semibold tracking-[-0.3px] text-text-primary;
+  }
+
+  /* Tabbed nav — used inside pages (HIG "Underlined Tabs") */
+  .page-tabs {
+    @apply flex gap-1 border-b border-separator;
+  }
+  .page-tab {
+    @apply px-3.5 py-2 text-[12px] tracking-[-0.1px] border-b-2 border-transparent
+           text-text-secondary hover:text-text-primary
+           transition-[color,border-color] duration-150 ease-standard
+           focus-visible:shadow-focus focus-visible:outline-none rounded-t-md;
+  }
+  .page-tab-active {
+    @apply border-accent text-text-primary font-medium;
+  }
+
+  /* Vibrancy / chrome — translucent material on light & dark */
+  .material {
+    background: rgb(var(--surface) / 0.72);
+    backdrop-filter: saturate(180%) blur(20px);
+    -webkit-backdrop-filter: saturate(180%) blur(20px);
+  }
+  .dark .material {
+    background: rgb(var(--surface) / 0.62);
   }
 }
 
 @layer utilities {
   .skeleton {
-    background: linear-gradient(90deg, #f0f0f0 25%, #e8e8e8 50%, #f0f0f0 75%);
+    background: linear-gradient(
+      90deg,
+      rgb(var(--fill) / 0.08) 25%,
+      rgb(var(--fill) / 0.16) 50%,
+      rgb(var(--fill) / 0.08) 75%
+    );
     background-size: 200% 100%;
     animation: shimmer 1.5s ease-in-out infinite;
   }
+
+  /* Hairline divider — uses the separator alpha rule above. */
+  .hairline {
+    height: 1px;
+    background: rgb(var(--separator) / 0.18);
+  }
+  .dark .hairline { background: rgb(var(--separator) / 0.45); }
 }

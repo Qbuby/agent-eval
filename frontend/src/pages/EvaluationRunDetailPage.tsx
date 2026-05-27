@@ -8,7 +8,7 @@ import {
 import { evaluationApi, tracesApi } from '@/services'
 import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
-import { Drawer } from '@/components/ui'
+import { Button, Drawer } from '@/components/ui'
 import {
   getScoreMeta, isPassing, directionMark, tone,
 } from '@/lib/scoreSemantics'
@@ -46,10 +46,6 @@ export default function EvaluationRunDetailPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['eval-run', runId] }),
   })
 
-  // ─── Trace lookup project ──────────────────────────────────────────────────
-  // Default: project bound at start time. User can override and re-run the
-  // backfill against a different project (e.g. fix permission later, or the
-  // run actually landed in a different bucket).
   const [projectInput, setProjectInput] = useState('')
   const [activeProject, setActiveProject] = useState<string | null>(null)
 
@@ -62,10 +58,6 @@ export default function EvaluationRunDetailPage() {
     },
   })
 
-  // Manual re-pull of Langfuse evaluator scores. Traces are already pushed
-  // by the run, so we skip push and only pull. One quick attempt is enough
-  // for an on-demand refresh — the user clicks again if Langfuse hasn't
-  // finished judging yet.
   const langfusePullMutation = useMutation({
     mutationFn: () => evaluationApi
       .syncLangfuseScores(runId!, { push: false, pull_attempts: 1 })
@@ -76,8 +68,6 @@ export default function EvaluationRunDetailPage() {
     },
   })
 
-  // Re-aggregate summary_scores from existing per-case scores. Useful for
-  // runs that finished before we started writing tool_usage / score_distribution.
   const reaggregateMutation = useMutation({
     mutationFn: () => evaluationApi.reaggregateRun(runId!).then(r => r.data),
     onSuccess: () => {
@@ -88,7 +78,6 @@ export default function EvaluationRunDetailPage() {
   const run = runQuery.data
   const langfuseHost = deriveLangfuseHost(run)
 
-  // ─── Selected sample for the detail drawer ─────────────────────────────────
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
 
   useEffect(() => {
@@ -101,13 +90,12 @@ export default function EvaluationRunDetailPage() {
     }
   }, [run, activeProject])
 
-
   if (!runId) return null
-  if (runQuery.isLoading) return <div className="text-[12px] text-text-tertiary">加载中…</div>
+  if (runQuery.isLoading) return <div className="empty-state">加载中…</div>
   if (runQuery.isError || !run) {
     return (
       <div className="text-[12px] text-negative">
-        加载失败。<Link to="/evaluation" className="underline">返回列表</Link>
+        加载失败。<Link to="/evaluation" className="text-accent hover:underline">返回列表</Link>
       </div>
     )
   }
@@ -131,71 +119,69 @@ export default function EvaluationRunDetailPage() {
 
   return (
     <div>
-      <header className="mb-5 flex items-start justify-between gap-4">
+      <Link to="/evaluation" className="back-link mb-2">
+        ← 评估列表
+      </Link>
+      <header className="mb-6 flex items-start justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 mb-1">
-            <Link to="/evaluation" className="text-[11px] text-text-tertiary hover:text-accent">← 评估列表</Link>
-          </div>
-          <h1 className="text-lg font-light tracking-tight mb-1">
-            Run <span className="font-mono text-[14px]">{run.id.slice(0, 8)}</span>
+          <div className="page-eyebrow">评估</div>
+          <h1 className="page-title">
+            Run <span className="font-mono text-[18px]">{run.id.slice(0, 8)}</span>
           </h1>
-          <p className="text-[10px] text-text-tertiary tracking-widest uppercase">
-            {run.langfuse_run_name ?? '—'}
-          </p>
+          <p className="page-subtitle">{run.langfuse_run_name ?? '—'}</p>
         </div>
-        <div className="flex items-center gap-2">
-          <StatusBadge status={run.status} />
+        <div className="flex items-center gap-2 mt-1">
+          <RunStatusBadge status={run.status} />
           {(run.status === 'running' || run.status === 'stopping') && (
-            <button
+            <Button
+              variant="secondary"
+              size="sm"
+              loading={stopMutation.isPending}
+              disabled={run.status === 'stopping'}
               onClick={() => stopMutation.mutate()}
-              disabled={stopMutation.isPending || run.status === 'stopping'}
-              className="py-1.5 px-3 text-[11px] rounded-[6px] border border-border text-text-secondary hover:border-negative hover:text-negative disabled:opacity-40 transition-all"
             >
               {run.status === 'stopping' ? '停止中…' : '停止'}
-            </button>
+            </Button>
           )}
-          <button
-            onClick={() => navigate(`/evaluation/compare?ids=${runId}`)}
-            className="py-1.5 px-3 text-[11px] rounded-[6px] border border-border text-text-secondary hover:border-accent hover:text-accent transition-all"
-          >
+          <Button variant="secondary" size="sm" onClick={() => navigate(`/evaluation/compare?ids=${runId}`)}>
             加入对比
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={langfusePullMutation.isPending}
             onClick={() => langfusePullMutation.mutate()}
-            disabled={langfusePullMutation.isPending}
-            title="向 Langfuse 拉一次 observation 级评估器分数（已推送的 trace 不再重复推）"
-            className="py-1.5 px-3 text-[11px] rounded-[6px] border border-border text-text-secondary hover:border-accent hover:text-accent disabled:opacity-40 transition-all"
+            title="向 Langfuse 拉一次 observation 级评估器分数"
           >
-            {langfusePullMutation.isPending ? '拉取中…' : '重拉 Langfuse 分数'}
-          </button>
-          <button
+            重拉 Langfuse 分数
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={reaggregateMutation.isPending}
             onClick={() => reaggregateMutation.mutate()}
-            disabled={reaggregateMutation.isPending}
-            title="从样例分数重新计算维度平均、工具调用统计、分数分布。老 run 跑这一下能补出综合报告区。"
-            className="py-1.5 px-3 text-[11px] rounded-[6px] border border-border text-text-secondary hover:border-accent hover:text-accent disabled:opacity-40 transition-all"
+            title="从样例分数重新计算维度平均、工具调用统计、分数分布"
           >
-            {reaggregateMutation.isPending ? '重算中…' : '重算汇总'}
-          </button>
+            重算汇总
+          </Button>
         </div>
       </header>
 
-      {/* Langfuse pull-back result banner */}
       {langfusePullMutation.data && (
-        <div className="mb-3 text-[11px] text-text-secondary border border-border bg-accent-subtle/40 rounded-[6px] px-3 py-2">
+        <div className="mb-3 text-[12px] text-text-secondary border border-border bg-fill/5 rounded-md px-3 py-2">
           已从 Langfuse 拉回 <span className="font-mono">{langfusePullMutation.data.pull.pulled}</span> 条新分数
           （poll {langfusePullMutation.data.pull.polls} 次）。如果是 0，可能 Langfuse 评估器还没算完，等几十秒后再点一次。
         </div>
       )}
       {langfusePullMutation.isError && (
-        <div className="mb-3 text-[11px] text-negative border border-red-200 bg-red-50 rounded-[6px] px-3 py-2">
+        <div className="mb-3 text-[12px] text-negative border border-negative/30 bg-negative/5 rounded-md px-3 py-2">
           拉取失败：{(langfusePullMutation.error as { response?: { data?: { detail?: string } } })
             ?.response?.data?.detail || (langfusePullMutation.error as Error)?.message || 'unknown'}
         </div>
       )}
 
-      {/* Reaggregate result banner */}
       {reaggregateMutation.data && (
-        <div className="mb-3 text-[11px] text-text-secondary border border-border bg-accent-subtle/40 rounded-[6px] px-3 py-2">
+        <div className="mb-3 text-[12px] text-text-secondary border border-border bg-fill/5 rounded-md px-3 py-2">
           已重算：{reaggregateMutation.data.case_count} 条样例，
           维度 {reaggregateMutation.data.dimensions.length} 个
           ({reaggregateMutation.data.dimensions.join(', ') || '无'})，
@@ -203,22 +189,19 @@ export default function EvaluationRunDetailPage() {
         </div>
       )}
       {reaggregateMutation.isError && (
-        <div className="mb-3 text-[11px] text-negative border border-red-200 bg-red-50 rounded-[6px] px-3 py-2">
+        <div className="mb-3 text-[12px] text-negative border border-negative/30 bg-negative/5 rounded-md px-3 py-2">
           重算失败：{(reaggregateMutation.error as { response?: { data?: { detail?: string } } })
             ?.response?.data?.detail || (reaggregateMutation.error as Error)?.message || 'unknown'}
         </div>
       )}
 
-      {/* Runtime error banner — most samples couldn't reach the agent */}
       {run.summary_scores?.runtime_error && (
-        <section className="mb-5 border border-amber-300 bg-amber-50 rounded-[6px] px-4 py-3">
+        <section className="mb-5 border border-warning/30 bg-warning/10 rounded-lg px-4 py-3">
           <div className="flex items-start gap-2">
-            <span className="text-amber-700 text-[14px] mt-0.5">⚠</span>
+            <span className="text-warning text-[14px] mt-0.5">⚠</span>
             <div className="flex-1">
-              <div className="text-[12px] font-medium text-amber-900 mb-1">
-                Agent 不可达
-              </div>
-              <div className="text-[11px] text-amber-800 leading-relaxed">
+              <div className="text-[12px] font-medium text-text-primary mb-1">Agent 不可达</div>
+              <div className="text-[11px] text-text-secondary leading-relaxed">
                 {run.summary_scores.runtime_error}
               </div>
             </div>
@@ -226,26 +209,21 @@ export default function EvaluationRunDetailPage() {
         </section>
       )}
 
-      {/* Meta grid */}
       <section className="grid grid-cols-4 gap-3 mb-5">
         <MetaCard label="总数" value={counts.total ?? run.progress.total ?? '—'} />
         <MetaCard label="通过" value={counts.passed ?? 0} hint="pass (所有指标≥0.5)" />
         <MetaCard label="失败" value={counts.failed ?? 0} hint="fail / error" />
-        <MetaCard
-          label="启动 → 完成"
-          value={fmtDuration(run.started_at, run.finished_at)}
-        />
+        <MetaCard label="启动 → 完成" value={fmtDuration(run.started_at, run.finished_at)} />
       </section>
 
-      {/* Agent config */}
-      <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
-        <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-2">Agent 配置</h3>
+      <section className="card p-4 mb-5">
+        <h3 className="page-eyebrow mb-2">Agent 配置</h3>
         <div className="grid grid-cols-3 gap-3 text-[12px]">
           <KV k="Type" v={(run.agent_config as { type?: string }).type ?? '—'} />
           <KV k="Model" v={(run.agent_config as { model?: string }).model ?? '—'} />
           <KV k="URL" v={(run.agent_config as { url?: string }).url ?? '—'} mono />
         </div>
-        <details className="mt-2">
+        <details className="mt-3">
           <summary className="text-[11px] text-text-secondary cursor-pointer">原始配置 / evaluators</summary>
           <div className="grid grid-cols-2 gap-3 mt-2">
             <JsonBlock label="agent_config" data={run.agent_config} />
@@ -254,13 +232,11 @@ export default function EvaluationRunDetailPage() {
         </details>
       </section>
 
-      {/* Trace project lookup */}
-      <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
-        <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-2">调用轨迹（LangSmith Project）</h3>
-        <p className="text-[11px] text-text-secondary mb-3">
-          输入要溯源的 LangSmith project 名称，平台会按 (project, 时间窗口, 问题文本)
-          反查并把每条样例对应的 run 写回。当前已绑定:{' '}
-          <span className="font-mono">{activeProject || '（未绑定）'}</span>
+      <section className="card p-4 mb-5">
+        <h3 className="page-eyebrow mb-2">调用轨迹（LangSmith Project）</h3>
+        <p className="text-[12px] text-text-secondary mb-3">
+          输入要溯源的 LangSmith project 名称，平台会按 (project, 时间窗口, 问题文本) 反查并把每条样例对应的 run 写回。
+          当前已绑定：<span className="font-mono">{activeProject || '（未绑定）'}</span>
         </p>
         <div className="flex items-center gap-2">
           <input
@@ -268,21 +244,20 @@ export default function EvaluationRunDetailPage() {
             value={projectInput}
             onChange={e => setProjectInput(e.target.value)}
             placeholder="例如 ruyi-agent"
-            className="flex-1 max-w-[360px] py-1.5 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent font-mono"
+            className="input max-w-[360px] font-mono"
           />
-          <button
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!projectInput.trim()}
+            loading={backfillMutation.isPending}
             onClick={() => projectInput.trim() && backfillMutation.mutate(projectInput.trim())}
-            disabled={!projectInput.trim() || backfillMutation.isPending}
-            className="py-1.5 px-3 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent disabled:opacity-40 hover:opacity-90 transition-all"
           >
-            {backfillMutation.isPending ? '查询中…' : '查询轨迹'}
-          </button>
+            查询轨迹
+          </Button>
         </div>
         {backfillMutation.data && (() => {
           const d = backfillMutation.data
-          // Three-state banner: matched > 0 (success), error_kind set
-          // (real failure with a known cause), or zero matches with no
-          // error (project name probably wrong / outside retention).
           if (d.matched > 0) {
             return (
               <div className="mt-2 text-[11px] text-positive">
@@ -315,8 +290,8 @@ export default function EvaluationRunDetailPage() {
             )
           }
           return (
-            <div className="mt-2 text-[11px] text-[#b87b00]">
-              匹配 0 / {d.scanned} 条样例。LangSmith 能查通，但 project 「{d.project}」
+            <div className="mt-2 text-[11px] text-warning">
+              匹配 0 / {d.scanned} 条样例。LangSmith 能查通，但 project「{d.project}」
               里没有时间窗口内、问题文本一致的 root run。请检查 project 名称是否正确，
               或样例发起时间是否在 LangSmith 数据保留期内。
             </div>
@@ -330,10 +305,9 @@ export default function EvaluationRunDetailPage() {
         )}
       </section>
 
-      {/* Dimension averages */}
       {Object.keys(dimAvg).length > 0 && (
-        <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
-          <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-3">维度平均分（0-1）</h3>
+        <section className="card p-4 mb-5">
+          <h3 className="page-eyebrow mb-3">维度平均分（0-1）</h3>
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
             {Object.entries(dimAvg).map(([name, val]) => {
               const meta = getScoreMeta(name)
@@ -343,24 +317,21 @@ export default function EvaluationRunDetailPage() {
               return (
                 <div key={name} title={meta.description}>
                   <div className="flex items-center justify-between mb-1">
-                    <span className="text-[11px] text-text-secondary">
-                      {meta.label}
-                    </span>
-                    <span className={`text-[9px] tracking-widest uppercase ${
-                      meta.direction === 'higher_better' ? 'text-text-tertiary' : 'text-amber-700'
+                    <span className="text-[11px] text-text-secondary">{meta.label}</span>
+                    <span className={`text-[10px] tracking-[0.1em] uppercase ${
+                      meta.direction === 'higher_better' ? 'text-text-tertiary' : 'text-warning'
                     }`}>
                       {directionMark(meta)}
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <div className="flex-1 relative h-2 bg-accent-subtle rounded-full overflow-hidden">
+                    <div className="flex-1 relative h-2 bg-fill/10 rounded-full overflow-hidden">
                       <div
                         className={`h-full rounded-full transition-all ${
-                          passing ? 'bg-green-500' : 'bg-red-400'
+                          passing ? 'bg-positive' : 'bg-negative'
                         }`}
                         style={{ width: `${pct}%` }}
                       />
-                      {/* Threshold marker */}
                       <div
                         className="absolute top-0 bottom-0 w-px bg-text-tertiary/70"
                         style={{ left: `${threshPct}%` }}
@@ -368,7 +339,7 @@ export default function EvaluationRunDetailPage() {
                       />
                     </div>
                     <span className={`font-mono text-[12px] min-w-[40px] text-right ${
-                      passing ? 'text-green-700' : 'text-red-700'
+                      passing ? 'text-positive' : 'text-negative'
                     }`}>
                       {val.toFixed(2)}
                     </span>
@@ -383,29 +354,33 @@ export default function EvaluationRunDetailPage() {
         </section>
       )}
 
-      {/* Latency distribution */}
       {latencyBars.length > 0 && (
-        <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
-          <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-3">
-            延迟分布（按样例 · ms）
-          </h3>
+        <section className="card p-4 mb-5">
+          <h3 className="page-eyebrow mb-3">延迟分布（按样例 · ms）</h3>
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={latencyBars} margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
+              <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--separator) / 0.3)" />
               <XAxis dataKey="label" tick={{ fontSize: 10 }} interval={0} />
               <YAxis tick={{ fontSize: 10 }} label={{ value: 'count', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
               <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
               <Bar dataKey="count" radius={[3, 3, 0, 0]}>
-                {latencyBars.map((_, i) => (
-                  <Cell key={i} fill={['#93c5fd', '#60a5fa', '#3b82f6', '#6366f1', '#a855f7', '#f87171'][i] || '#3b82f6'} />
-                ))}
+                {latencyBars.map((_, i) => {
+                  const palette = [
+                    'rgb(var(--positive))',
+                    'rgb(var(--accent))',
+                    'rgb(var(--info))',
+                    'rgb(var(--accent-hover))',
+                    'rgb(var(--warning))',
+                    'rgb(var(--negative))',
+                  ]
+                  return <Cell key={i} fill={palette[i] || 'rgb(var(--accent))'} />
+                })}
               </Bar>
             </BarChart>
           </ResponsiveContainer>
         </section>
       )}
 
-      {/* Comprehensive visualization report */}
       <ReportSection
         dimAvg={dimAvg}
         radarData={radarData}
@@ -414,7 +389,6 @@ export default function EvaluationRunDetailPage() {
         counts={counts}
       />
 
-      {/* Cost metrics */}
       <section className="grid grid-cols-2 gap-3 mb-5">
         <CostCard title="成功样例的成本" data={costSuccess} />
         <CostCard title="失败样例的成本" data={costFailure} />
@@ -422,43 +396,39 @@ export default function EvaluationRunDetailPage() {
 
       <RetryStatsCard stats={run.summary_scores?.retry_stats} />
 
-      {/* Results table */}
       <section>
-        <div className="flex items-center mb-2">
-          <h3 className="text-[12px] font-medium">样例结果</h3>
-          <span className="ml-2 text-[11px] text-text-tertiary">
-            共 {resultsQuery.data?.total ?? 0} 条
-          </span>
+        <div className="section-row">
+          <div className="page-eyebrow">样例结果 · 共 {resultsQuery.data?.total ?? 0} 条</div>
           {langfuseHost && run.summary_scores?.langfuse_dataset && (
             <a
               href={`${langfuseHost}/datasets`}
               target="_blank" rel="noreferrer"
-              className="ml-auto text-[11px] text-accent hover:underline"
+              className="text-[11px] text-accent hover:text-accent-hover transition-colors"
             >
               Langfuse 界面 ↗
             </a>
           )}
         </div>
-        <div className="border border-border rounded-[3px] overflow-hidden bg-surface">
-          <table className="w-full border-collapse">
+        <div className="table-card">
+          <table className="table-base">
             <thead>
               <tr>
-                <Th>样例</Th>
-                <Th>问题</Th>
-                <Th>状态</Th>
-                <Th>时延</Th>
-                <Th>输入 token</Th>
-                <Th>输出 token</Th>
-                <Th>缓存命中</Th>
-                <Th>工具</Th>
-                <Th>重试</Th>
-                <Th>分数</Th>
-                <Th>追踪</Th>
+                <th>样例</th>
+                <th>问题</th>
+                <th className="w-28">状态</th>
+                <th className="w-20">时延</th>
+                <th className="w-24">输入 token</th>
+                <th className="w-24">输出 token</th>
+                <th className="w-24">缓存命中</th>
+                <th className="w-16">工具</th>
+                <th className="w-16">重试</th>
+                <th>分数</th>
+                <th className="w-24">追踪</th>
               </tr>
             </thead>
             <tbody>
               {resultsQuery.isLoading && (
-                <tr><td colSpan={11} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+                <tr><td colSpan={11} className="empty-state">加载中…</td></tr>
               )}
               {items.map((r: EvalResultRow) => (
                 <ResultRow
@@ -470,7 +440,7 @@ export default function EvaluationRunDetailPage() {
                 />
               ))}
               {items.length === 0 && !resultsQuery.isLoading && (
-                <tr><td colSpan={11} className="py-8 text-center text-[11px] text-text-tertiary">
+                <tr><td colSpan={11} className="empty-state">
                   {run.status === 'running' ? '还没产出样例结果…' : '没有样例结果'}
                 </td></tr>
               )}
@@ -514,21 +484,19 @@ function ResultRow({ row, langfuseHost, selected, onSelect }: {
   return (
     <tr
       onClick={onSelect}
-      className={`cursor-pointer transition-colors ${
-        selected ? 'bg-accent-subtle' : 'hover:bg-accent-subtle/40'
-      }`}
+      className={`cursor-pointer ${selected ? 'bg-accent/5' : ''}`}
     >
-      <Td mono>{row.benchmark_case_id?.slice(0, 8) ?? row.id.slice(0, 8)}</Td>
-      <Td>
+      <td className="font-mono text-[11px]">{row.benchmark_case_id?.slice(0, 8) ?? row.id.slice(0, 8)}</td>
+      <td>
         <div className="max-w-[260px] truncate" title={row.question || ''}>
           {row.question || '—'}
         </div>
-      </Td>
-      <Td><StatusBadge status={row.status} /></Td>
-      <Td>{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</Td>
-      <Td>{row.prompt_tokens ?? '—'}</Td>
-      <Td>{row.completion_tokens ?? '—'}</Td>
-      <Td>
+      </td>
+      <td><RunStatusBadge status={row.status} /></td>
+      <td className="tabular-nums">{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</td>
+      <td className="tabular-nums">{row.prompt_tokens ?? '—'}</td>
+      <td className="tabular-nums">{row.completion_tokens ?? '—'}</td>
+      <td className="tabular-nums">
         {row.cache_read_tokens != null
           ? <span title={`命中: ${row.cache_read_tokens}, 创建: ${row.cache_creation_tokens ?? 0}`}>
               {row.cache_read_tokens}
@@ -537,28 +505,26 @@ function ResultRow({ row, langfuseHost, selected, onSelect }: {
               )}
             </span>
           : '—'}
-      </Td>
-      <Td>{row.tool_call_count ?? 0}</Td>
-      <Td>
+      </td>
+      <td className="tabular-nums">{row.tool_call_count ?? 0}</td>
+      <td>
         {row.attempts_made && row.attempts_made > 1
           ? <span className="text-warning" title={`实际尝试 ${row.attempts_made} 次（含重试）`}>
               {row.attempts_made}×
             </span>
           : <span className="text-text-tertiary">1</span>}
-      </Td>
-      <Td>
+      </td>
+      <td>
         <div className="flex flex-wrap gap-1">
           {scoreEntries.length === 0 && <span className="text-text-tertiary">—</span>}
           {scoreEntries.map(([n, v]) => {
             const meta = getScoreMeta(n)
             const t = tone(n, v)
-            const cls = t === 'good'
-              ? 'border-green-300 bg-green-50 text-green-800'
-              : 'border-red-300 bg-red-50 text-red-800'
+            const cls = t === 'good' ? 'badge badge-positive' : 'badge badge-negative'
             return (
               <span
                 key={n}
-                className={`text-[10px] px-1.5 py-0.5 rounded border ${cls}`}
+                className={cls}
                 title={`${meta.label} · ${directionMark(meta)} · 合格线 ${meta.threshold}\n${meta.description}`}
               >
                 {meta.label}: {v.toFixed(2)}
@@ -566,8 +532,8 @@ function ResultRow({ row, langfuseHost, selected, onSelect }: {
             )
           })}
         </div>
-      </Td>
-      <Td>
+      </td>
+      <td>
         {row.langsmith_run_id ? (
           <span className="text-[11px] font-mono text-accent">{row.langsmith_run_id.slice(0, 8)}</span>
         ) : row.langfuse_trace_id && langfuseHost ? (
@@ -575,12 +541,12 @@ function ResultRow({ row, langfuseHost, selected, onSelect }: {
             href={`${langfuseHost}/trace/${row.langfuse_trace_id}`}
             target="_blank" rel="noreferrer"
             onClick={e => e.stopPropagation()}
-            className="text-[11px] text-accent hover:underline font-mono"
+            className="text-[11px] text-accent hover:text-accent-hover font-mono transition-colors"
           >
             {row.langfuse_trace_id.slice(0, 8)} ↗
           </a>
         ) : '—'}
-      </Td>
+      </td>
     </tr>
   )
 }
@@ -637,15 +603,15 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
     <div className="text-[11px]">
       <div className="grid grid-cols-3 gap-3 mb-4">
         <div>
-          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">状态</div>
-          <StatusBadge status={row.status} />
+          <div className="field-label">状态</div>
+          <RunStatusBadge status={row.status} />
         </div>
         <div>
-          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">时延</div>
+          <div className="field-label">时延</div>
           <div className="font-mono text-[12px]">{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</div>
         </div>
         <div>
-          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">Tokens (in / out)</div>
+          <div className="field-label">Tokens (in / out)</div>
           <div className="font-mono text-[12px]">
             {row.prompt_tokens ?? '—'} / {row.completion_tokens ?? '—'}
           </div>
@@ -654,18 +620,16 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
 
       {scoreEntries.length > 0 && (
         <div className="mb-4">
-          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">评分</div>
+          <div className="field-label">评分</div>
           <div className="flex flex-wrap gap-1">
             {scoreEntries.map(([n, v]) => {
               const meta = getScoreMeta(n)
               const t = tone(n, v)
-              const cls = t === 'good'
-                ? 'border-green-300 bg-green-50 text-green-800'
-                : 'border-red-300 bg-red-50 text-red-800'
+              const cls = t === 'good' ? 'badge badge-positive' : 'badge badge-negative'
               return (
                 <span
                   key={n}
-                  className={`text-[10px] px-1.5 py-0.5 rounded border ${cls}`}
+                  className={cls}
                   title={`${meta.label} · ${directionMark(meta)} · 合格线 ${meta.threshold}\n${meta.description}`}
                 >
                   {meta.label}: {v.toFixed(2)}
@@ -677,16 +641,16 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
       )}
 
       <div className="mb-3">
-        <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-0.5">输出</div>
-        <pre className="font-mono text-[11px] bg-white border border-border rounded-[3px] p-2 max-h-[240px] overflow-y-auto whitespace-pre-wrap">
+        <div className="field-label">输出</div>
+        <pre className="font-mono text-[11px] bg-fill/5 border border-border rounded-md p-2.5 max-h-[240px] overflow-y-auto whitespace-pre-wrap">
           {row.actual_output || '（无输出）'}
         </pre>
       </div>
 
       {row.error_message && (
         <div className="mb-3">
-          <div className="text-[10px] tracking-widest uppercase text-negative mb-0.5">错误</div>
-          <pre className="font-mono text-[11px] bg-red-50 border border-red-200 rounded-[3px] p-2 whitespace-pre-wrap">
+          <div className="field-label text-negative">错误</div>
+          <pre className="font-mono text-[11px] bg-negative/5 border border-negative/30 rounded-md p-2.5 whitespace-pre-wrap">
             {row.error_message}
           </pre>
         </div>
@@ -694,18 +658,14 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
 
       {Array.isArray(row.full_trace?.steps) && row.full_trace!.steps!.length > 0 && (
         <div className="mb-3">
-          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
-            思维链 ({row.full_trace!.steps!.length} 步)
-          </div>
+          <div className="field-label">思维链 ({row.full_trace!.steps!.length} 步)</div>
           <CotTimeline steps={row.full_trace!.steps!} />
         </div>
       )}
 
       {Array.isArray(row.actual_tool_calls) && row.actual_tool_calls.length > 0 && (
         <div className="mb-3">
-          <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
-            工具调用 ({row.actual_tool_calls.length})
-          </div>
+          <div className="field-label">工具调用 ({row.actual_tool_calls.length})</div>
           <ToolCallsTable calls={row.actual_tool_calls as Array<Record<string, unknown>>} />
         </div>
       )}
@@ -715,7 +675,7 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
           <a
             href={`${langfuseHost}/trace/${row.langfuse_trace_id}`}
             target="_blank" rel="noreferrer"
-            className="text-[11px] text-accent hover:underline font-mono"
+            className="text-[11px] text-accent hover:text-accent-hover font-mono transition-colors"
           >
             在 Langfuse 中查看 trace ↗
           </a>
@@ -723,9 +683,9 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
       )}
 
       <div>
-        <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">LangSmith 追踪</div>
+        <div className="field-label">LangSmith 追踪</div>
         {!row.langsmith_run_id && (
-          <div className="text-[11px] text-text-tertiary border border-dashed border-border rounded-[4px] px-3 py-4 text-center">
+          <div className="text-[11px] text-text-tertiary border border-dashed border-border rounded-md px-3 py-4 text-center">
             {project
               ? `暂未在 project «${project}» 找到对应 run。点击页面顶部"查询轨迹"重试，或换一个 project。`
               : '请在页面顶部输入 LangSmith project 名称并点击"查询轨迹"，平台会按时间窗口和问题文本反查对应 run。'}
@@ -740,15 +700,15 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
           </div>
         )}
         {root && (
-          <div className="bg-surface border border-border rounded-[6px] p-3">
+          <div className="card p-3">
             <RunDetailBody detail={root} compact />
             {root.children.length > 0 && (
               <div className="mt-3">
-                <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
+                <div className="field-label">
                   Children ({root.children.length})
-                  {root.children_truncated && <span className="ml-2 text-[#b87b00]">已截断</span>}
+                  {root.children_truncated && <span className="ml-2 text-warning">已截断</span>}
                 </div>
-                <div className="border border-border rounded-[4px] bg-surface">
+                <div className="border border-border rounded-md bg-surface">
                   {root.children.map(c => (
                     <RunNodeRow
                       key={c.id}
@@ -773,26 +733,11 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
   )
 }
 
-function Th({ children }: { children: React.ReactNode }) {
-  return (
-    <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">
-      {children}
-    </th>
-  )
-}
-function Td({ children, mono }: { children: React.ReactNode; mono?: boolean }) {
-  return (
-    <td className={`py-2 px-3 border-b border-border text-[12px] ${mono ? 'font-mono text-[11px]' : ''}`}>
-      {children}
-    </td>
-  )
-}
-
 function MetaCard({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
   return (
-    <div className="border border-border rounded-[6px] bg-surface p-3">
-      <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">{label}</div>
-      <div className="text-[18px] font-medium tabular-nums">{value}</div>
+    <div className="metric-card">
+      <div className="metric-eyebrow">{label}</div>
+      <div className="metric-value">{value}</div>
       {hint && <div className="text-[10px] text-text-tertiary mt-0.5">{hint}</div>}
     </div>
   )
@@ -801,7 +746,7 @@ function MetaCard({ label, value, hint }: { label: string; value: string | numbe
 function KV({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
   return (
     <div>
-      <div className="text-[10px] tracking-widest uppercase text-text-tertiary">{k}</div>
+      <div className="field-label">{k}</div>
       <div className={mono ? 'font-mono text-[11px] break-all' : ''}>{v}</div>
     </div>
   )
@@ -810,8 +755,8 @@ function KV({ k, v, mono }: { k: string; v: string; mono?: boolean }) {
 function JsonBlock({ label, data }: { label: string; data: unknown }) {
   return (
     <div>
-      <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">{label}</div>
-      <pre className="font-mono text-[10px] bg-accent-subtle/40 border border-border rounded-[3px] p-2 max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all">
+      <div className="field-label">{label}</div>
+      <pre className="font-mono text-[10px] bg-fill/5 border border-border rounded-md p-2.5 max-h-[240px] overflow-y-auto whitespace-pre-wrap break-all">
         {JSON.stringify(data, null, 2)}
       </pre>
     </div>
@@ -832,13 +777,13 @@ function CostCard({ title, data }: { title: string; data: Record<string, number 
     { k: 'cache_hit_rate', label: 'Cache hit rate', fmt: (v) => `${(v * 100).toFixed(1)}%` },
   ]
   return (
-    <div className="border border-border rounded-[6px] bg-surface p-4">
-      <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-2">{title}</h3>
+    <div className="card p-4">
+      <h3 className="page-eyebrow mb-2">{title}</h3>
       <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px]">
         {rows.map(row => {
           const v = data?.[row.k]
           return (
-            <div key={row.k} className="flex justify-between border-b border-border/40 pb-1">
+            <div key={row.k} className="flex justify-between border-b border-separator pb-1">
               <span className="text-text-tertiary">{row.label}</span>
               <span className="font-mono text-text-primary">
                 {v == null ? '—' : (row.fmt ? row.fmt(v) : String(v))}
@@ -865,8 +810,8 @@ function RetryStatsCard({
   if (!stats || !stats.total_cases || (stats.cases_with_retries ?? 0) === 0) return null
   const ratio = stats.total_cases ? (stats.cases_with_retries ?? 0) / stats.total_cases : 0
   return (
-    <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
-      <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-2">重试情况</h3>
+    <section className="card p-4 mb-5">
+      <h3 className="page-eyebrow mb-2">重试情况</h3>
       <div className="grid grid-cols-4 gap-4 text-[11px]">
         <Metric label="重试样例" value={`${stats.cases_with_retries} / ${stats.total_cases}`} hint={`${(ratio * 100).toFixed(1)}%`} />
         <Metric label="总重试次数" value={String(stats.total_retries ?? 0)} />
@@ -880,37 +825,35 @@ function RetryStatsCard({
 function Metric({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="flex flex-col">
-      <span className="text-[10px] tracking-wider uppercase text-text-tertiary">{label}</span>
+      <span className="field-label">{label}</span>
       <span className="font-mono text-[14px] text-text-primary mt-0.5">{value}</span>
       {hint && <span className="font-mono text-[10px] text-text-tertiary">{hint}</span>}
     </div>
   )
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const styles: Record<string, string> = {
-    running: 'bg-blue-100 text-blue-700 border-blue-300',
-    completed: 'bg-green-100 text-green-700 border-green-300',
-    failed: 'bg-red-100 text-red-700 border-red-300',
-    stopping: 'bg-orange-100 text-orange-700 border-orange-300',
-    interrupted: 'bg-gray-200 text-gray-700 border-gray-300',
-    pending: 'bg-gray-100 text-gray-600 border-gray-300',
-    pass: 'bg-green-100 text-green-700 border-green-300',
-    fail: 'bg-red-100 text-red-700 border-red-300',
-    error: 'bg-red-200 text-red-800 border-red-400',
-    // Infrastructure failure — render neutral grey-orange to distinguish
-    // "agent didn't respond" from "agent answered wrong".
-    agent_unreachable: 'bg-amber-100 text-amber-800 border-amber-300',
-    agent_timeout: 'bg-amber-100 text-amber-800 border-amber-300',
+function RunStatusBadge({ status }: { status: string }) {
+  const tone: Record<string, string> = {
+    running: 'badge badge-info',
+    completed: 'badge badge-positive',
+    failed: 'badge badge-negative',
+    stopping: 'badge badge-warning',
+    interrupted: 'badge badge-neutral',
+    pending: 'badge badge-neutral',
+    pass: 'badge badge-positive',
+    fail: 'badge badge-negative',
+    error: 'badge badge-negative',
+    agent_unreachable: 'badge badge-warning',
+    agent_timeout: 'badge badge-warning',
   }
   const labels: Record<string, string> = {
     agent_unreachable: 'agent unreachable',
     agent_timeout: 'agent timeout',
   }
-  const cls = styles[status] ?? 'bg-gray-100 text-gray-600 border-gray-300'
+  const cls = tone[status] ?? 'badge badge-neutral'
   const label = labels[status] ?? status
   return (
-    <span className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border ${cls}`}>
+    <span className={cls}>
       {status === 'running' && (
         <span className="inline-block w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
       )}
@@ -937,8 +880,6 @@ function deriveLangfuseHost(run: EvalRunDetail | null | undefined): string | nul
   return h ? h.replace(/\/+$/, '') : null
 }
 
-// ─── Comprehensive Report Section ─────────────────────────────────────────
-
 function ReportSection({
   dimAvg, radarData, scoreDistribution, toolUsage, counts,
 }: {
@@ -957,13 +898,12 @@ function ReportSection({
     : '—'
 
   return (
-    <section className="border border-border rounded-[6px] bg-surface p-4 mb-5">
-      <h3 className="text-[11px] tracking-widest uppercase text-text-tertiary mb-4">综合报告</h3>
+    <section className="card p-4 mb-5">
+      <h3 className="page-eyebrow mb-4">综合报告</h3>
 
-      {/* Pass rate funnel */}
-      <div className="flex items-center gap-4 mb-5 pb-4 border-b border-border/50">
+      <div className="flex items-center gap-4 mb-5 pb-4 border-b border-separator">
         <div className="text-center">
-          <div className="text-[28px] font-light tabular-nums">{passRate}%</div>
+          <div className="text-[28px] font-display font-semibold tracking-[-0.5px] tabular-nums">{passRate}%</div>
           <div className="text-[10px] text-text-tertiary">合格率</div>
         </div>
         <div className="flex-1 grid grid-cols-3 gap-2 text-center text-[11px]">
@@ -972,37 +912,35 @@ function ReportSection({
             <div className="text-text-tertiary">总样例</div>
           </div>
           <div>
-            <div className="font-mono text-[14px] text-green-700">{counts.passed ?? 0}</div>
+            <div className="font-mono text-[14px] text-positive">{counts.passed ?? 0}</div>
             <div className="text-text-tertiary">通过</div>
           </div>
           <div>
-            <div className="font-mono text-[14px] text-red-700">{counts.failed ?? 0}</div>
+            <div className="font-mono text-[14px] text-negative">{counts.failed ?? 0}</div>
             <div className="text-text-tertiary">失败</div>
           </div>
         </div>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-        {/* Radar chart */}
         {radarData.length >= 3 && (
           <div>
-            <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-2">维度雷达图</div>
+            <div className="field-label">维度雷达图</div>
             <ResponsiveContainer width="100%" height={240}>
               <RadarChart data={radarData} cx="50%" cy="50%" outerRadius="70%">
-                <PolarGrid stroke="var(--color-border, #e5e5e5)" />
+                <PolarGrid stroke="rgb(var(--separator) / 0.3)" />
                 <PolarAngleAxis dataKey="dimension" tick={{ fontSize: 10 }} />
                 <PolarRadiusAxis angle={90} domain={[0, 1]} tick={{ fontSize: 9 }} tickCount={6} />
-                <Radar name="得分" dataKey="score" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.25} />
+                <Radar name="得分" dataKey="score" stroke="rgb(var(--accent))" fill="rgb(var(--accent))" fillOpacity={0.25} />
                 <Legend wrapperStyle={{ fontSize: 10 }} />
               </RadarChart>
             </ResponsiveContainer>
           </div>
         )}
 
-        {/* Score distribution histogram */}
         {scoreDistribution && Object.keys(scoreDistribution.by_dimension).length > 0 && (
           <div>
-            <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-2">分数分布</div>
+            <div className="field-label">分数分布</div>
             <div className="space-y-3 max-h-[240px] overflow-y-auto">
               {Object.entries(scoreDistribution.by_dimension).map(([dim, bucketCounts]) => {
                 const meta = getScoreMeta(dim)
@@ -1014,7 +952,7 @@ function ReportSection({
                       {bucketCounts.map((c, i) => (
                         <div
                           key={i}
-                          className="flex-1 bg-blue-400 rounded-t-sm transition-all"
+                          className="flex-1 bg-accent/70 rounded-t-sm transition-all"
                           style={{ height: `${(c / max) * 100}%`, minHeight: c > 0 ? 2 : 0 }}
                           title={`${scoreDistribution.buckets[i]}: ${c} 条`}
                         />
@@ -1030,24 +968,21 @@ function ReportSection({
           </div>
         )}
 
-        {/* Tool usage top-N */}
         {hasTools && (
           <div className={radarData.length < 3 && !scoreDistribution ? 'md:col-span-2' : ''}>
-            <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-2">
-              工具调用统计 (Top {Math.min(toolUsage.length, 10)})
-            </div>
+            <div className="field-label">工具调用统计 (Top {Math.min(toolUsage.length, 10)})</div>
             <ResponsiveContainer width="100%" height={Math.min(toolUsage.length, 10) * 28 + 30}>
               <BarChart
                 data={toolUsage.slice(0, 10)}
                 layout="vertical"
                 margin={{ top: 5, right: 30, left: 80, bottom: 5 }}
               >
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
+                <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--separator) / 0.3)" />
                 <XAxis type="number" tick={{ fontSize: 10 }} />
                 <YAxis type="category" dataKey="name" tick={{ fontSize: 10 }} width={75} />
                 <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
-                <Bar dataKey="calls" name="调用次数" fill="#60a5fa" radius={[0, 3, 3, 0]} />
-                <Bar dataKey="errors" name="失败次数" fill="#f87171" radius={[0, 3, 3, 0]} />
+                <Bar dataKey="calls" name="调用次数" fill="rgb(var(--accent))" radius={[0, 3, 3, 0]} />
+                <Bar dataKey="errors" name="失败次数" fill="rgb(var(--negative))" radius={[0, 3, 3, 0]} />
               </BarChart>
             </ResponsiveContainer>
             <div className="mt-2 text-[10px] text-text-tertiary">
@@ -1063,11 +998,9 @@ function ReportSection({
 }
 
 
-// ─── Per-case CoT timeline ────────────────────────────────────────────────
-
 function CotTimeline({ steps }: { steps: CotStep[] }) {
   return (
-    <div className="border border-border rounded-[4px] bg-white overflow-hidden">
+    <div className="border border-border rounded-md bg-surface overflow-hidden">
       {steps.map((step, i) => (
         <CotStepRow key={i} step={step} index={i} last={i === steps.length - 1} />
       ))}
@@ -1078,26 +1011,26 @@ function CotTimeline({ steps }: { steps: CotStep[] }) {
 function CotStepRow({ step, index, last }: { step: CotStep; index: number; last: boolean }) {
   const [open, setOpen] = useState(step.type !== 'thought')
   const dur = step.duration_ms != null ? `${step.duration_ms}ms` : null
-  const border = last ? '' : 'border-b border-border/40'
+  const border = last ? '' : 'border-b border-separator'
 
   if (step.type === 'thought' || step.type === 'answer') {
     const isAnswer = step.type === 'answer'
-    const tagBg = isAnswer ? 'bg-emerald-100 text-emerald-800' : 'bg-zinc-100 text-zinc-600'
+    const tagCls = isAnswer ? 'badge badge-positive' : 'badge badge-neutral'
     const tagLabel = isAnswer ? '答复' : '思考'
     const text = step.content || ''
     const long = text.length > 200
     const preview = long && !open ? `${text.slice(0, 200)}…` : text
     return (
-      <div className={`px-3 py-2 ${border} ${isAnswer ? 'bg-emerald-50/40' : ''}`}>
+      <div className={`px-3 py-2 ${border} ${isAnswer ? 'bg-positive/5' : ''}`}>
         <div className="flex items-center gap-2 mb-1">
           <span className="text-[10px] text-text-tertiary tabular-nums w-5 text-right">{index + 1}</span>
-          <span className={`text-[10px] px-1.5 py-0.5 rounded ${tagBg}`}>{tagLabel}</span>
+          <span className={tagCls}>{tagLabel}</span>
           {dur && <span className="text-[10px] text-text-tertiary tabular-nums">{dur}</span>}
           {long && (
             <button
               type="button"
               onClick={() => setOpen(o => !o)}
-              className="ml-auto text-[10px] text-accent hover:underline"
+              className="ml-auto text-[10px] text-accent hover:text-accent-hover transition-colors"
             >
               {open ? '收起' : '展开'}
             </button>
@@ -1108,22 +1041,21 @@ function CotStepRow({ step, index, last }: { step: CotStep; index: number; last:
     )
   }
 
-  // tool_call
   const argsStr =
     step.args == null ? '' : typeof step.args === 'string' ? step.args : JSON.stringify(step.args, null, 2)
   const outStr =
     step.output == null ? '' : typeof step.output === 'string' ? step.output : JSON.stringify(step.output, null, 2)
   return (
-    <div className={`px-3 py-2 bg-amber-50/50 ${border}`}>
+    <div className={`px-3 py-2 bg-warning/5 ${border}`}>
       <div className="flex items-center gap-2 mb-1">
         <span className="text-[10px] text-text-tertiary tabular-nums w-5 text-right">{index + 1}</span>
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-200 text-amber-900">工具</span>
+        <span className="badge badge-warning">工具</span>
         <span className="text-[11px] font-mono">{step.tool_name || '?'}</span>
         {dur && <span className="text-[10px] text-text-tertiary tabular-nums">{dur}</span>}
         <button
           type="button"
           onClick={() => setOpen(o => !o)}
-          className="ml-auto text-[10px] text-accent hover:underline"
+          className="ml-auto text-[10px] text-accent hover:text-accent-hover transition-colors"
         >
           {open ? '收起' : '展开'}
         </button>
@@ -1133,13 +1065,13 @@ function CotStepRow({ step, index, last }: { step: CotStep; index: number; last:
           {argsStr && (
             <div>
               <div className="text-[10px] text-text-tertiary mb-0.5">参数</div>
-              <pre className="font-mono text-[10px] bg-white border border-border/60 rounded-[3px] p-1.5 max-h-[140px] overflow-auto whitespace-pre-wrap">{argsStr}</pre>
+              <pre className="font-mono text-[10px] bg-surface border border-border rounded-md p-1.5 max-h-[140px] overflow-auto whitespace-pre-wrap">{argsStr}</pre>
             </div>
           )}
           {outStr && (
             <div>
               <div className="text-[10px] text-text-tertiary mb-0.5">输出</div>
-              <pre className="font-mono text-[10px] bg-white border border-border/60 rounded-[3px] p-1.5 max-h-[160px] overflow-auto whitespace-pre-wrap">{outStr}</pre>
+              <pre className="font-mono text-[10px] bg-surface border border-border rounded-md p-1.5 max-h-[160px] overflow-auto whitespace-pre-wrap">{outStr}</pre>
             </div>
           )}
         </div>
@@ -1149,10 +1081,7 @@ function CotStepRow({ step, index, last }: { step: CotStep; index: number; last:
 }
 
 
-// ─── Per-case tool calls table ────────────────────────────────────────────
-
 function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
-  // Group by tool_name for a compact summary
   const grouped: Record<string, { count: number; errors: number }> = {}
   for (const c of calls) {
     const name = (c.tool_name || c.name || 'unknown') as string
@@ -1168,21 +1097,21 @@ function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
   const entries = Object.entries(grouped).sort((a, b) => b[1].count - a[1].count)
 
   return (
-    <div className="border border-border rounded-[3px] overflow-hidden">
-      <table className="w-full border-collapse text-[11px]">
+    <div className="table-card">
+      <table className="table-base">
         <thead>
-          <tr className="bg-accent-subtle/60">
-            <th className="text-left py-1 px-2 font-normal text-text-tertiary">工具</th>
-            <th className="text-right py-1 px-2 font-normal text-text-tertiary">次数</th>
-            <th className="text-right py-1 px-2 font-normal text-text-tertiary">失败</th>
+          <tr>
+            <th>工具</th>
+            <th className="text-right w-20">次数</th>
+            <th className="text-right w-20">失败</th>
           </tr>
         </thead>
         <tbody>
           {entries.map(([name, { count, errors }]) => (
-            <tr key={name} className="border-t border-border/40">
-              <td className="py-1 px-2 font-mono">{name}</td>
-              <td className="py-1 px-2 text-right tabular-nums">{count}</td>
-              <td className={`py-1 px-2 text-right tabular-nums ${errors > 0 ? 'text-red-700' : ''}`}>
+            <tr key={name}>
+              <td className="font-mono text-[11px]">{name}</td>
+              <td className="text-right tabular-nums">{count}</td>
+              <td className={`text-right tabular-nums ${errors > 0 ? 'text-negative' : ''}`}>
                 {errors || '—'}
               </td>
             </tr>
@@ -1190,11 +1119,11 @@ function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
         </tbody>
       </table>
       {calls.length > 5 && (
-        <details className="px-2 py-1 border-t border-border/40">
+        <details className="px-2 py-1 border-t border-separator">
           <summary className="text-[10px] text-text-tertiary cursor-pointer">展开全部调用详情</summary>
           <div className="mt-1 max-h-[200px] overflow-y-auto">
             {calls.map((c, i) => (
-              <div key={i} className="flex gap-2 py-0.5 border-b border-border/20 last:border-0">
+              <div key={i} className="flex gap-2 py-0.5 border-b border-separator last:border-0">
                 <span className="text-[10px] text-text-tertiary w-4 text-right">{i + 1}</span>
                 <span className="font-mono text-[10px]">{(c.tool_name || c.name || '?') as string}</span>
                 {c.args != null && (
@@ -1212,8 +1141,6 @@ function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
 }
 
 
-// ─── Radar data builder ───────────────────────────────────────────────────
-
 function buildRadarData(dimAvg: Record<string, number>) {
   return Object.entries(dimAvg).map(([name, val]) => ({
     dimension: getScoreMeta(name).label,
@@ -1223,8 +1150,6 @@ function buildRadarData(dimAvg: Record<string, number>) {
 }
 
 
-// Split a set of samples' latency_ms into fixed buckets for a histogram.
-// Buckets are chosen empirically to be useful for 1-60 s agent calls.
 function buildLatencyBuckets(items: EvalResultRow[]): Array<{ label: string; count: number }> {
   const buckets = [
     { label: '<1s', max: 1000, count: 0 },

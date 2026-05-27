@@ -1,5 +1,6 @@
-import { ReactNode, useEffect, useRef } from 'react'
+import { ReactNode, useEffect, useId } from 'react'
 import { createPortal } from 'react-dom'
+import { useDialogFocus } from '../../hooks/useDialogFocus'
 
 interface DrawerProps {
   open: boolean
@@ -26,7 +27,10 @@ export function Drawer({
   width = 'default',
   children,
 }: DrawerProps) {
-  const panelRef = useRef<HTMLDivElement | null>(null)
+  const panelRef = useDialogFocus<HTMLDivElement>(open)
+  const reactId = useId()
+  const titleId = `drawer-title-${reactId}`
+  const subtitleId = `drawer-subtitle-${reactId}`
 
   // ESC 关闭
   useEffect(() => {
@@ -56,25 +60,31 @@ export function Drawer({
       : 'w-full lg:w-[560px] xl:w-[600px] 2xl:w-[720px]'
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex justify-end" aria-modal="true" role="dialog">
-      {/* 遮罩 */}
+    <div className="fixed inset-0 z-50 flex justify-end">
+      {/* Overlay — softer in light, heavier in dark, with HIG-style blur */}
       <div
-        className="absolute inset-0 bg-black/30 backdrop-blur-[1px] animate-overlay-in"
+        className="absolute inset-0 bg-black/25 dark:bg-black/55 backdrop-blur-[6px] animate-overlay-in"
         onClick={onClose}
+        aria-hidden="true"
       />
-      {/* 面板 */}
+      {/* Panel — vibrancy material, hairline left border */}
       <div
         ref={panelRef}
-        className={`relative h-full ${widthClass} bg-surface shadow-lg flex flex-col animate-drawer-in`}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={title ? titleId : undefined}
+        aria-describedby={subtitle ? subtitleId : undefined}
+        tabIndex={-1}
+        className={`relative h-full ${widthClass} bg-bg-elevated border-l border-border/60 shadow-xl flex flex-col animate-drawer-in outline-none`}
       >
         {(title || subtitle || actions) && (
-          <div className="flex items-start justify-between gap-4 px-6 py-4 border-b border-border">
+          <div className="flex items-start justify-between gap-4 px-6 py-4 border-b border-separator">
             <div className="min-w-0 flex-1">
               {title && (
-                <div className="text-base font-semibold text-text-primary truncate">{title}</div>
+                <div id={titleId} className="text-[17px] font-display font-semibold tracking-[-0.4px] text-text-primary truncate">{title}</div>
               )}
               {subtitle && (
-                <div className="mt-1 text-xs text-text-tertiary truncate">{subtitle}</div>
+                <div id={subtitleId} className="mt-1 text-[12px] text-text-tertiary truncate">{subtitle}</div>
               )}
             </div>
             <div className="flex items-center gap-2">
@@ -83,9 +93,9 @@ export function Drawer({
                 type="button"
                 onClick={onClose}
                 aria-label="关闭"
-                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-text-secondary hover:bg-accent-subtle hover:text-text-primary transition-colors"
+                className="inline-flex h-8 w-8 items-center justify-center rounded-full text-text-secondary hover:bg-fill/10 hover:text-text-primary transition-colors duration-150 ease-standard focus-visible:shadow-focus focus-visible:outline-none"
               >
-                <svg viewBox="0 0 20 20" width="16" height="16" fill="none" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="14" height="14" fill="none" aria-hidden="true">
                   <path
                     d="M5 5l10 10M15 5L5 15"
                     stroke="currentColor"

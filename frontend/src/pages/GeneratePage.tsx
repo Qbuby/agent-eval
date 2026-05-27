@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { generateApi, datasetsApi } from '@/services'
+import { Button } from '@/components/ui'
 import type { TestCase } from '@/types'
 
 type Scenario = 'faithfulness' | 'context_recall' | 'answer_relevancy' | 'context_precision' | 'context_relevancy' | 'hallucination'
@@ -29,8 +30,6 @@ const CATEGORIES: { value: Category; label: string }[] = [
   { value: 'edge_case', label: 'Edge Case' },
 ]
 
-// FastAPI 校验失败时 detail 是数组，直接 setError(detail) 会让 React 渲染崩溃
-// (error #31: Objects are not valid as a React child)。统一在这里转成字符串。
 function extractErrorMessage(err: unknown): string {
   const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
   if (typeof detail === 'string') return detail
@@ -117,23 +116,22 @@ export default function GeneratePage() {
 
   return (
     <div>
-      <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">样例生成</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">场景生成 · 测试用例创建</p>
+      <header className="mb-6">
+        <div className="page-eyebrow">数据集</div>
+        <h1 className="page-title">样例生成</h1>
+        <p className="page-subtitle">按测试场景与类别批量生成样例，预览后入库</p>
       </header>
 
       {phase === 'form' && (
-        <form onSubmit={handlePreview} className="bg-surface border border-border rounded-md p-5 space-y-4 max-w-[520px]">
-          <div className="group">
-            <label htmlFor="gen-dataset" className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1.5 group-focus-within:text-accent transition-colors">
-              目标数据集
-            </label>
+        <form onSubmit={handlePreview} className="card p-5 max-w-[560px] space-y-4">
+          <div>
+            <label htmlFor="gen-dataset" className="field-label">目标数据集</label>
             <select
               id="gen-dataset"
               value={form.dataset}
               onChange={(e) => setForm({ ...form, dataset: e.target.value })}
               required
-              className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
+              className="input"
             >
               <option value="">选择数据集</option>
               {datasets?.map((ds) => (
@@ -142,16 +140,14 @@ export default function GeneratePage() {
             </select>
           </div>
 
-          <div className="group">
-            <label htmlFor="gen-scenario" className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1.5 group-focus-within:text-accent transition-colors">
-              测试场景
-            </label>
+          <div>
+            <label htmlFor="gen-scenario" className="field-label">测试场景</label>
             <select
               id="gen-scenario"
               value={form.scenario}
               onChange={(e) => setForm({ ...form, scenario: e.target.value as Scenario })}
               required
-              className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
+              className="input"
             >
               <option value="">选择场景</option>
               {SCENARIOS.map((s) => (
@@ -160,16 +156,14 @@ export default function GeneratePage() {
             </select>
           </div>
 
-          <div className="group">
-            <label htmlFor="gen-category" className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1.5 group-focus-within:text-accent transition-colors">
-              样例类别
-            </label>
+          <div>
+            <label htmlFor="gen-category" className="field-label">样例类别</label>
             <select
               id="gen-category"
               value={form.category}
               onChange={(e) => setForm({ ...form, category: e.target.value as Category })}
               required
-              className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
+              className="input"
             >
               <option value="">选择类别</option>
               {CATEGORIES.map((c) => (
@@ -178,10 +172,8 @@ export default function GeneratePage() {
             </select>
           </div>
 
-          <div className="group">
-            <label htmlFor="gen-count" className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1.5 group-focus-within:text-accent transition-colors">
-              生成数量
-            </label>
+          <div>
+            <label htmlFor="gen-count" className="field-label">生成数量</label>
             <input
               id="gen-count"
               type="number"
@@ -189,67 +181,62 @@ export default function GeneratePage() {
               max={20}
               value={form.count}
               onChange={(e) => setForm({ ...form, count: Number(e.target.value) })}
-              className="w-24 py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
+              className="input w-28"
             />
           </div>
 
-          <div className="group">
-            <label htmlFor="gen-context" className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1.5 group-focus-within:text-accent transition-colors">
-              上下文（可选）
-            </label>
+          <div>
+            <label htmlFor="gen-context" className="field-label">上下文（可选）</label>
             <textarea
               id="gen-context"
               value={form.context}
               onChange={(e) => setForm({ ...form, context: e.target.value })}
               rows={3}
-              className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 resize-y transition-all duration-200"
+              className="input resize-y"
             />
           </div>
 
-          {error && <p className="text-[11px] text-negative animate-fade-in">{error}</p>}
+          {error && <p className="text-[12px] text-negative">{error}</p>}
 
-          <button
-            type="submit"
-            disabled={generateMutation.isPending}
-            className="inline-flex items-center gap-1.5 py-2 px-4 text-[11px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent cursor-pointer hover:opacity-90 hover:scale-[1.02] active:scale-[0.97] focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:opacity-40 transition-all duration-200"
-          >
-            {generateMutation.isPending ? (
-              <span className="inline-block w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />
-            ) : '生成预览'}
-          </button>
+          <div className="pt-2">
+            <Button type="submit" variant="primary" size="md" loading={generateMutation.isPending}>
+              生成预览
+            </Button>
+          </div>
         </form>
       )}
 
       {phase === 'preview' && (
         <div className="space-y-4">
           <div className="flex items-center justify-between">
-            <div>
-              <span className="text-[12px] text-text-secondary">
-                已生成 {previewCases.length} 条样例，可编辑或删除后确认添加
-              </span>
-            </div>
+            <span className="text-[12px] text-text-secondary">
+              已生成 {previewCases.length} 条样例，可编辑或删除后确认添加
+            </span>
             <div className="flex gap-2">
-              <button
+              <Button
+                variant="secondary"
+                size="sm"
                 onClick={() => { setPhase('form'); setPreviewCases([]) }}
-                className="py-1.5 px-3 text-[11px] font-medium tracking-wide rounded-[6px] bg-surface text-text-primary border border-border hover:border-accent active:scale-[0.97] transition-all duration-200"
               >
                 返回修改
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={previewCases.length === 0}
+                loading={saveMutation.isPending}
                 onClick={() => saveMutation.mutate()}
-                disabled={previewCases.length === 0 || saveMutation.isPending}
-                className="py-1.5 px-3 text-[11px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 active:scale-[0.97] disabled:opacity-40 transition-all duration-200"
               >
-                {saveMutation.isPending ? '保存中...' : `确认添加 (${previewCases.length})`}
-              </button>
+                确认添加 ({previewCases.length})
+              </Button>
             </div>
           </div>
 
-          {error && <p className="text-[11px] text-negative animate-fade-in">{error}</p>}
+          {error && <p className="text-[12px] text-negative">{error}</p>}
 
           <div className="space-y-3">
             {previewCases.map((c, idx) => (
-              <div key={idx} className="bg-surface border border-border rounded-md p-4 animate-fade-in hover:border-accent/20 transition-all">
+              <div key={idx} className="card p-4">
                 {editingIndex === idx ? (
                   <PreviewCaseEditor
                     caseData={c}
@@ -259,47 +246,45 @@ export default function GeneratePage() {
                 ) : (
                   <div>
                     <div className="flex justify-between items-start mb-2">
-                      <span className="text-[12px] font-medium text-text-primary">{c.name || `样例 ${idx + 1}`}</span>
-                      <div className="flex gap-2">
+                      <span className="text-[13px] font-medium text-text-primary">{c.name || `样例 ${idx + 1}`}</span>
+                      <div className="flex gap-3">
                         <button
                           onClick={() => setEditingIndex(idx)}
-                          className="text-[10px] text-text-tertiary hover:text-accent active:scale-95 transition-all"
+                          className="text-action"
                         >
                           编辑
                         </button>
                         <button
                           onClick={() => removePreviewCase(idx)}
-                          className="text-[10px] text-text-tertiary hover:text-negative active:scale-95 transition-all"
+                          className="text-action-danger"
                         >
                           删除
                         </button>
                       </div>
                     </div>
                     {c.description && (
-                      <p className="text-[11px] text-text-secondary mb-2">{c.description}</p>
+                      <p className="text-[12px] text-text-secondary mb-2">{c.description}</p>
                     )}
                     {c.tags && c.tags.length > 0 && (
                       <div className="flex gap-1 mb-2">
                         {c.tags.map((tag) => (
-                          <span key={tag} className="px-1.5 py-0.5 bg-accent-subtle rounded text-[10px] text-text-secondary">
-                            {tag}
-                          </span>
+                          <span key={tag} className="badge badge-neutral">{tag}</span>
                         ))}
                       </div>
                     )}
                     {c.input_messages && c.input_messages.length > 0 && (
                       <div className="mt-2 space-y-1">
                         {c.input_messages.map((msg, mi) => (
-                          <div key={mi} className="text-[11px] font-mono bg-accent-subtle rounded px-2 py-1">
+                          <div key={mi} className="text-[11px] font-mono bg-fill/5 rounded-md px-2.5 py-1.5">
                             <span className="text-text-tertiary">{msg.role}:</span>{' '}
-                            <span className="text-text-primary">{msg.content.length > 120 ? msg.content.slice(0, 120) + '...' : msg.content}</span>
+                            <span className="text-text-primary">{msg.content.length > 120 ? msg.content.slice(0, 120) + '…' : msg.content}</span>
                           </div>
                         ))}
                       </div>
                     )}
                     {c.expected_output && (
-                      <div className="mt-2 text-[11px] text-text-secondary">
-                        <span className="text-text-tertiary">期望输出: </span>{c.expected_output.length > 100 ? c.expected_output.slice(0, 100) + '...' : c.expected_output}
+                      <div className="mt-2 text-[12px] text-text-secondary">
+                        <span className="text-text-tertiary">期望输出：</span>{c.expected_output.length > 100 ? c.expected_output.slice(0, 100) + '…' : c.expected_output}
                       </div>
                     )}
                   </div>
@@ -309,7 +294,7 @@ export default function GeneratePage() {
           </div>
 
           {previewCases.length === 0 && (
-            <div className="text-center py-8 text-text-tertiary text-[12px]">所有样例已删除，请返回重新生成</div>
+            <div className="empty-state">所有样例已删除，请返回重新生成</div>
           )}
         </div>
       )}
@@ -343,46 +328,30 @@ function PreviewCaseEditor({
 
   return (
     <div className="space-y-3">
-      <div className="group">
-        <label className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1 group-focus-within:text-accent transition-colors">名称</label>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          className="w-full py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
-        />
+      <div>
+        <label className="field-label">名称</label>
+        <input value={name} onChange={(e) => setName(e.target.value)} className="input" />
       </div>
-      <div className="group">
-        <label className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1 group-focus-within:text-accent transition-colors">描述</label>
-        <input
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          className="w-full py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
-        />
+      <div>
+        <label className="field-label">描述</label>
+        <input value={description} onChange={(e) => setDescription(e.target.value)} className="input" />
       </div>
-      <div className="group">
-        <label className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1 group-focus-within:text-accent transition-colors">标签</label>
-        <input
-          value={tags}
-          onChange={(e) => setTags(e.target.value)}
-          className="w-full py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
-        />
+      <div>
+        <label className="field-label">标签</label>
+        <input value={tags} onChange={(e) => setTags(e.target.value)} className="input" />
       </div>
-      <div className="group">
-        <label className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1 group-focus-within:text-accent transition-colors">期望输出</label>
+      <div>
+        <label className="field-label">期望输出</label>
         <textarea
           value={expectedOutput}
           onChange={(e) => setExpectedOutput(e.target.value)}
           rows={2}
-          className="w-full py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent resize-y transition-all"
+          className="input resize-y"
         />
       </div>
-      <div className="flex gap-2">
-        <button onClick={handleSave} className="py-1.5 px-3 text-[10px] font-medium rounded-[6px] bg-accent text-white hover:opacity-90 active:scale-[0.97] transition-all">
-          保存
-        </button>
-        <button onClick={onCancel} className="py-1.5 px-3 text-[10px] font-medium rounded-[6px] border border-border text-text-primary hover:border-accent active:scale-[0.97] transition-all">
-          取消
-        </button>
+      <div className="flex gap-2 pt-1">
+        <Button variant="primary" size="sm" onClick={handleSave}>保存</Button>
+        <Button variant="secondary" size="sm" onClick={onCancel}>取消</Button>
       </div>
     </div>
   )

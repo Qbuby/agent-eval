@@ -1,16 +1,11 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useConfirm, useToast } from '@/components/ui'
+import { Button, Dialog, useConfirm, useToast } from '@/components/ui'
 import { evaluationApi } from '@/services'
 import type {
   CreateEvaluatorRequest, EvaluatorInstance,
 } from '@/types'
 
-// Tag-only mode (since 2026-05-19): an evaluator is just a named template
-// for a Langfuse trace tag. Selecting evaluators on a run stamps each
-// one's `tag` onto every sample's Langfuse trace, then Langfuse-side
-// evaluators bound to those tags pick the trace up and produce scores —
-// which we pull back into evaluation_scores. No more local scoring fns.
 export default function EvaluatorsPage() {
   const qc = useQueryClient()
   const confirm = useConfirm()
@@ -22,104 +17,106 @@ export default function EvaluatorsPage() {
     queryFn: () => evaluationApi.listEvaluators().then(r => r.data),
   })
 
-  const [showCreate, setShowCreate] = useState(false)
+  const [showEditor, setShowEditor] = useState(false)
   const [editing, setEditing] = useState<EvaluatorInstance | null>(null)
 
   return (
     <div>
-      <header className="mb-5 flex items-start justify-between">
-        <div>
-          <h1 className="text-lg font-light tracking-tight mb-1">评估器</h1>
-          <p className="text-[10px] text-text-tertiary tracking-widest uppercase">
-            Tag templates · stamped onto every sample's Langfuse trace
-          </p>
-        </div>
-        <button
-          onClick={() => { setEditing(null); setShowCreate(true) }}
-          className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90"
-        >
-          + 新建评估器
-        </button>
+      <header className="mb-6">
+        <div className="page-eyebrow">评估</div>
+        <h1 className="page-title">评估器</h1>
+        <p className="page-subtitle">Tag 模板 — 运行时把它打到每条样例的 Langfuse trace 上</p>
       </header>
 
-      <div className="border border-border rounded-[3px] overflow-hidden bg-surface">
-        <table className="w-full border-collapse">
+      <div className="section-row">
+        <div className="page-eyebrow">评估器列表</div>
+        <Button variant="primary" size="sm" onClick={() => { setEditing(null); setShowEditor(true) }}>
+          新建评估器
+        </Button>
+      </div>
+
+      <div className="table-card">
+        <table className="table-base">
           <thead>
             <tr>
-              <Th>名称</Th><Th>Tag (写到 trace)</Th><Th>状态</Th><Th>创建时间</Th><Th>操作</Th>
+              <th>名称</th>
+              <th>Tag</th>
+              <th className="w-24">状态</th>
+              <th className="w-44">创建时间</th>
+              <th className="w-28 text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             {listQuery.isLoading && (
-              <tr><td colSpan={5} className="py-6 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+              <tr><td colSpan={5} className="empty-state">加载中…</td></tr>
             )}
             {listQuery.data?.length === 0 && !listQuery.isLoading && (
-              <tr><td colSpan={5} className="py-10 text-center text-[12px] text-text-tertiary">
-                还没有评估器。新建一个：填好 tag 后，运行评估时勾选它，
-                平台会把这个 tag 加到每条样例的 Langfuse trace 上。
+              <tr><td colSpan={5} className="empty-state">
+                还没有评估器。新建一个，运行评估时勾选它，平台会把这个 tag 加到每条样例的 Langfuse trace 上。
               </td></tr>
             )}
             {listQuery.data?.map(e => (
-              <tr key={e.id} className="hover:bg-accent-subtle/40">
-                <Td><span className="font-medium">{e.name}</span></Td>
-                <Td mono>
-                  <span className="text-[10px] px-1.5 py-0.5 rounded border border-blue-300 bg-blue-50 text-blue-800">
-                    {e.tag || e.name}
+              <tr key={e.id} className="group">
+                <td className="font-medium">{e.name}</td>
+                <td>
+                  <span className="font-mono text-[11px] text-text-secondary">{e.tag || e.name}</span>
+                </td>
+                <td>
+                  <span className={e.is_active ? 'badge badge-positive' : 'badge badge-neutral'}>
+                    {e.is_active ? '启用' : '停用'}
                   </span>
-                </Td>
-                <Td>
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded-full border ${
-                    e.is_active ? 'border-green-300 bg-green-50 text-green-700' : 'border-gray-300 bg-gray-50 text-gray-600'
-                  }`}>
-                    {e.is_active ? 'active' : 'inactive'}
-                  </span>
-                </Td>
-                <Td>{e.created_at ? new Date(e.created_at).toLocaleString() : '—'}</Td>
-                <Td>
-                  <button
-                    onClick={() => { setEditing(e); setShowCreate(true) }}
-                    className="text-[11px] text-accent hover:underline mr-2"
-                  >
-                    编辑
-                  </button>
-                  <button
-                    onClick={async () => {
-                      const ok = await confirm({
-                        title: '删除评估器',
-                        description: `删除评估器「${e.name}」？`,
-                        confirmText: '删除',
-                        danger: true,
-                      })
-                      if (!ok) return
-                      setDeletingId(e.id)
-                      try {
-                        await evaluationApi.deleteEvaluator(e.id)
-                        qc.invalidateQueries({ queryKey: ['evaluator-instances'] })
-                        toast.success('评估器已删除')
-                      } catch (err) {
-                        const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
-                          || (err as Error)?.message || '未知错误'
-                        toast.error(msg, '删除失败')
-                      } finally {
-                        setDeletingId(null)
-                      }
-                    }}
-                    disabled={deletingId === e.id}
-                    className="text-[11px] text-negative hover:underline disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed"
-                  >
-                    {deletingId === e.id ? '删除中…' : '删除'}
-                  </button>
-                </Td>
+                </td>
+                <td className="text-text-tertiary text-[11px]">
+                  {e.created_at ? new Date(e.created_at).toLocaleString() : '—'}
+                </td>
+                <td className="text-right">
+                  <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button
+                      onClick={() => { setEditing(e); setShowEditor(true) }}
+                      className="text-action"
+                    >
+                      编辑
+                    </button>
+                    <button
+                      onClick={async () => {
+                        const ok = await confirm({
+                          title: '删除评估器',
+                          description: `删除评估器"${e.name}"？`,
+                          confirmText: '删除',
+                          danger: true,
+                        })
+                        if (!ok) return
+                        setDeletingId(e.id)
+                        try {
+                          await evaluationApi.deleteEvaluator(e.id)
+                          qc.invalidateQueries({ queryKey: ['evaluator-instances'] })
+                          toast.success('评估器已删除')
+                        } catch (err) {
+                          const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
+                            || (err as Error)?.message || '未知错误'
+                          toast.error(msg, '删除失败')
+                        } finally {
+                          setDeletingId(null)
+                        }
+                      }}
+                      disabled={deletingId === e.id}
+                      className="text-action-danger"
+                    >
+                      {deletingId === e.id ? '删除中…' : '删除'}
+                    </button>
+                  </div>
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
 
-      {showCreate && (
+      {showEditor && (
         <EvaluatorEditor
+          open={showEditor}
           editing={editing}
-          onClose={() => { setShowCreate(false); setEditing(null) }}
+          onClose={() => { setShowEditor(false); setEditing(null) }}
         />
       )}
     </div>
@@ -128,16 +125,20 @@ export default function EvaluatorsPage() {
 
 
 function EvaluatorEditor({
-  editing, onClose,
+  open, editing, onClose,
 }: {
+  open: boolean
   editing: EvaluatorInstance | null
   onClose: () => void
 }) {
   const qc = useQueryClient()
   const [name, setName] = useState(editing?.name || '')
-  // Default tag = name on create. Editing: keep whatever the row has.
   const [tag, setTag] = useState(editing?.tag || '')
   const [isActive, setIsActive] = useState(editing ? editing.is_active : true)
+  const reactId = useId()
+  const nameId = `${reactId}-name`
+  const tagId = `${reactId}-tag`
+  const activeId = `${reactId}-active`
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -159,88 +160,72 @@ function EvaluatorEditor({
   })
 
   return (
-    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={onClose}>
-      <div className="bg-surface rounded-[8px] border border-border w-[560px] max-h-[90vh] overflow-y-auto p-5"
-           onClick={e => e.stopPropagation()}>
-        <h3 className="text-[13px] font-medium mb-4">
-          {editing ? '编辑评估器' : '新建评估器'}
-        </h3>
+    <Dialog
+      open={open}
+      onClose={onClose}
+      title={editing ? '编辑评估器' : '新建评估器'}
+      width={520}
+      footer={
+        <>
+          <Button variant="secondary" size="md" onClick={onClose}>取消</Button>
+          <Button
+            variant="primary"
+            size="md"
+            disabled={!name.trim()}
+            loading={saveMutation.isPending}
+            onClick={() => saveMutation.mutate()}
+          >
+            保存
+          </Button>
+        </>
+      }
+    >
+      <p className="text-[12px] text-text-secondary mb-4 leading-relaxed">
+        每个评估器对应一个 Langfuse trace tag。运行评估时勾选它，平台会把
+        <code className="mx-1 px-1.5 py-0.5 bg-fill/10 rounded font-mono text-[11px]">tag</code>
+        加到每条样例的 trace 上 — 在 Langfuse 里配置成 target=tag 的评估器会自动处理这些 trace 并打分，结果会被本平台拉回展示。
+      </p>
 
-        <p className="text-[11px] text-text-secondary mb-4 leading-relaxed">
-          每个评估器对应一个 Langfuse trace tag。运行评估时勾选它，平台会把
-          <code className="mx-1 px-1 bg-accent-subtle rounded">tag</code>
-          加到每条样例的 trace 上 — 这样在 Langfuse 里配置成 target=tag 的评估器
-          就会自动处理这些 trace 并打分。打分会被本平台拉回展示在样例旁。
-        </p>
-
-        <div className="flex flex-col gap-3">
-          <Field label="名称（唯一，UI 展示用）">
-            <input
-              type="text" value={name} onChange={e => setName(e.target.value)}
-              placeholder="例如：正确性 / Goal Accuracy"
-              className="input"
-            />
-          </Field>
-
-          <Field label="Tag（写到 Langfuse trace 的字符串，留空则用名称）">
-            <input
-              type="text" value={tag} onChange={e => setTag(e.target.value)}
-              placeholder="例如：agent-eval-correctness"
-              className="input font-mono text-[11px]"
-            />
-            <div className="mt-1 text-[10px] text-text-tertiary">
-              每条样例的 Langfuse trace 都会带上这个 tag。Langfuse 端配的同名
-              evaluator 会被触发；你也可以多个评估器用相同 tag 让它们共用一份
-              Langfuse 配置。
-            </div>
-          </Field>
-
-          <label className="inline-flex items-center gap-1.5 text-[12px]">
-            <input
-              type="checkbox" checked={isActive}
-              onChange={e => setIsActive(e.target.checked)}
-              className="accent-accent"
-            />
-            启用（运行时可选）
-          </label>
+      <div className="space-y-4">
+        <div>
+          <label htmlFor={nameId} className="field-label">名称（唯一，UI 展示用）</label>
+          <input
+            id={nameId}
+            type="text" value={name} onChange={e => setName(e.target.value)}
+            placeholder="例如：正确性 / Goal Accuracy"
+            className="input"
+          />
         </div>
 
+        <div>
+          <label htmlFor={tagId} className="field-label">Tag（写到 Langfuse trace，留空则用名称）</label>
+          <input
+            id={tagId}
+            type="text" value={tag} onChange={e => setTag(e.target.value)}
+            placeholder="例如：agent-eval-correctness"
+            className="input font-mono"
+          />
+          <div className="mt-1.5 text-[10px] text-text-tertiary">
+            每条样例的 Langfuse trace 都会带上这个 tag。Langfuse 端配的同名 evaluator 会被触发；你也可以让多个评估器用相同 tag。
+          </div>
+        </div>
+
+        <label htmlFor={activeId} className="inline-flex items-center gap-2 text-[12px] cursor-pointer">
+          <input
+            id={activeId}
+            type="checkbox" checked={isActive}
+            onChange={e => setIsActive(e.target.checked)}
+            className="accent-accent"
+          />
+          启用（运行时可选）
+        </label>
+
         {saveMutation.isError && (
-          <p className="text-[11px] text-negative mt-2">
+          <p className="text-[12px] text-negative">
             {(saveMutation.error as Error)?.message || '保存失败'}
           </p>
         )}
-
-        <div className="flex items-center justify-end gap-2 mt-4 pt-3 border-t border-border">
-          <button onClick={onClose}
-                  className="py-1.5 px-3 text-[11px] rounded-[6px] border border-border hover:border-accent">
-            取消
-          </button>
-          <button
-            onClick={() => saveMutation.mutate()}
-            disabled={!name.trim() || saveMutation.isPending}
-            className="py-1.5 px-3 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent disabled:opacity-40 hover:opacity-90"
-          >
-            {saveMutation.isPending ? '保存中…' : '保存'}
-          </button>
-        </div>
       </div>
-    </div>
-  )
-}
-
-
-function Th({ children }: { children: React.ReactNode }) {
-  return <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">{children}</th>
-}
-function Td({ children, mono }: { children: React.ReactNode; mono?: boolean }) {
-  return <td className={`py-2 px-3 border-b border-border text-[12px] ${mono ? 'font-mono text-[11px]' : ''}`}>{children}</td>
-}
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="flex flex-col gap-1">
-      <span className="text-[10px] tracking-widest uppercase text-text-tertiary">{label}</span>
-      {children}
-    </label>
+    </Dialog>
   )
 }

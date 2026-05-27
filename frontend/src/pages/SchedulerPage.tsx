@@ -11,12 +11,15 @@ export default function SchedulerPage() {
   if (isLoading) {
     return (
       <div>
-        <div className="skeleton h-5 w-40 rounded mb-6" />
-        <div className="grid grid-cols-4 gap-px bg-border border border-border rounded-[3px] overflow-hidden mb-8">
-          {[1,2,3,4].map(i => (
-            <div key={i} className="bg-surface p-5">
+        <header className="mb-6">
+          <h1 className="page-title">调度监控</h1>
+          <p className="page-subtitle">实时轮询状态</p>
+        </header>
+        <div className="grid grid-cols-4 gap-3 mb-8">
+          {[1, 2, 3, 4].map(i => (
+            <div key={i} className="metric-card">
               <div className="skeleton h-2 w-12 rounded mb-2" />
-              <div className="skeleton h-6 w-8 rounded" />
+              <div className="skeleton h-6 w-16 rounded" />
             </div>
           ))}
         </div>
@@ -24,76 +27,71 @@ export default function SchedulerPage() {
     )
   }
 
+  const active = status?.watches?.filter(w => w.status === 'active').length ?? 0
+  const idle = status?.watches?.filter(w => w.status !== 'active').length ?? 0
+  const total = status?.watches?.length ?? 0
+
   return (
     <div>
-      <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">调度监控</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">实时轮询状态</p>
+      <header className="mb-6">
+        <h1 className="page-title">调度监控</h1>
+        <p className="page-subtitle">实时轮询状态</p>
       </header>
 
-      <div className="grid grid-cols-4 gap-px bg-border border border-border rounded-[3px] overflow-hidden mb-8">
-        <div className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
-          <div className="text-[10px] tracking-wider text-text-tertiary mb-2">运行状态</div>
-          <div className={`text-[24px] font-light tracking-tight ${status?.running ? 'text-positive' : 'text-negative'}`}>
+      <div className="grid grid-cols-4 gap-3 mb-8">
+        <div className="metric-card">
+          <div className="metric-eyebrow">运行状态</div>
+          <div className={`metric-value ${status?.running ? 'text-positive' : 'text-negative'}`}>
             {status?.running ? '运行中' : '已停止'}
           </div>
         </div>
-        <div className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
-          <div className="text-[10px] tracking-wider text-text-tertiary mb-2">活跃</div>
-          <div className="text-[24px] font-light tracking-tight text-positive">
-            {status?.watches?.filter((w) => w.status === 'active').length ?? 0}
-          </div>
+        <div className="metric-card">
+          <div className="metric-eyebrow">活跃</div>
+          <div className="metric-value text-positive">{active}</div>
         </div>
-        <div className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
-          <div className="text-[10px] tracking-wider text-text-tertiary mb-2">空闲</div>
-          <div className="text-[24px] font-light tracking-tight text-text-tertiary">
-            {status?.watches?.filter((w) => w.status !== 'active').length ?? 0}
-          </div>
+        <div className="metric-card">
+          <div className="metric-eyebrow">空闲</div>
+          <div className="metric-value text-text-tertiary">{idle}</div>
         </div>
-        <div className="bg-surface p-5 hover:bg-accent-subtle transition-colors">
-          <div className="text-[10px] tracking-wider text-text-tertiary mb-2">总数</div>
-          <div className="text-[24px] font-light tracking-tight">
-            {status?.watches?.length ?? 0}
-          </div>
+        <div className="metric-card">
+          <div className="metric-eyebrow">总数</div>
+          <div className="metric-value">{total}</div>
         </div>
       </div>
 
-      <div className="text-[10px] tracking-wider text-text-tertiary mb-4 pb-2 border-b border-border">
-        项目轮询状态
+      <div className="section-row">
+        <div className="page-eyebrow">项目轮询状态</div>
       </div>
 
-      <table className="w-full border-collapse">
-        <thead>
-          <tr>
-            <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">项目</th>
-            <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">状态</th>
-            <th className="text-[10px] tracking-wider text-text-tertiary text-left py-2 px-3 border-b border-border font-normal">最近轮询</th>
-          </tr>
-        </thead>
-        <tbody>
-          {status?.watches?.map((w) => (
-            <tr key={w.project_name} className="hover:bg-accent-subtle group cursor-default">
-              <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-secondary font-medium group-hover:text-text-primary transition-colors">{w.project_name}</td>
-              <td className="py-2.5 px-3 border-b border-border text-[12px]">
-                <span className={`inline-block px-2 py-0.5 rounded-full text-[9px] tracking-wide font-medium ${
-                  w.status === 'active'
-                    ? 'bg-[#e6f7ed] text-[#1a6]'
-                    : 'bg-[#f5f5f5] text-[#999]'
-                }`}>
-                  {w.status === 'active' ? '运行中' : '空闲'}
-                </span>
-              </td>
-              <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-secondary">
-                {w.last_poll ? new Date(w.last_poll).toLocaleString() : '—'}
-              </td>
+      <div className="table-card">
+        <table className="table-base">
+          <thead>
+            <tr>
+              <th>项目</th>
+              <th className="w-28">状态</th>
+              <th className="w-44">最近轮询</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
-
-      {(!status?.watches || status.watches.length === 0) && (
-        <div className="text-center py-10 text-text-tertiary text-[12px]">暂无监听项目</div>
-      )}
+          </thead>
+          <tbody>
+            {status?.watches?.map((w) => (
+              <tr key={w.project_name}>
+                <td className="font-medium">{w.project_name}</td>
+                <td>
+                  <span className={w.status === 'active' ? 'badge badge-positive' : 'badge badge-neutral'}>
+                    {w.status === 'active' ? '运行中' : '空闲'}
+                  </span>
+                </td>
+                <td className="text-text-secondary">
+                  {w.last_poll ? new Date(w.last_poll).toLocaleString() : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {(!status?.watches || status.watches.length === 0) && (
+          <div className="empty-state">暂无监听项目</div>
+        )}
+      </div>
     </div>
   )
 }

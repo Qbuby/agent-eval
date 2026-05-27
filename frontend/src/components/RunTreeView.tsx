@@ -10,13 +10,13 @@ export interface NodeState {
 export type NodeCache = Record<string, NodeState>
 
 const RUN_TYPE_COLORS: Record<string, { border: string; badge: string }> = {
-  llm: { border: '#3b82f6', badge: 'bg-blue-50 text-blue-700' },
-  tool: { border: '#10b981', badge: 'bg-emerald-50 text-emerald-700' },
-  chain: { border: '#8b5cf6', badge: 'bg-violet-50 text-violet-700' },
-  retriever: { border: '#f59e0b', badge: 'bg-amber-50 text-amber-700' },
-  prompt: { border: '#ec4899', badge: 'bg-pink-50 text-pink-700' },
+  llm: { border: 'rgb(var(--accent))', badge: 'bg-accent/10 text-accent' },
+  tool: { border: 'rgb(var(--positive))', badge: 'bg-positive/10 text-positive' },
+  chain: { border: 'rgb(var(--info))', badge: 'bg-info/15 text-info' },
+  retriever: { border: 'rgb(var(--warning))', badge: 'bg-warning/15 text-warning' },
+  prompt: { border: 'rgb(var(--negative))', badge: 'bg-negative/10 text-negative' },
 }
-const DEFAULT_TYPE_COLOR = { border: '#9ca3af', badge: 'bg-gray-50 text-gray-700' }
+const DEFAULT_TYPE_COLOR = { border: 'rgb(var(--fill) / 0.6)', badge: 'bg-fill/10 text-text-secondary' }
 
 interface RunNodeRowProps {
   meta: RunChildMeta
@@ -39,7 +39,7 @@ export const RunNodeRow = memo(function RunNodeRow({
   return (
     <div>
       <div
-        className="flex items-center gap-2 py-1.5 border-b border-border hover:bg-accent-subtle cursor-default text-[11px]"
+        className="flex items-center gap-2 py-1.5 border-b border-separator hover:bg-fill/5 cursor-default text-[11px] transition-colors duration-150 ease-standard"
         style={{ paddingLeft: 12 + depth * 16, borderLeft: `2px solid ${color.border}` }}
       >
         <button
@@ -63,7 +63,7 @@ export const RunNodeRow = memo(function RunNodeRow({
       </div>
 
       {isOpen && (
-        <div style={{ paddingLeft: 12 + depth * 16 }} className="border-b border-border">
+        <div style={{ paddingLeft: 12 + depth * 16 }} className="border-b border-separator">
           {state?.loading && !state.data && <div className="py-3 px-3 text-[11px] text-text-tertiary">加载中…</div>}
           {state?.error && !state.data && (
             <div className="py-3 px-3 text-[11px] text-negative">
@@ -72,14 +72,14 @@ export const RunNodeRow = memo(function RunNodeRow({
             </div>
           )}
           {state?.data && (
-            <div className="py-3 px-3 space-y-3 bg-accent-subtle/40">
+            <div className="py-3 px-3 space-y-3 bg-fill/5">
               <RunDetailBody detail={state.data} compact />
               {state.data.children.length > 0 && (
                 <div className="mt-3">
                   <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
-                    Children ({state.data.children.length}) {state.data.children_truncated && <span className="ml-2 text-[#b87b00]">已截断</span>}
+                    Children ({state.data.children.length}) {state.data.children_truncated && <span className="ml-2 text-warning">已截断</span>}
                   </div>
-                  <div className="border border-border rounded-[4px] bg-surface">
+                  <div className="border border-border rounded-md bg-surface">
                     {state.data.children.map(c => (
                       <RunNodeRow
                         key={c.id}
@@ -164,7 +164,7 @@ function JsonField({ label, value, collapsed }: { label: string; value: unknown;
         <span className="normal-case tracking-normal text-[9px] opacity-60">({text.length} chars)</span>
       </button>
       {open && (
-        <pre className="text-[11px] leading-relaxed whitespace-pre-wrap break-all p-2.5 rounded-[6px] border border-border bg-accent-subtle text-text-primary font-mono max-h-80 overflow-y-auto">
+        <pre className="text-[11px] leading-relaxed whitespace-pre-wrap break-all p-2.5 rounded-md border border-border bg-fill/5 text-text-primary font-mono max-h-80 overflow-y-auto">
           {text}
         </pre>
       )}
@@ -177,7 +177,7 @@ function PreviewField({ label, value, mono, error }: { label: string; value: str
   return (
     <div>
       <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">{label}</div>
-      <div className={`text-[12px] leading-relaxed whitespace-pre-wrap break-all p-2.5 rounded-[6px] border border-border bg-accent-subtle ${mono ? 'font-mono text-[11px]' : ''} ${error ? 'text-negative bg-[#fde8e8] border-negative/20' : 'text-text-primary'}`}>
+      <div className={`text-[12px] leading-relaxed whitespace-pre-wrap break-all p-2.5 rounded-md border border-border bg-fill/5 ${mono ? 'font-mono text-[11px]' : ''} ${error ? 'text-negative bg-negative/5 border-negative/30' : 'text-text-primary'}`}>
         {text}
       </div>
     </div>

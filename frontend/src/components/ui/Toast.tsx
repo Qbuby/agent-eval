@@ -145,7 +145,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               <div
                 key={t.id}
                 role="status"
-                className={`pointer-events-auto min-w-[260px] max-w-sm rounded-lg border border-border bg-surface shadow-md ring-1 ${tone.ring} animate-toast-in`}
+                className={`pointer-events-auto min-w-[280px] max-w-sm rounded-2xl border border-border/60 bg-bg-elevated shadow-lg ring-1 ${tone.ring} animate-toast-in`}
               >
                 <div className="flex items-start gap-3 p-3">
                   <span

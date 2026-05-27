@@ -23,7 +23,7 @@ export function Spinner({ size = 'md', className = '', inherit = false, label }:
   const style: CSSProperties = {
     width: px,
     height: px,
-    color: inherit ? 'currentColor' : '#6b6b6b',
+    color: inherit ? 'currentColor' : 'rgb(var(--text-tertiary) / 0.55)',
   }
   return (
     <span

@@ -1,19 +1,33 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useToast, useConfirm } from '@/components/ui'
+import { Button, Dialog, useToast, useConfirm } from '@/components/ui'
 import { candidatesApi, projectsApi, type CandidateCase } from '@/services/benchmark'
 
-const STATUS_LABELS: Record<string, { label: string; color: string }> = {
-  pending: { label: '暂存', color: 'bg-[#fff3e0] text-[#e65100]' },
-  ready: { label: '待导入', color: 'bg-[#e8f5e9] text-[#2e7d32]' },
-  imported: { label: '已导入', color: 'bg-[#e3f2fd] text-[#1565c0]' },
-  rejected: { label: '已拒绝', color: 'bg-[#fde8e8] text-[#b33]' },
+const STATUS_BADGE: Record<string, string> = {
+  pending: 'badge badge-warning',
+  ready: 'badge badge-positive',
+  imported: 'badge badge-info',
+  rejected: 'badge badge-negative',
+}
+const STATUS_LABEL: Record<string, string> = {
+  pending: '暂存',
+  ready: '待导入',
+  imported: '已导入',
+  rejected: '已拒绝',
 }
 
 export default function CandidatesPage() {
   const queryClient = useQueryClient()
   const toast = useToast()
   const confirm = useConfirm()
+  const reactId = useId()
+  const editAnswerId = `${reactId}-edit-answer`
+  const editKeyPointsId = `${reactId}-edit-key-points`
+  const editNegativePointsId = `${reactId}-edit-negative-points`
+  const promoteProjectFieldId = `${reactId}-promote-project`
+  const lsDatasetNameId = `${reactId}-ls-dataset-name`
+  const lsProjectFieldId = `${reactId}-ls-project`
+  const lsLimitId = `${reactId}-ls-limit`
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState('pending')
   const [search, setSearch] = useState('')
@@ -123,23 +137,23 @@ export default function CandidatesPage() {
   return (
     <div>
       <header className="mb-6">
-        <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">staging</div>
-        <h1 className="text-xl font-medium tracking-tight">备选数据集</h1>
-        <p className="text-[12px] text-text-tertiary mt-0.5">管理暂存区样例，补全答案后可导入基准测试集</p>
+        <div className="page-eyebrow">staging</div>
+        <h1 className="page-title">备选数据集</h1>
+        <p className="page-subtitle">管理暂存区样例，补全答案后可导入基准测试集</p>
       </header>
 
-      <div className="flex items-center gap-3 mb-5 flex-wrap">
+      <div className="toolbar">
         <input
           type="text"
-          placeholder="搜索问题..."
+          placeholder="搜索问题"
           value={search}
           onChange={e => { setSearch(e.target.value); setPage(1) }}
-          className="flex-1 max-w-[240px] py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
+          className="input-sm flex-1 max-w-[260px]"
         />
         <select
           value={statusFilter}
           onChange={e => { setStatusFilter(e.target.value); setPage(1) }}
-          className="py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
+          className="select-sm"
         >
           <option value="">全部状态</option>
           <option value="pending">暂存区</option>
@@ -148,78 +162,93 @@ export default function CandidatesPage() {
           <option value="rejected">已拒绝</option>
         </select>
         <div className="flex-1" />
-        <button
-          onClick={() => setShowLangSmithImport(true)}
-          className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-surface text-text-primary border border-border hover:border-accent active:scale-[0.97] transition-all"
-        >
+        <Button onClick={() => setShowLangSmithImport(true)} variant="secondary" size="md">
           从 LangSmith 导入
-        </button>
+        </Button>
         {selectedIds.size > 0 && statusFilter === 'ready' && (
-          <button
-            onClick={() => setShowPromote(true)}
-            className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-[#1a6] text-white border border-[#1a6] hover:opacity-90 active:scale-[0.97] transition-all"
-          >
+          <Button onClick={() => setShowPromote(true)} variant="primary" size="md">
             导入基准测试集 ({selectedIds.size})
-          </button>
+          </Button>
         )}
         {selectedIds.size > 0 && statusFilter === 'pending' && (
           <>
-            <button
+            <Button
               onClick={() => reviewMutation.mutate({ ids: Array.from(selectedIds), action: 'approve' })}
-              className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-[#1a6] text-white border border-[#1a6] hover:opacity-90 transition-all"
+              variant="primary"
+              size="md"
             >
               批准 ({selectedIds.size})
-            </button>
-            <button
+            </Button>
+            <Button
               onClick={() => reviewMutation.mutate({ ids: Array.from(selectedIds), action: 'reject' })}
-              className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-surface text-negative border border-negative/30 hover:bg-negative/5 transition-all"
+              variant="danger"
+              size="md"
             >
               拒绝
-            </button>
+            </Button>
           </>
         )}
       </div>
 
-      <div className="border border-border rounded-[6px] overflow-hidden bg-surface">
-        <table className="w-full border-collapse">
+      <div className="table-card">
+        <table className="table-base">
           <thead>
             <tr>
-              <th className="w-8 text-center py-2 px-2 border-b border-border bg-accent-subtle">
-                <input type="checkbox" checked={cases.length > 0 && selectedIds.size === cases.length} onChange={() => {
-                  if (selectedIds.size === cases.length) setSelectedIds(new Set())
-                  else setSelectedIds(new Set(cases.map(c => c.id)))
-                }} className="w-3 h-3 accent-accent" />
+              <th className="w-10 text-center">
+                <input
+                  type="checkbox"
+                  checked={cases.length > 0 && selectedIds.size === cases.length}
+                  onChange={() => {
+                    if (selectedIds.size === cases.length) setSelectedIds(new Set())
+                    else setSelectedIds(new Set(cases.map(c => c.id)))
+                  }}
+                  className="accent-accent w-3.5 h-3.5"
+                />
               </th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">问题</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle w-20">来源</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle w-20">状态</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-right py-2 px-3 border-b border-border font-normal bg-accent-subtle w-24">操作</th>
+              <th>问题</th>
+              <th className="w-24">来源</th>
+              <th className="w-24">状态</th>
+              <th className="w-28 text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             {cases.map(c => (
-              <tr key={c.id} className="hover:bg-accent-subtle group">
-                <td className="text-center py-2.5 px-2 border-b border-border">
-                  <input type="checkbox" checked={selectedIds.has(c.id)} onChange={() => toggleSelect(c.id)} className="w-3 h-3 accent-accent" />
+              <tr key={c.id} className="group">
+                <td className="text-center">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(c.id)}
+                    onChange={() => toggleSelect(c.id)}
+                    className="accent-accent w-3.5 h-3.5"
+                  />
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-primary max-w-[400px]">
-                  <div className="truncate">{c.question}</div>
-                  {c.answer && <div className="text-[10px] text-text-tertiary mt-0.5 truncate">答: {c.answer.slice(0, 80)}</div>}
+                <td className="max-w-[420px]">
+                  <div className="truncate text-text-primary">{c.question}</div>
+                  {c.answer && (
+                    <div className="text-[11px] text-text-tertiary mt-0.5 truncate">
+                      答：{c.answer.slice(0, 80)}
+                    </div>
+                  )}
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-tertiary">{c.source}</td>
-                <td className="py-2.5 px-3 border-b border-border">
-                  <span className={`inline-block px-1.5 py-0.5 rounded text-[9px] font-medium ${STATUS_LABELS[c.status]?.color || ''}`}>
-                    {STATUS_LABELS[c.status]?.label || c.status}
+                <td className="text-[11px] text-text-secondary">{c.source}</td>
+                <td>
+                  <span className={STATUS_BADGE[c.status] || 'badge badge-neutral'}>
+                    {STATUS_LABEL[c.status] || c.status}
                   </span>
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-right">
-                  <div className="flex gap-2 justify-end opacity-0 group-hover:opacity-100 transition-all">
-                    <button onClick={() => startEdit(c)} className="text-[10px] text-text-secondary hover:text-accent">编辑</button>
+                <td className="text-right">
+                  <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button
+                      onClick={() => startEdit(c)}
+                      className="text-action"
+                    >
+                      编辑
+                    </button>
                     <button
                       onClick={async () => {
                         const ok = await confirm({
                           title: '删除样例',
-                          description: `确定删除该样例？此操作不可撤销。`,
+                          description: '确定删除该样例？此操作不可撤销。',
                           confirmText: '删除',
                           danger: true,
                         })
@@ -239,8 +268,10 @@ export default function CandidatesPage() {
                         }
                       }}
                       disabled={deletingId === c.id}
-                      className="text-[10px] text-text-secondary hover:text-negative disabled:opacity-50"
-                    >{deletingId === c.id ? '删除中…' : '删除'}</button>
+                      className="text-action-danger"
+                    >
+                      {deletingId === c.id ? '删除中…' : '删除'}
+                    </button>
                   </div>
                 </td>
               </tr>
@@ -248,7 +279,7 @@ export default function CandidatesPage() {
           </tbody>
         </table>
         {cases.length === 0 && !isLoading && (
-          <div className="text-center py-10 text-text-tertiary text-[12px]">暂无数据</div>
+          <div className="empty-state">暂无数据</div>
         )}
       </div>
 
@@ -256,141 +287,166 @@ export default function CandidatesPage() {
         <div className="flex items-center justify-between mt-4">
           <span className="text-[11px] text-text-tertiary">共 {total} 条，第 {page}/{totalPages} 页</span>
           <div className="flex gap-1">
-            <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page <= 1} className="py-1 px-2.5 text-[11px] border border-border rounded-[4px] hover:border-accent disabled:opacity-30 transition-all">上一页</button>
-            <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className="py-1 px-2.5 text-[11px] border border-border rounded-[4px] hover:border-accent disabled:opacity-30 transition-all">下一页</button>
+            <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page <= 1} className="pager-btn">
+              上一页
+            </button>
+            <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page >= totalPages} className="pager-btn">
+              下一页
+            </button>
           </div>
         </div>
       )}
 
-      {editingId && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setEditingId(null)}>
-          <div className="bg-surface border border-border rounded-lg p-6 w-[520px] max-h-[85vh] overflow-y-auto shadow-lg" onClick={e => e.stopPropagation()}>
-            <div className="flex justify-between items-center mb-5">
-              <h2 className="text-[14px] font-medium">编辑样例</h2>
-              <button onClick={() => setEditingId(null)} className="text-text-tertiary hover:text-text-primary text-lg">×</button>
-            </div>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">问题</label>
-                <div className="py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-accent-subtle text-text-secondary">
-                  {cases.find(c => c.id === editingId)?.question}
-                </div>
-              </div>
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">参考答案</label>
-                <textarea
-                  value={editAnswer}
-                  onChange={e => setEditAnswer(e.target.value)}
-                  rows={4}
-                  className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent resize-y transition-all"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">关键点（逗号分隔）</label>
-                <input
-                  value={editKeyPoints}
-                  onChange={e => setEditKeyPoints(e.target.value)}
-                  placeholder="要点1, 要点2, ..."
-                  className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">反向关键点（逗号分隔）</label>
-                <input
-                  value={editNegativePoints}
-                  onChange={e => setEditNegativePoints(e.target.value)}
-                  placeholder="不应出现的内容..."
-                  className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
-                />
-              </div>
-              <div className="flex gap-2 justify-end pt-2">
-                <button onClick={() => setEditingId(null)} className="py-2 px-3.5 text-[11px] rounded-[6px] border border-border hover:bg-accent-subtle transition-all">取消</button>
-                <button onClick={saveEdit} disabled={updateMutation.isPending} className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 disabled:opacity-40 transition-all">
-                  保存
-                </button>
-              </div>
+      <Dialog
+        open={!!editingId}
+        onClose={() => setEditingId(null)}
+        title="编辑样例"
+        width={520}
+        footer={
+          <>
+            <Button variant="secondary" size="md" onClick={() => setEditingId(null)}>取消</Button>
+            <Button
+              variant="primary"
+              size="md"
+              onClick={saveEdit}
+              loading={updateMutation.isPending}
+            >
+              保存
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div>
+            <label className="field-label">问题</label>
+            <div className="px-3 py-2 text-[13px] border border-border rounded-md bg-fill/5 text-text-secondary">
+              {cases.find(c => c.id === editingId)?.question}
             </div>
           </div>
+          <div>
+            <label htmlFor={editAnswerId} className="field-label">参考答案</label>
+            <textarea
+              id={editAnswerId}
+              value={editAnswer}
+              onChange={e => setEditAnswer(e.target.value)}
+              rows={4}
+              className="input resize-y"
+            />
+          </div>
+          <div>
+            <label htmlFor={editKeyPointsId} className="field-label">关键点（逗号分隔）</label>
+            <input
+              id={editKeyPointsId}
+              value={editKeyPoints}
+              onChange={e => setEditKeyPoints(e.target.value)}
+              placeholder="要点1, 要点2, …"
+              className="input"
+            />
+          </div>
+          <div>
+            <label htmlFor={editNegativePointsId} className="field-label">反向关键点（逗号分隔）</label>
+            <input
+              id={editNegativePointsId}
+              value={editNegativePoints}
+              onChange={e => setEditNegativePoints(e.target.value)}
+              placeholder="不应出现的内容…"
+              className="input"
+            />
+          </div>
         </div>
-      )}
+      </Dialog>
 
-      {showPromote && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setShowPromote(false)}>
-          <div className="bg-surface border border-border rounded-lg p-6 w-[400px] shadow-lg" onClick={e => e.stopPropagation()}>
-            <h2 className="text-[14px] font-medium mb-4">导入基准测试集</h2>
-            <p className="text-[11px] text-text-secondary mb-4">将 {selectedIds.size} 条样例导入到基准测试集。</p>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">目标项目</label>
-                <select value={promoteProjectId} onChange={e => setPromoteProjectId(e.target.value)} className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent">
-                  <option value="">选择项目...</option>
-                  {projects?.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </select>
-              </div>
-              <div className="flex gap-2 justify-end pt-2">
-                <button onClick={() => setShowPromote(false)} className="py-2 px-3.5 text-[11px] rounded-[6px] border border-border hover:bg-accent-subtle transition-all">取消</button>
-                <button
-                  onClick={() => promoteMutation.mutate()}
-                  disabled={!promoteProjectId || promoteMutation.isPending}
-                  className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 disabled:opacity-40 transition-all"
-                >
-                  确认导入
-                </button>
-              </div>
-            </div>
-          </div>
+      <Dialog
+        open={showPromote}
+        onClose={() => setShowPromote(false)}
+        title="导入基准测试集"
+        description={`将 ${selectedIds.size} 条样例导入到基准测试集。`}
+        footer={
+          <>
+            <Button variant="secondary" size="md" onClick={() => setShowPromote(false)}>取消</Button>
+            <Button
+              variant="primary"
+              size="md"
+              onClick={() => promoteMutation.mutate()}
+              disabled={!promoteProjectId}
+              loading={promoteMutation.isPending}
+            >
+              确认导入
+            </Button>
+          </>
+        }
+      >
+        <div>
+          <label htmlFor={promoteProjectFieldId} className="field-label">目标项目</label>
+          <select
+            id={promoteProjectFieldId}
+            value={promoteProjectId}
+            onChange={e => setPromoteProjectId(e.target.value)}
+            className="input"
+          >
+            <option value="">选择项目…</option>
+            {projects?.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
         </div>
-      )}
+      </Dialog>
 
-      {showLangSmithImport && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setShowLangSmithImport(false)}>
-          <div className="bg-surface border border-border rounded-lg p-6 w-[440px] shadow-lg" onClick={e => e.stopPropagation()}>
-            <div className="flex justify-between items-center mb-5">
-              <h2 className="text-[14px] font-medium">从 LangSmith 导入</h2>
-              <button onClick={() => setShowLangSmithImport(false)} className="text-text-tertiary hover:text-text-primary text-lg">×</button>
-            </div>
-            <p className="text-[11px] text-text-secondary mb-4">从 LangSmith 数据集中导入样例到备选数据集。有参考答案的样例状态为"待导入"，无答案的进入暂存区。</p>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">LangSmith 数据集名称</label>
-                <input
-                  value={lsDatasetName}
-                  onChange={e => setLsDatasetName(e.target.value)}
-                  placeholder="例如：noble-agent-dataset-test"
-                  className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">关联项目（可选）</label>
-                <select value={lsProjectId} onChange={e => setLsProjectId(e.target.value)} className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent">
-                  <option value="">不关联项目</option>
-                  {projects?.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">最大数量（可选）</label>
-                <input
-                  value={lsLimit}
-                  onChange={e => setLsLimit(e.target.value)}
-                  type="number"
-                  placeholder="不限"
-                  className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
-                />
-              </div>
-              <div className="flex gap-2 justify-end pt-2">
-                <button onClick={() => setShowLangSmithImport(false)} className="py-2 px-3.5 text-[11px] rounded-[6px] border border-border hover:bg-accent-subtle transition-all">取消</button>
-                <button
-                  onClick={() => langsmithImportMutation.mutate()}
-                  disabled={!lsDatasetName.trim() || langsmithImportMutation.isPending}
-                  className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 disabled:opacity-40 transition-all"
-                >
-                  {langsmithImportMutation.isPending ? '导入中...' : '开始导入'}
-                </button>
-              </div>
-            </div>
+      <Dialog
+        open={showLangSmithImport}
+        onClose={() => setShowLangSmithImport(false)}
+        title="从 LangSmith 导入"
+        description='从 LangSmith 数据集导入样例到备选数据集。有参考答案的状态为"待导入"，无答案的进入暂存区。'
+        width={460}
+        footer={
+          <>
+            <Button variant="secondary" size="md" onClick={() => setShowLangSmithImport(false)}>取消</Button>
+            <Button
+              variant="primary"
+              size="md"
+              onClick={() => langsmithImportMutation.mutate()}
+              disabled={!lsDatasetName.trim()}
+              loading={langsmithImportMutation.isPending}
+            >
+              开始导入
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div>
+            <label htmlFor={lsDatasetNameId} className="field-label">LangSmith 数据集名称</label>
+            <input
+              id={lsDatasetNameId}
+              value={lsDatasetName}
+              onChange={e => setLsDatasetName(e.target.value)}
+              placeholder="例如：noble-agent-dataset-test"
+              className="input"
+            />
+          </div>
+          <div>
+            <label htmlFor={lsProjectFieldId} className="field-label">关联项目（可选）</label>
+            <select
+              id={lsProjectFieldId}
+              value={lsProjectId}
+              onChange={e => setLsProjectId(e.target.value)}
+              className="input"
+            >
+              <option value="">不关联项目</option>
+              {projects?.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label htmlFor={lsLimitId} className="field-label">最大数量（可选）</label>
+            <input
+              id={lsLimitId}
+              value={lsLimit}
+              onChange={e => setLsLimit(e.target.value)}
+              type="number"
+              placeholder="不限"
+              className="input"
+            />
           </div>
         </div>
-      )}
+      </Dialog>
     </div>
   )
 }

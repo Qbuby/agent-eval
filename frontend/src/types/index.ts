@@ -209,9 +209,16 @@ export interface FillModelsResponse {
   missing: string[]
 }
 
+export interface ConfigOption {
+  value: unknown
+  label: string | null
+}
+
 export interface ConfigItem {
   key: string
-  value: unknown
+  value: unknown                  // default option's value (back-compat)
+  options: ConfigOption[]
+  default_index: number
   category: string
   description: string | null
   updated_by: string | null
@@ -221,6 +228,18 @@ export interface ConfigItem {
 export interface ConfigUpdateRequest {
   value: unknown
   description?: string
+}
+
+export interface AddConfigOptionRequest {
+  value: unknown
+  label?: string | null
+  make_default?: boolean
+  description?: string
+}
+
+export interface UpdateConfigOptionRequest {
+  value: unknown
+  label?: string | null
 }
 
 export interface AuditLog {

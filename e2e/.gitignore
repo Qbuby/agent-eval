@@ -3,3 +3,6 @@ auth.json
 test-user.json
 test-results/
 playwright-report/
+
+# Verify script artifacts (screenshots only; verify-*.mjs scripts are tracked)
+*.png

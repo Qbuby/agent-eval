@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { useConfirm, useToast } from '@/components/ui'
+import { Button, useConfirm, useToast } from '@/components/ui'
 import { datasetsApi } from '@/services'
 import type { CreateDatasetRequest } from '@/types'
 
@@ -13,6 +13,7 @@ export default function DatasetsPage() {
   const [deletingName, setDeletingName] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState<CreateDatasetRequest>({ name: '', description: '', source_project: '' })
+  const [search, setSearch] = useState('')
 
   const { data: datasets, isLoading, isFetching } = useQuery({
     queryKey: ['datasets'],
@@ -35,13 +36,22 @@ export default function DatasetsPage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['datasets'] }),
   })
 
+  const filtered = datasets?.filter(d =>
+    !search.trim() ||
+    d.name.toLowerCase().includes(search.toLowerCase()) ||
+    (d.description ?? '').toLowerCase().includes(search.toLowerCase())
+  )
+
   if (isLoading) {
     return (
       <div>
-        <div className="skeleton h-6 w-48 rounded mb-6" />
+        <header className="mb-6">
+          <h1 className="page-title">备选数据集</h1>
+          <p className="page-subtitle">管理评测数据集、样本和质量指标</p>
+        </header>
         <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-4">
-          {[1,2,3].map(i => (
-            <div key={i} className="bg-surface border border-border rounded-md p-5">
+          {[1, 2, 3].map(i => (
+            <div key={i} className="card p-5">
               <div className="skeleton h-4 w-32 rounded mb-3" />
               <div className="skeleton h-3 w-20 rounded mb-2" />
               <div className="skeleton h-3 w-24 rounded" />
@@ -55,25 +65,25 @@ export default function DatasetsPage() {
   return (
     <div>
       <header className="mb-6">
-        <h1 className="text-xl font-semibold tracking-tight mb-1">备选数据集</h1>
-        <p className="text-[13px] text-text-secondary">管理评测数据集、样本和质量指标</p>
+        <h1 className="page-title">备选数据集</h1>
+        <p className="page-subtitle">管理评测数据集、样本和质量指标</p>
       </header>
 
-      <div className="flex gap-3 items-center mb-6">
+      <div className="toolbar">
         <input
           type="text"
-          placeholder="搜索数据集..."
-          className="flex-1 max-w-[280px] py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 placeholder:text-text-tertiary transition-all duration-200"
+          placeholder="搜索数据集"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          className="input-sm flex-1 max-w-[280px]"
         />
         {isFetching && !isLoading && (
           <span className="text-[10px] text-text-tertiary">刷新中…</span>
         )}
-        <button
-          onClick={() => setShowCreate(true)}
-          className="inline-flex items-center gap-1.5 py-2 px-3.5 text-[11px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent cursor-pointer hover:opacity-90 hover:scale-[1.02] active:scale-[0.97] focus:outline-none focus:ring-2 focus:ring-accent/20 transition-all duration-200"
-        >
-          + 新建数据集
-        </button>
+        <div className="flex-1" />
+        <Button onClick={() => setShowCreate(true)} variant="primary" size="md">
+          新建数据集
+        </Button>
       </div>
 
       {showCreate && (
@@ -82,53 +92,47 @@ export default function DatasetsPage() {
             e.preventDefault()
             createMutation.mutate(form)
           }}
-          className="bg-surface border border-border rounded-md p-5 mb-6 space-y-3 animate-fade-in"
+          className="card p-5 mb-6 space-y-4 animate-fade-in"
         >
-          <div className="group">
-            <label className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1 group-focus-within:text-accent transition-colors">名称</label>
+          <div>
+            <label className="field-label">名称</label>
             <input
               placeholder="数据集名称"
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               required
-              className="w-full max-w-[280px] py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
+              className="input max-w-[320px]"
             />
           </div>
-          <div className="group">
-            <label className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1 group-focus-within:text-accent transition-colors">描述</label>
+          <div>
+            <label className="field-label">描述</label>
             <input
               placeholder="描述（可选）"
               value={form.description}
               onChange={(e) => setForm({ ...form, description: e.target.value })}
-              className="w-full max-w-[280px] py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
+              className="input max-w-[320px]"
             />
           </div>
-          <div className="group">
-            <label className="block text-[10px] text-text-tertiary tracking-widest uppercase mb-1 group-focus-within:text-accent transition-colors">数据源（LangSmith Project）</label>
+          <div>
+            <label className="field-label">数据源（LangSmith Project）</label>
             <input
               placeholder="绑定后系统会自动从该 project 增量同步新样例"
               value={form.source_project}
               onChange={(e) => setForm({ ...form, source_project: e.target.value })}
-              className="w-full max-w-[280px] py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 transition-all duration-200"
+              className="input max-w-[320px]"
             />
           </div>
           <div className="flex gap-2 pt-1">
-            <button type="submit" className="py-1.5 px-3.5 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 active:scale-[0.97] transition-all duration-200">
-              创建
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowCreate(false)}
-              className="py-1.5 px-3.5 text-[11px] font-medium rounded-[6px] bg-surface text-text-primary border border-border hover:border-accent active:scale-[0.97] transition-all duration-200"
-            >
+            <Button type="submit" variant="primary" size="md">创建</Button>
+            <Button type="button" variant="secondary" size="md" onClick={() => setShowCreate(false)}>
               取消
-            </button>
+            </Button>
           </div>
         </form>
       )}
 
       <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-4">
-        {datasets?.map((ds, i) => (
+        {filtered?.map((ds, i) => (
           <div
             key={ds.id}
             role="link"
@@ -140,25 +144,25 @@ export default function DatasetsPage() {
                 navigate(`/datasets/${ds.name}`)
               }
             }}
-            className="block bg-surface border border-border rounded-md p-5 cursor-pointer hover:-translate-y-0.5 hover:shadow-md hover:border-accent/20 transition-all duration-200 animate-fade-in focus:outline-none focus:ring-2 focus:ring-accent/30"
+            className="card p-5 cursor-pointer animate-fade-in transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:shadow-md hover:border-border-strong focus:outline-none focus-visible:shadow-focus"
             style={{ animationDelay: `${i * 40}ms` }}
           >
-            <div className="flex justify-between items-start mb-3">
-              <span className="text-[14px] font-semibold text-text-primary">
+            <div className="flex justify-between items-start mb-3 gap-2">
+              <span className="text-[15px] font-display font-semibold tracking-[-0.2px] text-text-primary truncate">
                 {ds.name}
               </span>
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-[#ecfdf5] text-positive">
-                启用中
-              </span>
+              <span className="badge badge-positive shrink-0">启用中</span>
             </div>
-            <div className="space-y-1.5 mb-3">
+            <div className="space-y-1.5 mb-4">
               <div className="flex justify-between items-center">
-                <span className="text-[10px] tracking-wider text-text-tertiary">样例数</span>
-                <span className="text-[12px] font-medium">{ds.example_count}</span>
+                <span className="text-[11px] text-text-tertiary">样例数</span>
+                <span className="text-[12px] tabular-nums font-medium text-text-primary">
+                  {ds.example_count}
+                </span>
               </div>
-              <div className="flex justify-between items-center">
-                <span className="text-[10px] tracking-wider text-text-tertiary">描述</span>
-                <span className="text-[12px] text-text-secondary truncate max-w-[140px]">{ds.description || '—'}</span>
+              <div className="flex justify-between items-center gap-2">
+                <span className="text-[11px] text-text-tertiary shrink-0">描述</span>
+                <span className="text-[12px] text-text-secondary truncate">{ds.description || '—'}</span>
               </div>
             </div>
             <button
@@ -185,7 +189,7 @@ export default function DatasetsPage() {
                 }
               }}
               disabled={deletingName === ds.name}
-              className="text-[10px] text-text-tertiary hover:text-negative active:scale-95 transition-all tracking-wide disabled:opacity-50"
+              className="text-[11px] text-text-tertiary hover:text-negative active:opacity-80 transition-colors disabled:opacity-50"
             >
               {deletingName === ds.name ? '删除中…' : '删除'}
             </button>
@@ -193,11 +197,13 @@ export default function DatasetsPage() {
         ))}
       </div>
 
-      {datasets?.length === 0 && (
-        <div className="bg-surface border border-dashed border-border rounded-md py-12 px-8 text-center mt-6">
-          <h3 className="text-[14px] font-medium mb-1">暂无数据集</h3>
+      {filtered?.length === 0 && (
+        <div className="card border-dashed empty-state mt-6">
+          <h3 className="text-[14px] font-medium text-text-primary mb-1">
+            {search.trim() ? '没有匹配的数据集' : '暂无数据集'}
+          </h3>
           <p className="text-[12px] text-text-tertiary max-w-[280px] mx-auto">
-            创建第一个数据集开始评测。
+            {search.trim() ? '换个关键词试试' : '创建第一个数据集开始评测'}
           </p>
         </div>
       )}

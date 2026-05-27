@@ -7,18 +7,12 @@ interface SkeletonProps {
 }
 
 export function Skeleton({ className = '', width, height, circle = false }: SkeletonProps) {
-  const style: React.CSSProperties = {
-    width,
-    height,
-    backgroundImage:
-      'linear-gradient(90deg, rgba(0,0,0,0.04) 0%, rgba(0,0,0,0.10) 50%, rgba(0,0,0,0.04) 100%)',
-    backgroundSize: '200% 100%',
-  }
+  const style: React.CSSProperties = { width, height }
   return (
     <div
       aria-hidden="true"
       style={style}
-      className={`animate-shimmer ${circle ? 'rounded-full' : 'rounded-md'} ${className}`}
+      className={`skeleton ${circle ? 'rounded-full' : 'rounded-md'} ${className}`}
     />
   )
 }

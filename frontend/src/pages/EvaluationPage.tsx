@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useConfirm, useToast } from '@/components/ui'
+import { Button, useConfirm, useToast } from '@/components/ui'
 import {
   benchmarkApi,
   evaluationApi,
@@ -12,12 +12,14 @@ import type {
   Project,
 } from '@/services/benchmark'
 import type {
+  ConfigOption,
   EvalAgentConfig,
   EvalRunSummary,
   EvaluatorInstance,
   StartEvalRequest,
   UploadCasesResponse,
 } from '@/types'
+import { configOptionToString, useConfigOptions } from '@/hooks/useConfigOptions'
 
 type Tab = 'history' | 'new'
 
@@ -27,13 +29,12 @@ export default function EvaluationPage() {
   return (
     <div>
       <header className="mb-6">
-        <h1 className="text-lg font-light tracking-tight mb-1">评估</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">
-          运行管理 · LangSmith 追踪 · 本地评分
-        </p>
+        <div className="page-eyebrow">评估</div>
+        <h1 className="page-title">评估</h1>
+        <p className="page-subtitle">运行管理 · LangSmith 追踪 · 本地评分</p>
       </header>
 
-      <div className="flex gap-1 mb-5 border-b border-border">
+      <div className="page-tabs mb-5">
         {([
           { id: 'history', label: '运行历史' },
           { id: 'new', label: '新建评估' },
@@ -41,11 +42,7 @@ export default function EvaluationPage() {
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
-            className={`px-4 py-2 text-[12px] tracking-wide border-b-2 transition-all ${
-              tab === t.id
-                ? 'border-accent text-text-primary font-medium'
-                : 'border-transparent text-text-secondary hover:text-text-primary'
-            }`}
+            className={`page-tab ${tab === t.id ? 'page-tab-active' : ''}`}
           >
             {t.label}
           </button>
@@ -126,11 +123,11 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
 
   return (
     <div>
-      <div className="flex flex-wrap items-center gap-2 mb-3">
+      <div className="toolbar">
         <select
           value={statusFilter}
           onChange={e => { setStatusFilter(e.target.value); setPage(1) }}
-          className="py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent"
+          className="select-sm"
         >
           <option value="">全部状态</option>
           <option value="running">运行中</option>
@@ -143,66 +140,65 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
           type="text" value={searchText}
           onChange={e => { setSearchText(e.target.value); setPage(1) }}
           placeholder="搜运行名 / 模型 / URL / 项目"
-          className="py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent w-[220px]"
+          className="input-sm w-[220px]"
         />
-        <span className="text-[10px] text-text-tertiary tracking-wider">起</span>
+        <span className="text-[11px] text-text-tertiary">起</span>
         <input
           type="date" value={startedAfter}
           onChange={e => { setStartedAfter(e.target.value); setPage(1) }}
-          className="py-1 px-1.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent"
+          className="input-sm"
         />
-        <span className="text-[10px] text-text-tertiary tracking-wider">至</span>
+        <span className="text-[11px] text-text-tertiary">至</span>
         <input
           type="date" value={startedBefore}
           onChange={e => { setStartedBefore(e.target.value); setPage(1) }}
-          className="py-1 px-1.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent"
+          className="input-sm"
         />
         <input
           type="number" min={0} max={100} step={5}
           value={minPassRate}
           onChange={e => { setMinPassRate(e.target.value); setPage(1) }}
           placeholder="通过率 ≥ %"
-          className="py-1.5 px-2 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent w-[110px]"
+          className="input-sm w-[110px]"
         />
         {filtersActive && (
           <button
             onClick={clearFilters}
-            className="text-[11px] text-text-tertiary hover:text-text-primary underline"
+            className="text-[11px] text-text-tertiary hover:text-text-primary transition-colors"
           >
             清除筛选
           </button>
         )}
-        <span className="text-[11px] text-text-tertiary">
+        <span className="text-[11px] text-text-tertiary tabular-nums">
           共 {runsQuery.data?.total ?? 0} 条
         </span>
         {selected.size > 0 && (
           <>
             <span className="text-[11px] text-text-tertiary">· 已选 {selected.size}</span>
-            <button
-              onClick={() => navigate(`/evaluation/compare?ids=${Array.from(selected).join(',')}`)}
+            <Button
+              variant="tinted"
+              size="sm"
               disabled={selected.size < 2}
-              className="py-1.5 px-3 text-[11px] font-medium rounded-[6px] border border-accent text-accent disabled:opacity-40 hover:bg-accent-subtle"
+              onClick={() => navigate(`/evaluation/compare?ids=${Array.from(selected).join(',')}`)}
             >
               对比所选（{selected.size}）
-            </button>
+            </Button>
             <button
               onClick={() => setSelected(new Set())}
-              className="text-[11px] text-text-tertiary hover:text-text-primary underline"
+              className="text-[11px] text-text-tertiary hover:text-text-primary transition-colors"
             >
               清空
             </button>
           </>
         )}
-        <button
-          onClick={onNewRun}
-          className="ml-auto inline-flex items-center gap-1.5 py-2 px-3.5 text-[11px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 transition-all"
-        >
-          + 新建评估
-        </button>
+        <div className="flex-1" />
+        <Button variant="primary" size="sm" onClick={onNewRun}>
+          新建评估
+        </Button>
       </div>
 
-      <div className="border border-border rounded-[3px] overflow-hidden bg-surface">
-        <table className="w-full border-collapse">
+      <div className="table-card">
+        <table className="table-base">
           <thead>
             <tr>
               <Th>
@@ -221,14 +217,14 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
           </thead>
           <tbody>
             {runsQuery.isLoading && (
-              <tr><td colSpan={10} className="py-8 text-center text-[12px] text-text-tertiary">加载中…</td></tr>
+              <tr><td colSpan={10} className="empty-state">加载中…</td></tr>
             )}
             {runsQuery.data?.items.length === 0 && !runsQuery.isLoading && (
               <tr>
-                <td colSpan={10} className="py-10 text-center text-[12px] text-text-tertiary">
+                <td colSpan={10} className="empty-state">
                   {filtersActive
-                    ? '没有匹配筛选的评估记录。'
-                    : '还没有评估记录。点右上角「新建评估」启动第一个 run。'}
+                    ? '没有匹配筛选的评估记录'
+                    : '还没有评估记录。点右上角「新建评估」启动第一个 run'}
                 </td>
               </tr>
             )}
@@ -271,20 +267,12 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
       </div>
 
       {totalPages > 1 && (
-        <div className="flex items-center justify-end gap-2 mt-4 text-[11px] text-text-secondary">
-          <button
-            disabled={page <= 1}
-            onClick={() => setPage(p => p - 1)}
-            className="px-2 py-0.5 border border-border rounded-[4px] disabled:opacity-40 hover:border-accent"
-          >
+        <div className="flex items-center justify-end gap-2 mt-4 text-[12px] text-text-secondary">
+          <button disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="pager-btn">
             ‹ 上一页
           </button>
-          <span>{page} / {totalPages}</span>
-          <button
-            disabled={page >= totalPages}
-            onClick={() => setPage(p => p + 1)}
-            className="px-2 py-0.5 border border-border rounded-[4px] disabled:opacity-40 hover:border-accent"
-          >
+          <span className="tabular-nums">{page} / {totalPages}</span>
+          <button disabled={page >= totalPages} onClick={() => setPage(p => p + 1)} className="pager-btn">
             下一页 ›
           </button>
         </div>
@@ -294,11 +282,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
 }
 
 function Th({ children }: { children: React.ReactNode }) {
-  return (
-    <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">
-      {children}
-    </th>
-  )
+  return <th>{children}</th>
 }
 
 function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
@@ -323,14 +307,26 @@ function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
   const agentLabel = agent?.model || agent?.type || '—'
 
   return (
-    <tr onClick={onClick} className="hover:bg-accent-subtle/40 cursor-pointer transition-colors">
+    <tr
+      onClick={onClick}
+      onKeyDown={e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onClick()
+        }
+      }}
+      role="button"
+      tabIndex={0}
+      aria-label={`查看运行 ${run.id.slice(0, 8)}`}
+      className="cursor-pointer focus-visible:outline-none focus-visible:shadow-focus"
+    >
       <Td>
         <input
           type="checkbox"
           checked={selected}
           onClick={e => e.stopPropagation()}
           onChange={onToggle}
-          className="accent-accent"
+          className="accent-accent w-3.5 h-3.5"
         />
       </Td>
       <Td mono>{run.id.slice(0, 8)}</Td>
@@ -347,7 +343,7 @@ function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
         <button
           onClick={e => { e.stopPropagation(); onDelete() }}
           disabled={deleting}
-          className="text-[11px] text-negative hover:underline disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed"
+          className="text-action-danger disabled:opacity-50"
           title="软删除：行隐藏但 DB 保留 deleted_at"
         >
           {deleting ? '删除中…' : '删除'}
@@ -359,24 +355,24 @@ function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
 
 function Td({ children, mono }: { children: React.ReactNode; mono?: boolean }) {
   return (
-    <td className={`py-2 px-3 border-b border-border text-[12px] ${mono ? 'font-mono text-[11px]' : 'text-text-primary'}`}>
+    <td className={mono ? 'font-mono text-[11px]' : ''}>
       {children}
     </td>
   )
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const styles: Record<string, string> = {
-    running: 'bg-blue-100 text-blue-700 border-blue-300',
-    completed: 'bg-green-100 text-green-700 border-green-300',
-    failed: 'bg-red-100 text-red-700 border-red-300',
-    stopping: 'bg-orange-100 text-orange-700 border-orange-300',
-    interrupted: 'bg-gray-200 text-gray-700 border-gray-300',
-    pending: 'bg-gray-100 text-gray-600 border-gray-300',
+  const tone: Record<string, string> = {
+    running: 'badge badge-info',
+    completed: 'badge badge-positive',
+    failed: 'badge badge-negative',
+    stopping: 'badge badge-warning',
+    interrupted: 'badge badge-neutral',
+    pending: 'badge badge-neutral',
   }
-  const cls = styles[status] ?? 'bg-gray-100 text-gray-600 border-gray-300'
+  const cls = tone[status] ?? 'badge badge-neutral'
   return (
-    <span className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border ${cls}`}>
+    <span className={cls}>
       {status === 'running' && (
         <span className="inline-block w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
       )}
@@ -450,7 +446,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
 
   // ── agent ──
   const [agentType, setAgentType] = useState<'sse' | 'openai' | 'sse_generic'>('sse')
-  const [agentUrl, setAgentUrl] = useState('http://localhost:18094/api/agent/langgraph')
+  const [agentUrl, setAgentUrl] = useState('')
   const [agentApiKey, setAgentApiKey] = useState('')
   const [agentModel, setAgentModel] = useState('')
   const [agentLanguage, setAgentLanguage] = useState('请用中文回复')
@@ -460,6 +456,29 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const [concurrency, setConcurrency] = useState(3)
   const [runName, setRunName] = useState('')
   const [langsmithProject, setLangsmithProject] = useState('')
+
+  // Multi-value config options — pickers in the form let users reuse
+  // pre-saved presets from /config; the URL field also auto-prefills with
+  // the default option on first load (falling back to a localhost hint
+  // when no config is set).
+  const endpointOpts = useConfigOptions('target_agent.endpoint_url')
+  const apiKeyOpts = useConfigOptions('target_agent.api_key')
+  const timeoutOpts = useConfigOptions('target_agent.timeout')
+  const headersOpts = useConfigOptions('target_agent.headers')
+  const payloadOpts = useConfigOptions('target_agent.request_template')
+  const prefilledRef = useRef(false)
+  useEffect(() => {
+    if (prefilledRef.current) return
+    if (endpointOpts.isLoading) return
+    prefilledRef.current = true
+    if (!agentUrl) {
+      setAgentUrl(
+        endpointOpts.defaultValue
+          ? configOptionToString(endpointOpts.defaultValue)
+          : 'http://localhost:18094/api/agent/langgraph',
+      )
+    }
+  }, [endpointOpts.isLoading, endpointOpts.defaultValue, agentUrl])
 
   // ── evaluator instances ──
   const evaluatorsQuery = useQuery({
@@ -539,7 +558,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     <div className="flex flex-col gap-5 max-w-[900px]">
       {/* Step 1: case source */}
       <Section title="1. 选择样例来源">
-        <div className="flex gap-1 mb-3 border-b border-border">
+        <div className="page-tabs mb-3">
           {([
             { id: 'benchmark', label: '从基准数据集' },
             { id: 'upload', label: '上传文件' },
@@ -547,11 +566,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
             <button
               key={t.id}
               onClick={() => setSourceTab(t.id)}
-              className={`px-3 py-1.5 text-[12px] border-b-2 transition-all ${
-                sourceTab === t.id
-                  ? 'border-accent text-text-primary font-medium'
-                  : 'border-transparent text-text-secondary hover:text-text-primary'
-              }`}
+              className={`page-tab ${sourceTab === t.id ? 'page-tab-active' : ''}`}
             >
               {t.label}
             </button>
@@ -603,12 +618,12 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               ))}
             </div>
 
-            {/* Selection summary banner — 让用户一眼看到这次会跑多少条 */}
+            {/* Selection summary banner */}
             {projectId && (
-              <div className={`flex items-center gap-2 mb-3 px-3 py-2 rounded-[6px] border text-[12px] ${
+              <div className={`flex items-center gap-2 mb-3 px-3 py-2 rounded-md border text-[12px] ${
                 willRunCount === 0
-                  ? 'border-amber-300 bg-amber-50 text-amber-800'
-                  : 'border-accent/30 bg-accent-subtle/40 text-text-primary'
+                  ? 'border-warning/30 bg-warning/10 text-warning'
+                  : 'border-accent/30 bg-accent/5 text-text-primary'
               }`}>
                 <span className="text-[14px]">{willRunCount === 0 ? '⚠' : '✓'}</span>
                 <span>
@@ -656,17 +671,16 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                     value={searchText} onChange={e => setSearchText(e.target.value)}
                     className="input flex-1"
                   />
-                  <button onClick={() => setPickedCaseIds(new Set())}
-                          className="text-[11px] px-2 py-1 border border-border rounded-[4px] hover:border-accent">
+                  <Button variant="secondary" size="sm" onClick={() => setPickedCaseIds(new Set())}>
                     清空
-                  </button>
+                  </Button>
                 </div>
-                <div className="border border-border rounded-[4px] max-h-[280px] overflow-y-auto divide-y divide-border">
+                <div className="border border-border rounded-md max-h-[280px] overflow-y-auto bg-surface">
                   {casesQuery.data?.items.map((c: BenchmarkCase) => {
                     const checked = pickedCaseIds.has(c.id)
                     return (
                       <label key={c.id}
-                             className="flex items-start gap-2 py-1.5 px-2 hover:bg-accent-subtle/40 cursor-pointer text-[12px]">
+                             className="flex items-start gap-2 py-1.5 px-2.5 hover:bg-fill/5 cursor-pointer text-[12px] border-b border-separator last:border-b-0">
                         <input
                           type="checkbox" checked={checked}
                           onChange={() => {
@@ -674,7 +688,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                             if (s.has(c.id)) s.delete(c.id); else s.add(c.id)
                             setPickedCaseIds(s)
                           }}
-                          className="mt-0.5 w-3.5 h-3.5 accent-accent shrink-0"
+                          className="mt-0.5 accent-accent shrink-0"
                         />
                         <span className="flex-1 break-all">
                           {c.question.length > 120 ? c.question.slice(0, 120) + '…' : c.question}
@@ -683,7 +697,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                     )
                   })}
                   {casesQuery.data?.items.length === 0 && (
-                    <div className="py-6 text-center text-[11px] text-text-tertiary">
+                    <div className="empty-state">
                       {projectId ? '没有匹配的样例' : '先选项目'}
                     </div>
                   )}
@@ -716,12 +730,12 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               期望答案写在 <code>expected_output</code> 或 <code>reference_answer</code>。
             </p>
             {uploadedSource?.preview && uploadedSource.preview.length > 0 && (
-              <div className="mt-3 border border-border rounded-[4px] bg-surface p-2">
-                <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">前 3 条预览</div>
+              <div className="mt-3 border border-border rounded-md bg-fill/5 p-2.5">
+                <div className="page-eyebrow mb-1">前 3 条预览</div>
                 {uploadedSource.preview.map((c, i) => {
                   const q = String((c as { question?: unknown }).question ?? '')
                   return (
-                    <div key={i} className="text-[11px] py-1 border-b border-border/40 last:border-b-0">
+                    <div key={i} className="text-[11px] py-1 border-b border-separator last:border-b-0">
                       <span className="font-mono text-text-tertiary mr-2">
                         {String((c as { name?: unknown }).name ?? '')}
                       </span>
@@ -758,14 +772,39 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
             <input type="text" value={agentModel} onChange={e => setAgentModel(e.target.value)} className="input" />
           </Field>
           <Field label="智能体 URL">
-            <input type="text" value={agentUrl} onChange={e => setAgentUrl(e.target.value)}
-                   placeholder="http://localhost:18094/api/agent/langgraph" className="input" />
+            <div className="relative">
+              <input type="text" value={agentUrl} onChange={e => setAgentUrl(e.target.value)}
+                     placeholder="http://localhost:18094/api/agent/langgraph" className="input pr-9" />
+              <OptionPicker
+                options={endpointOpts.options}
+                currentValue={agentUrl}
+                onPick={v => setAgentUrl(configOptionToString(v))}
+              />
+            </div>
           </Field>
           <Field label="API Key（可选）">
-            <input type="password" value={agentApiKey} onChange={e => setAgentApiKey(e.target.value)} className="input" />
+            <div className="relative">
+              <input type="password" value={agentApiKey} onChange={e => setAgentApiKey(e.target.value)} className="input pr-9" />
+              <OptionPicker
+                options={apiKeyOpts.options}
+                currentValue={agentApiKey}
+                onPick={v => setAgentApiKey(configOptionToString(v))}
+                maskValues
+              />
+            </div>
           </Field>
           <Field label="超时（秒）">
-            <input type="number" min={10} value={agentTimeout} onChange={e => setAgentTimeout(Number(e.target.value))} className="input" />
+            <div className="relative">
+              <input type="number" min={10} value={agentTimeout} onChange={e => setAgentTimeout(Number(e.target.value))} className="input pr-9" />
+              <OptionPicker
+                options={timeoutOpts.options}
+                currentValue={String(agentTimeout)}
+                onPick={v => {
+                  const n = Number(configOptionToString(v))
+                  if (!Number.isNaN(n) && n > 0) setAgentTimeout(n)
+                }}
+              />
+            </div>
           </Field>
           <Field label="并发数">
             <input type="number" min={1} max={20} value={concurrency} onChange={e => setConcurrency(Number(e.target.value))} className="input" />
@@ -785,12 +824,26 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
           <summary className="text-[11px] text-text-secondary cursor-pointer">高级：自定义 headers / payload</summary>
           <div className="grid grid-cols-2 gap-3 mt-2">
             <Field label="请求头 (JSON)">
-              <textarea value={agentHeadersText} onChange={e => setAgentHeadersText(e.target.value)}
-                        rows={3} placeholder='{"X-Custom": "value"}' className="input font-mono text-[11px]" />
+              <div className="relative">
+                <textarea value={agentHeadersText} onChange={e => setAgentHeadersText(e.target.value)}
+                          rows={3} placeholder='{"X-Custom": "value"}' className="input pr-9 font-mono text-[11px]" />
+                <OptionPicker
+                  options={headersOpts.options}
+                  currentValue={agentHeadersText}
+                  onPick={v => setAgentHeadersText(configOptionToString(v))}
+                />
+              </div>
             </Field>
             <Field label="请求体模板 (JSON, SSE 通用专用)">
-              <textarea value={agentPayloadText} onChange={e => setAgentPayloadText(e.target.value)}
-                        rows={3} placeholder='{"question": "{input}"}' className="input font-mono text-[11px]" />
+              <div className="relative">
+                <textarea value={agentPayloadText} onChange={e => setAgentPayloadText(e.target.value)}
+                          rows={3} placeholder='{"question": "{input}"}' className="input pr-9 font-mono text-[11px]" />
+                <OptionPicker
+                  options={payloadOpts.options}
+                  currentValue={agentPayloadText}
+                  onPick={v => setAgentPayloadText(configOptionToString(v))}
+                />
+              </div>
             </Field>
           </div>
         </details>
@@ -811,7 +864,9 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
             const checked = selectedEvaluatorIds.has(e.id)
             return (
               <label key={e.id}
-                     className="flex items-start gap-2 border border-border rounded-[4px] p-3 cursor-pointer">
+                     className={`flex items-start gap-2 border rounded-md p-3 cursor-pointer transition-colors ${
+                       checked ? 'border-accent bg-accent/5' : 'border-border hover:border-border-strong'
+                     }`}>
                 <input
                   type="checkbox" checked={checked}
                   onChange={() => {
@@ -819,11 +874,12 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                     if (s.has(e.id)) s.delete(e.id); else s.add(e.id)
                     setSelectedEvaluatorIds(s)
                   }}
-                  className="mt-0.5 w-3.5 h-3.5 accent-accent"
+                  className="mt-0.5 accent-accent"
                 />
                 <div className="flex-1">
-                  <div className="font-medium text-[12px]">{e.name}
-                    <span className="ml-2 text-[10px] font-mono text-blue-700 bg-blue-50 px-1 py-0.5 rounded border border-blue-200" title="写到 Langfuse trace 的 tag">
+                  <div className="font-medium text-[12px] flex items-center gap-2">
+                    {e.name}
+                    <span className="badge badge-accent font-mono" title="写到 Langfuse trace 的 tag">
                       {e.tag || e.name}
                     </span>
                   </div>
@@ -844,19 +900,21 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       </Section>
 
       {/* Start */}
-      <div className="flex items-center gap-3 pt-2 border-t border-border">
-        <button
+      <div className="flex items-center gap-3 pt-3 border-t border-separator">
+        <Button
+          variant="primary"
+          size="lg"
           disabled={!canStart}
+          loading={startMutation.isPending}
           onClick={handleStart}
           title={
             startBlockers.length > 0
               ? `还差：${startBlockers.map((b, i) => `${i + 1}) ${b}`).join('  ')}`
               : '启动评估'
           }
-          className="inline-flex items-center gap-1.5 py-2.5 px-5 text-[12px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 active:scale-[0.97] disabled:opacity-40 transition-all"
         >
-          {startMutation.isPending ? '启动中…' : '启动评估'}
-        </button>
+          启动评估
+        </Button>
         {startBlockers.length > 0 && !startMutation.isPending && (
           <span className="text-[11px] text-text-tertiary">
             还差：{startBlockers.map((b, i) => (
@@ -882,8 +940,8 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="border border-border rounded-[6px] bg-surface p-4">
-      <h3 className="text-[12px] font-medium mb-3 tracking-tight">{title}</h3>
+    <section className="card p-4">
+      <h3 className="text-subhead font-semibold mb-3 text-text-primary">{title}</h3>
       {children}
     </section>
   )
@@ -891,10 +949,175 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <label className="flex flex-col gap-1">
-      <span className="text-[10px] tracking-widest uppercase text-text-tertiary">{label}</span>
+    <label className="flex flex-col gap-0">
+      <span className="field-label">{label}</span>
       {children}
     </label>
+  )
+}
+
+// Dropdown trigger that lists pre-configured options for a config key.
+// Renders an absolutely-positioned chevron button — its parent must be
+// `relative`, and the sibling input should reserve space with `pr-9`.
+// Returns null when no options exist so unconfigured keys stay invisible.
+//
+// Fluent-Design notes: chevron rotates on open (motion), the popover floats
+// with layered shadow + faint border (depth), the focused row has a 2px
+// accent leading bar (light/selection), and ↑↓ Enter Esc work for keyboard
+// users.
+function OptionPicker({ options, currentValue, onPick, maskValues }: {
+  options: ConfigOption[]
+  currentValue: string
+  onPick: (value: unknown) => void
+  maskValues?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [focusIdx, setFocusIdx] = useState<number>(-1)
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const reactId = useId()
+  const listboxId = `optionpicker-list-${reactId}`
+  const optionId = (i: number) => `${listboxId}-opt-${i}`
+
+  // When opening, focus the currently-selected option (or first).
+  useEffect(() => {
+    if (!open) { setFocusIdx(-1); return }
+    const sel = options.findIndex(o => configOptionToString(o.value) === currentValue)
+    setFocusIdx(sel >= 0 ? sel : 0)
+  }, [open, options, currentValue])
+
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setOpen(false); return }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setFocusIdx(i => (i + 1) % options.length)
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setFocusIdx(i => (i <= 0 ? options.length - 1 : i - 1))
+      } else if (e.key === 'Enter') {
+        e.preventDefault()
+        const opt = options[focusIdx]
+        if (opt) { onPick(opt.value); setOpen(false) }
+      } else if (e.key === 'Home') {
+        e.preventDefault(); setFocusIdx(0)
+      } else if (e.key === 'End') {
+        e.preventDefault(); setFocusIdx(options.length - 1)
+      }
+    }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open, options, focusIdx, onPick])
+
+  // Keep the focused row in view.
+  useEffect(() => {
+    if (!open || focusIdx < 0) return
+    const node = listRef.current?.querySelector<HTMLButtonElement>(`[data-idx="${focusIdx}"]`)
+    node?.scrollIntoView({ block: 'nearest' })
+  }, [open, focusIdx])
+
+  if (!options || options.length === 0) return null
+
+  const display = (v: unknown) => {
+    const s = configOptionToString(v)
+    if (maskValues && s) return s.length <= 6 ? '••••' : `••••${s.slice(-4)}`
+    return s.length > 60 ? s.slice(0, 60) + '…' : s
+  }
+
+  return (
+    <div ref={wrapRef} className="absolute right-1 top-1.5">
+      <button
+        type="button"
+        tabIndex={-1}
+        onClick={() => setOpen(o => !o)}
+        aria-label="选择预设值"
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        aria-controls={open ? listboxId : undefined}
+        title="选择预设值"
+        className={`inline-flex items-center justify-center w-6 h-6 rounded-md border transition-[color,background-color,border-color,box-shadow] duration-150 ease-standard ${
+          open
+            ? 'border-accent text-accent bg-accent/10 shadow-sm'
+            : 'border-transparent text-text-tertiary hover:border-border hover:bg-fill/10 hover:text-text-primary'
+        }`}
+      >
+        <svg
+          viewBox="0 0 12 12"
+          width="10"
+          height="10"
+          aria-hidden="true"
+          className={`transition-transform duration-200 ease-standard ${open ? 'rotate-180' : ''}`}
+        >
+          <path d="M2.5 4.5l3.5 3.5 3.5-3.5" stroke="currentColor" strokeWidth="1.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open && (
+        <div
+          id={listboxId}
+          role="listbox"
+          aria-label="预设值"
+          aria-activedescendant={focusIdx >= 0 ? optionId(focusIdx) : undefined}
+          className="absolute right-0 top-[calc(100%+4px)] z-20 min-w-[260px] max-w-[380px] bg-bg-elevated border border-border rounded-lg shadow-lg overflow-hidden animate-popover-in origin-top-right"
+        >
+          <div className="px-3 py-1.5 flex items-center justify-between border-b border-separator bg-fill/5">
+            <span className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary font-medium">预设值</span>
+            <span className="text-[10px] text-text-tertiary tabular-nums">{options.length}</span>
+          </div>
+          <div ref={listRef} className="max-h-64 overflow-auto py-1">
+            {options.map((opt, i) => {
+              const valueStr = configOptionToString(opt.value)
+              const active = valueStr === currentValue
+              const focused = i === focusIdx
+              return (
+                <button
+                  key={i}
+                  id={optionId(i)}
+                  type="button"
+                  data-idx={i}
+                  role="option"
+                  aria-selected={active}
+                  onMouseEnter={() => setFocusIdx(i)}
+                  onClick={() => { onPick(opt.value); setOpen(false) }}
+                  title={maskValues ? opt.label || `选项 #${i}` : valueStr}
+                  className={`relative w-full text-left pl-6 pr-3 py-1.5 text-[11px] flex flex-col gap-0.5 transition-colors duration-150 ease-standard ${
+                    focused ? 'bg-fill/10' : ''
+                  } ${active ? 'text-text-primary' : 'text-text-secondary'}`}
+                >
+                  {active && (
+                    <span className="absolute left-1 top-1 bottom-1 w-[2px] rounded-full bg-accent" aria-hidden="true" />
+                  )}
+                  {active && (
+                    <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true" className="absolute left-3 top-1/2 -translate-y-1/2 text-accent">
+                      <path d="M2.5 6.2l2.4 2.4L9.5 3.6" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  )}
+                  <span className="truncate font-medium">{opt.label ? opt.label : display(opt.value)}</span>
+                  {opt.label && (
+                    <span className="text-text-tertiary text-[10px] truncate font-mono">{display(opt.value)}</span>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+          <div className="px-3 py-1 border-t border-separator bg-fill/5 text-[10px] text-text-tertiary flex items-center gap-2">
+            <kbd className="font-mono px-1 py-px rounded border border-border bg-surface">↑↓</kbd>
+            <span>导航</span>
+            <kbd className="font-mono px-1 py-px rounded border border-border bg-surface">Enter</kbd>
+            <span>选择</span>
+            <kbd className="font-mono px-1 py-px rounded border border-border bg-surface">Esc</kbd>
+            <span>关闭</span>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
 
