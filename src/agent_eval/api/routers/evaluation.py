@@ -13,12 +13,17 @@ from agent_eval.api.dependencies import get_extractor
 from agent_eval.api.schemas import (
     BuiltinEvaluator,
     CreateEvaluatorRequest,
+    CreateEvaluatorVersionRequest,
+    DryRunRequest,
+    DryRunResponse,
+    DryRunScoreItem,
     EvalCaseSourceSummary,
     EvalRunDetail,
     EvalRunSummary,
     EvalResultRow,
     EvalResultsPage,
     EvaluatorInstance,
+    EvaluatorVersion,
     RunDetailResponse,
     StartEvalRequest,
     UpdateEvaluatorRequest,
@@ -148,6 +153,12 @@ async def start_eval(req: StartEvalRequest):
                 "tag": row.tag or row.name,
                 "evaluator_type": row.evaluator_type,
                 "params": row.params or {},
+                # Pin to the active version so historical reproductions don't
+                # silently follow future edits. Stored verbatim into
+                # test_runs.evaluator_configs[].evaluator_version_id.
+                "evaluator_version_id": (
+                    str(row.current_version_id) if row.current_version_id else None
+                ),
             })
 
     agent_cfg = req.agent.model_dump()
@@ -593,6 +604,7 @@ def _row_to_instance(row) -> EvaluatorInstance:
         description=row.description,
         params=row.params or {},
         is_active=row.is_active,
+        current_version_id=str(row.current_version_id) if row.current_version_id else None,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -621,6 +633,17 @@ async def create_evaluator_instance(req: CreateEvaluatorRequest):
                 description=req.description, params=req.params,
                 is_active=req.is_active,
             )
+            # For versioned evaluators (configurable_judge), seed v1 so the
+            # editor's "versions" tab has something to show on day one and so
+            # runs can pin to a stable evaluator_version_id from the start.
+            if req.evaluator_type == "configurable_judge" and req.params:
+                version = await repo.create_evaluator_version(
+                    evaluator_id=row.id,
+                    params=req.params,
+                    description="initial version",
+                )
+                row.current_version_id = version.id
+                await session.flush()
             await session.commit()
         except Exception as e:
             await session.rollback()
@@ -636,6 +659,21 @@ async def update_evaluator_instance(evaluator_id: str, req: UpdateEvaluatorReque
         row = await repo.update_evaluator_config(uuid.UUID(evaluator_id), **updates)
         if row is None:
             raise HTTPException(status_code=404, detail="evaluator not found")
+        # If the editor pushed a new params payload onto a configurable_judge
+        # evaluator, append it as a new version and route future runs to it.
+        # Tag/name/active changes don't bump a version — those are display-only.
+        new_params = updates.get("params")
+        if (
+            row.evaluator_type == "configurable_judge"
+            and isinstance(new_params, dict)
+            and new_params
+        ):
+            version = await repo.create_evaluator_version(
+                evaluator_id=row.id,
+                params=new_params,
+            )
+            row.current_version_id = version.id
+            await session.flush()
         await session.commit()
     return _row_to_instance(row)
 
@@ -649,6 +687,161 @@ async def delete_evaluator_instance(evaluator_id: str):
             raise HTTPException(status_code=404, detail="evaluator not found")
         await session.commit()
     return {"id": evaluator_id, "deleted": True}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Configurable judge dry-run (PR-B)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@router.post("/evaluators/{evaluator_id}/dry-run", response_model=DryRunResponse)
+async def dry_run_evaluator(evaluator_id: str, req: DryRunRequest):
+    """Score one (input, output, expected) tuple using the params being
+    drafted in the editor — without saving a new version.
+
+    The body wins over the saved row: ``params`` from the request becomes
+    the judge config, and ``provider_id`` (when given) overrides whatever
+    is in ``params['provider_id']``. This lets the user try an unsaved
+    prompt against a different provider in one click.
+    """
+    from agent_eval.evaluation.configurable_judge import run_configurable_judge
+
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        evaluator_row = await repo.get_evaluator_config(uuid.UUID(evaluator_id))
+        if evaluator_row is None:
+            raise HTTPException(status_code=404, detail="evaluator not found")
+
+        params = dict(req.params or evaluator_row.params or {})
+        provider_id = req.provider_id or params.get("provider_id")
+        if not provider_id:
+            raise HTTPException(
+                status_code=400,
+                detail="provider_id is required (in body or params['provider_id'])",
+            )
+        try:
+            provider_uuid = uuid.UUID(provider_id)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid provider_id: {e}") from e
+
+        provider_row = await repo.get_evaluator_provider(provider_uuid)
+        if provider_row is None:
+            raise HTTPException(status_code=404, detail="provider not found")
+
+    result = await run_configurable_judge(
+        params=params,
+        provider=provider_row,
+        input_text=req.input,
+        output_text=req.output,
+        expected_output=req.expected_output,
+        metadata=req.metadata,
+        evaluator_name=evaluator_row.name or "score",
+    )
+    return DryRunResponse(
+        scores=[
+            DryRunScoreItem(
+                name=s.name,
+                value=s.value,
+                reason=s.reason,
+                raw_value=s.raw_value,
+            )
+            for s in result.scores
+        ],
+        model=result.model,
+        usage={
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+            "total_tokens": result.usage.total_tokens,
+        },
+        raw_content=result.raw_content,
+        rendered_messages=result.rendered_messages,
+        error=result.error,
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Evaluator versions (PR-C)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _row_to_version(row) -> EvaluatorVersion:
+    return EvaluatorVersion(
+        id=str(row.id),
+        evaluator_id=str(row.evaluator_id),
+        version_number=row.version_number,
+        params=row.params or {},
+        description=row.description,
+        created_by=str(row.created_by) if row.created_by else None,
+        created_at=row.created_at,
+    )
+
+
+@router.get("/evaluators/{evaluator_id}/versions", response_model=list[EvaluatorVersion])
+async def list_evaluator_versions(evaluator_id: str):
+    """Versions newest-first. Caller cross-references against the
+    evaluator's ``current_version_id`` to render the active row."""
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        evaluator_row = await repo.get_evaluator_config(uuid.UUID(evaluator_id))
+        if evaluator_row is None:
+            raise HTTPException(status_code=404, detail="evaluator not found")
+        rows = await repo.list_evaluator_versions(uuid.UUID(evaluator_id))
+    return [_row_to_version(r) for r in rows]
+
+
+@router.post("/evaluators/{evaluator_id}/versions", response_model=EvaluatorVersion)
+async def create_evaluator_version(
+    evaluator_id: str, req: CreateEvaluatorVersionRequest,
+):
+    """Append a new version snapshot. With ``activate=true`` (default) also
+    routes future invocations to it. The PUT /evaluators/{id} flow already
+    auto-bumps versions when ``params`` change, so this endpoint is for
+    explicit "save as new version without changing other fields" workflows."""
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        evaluator_row = await repo.get_evaluator_config(uuid.UUID(evaluator_id))
+        if evaluator_row is None:
+            raise HTTPException(status_code=404, detail="evaluator not found")
+        try:
+            version = await repo.create_evaluator_version(
+                evaluator_id=uuid.UUID(evaluator_id),
+                params=req.params,
+                description=req.description,
+            )
+            if req.activate:
+                await repo.set_current_evaluator_version(
+                    uuid.UUID(evaluator_id), version.id,
+                )
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=f"创建版本失败：{e}") from e
+    return _row_to_version(version)
+
+
+@router.post(
+    "/evaluators/{evaluator_id}/versions/{version_id}/activate",
+    response_model=EvaluatorInstance,
+)
+async def activate_evaluator_version(evaluator_id: str, version_id: str):
+    """Make ``version_id`` the active version, copying its params back onto
+    the evaluator row. Returns the updated evaluator so the editor can
+    refresh its form state in one round-trip."""
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        try:
+            row = await repo.set_current_evaluator_version(
+                uuid.UUID(evaluator_id), uuid.UUID(version_id),
+            )
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid id: {e}") from e
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="evaluator or version not found, or version belongs to another evaluator",
+            )
+        await session.commit()
+    return _row_to_instance(row)
 
 
 # ───────────────────────────────────────────────────────────────────────────

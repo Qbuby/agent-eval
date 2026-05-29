@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -510,5 +511,74 @@ class EvaluatorConfigRow(Base):
     description: Mapped[str | None] = mapped_column(Text)
     params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Pointer to the most recently published EvaluatorVersionRow. Nullable for
+    # legacy rows (pre-versioning) and for evaluators that haven't been saved
+    # through the versioned editor yet.
+    current_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("evaluator_versions.id", ondelete="SET NULL"),
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class EvaluatorVersionRow(Base):
+    """Append-only snapshot of an evaluator's config at a point in time.
+
+    Each save through the configurable-judge editor writes a new row;
+    ``version_number`` is a per-evaluator monotonic counter starting at 1.
+    Runs pin to a specific version via
+    ``test_runs.evaluator_configs[].evaluator_version_id`` so historical
+    results reproduce against the exact prompt/model used at the time.
+    """
+    __tablename__ = "evaluator_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "evaluator_id", "version_number",
+            name="uq_evaluator_versions_evaluator_id_version_number",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    evaluator_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("evaluator_configs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class EvaluatorProviderRow(Base):
+    """LLM-judge provider credential record.
+
+    A row represents one usable LLM endpoint (OpenAI / Anthropic / DeepSeek /
+    Azure / OpenAI-compatible) the user wants their configurable evaluators to
+    call. ``api_key_encrypted`` holds a fernet-encrypted key blob; plaintext
+    never touches DB or API responses (see ``evaluation.crypto``).
+
+    Evaluators reference a provider via ``evaluator_configs.params['provider_id']``
+    as a UUID string — kept loosely coupled (no FK) so deleting a provider
+    leaves historical evaluators in an "unconfigured" state instead of cascading.
+    """
+    __tablename__ = "evaluator_providers"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(Text)
+    api_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
+    default_model: Mapped[str | None] = mapped_column(String(128))
+    extra_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

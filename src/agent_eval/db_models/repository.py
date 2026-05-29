@@ -12,6 +12,8 @@ from agent_eval.db_models.tables import (
     EvalCaseSourceRow,
     EvaluationScoreRow,
     EvaluatorConfigRow,
+    EvaluatorProviderRow,
+    EvaluatorVersionRow,
     LoopControlLogRow,
     OptimizationRow,
     RoutingLogRow,
@@ -468,6 +470,147 @@ class Repository:
 
     async def delete_evaluator_config(self, eid: uuid.UUID) -> bool:
         row = await self.get_evaluator_config(eid)
+        if row is None:
+            return False
+        await self.session.delete(row)
+        await self.session.flush()
+        return True
+
+    # ---- Evaluator versions (append-only snapshots) ----
+
+    async def create_evaluator_version(
+        self,
+        *,
+        evaluator_id: uuid.UUID,
+        params: dict,
+        description: str | None = None,
+        created_by: uuid.UUID | None = None,
+    ) -> EvaluatorVersionRow:
+        """Append a new version row, monotonic version_number per evaluator.
+
+        Race-tolerant: counts existing rows under FLUSH so concurrent saves
+        will collide on the unique (evaluator_id, version_number) constraint
+        and the loser raises IntegrityError — caller commits in its own
+        transaction so the rollback is cheap. Real high-contention clients
+        should retry once.
+        """
+        existing = (await self.session.execute(
+            select(EvaluatorVersionRow.version_number)
+            .where(EvaluatorVersionRow.evaluator_id == evaluator_id)
+            .order_by(EvaluatorVersionRow.version_number.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        next_n = (existing or 0) + 1
+        row = EvaluatorVersionRow(
+            evaluator_id=evaluator_id,
+            version_number=next_n,
+            params=params or {},
+            description=description,
+            created_by=created_by,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_evaluator_version(
+        self, vid: uuid.UUID,
+    ) -> EvaluatorVersionRow | None:
+        return (await self.session.execute(
+            select(EvaluatorVersionRow).where(EvaluatorVersionRow.id == vid)
+        )).scalar_one_or_none()
+
+    async def list_evaluator_versions(
+        self, evaluator_id: uuid.UUID,
+    ) -> list[EvaluatorVersionRow]:
+        rows = (await self.session.execute(
+            select(EvaluatorVersionRow)
+            .where(EvaluatorVersionRow.evaluator_id == evaluator_id)
+            .order_by(EvaluatorVersionRow.version_number.desc())
+        )).scalars().all()
+        return list(rows)
+
+    async def set_current_evaluator_version(
+        self, evaluator_id: uuid.UUID, version_id: uuid.UUID,
+    ) -> EvaluatorConfigRow | None:
+        """Point ``evaluator_configs.current_version_id`` at ``version_id``,
+        and copy the version's params back onto the config row.
+
+        Copying params keeps the "live" view (used by editor / list endpoints)
+        cheap — no JOIN needed. If the FK is broken (version belongs to a
+        different evaluator), returns None.
+        """
+        version = await self.get_evaluator_version(version_id)
+        if version is None or version.evaluator_id != evaluator_id:
+            return None
+        config = await self.get_evaluator_config(evaluator_id)
+        if config is None:
+            return None
+        config.current_version_id = version.id
+        config.params = dict(version.params or {})
+        config.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return config
+
+    # ---- Evaluator providers (LLM-judge credentials) ----
+
+    async def create_evaluator_provider(
+        self,
+        *,
+        name: str,
+        provider_type: str,
+        base_url: str | None = None,
+        api_key_encrypted: bytes | None = None,
+        default_model: str | None = None,
+        extra_config: dict | None = None,
+        is_active: bool = True,
+        created_by: uuid.UUID | None = None,
+    ) -> EvaluatorProviderRow:
+        row = EvaluatorProviderRow(
+            name=name,
+            provider_type=provider_type,
+            base_url=base_url,
+            api_key_encrypted=api_key_encrypted,
+            default_model=default_model,
+            extra_config=extra_config or {},
+            is_active=is_active,
+            created_by=created_by,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_evaluator_provider(
+        self, pid: uuid.UUID,
+    ) -> EvaluatorProviderRow | None:
+        return (await self.session.execute(
+            select(EvaluatorProviderRow).where(EvaluatorProviderRow.id == pid)
+        )).scalar_one_or_none()
+
+    async def list_evaluator_providers(
+        self, *, active_only: bool = False,
+    ) -> list[EvaluatorProviderRow]:
+        stmt = select(EvaluatorProviderRow).order_by(
+            EvaluatorProviderRow.created_at.desc()
+        )
+        if active_only:
+            stmt = stmt.where(EvaluatorProviderRow.is_active.is_(True))
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def update_evaluator_provider(
+        self, pid: uuid.UUID, **updates: Any,
+    ) -> EvaluatorProviderRow | None:
+        row = await self.get_evaluator_provider(pid)
+        if row is None:
+            return None
+        for k, v in updates.items():
+            if hasattr(row, k) and k != "id":
+                setattr(row, k, v)
+        row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    async def delete_evaluator_provider(self, pid: uuid.UUID) -> bool:
+        row = await self.get_evaluator_provider(pid)
         if row is None:
             return False
         await self.session.delete(row)

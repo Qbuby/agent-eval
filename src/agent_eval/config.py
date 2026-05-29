@@ -81,6 +81,20 @@ class AuthSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AUTH_", env_file=_ENV_FILE, extra="ignore")
 
 
+class SecuritySettings(BaseSettings):
+    """Crypto material that is *not* tied to user-session JWTs.
+
+    ``fernet_key`` encrypts at-rest secrets such as evaluator-provider API
+    keys. Generate with ``python -c "from cryptography.fernet import Fernet;
+    print(Fernet.generate_key().decode())"`` and store in ``.env``. Rotating
+    this key invalidates all stored ciphertexts (re-enter API keys after
+    rotation); see ``crypto.encrypt_secret`` for the migration helper.
+    """
+    fernet_key: str = ""
+
+    model_config = SettingsConfigDict(env_prefix="SECURITY_", env_file=_ENV_FILE, extra="ignore")
+
+
 class RoutingSettings(BaseSettings):
     enabled: bool = True
     max_retries: int = 3
@@ -118,6 +132,7 @@ class Settings(BaseSettings):
     langsmith: LangSmithSettings = LangSmithSettings()
     langfuse: LangfuseSettings = LangfuseSettings()
     auth: AuthSettings = AuthSettings()
+    security: SecuritySettings = SecuritySettings()
     routing: RoutingSettings = RoutingSettings()
     governance: GovernanceSettings = GovernanceSettings()
     logging: LoggingSettings = LoggingSettings()

@@ -294,8 +294,35 @@ class EvaluatorInstance(BaseModel):
     description: str | None = None
     params: dict[str, Any] = {}
     is_active: bool = True
+    # Pointer to the active version row (None for legacy / unversioned
+    # evaluators). The frontend uses it to highlight the active row in
+    # the versions tab.
+    current_version_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class EvaluatorVersion(BaseModel):
+    """One snapshot of an evaluator's params at a point in time."""
+    id: str
+    evaluator_id: str
+    version_number: int
+    params: dict[str, Any] = {}
+    description: str | None = None
+    created_by: str | None = None
+    created_at: datetime | None = None
+
+
+class CreateEvaluatorVersionRequest(BaseModel):
+    """Body for `POST /evaluators/{id}/versions` — appends a new snapshot.
+
+    ``activate`` defaults to True so the common "Save" path immediately
+    routes future invocations to this version. Set False for "Save as
+    draft" workflows that the UI may add later.
+    """
+    params: dict[str, Any] = {}
+    description: str | None = None
+    activate: bool = True
 
 
 class CreateEvaluatorRequest(BaseModel):
@@ -313,6 +340,114 @@ class UpdateEvaluatorRequest(BaseModel):
     description: str | None = None
     params: dict[str, Any] | None = None
     is_active: bool | None = None
+
+
+# ─── Evaluator providers (LLM-judge credentials) ───
+
+# Provider types we know how to call. Stored as a free string in DB so
+# new types can be added without a migration; the API validates the
+# enum on create/update.
+ALLOWED_PROVIDER_TYPES = (
+    "openai",
+    "openai_compatible",
+    "anthropic",
+    "deepseek",
+    "azure",
+    "custom",
+)
+
+
+class EvaluatorProviderResponse(BaseModel):
+    id: str
+    name: str
+    provider_type: str
+    base_url: str | None = None
+    default_model: str | None = None
+    extra_config: dict[str, Any] = {}
+    is_active: bool
+    has_api_key: bool = False
+    api_key_masked: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class CreateEvaluatorProviderRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    provider_type: str = Field(min_length=1, max_length=32)
+    base_url: str | None = Field(default=None, max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    default_model: str | None = Field(default=None, max_length=128)
+    extra_config: dict[str, Any] = {}
+    is_active: bool = True
+
+
+class UpdateEvaluatorProviderRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    provider_type: str | None = Field(default=None, min_length=1, max_length=32)
+    base_url: str | None = Field(default=None, max_length=500)
+    # api_key semantics:
+    #   omitted (field unset)  -> keep existing ciphertext
+    #   ""                     -> clear the stored key
+    #   "<value>"              -> re-encrypt and replace
+    api_key: str | None = Field(default=None, max_length=500)
+    default_model: str | None = Field(default=None, max_length=128)
+    extra_config: dict[str, Any] | None = None
+    is_active: bool | None = None
+
+
+class TestProviderResponse(BaseModel):
+    ok: bool
+    latency_ms: int | None = None
+    detail: str = ""
+    # When ok=true and the provider exposed a /models listing, surface a
+    # trimmed sample so the editor UI can offer a model dropdown without
+    # a second round-trip.
+    models: list[str] = []
+
+
+class ProviderModelsResponse(BaseModel):
+    """Models listing for the editor's model dropdown."""
+    ok: bool
+    models: list[str] = []
+    detail: str = ""
+
+
+# ─── Configurable judge dry-run ───
+#
+# The editor drawer (PR-B) lets the user click "Try" on a sample
+# (input, output, expected) and see exactly what the configured judge
+# returns *before* saving the evaluator. ``params`` is the evaluator
+# config under construction; ``provider_id`` lets the user override
+# the saved provider for a one-off test (e.g. trying gpt-4o vs claude
+# without committing the change).
+
+class DryRunRequest(BaseModel):
+    provider_id: str | None = None
+    params: dict[str, Any] = {}
+    input: str = ""
+    output: str = ""
+    expected_output: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class DryRunScoreItem(BaseModel):
+    name: str
+    value: float
+    reason: str = ""
+    # raw_value 保留模型原始输出（数值/布尔/类别名），UI 在归一分旁边
+    # 展示原始值，便于核对；可能是 number / bool / string，故用 Any。
+    raw_value: Any = None
+
+
+class DryRunResponse(BaseModel):
+    # 单分数范式：``scores`` 至多一个元素，UI 直接展示首项即可。
+    # 旧的 ``aggregate`` 字段（多维度加权平均）已不复存在。
+    scores: list[DryRunScoreItem] = []
+    model: str = ""
+    usage: dict[str, int] = {}
+    raw_content: str = ""
+    rendered_messages: list[dict[str, str]] = []
+    error: str | None = None
 
 
 # ─── Uploaded case sources ───

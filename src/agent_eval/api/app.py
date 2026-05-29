@@ -8,8 +8,8 @@ from fastapi.responses import JSONResponse
 
 from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
-    admin, auth, benchmark, candidates, cases, config, datasets, evaluation, generate,
-    governance, projects, routing, scheduler, traces,
+    admin, auth, benchmark, candidates, cases, config, datasets, evaluation,
+    evaluator_providers, generate, governance, projects, routing, scheduler, traces,
 )
 from agent_eval.config import settings
 from agent_eval.logging_config import setup_logging
@@ -107,6 +107,7 @@ def create_app() -> FastAPI:
     app.include_router(routing.router)
     app.include_router(scheduler.router)
     app.include_router(evaluation.router)
+    app.include_router(evaluator_providers.router)
     app.include_router(admin.router)
 
     @app.get("/health")

@@ -30,7 +30,6 @@ from langfuse import Langfuse  # kept for optional remote write; unused otherwis
 from sqlalchemy import select
 
 from agent_eval.config import settings
-from agent_eval.data._utils import truncate
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import BenchmarkCaseRow
@@ -39,10 +38,7 @@ from agent_eval.evaluation.agent_adapter import (
     OpenAICompatibleAdapter,
     SSEStreamAdapter,
 )
-from agent_eval.evaluation.scorers.llm_judge import (
-    JudgeDimension,
-    LLMJudgeScorer,
-)
+from agent_eval.evaluation.configurable_judge import run_configurable_judge
 
 logger = logging.getLogger(__name__)
 
@@ -98,48 +94,6 @@ def _evaluator_tool_sequence(
     )])
 
 
-async def _evaluator_llm_judge(
-    *, input: str, output: str, expected_output: str | None,
-    params: dict, llm_client: Any, **_,
-) -> EvaluatorResult:
-    """Run LLMJudgeScorer; emit one score per dimension on a 0..1 scale."""
-    if llm_client is None:
-        return EvaluatorResult([("llm_judge_error", 0.0, "no llm client configured")])
-    dim_cfgs = params.get("dimensions") or [
-        {"name": "accuracy", "weight": 0.4, "description": "答案是否准确、事实正确"},
-        {"name": "completeness", "weight": 0.3, "description": "答案是否完整"},
-        {"name": "relevance", "weight": 0.3, "description": "答案是否切题"},
-    ]
-    judge = LLMJudgeScorer(
-        llm=llm_client,
-        dimensions=[
-            JudgeDimension(name=d["name"], weight=d.get("weight", 1.0),
-                          description=d.get("description", ""))
-            for d in dim_cfgs
-        ],
-        system_prompt=params.get("system_prompt"),
-        user_template=params.get("user_template"),
-    )
-    question = input
-    if expected_output:
-        question = f"{input}\n\n[期望答案] {expected_output}"
-    result = await judge.score(question, output)
-    # Emit each dimension score normalised to 0..1 (LLMJudge is 1-10 scale)
-    out: list[tuple[str, float, str]] = []
-    for dim in result.dimensions:
-        out.append((
-            f"llm_judge.{dim.dimension}",
-            round(dim.score / 10.0, 3),
-            dim.reason or "",
-        ))
-    out.append((
-        "llm_judge.aggregate",
-        round(result.aggregate_score / 10.0, 3),
-        truncate(result.raw_response, 200),
-    ))
-    return EvaluatorResult(out)
-
-
 BUILTIN_EVALUATORS = {
     "exact_match": {
         "fn": _evaluator_exact_match, "is_async": False,
@@ -150,15 +104,6 @@ BUILTIN_EVALUATORS = {
         "fn": _evaluator_tool_sequence, "is_async": False,
         "description": "对比 actual_tool_calls 与 expected_tool_calls 的工具名前缀匹配率。",
         "params_schema": {},
-    },
-    "llm_judge": {
-        "fn": _evaluator_llm_judge, "is_async": True,
-        "description": "用 LLM 当裁判按维度打分。可自定义 prompt 与 dimensions。",
-        "params_schema": {
-            "dimensions": {"type": "array", "default": []},
-            "system_prompt": {"type": "string"},
-            "user_template": {"type": "string"},
-        },
     },
 }
 
@@ -283,23 +228,43 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
     raise ValueError(f"unknown agent type: {t!r}")
 
 
-def _make_judge_llm() -> Any | None:
-    """Build a ChatOpenAI client for llm_judge using settings.llm."""
-    if not settings.llm.api_key:
-        return None
-    try:
-        from langchain_openai import ChatOpenAI
-        kwargs = {
-            "model": settings.llm.judge_model or settings.llm.model,
-            "api_key": settings.llm.api_key,
-            "temperature": 0.0,
-        }
-        if settings.llm.base_url:
-            kwargs["base_url"] = settings.llm.base_url
-        return ChatOpenAI(**kwargs)
-    except Exception as e:
-        logger.warning("could not build judge LLM: %s", e)
-        return None
+async def _resolve_judge_providers(specs: list[dict[str, Any]]) -> None:
+    """Mutate ``specs`` in place: for any ``configurable_judge`` evaluator
+    whose params reference a provider_id, fetch the EvaluatorProviderRow
+    once and stash it under ``_provider``. Subsequent per-case scoring then
+    reuses the row instead of round-tripping the DB on every sample.
+
+    Resolution failures are logged but non-fatal — the case-level loop
+    will detect ``_provider is None`` and skip the dimension instead of
+    crashing the whole run.
+    """
+    needed: dict[str, list[dict[str, Any]]] = {}
+    for spec in specs:
+        if spec.get("evaluator_type") != "configurable_judge":
+            continue
+        pid = (spec.get("params") or {}).get("provider_id")
+        if not pid:
+            continue
+        needed.setdefault(pid, []).append(spec)
+
+    if not needed:
+        return
+
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        for pid, specs_for_pid in needed.items():
+            try:
+                row = await repo.get_evaluator_provider(uuid.UUID(pid))
+            except (TypeError, ValueError):
+                row = None
+            if row is None:
+                logger.warning(
+                    "configurable_judge: provider %s not found — affected evaluators "
+                    "(%s) will be skipped at score time",
+                    pid, ", ".join(s.get("label", "?") for s in specs_for_pid),
+                )
+            for s in specs_for_pid:
+                s["_provider"] = row
 
 
 def _langfuse_client() -> Langfuse:
@@ -558,7 +523,6 @@ async def _run_one_case(
     case: dict[str, Any],
     agent_cfg: dict,
     evaluator_specs: list[dict[str, Any]],
-    judge_llm: Any,
     cancel_event: asyncio.Event | None = None,
     retry_policy: _RetryPolicy | None = None,
 ) -> dict[str, Any]:
@@ -655,26 +619,65 @@ async def _run_one_case(
     if not error_msg:
         for spec in evaluator_specs:
             etype = spec.get("evaluator_type")
+            label = spec.get("label") or etype or "evaluator"
             # In tag-only mode (post-2026-05-19) evaluators don't define a
             # local scoring function — they're just template tags forwarded
             # to Langfuse. Skip the local-scoring loop for them; their
             # contribution shows up later via the Langfuse pull-back.
             if not etype:
                 continue
+            # Configurable LLM judge — params (provider/model/prompt/dims)
+            # are saved on the evaluator row; provider was pre-resolved into
+            # spec['_provider'] by _execute_run.
+            if etype == "configurable_judge":
+                provider_row = spec.get("_provider")
+                if provider_row is None:
+                    logger.warning(
+                        "configurable_judge[%s]: skipped (no provider resolved) on case %s",
+                        label, case.get("id"),
+                    )
+                    continue
+                try:
+                    judge_result = await run_configurable_judge(
+                        params=spec.get("params") or {},
+                        provider=provider_row,
+                        input_text=question,
+                        output_text=output_text,
+                        expected_output=expected,
+                        metadata=case.get("metadata"),
+                        evaluator_name=label,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "configurable_judge[%s] crashed on case %s: %s",
+                        label, case.get("id"), e,
+                    )
+                    continue
+                if judge_result.error and not judge_result.scores:
+                    logger.warning(
+                        "configurable_judge[%s] error on case %s: %s",
+                        label, case.get("id"), judge_result.error,
+                    )
+                    continue
+                # Single-score paradigm: configurable_judge produces at most
+                # one JudgeScore per evaluator; we use evaluator label as the
+                # score key so multiple instances don't collide.
+                for s in judge_result.scores:
+                    scores[label] = float(s.value)
+                continue
+
             ev_def = BUILTIN_EVALUATORS.get(etype)
             if ev_def is None:
                 # Unknown legacy type — silently skip so old runs don't
                 # crash the pipeline.
                 continue
             fn = ev_def["fn"]
-            label = spec.get("label") or etype
             kwargs = {
                 "input": question, "output": output_text,
                 "expected_output": expected,
                 "expected_tool_calls": expected_tool_calls,
                 "actual_tool_calls": actual_tool_calls,
                 "params": spec.get("params") or {},
-                "llm_client": judge_llm,
             }
             try:
                 result = await fn(**kwargs) if ev_def["is_async"] else fn(**kwargs)
@@ -740,13 +743,17 @@ async def _execute_run(
     persists results. After all cases settle, optionally kicks off the
     LangSmith backfill (non-blocking)."""
     handle.progress["total"] = len(cases)
-    judge_llm = _make_judge_llm()
     retry_policy = await _resolve_retry_policy(agent_cfg)
     logger.info(
         "eval run %s retry policy: max_retries=%d initial=%.1fs factor=%.1f cap=%.1fs",
         run_id, retry_policy.max_retries, retry_policy.initial_backoff_s,
         retry_policy.backoff_factor, retry_policy.max_backoff_s,
     )
+
+    # Pre-resolve EvaluatorProviderRow for any configurable_judge specs so
+    # _run_one_case doesn't hit the DB per case. Each spec gets a `_provider`
+    # field — runtime cache only, never persisted.
+    await _resolve_judge_providers(evaluator_specs)
 
     sem = asyncio.Semaphore(max(1, concurrency))
     per_case_results: list[dict[str, Any]] = []
@@ -762,7 +769,6 @@ async def _execute_run(
                     case=case,
                     agent_cfg=agent_cfg,
                     evaluator_specs=evaluator_specs,
-                    judge_llm=judge_llm,
                     cancel_event=cancel_event,
                     retry_policy=retry_policy,
                 )
@@ -1276,7 +1282,7 @@ async def start_run(
           "expected_tool_calls": list, "metadata": dict, "source": "benchmark"|"file"}, ...]
 
     ``evaluator_specs`` is a list of DB-resolved evaluator configs:
-        [{"evaluator_type": "llm_judge", "params": {...}, "label": "my-judge"}, ...]
+        [{"evaluator_type": "configurable_judge", "params": {...}, "label": "my-judge"}, ...]
     """
     if not cases:
         raise ValueError("no cases selected")
