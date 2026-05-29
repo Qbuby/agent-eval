@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef, memo } from 'react'
 import { useToast } from '@/components/ui'
 import { tracesApi, datasetsApi } from '@/services'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { ListRunsRequest, RunSummary, Dataset, RunDetail, RunChildMeta } from '@/types'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 
@@ -185,8 +186,7 @@ export default function TracesPage() {
       }
       setHasMore(newItems.length >= 50)
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setError(msg || '查询失败')
+      setError(toToastMessage(formatApiError(err, { fallbackMessage: '查询失败' })))
     } finally {
       setLoading(false)
       setLoadingMore(false)
@@ -248,8 +248,7 @@ export default function TracesPage() {
         (stillMissing.length > 0 ? `，${stillMissing.length} 条无 LLM 子 run` : '')
       )
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setFillModelsMsg(`补齐失败：${msg || '未知错误'}`)
+      setFillModelsMsg(`补齐失败：${toToastMessage(formatApiError(err, { fallbackMessage: '未知错误' }))}`)
     } finally {
       setFillingModels(false)
     }
@@ -428,8 +427,7 @@ export default function TracesPage() {
       toast.success(`成功导入 ${res.data.imported} 条用例到 ${target}`)
       datasetsApi.list().then(r => setDatasets(r.data)).catch(() => {})
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      toast.error(msg || '导入失败')
+      toast.error(toToastMessage(formatApiError(err, { fallbackTitle: '导入失败', fallbackMessage: '导入失败' })))
     } finally {
       setImporting(false)
     }
@@ -441,8 +439,8 @@ export default function TracesPage() {
       const res = await tracesApi.getDetail({ run_id: runId, project_name: projectName || undefined })
       setNodeCache(prev => ({ ...prev, [runId]: { loading: false, data: res.data } }))
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setNodeCache(prev => ({ ...prev, [runId]: { loading: false, error: msg || '加载失败' } }))
+      const msg = toToastMessage(formatApiError(err, { fallbackMessage: '加载失败' }))
+      setNodeCache(prev => ({ ...prev, [runId]: { loading: false, error: msg } }))
     }
   }, [projectName])
 

@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useConfirm, useToast } from '@/components/ui'
 import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn } from '@/services/benchmark'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 
 export default function BenchmarkPage() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -139,8 +140,9 @@ export default function BenchmarkPage() {
       queryClient.invalidateQueries({ queryKey: ['categories', projectId] })
       if (categoryFilter === deleteCategoryMutation.variables) setCategoryFilter('')
     },
-    onError: (err: any) => {
-      toast.error(err?.response?.data?.detail || '删除失败')
+    onError: (err: unknown) => {
+      const norm = formatApiError(err, { fallbackTitle: '删除失败' })
+      toast.error(toToastMessage(norm), '删除失败')
     },
   })
 

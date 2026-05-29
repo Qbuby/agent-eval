@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { generateApi, datasetsApi } from '@/services'
 import { Button } from '@/components/ui'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { TestCase } from '@/types'
 
 type Scenario = 'faithfulness' | 'context_recall' | 'answer_relevancy' | 'context_precision' | 'context_relevancy' | 'hallucination'
@@ -31,20 +32,7 @@ const CATEGORIES: { value: Category; label: string }[] = [
 ]
 
 function extractErrorMessage(err: unknown): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail
-  if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) {
-    return detail
-      .map((d: unknown) => {
-        if (typeof d === 'string') return d
-        const o = d as { loc?: unknown[]; msg?: string }
-        const loc = Array.isArray(o.loc) ? o.loc.slice(1).join('.') : ''
-        return loc ? `${loc}: ${o.msg ?? '校验失败'}` : (o.msg ?? '校验失败')
-      })
-      .join('；')
-  }
-  if (detail && typeof detail === 'object') return JSON.stringify(detail)
-  return (err as Error)?.message ?? ''
+  return toToastMessage(formatApiError(err, { fallbackMessage: '' }))
 }
 
 export default function GeneratePage() {

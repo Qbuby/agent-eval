@@ -2,6 +2,7 @@ import { useId, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useToast, useConfirm } from '@/components/ui'
 import { candidatesApi, projectsApi, type CandidateCase } from '@/services/benchmark'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 
 const STATUS_BADGE: Record<string, string> = {
   pending: 'badge badge-warning',
@@ -260,9 +261,8 @@ export default function CandidatesPage() {
                           queryClient.invalidateQueries({ queryKey: ['dataset-candidates'] })
                           toast.success('样例已删除')
                         } catch (err) {
-                          const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
-                            || (err as Error)?.message || '未知错误'
-                          toast.error(msg, '删除失败')
+                          const norm = formatApiError(err, { fallbackTitle: '删除失败' })
+                          toast.error(toToastMessage(norm), '删除失败')
                         } finally {
                           setDeletingId(null)
                         }

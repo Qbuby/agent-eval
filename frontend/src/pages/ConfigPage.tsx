@@ -11,6 +11,7 @@ import {
   inferConfigCategory,
   inferConfigType,
 } from '@/lib/configSchema'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { ConfigItem, ConfigOption } from '@/types'
 
 type FormMode = { kind: 'closed' } | { kind: 'create' } | { kind: 'edit'; row: ConfigItem }
@@ -879,6 +880,5 @@ function fmtTime(iso: string | null): string {
 }
 
 function extractError(err: unknown): string {
-  const e = err as { response?: { data?: { detail?: string } }; message?: string }
-  return e?.response?.data?.detail || e?.message || '未知错误'
+  return toToastMessage(formatApiError(err, { fallbackMessage: '未知错误' }))
 }

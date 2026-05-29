@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { authApi } from '@/services'
 import { Button } from '@/components/ui'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 
 export default function RegisterPage() {
   const [username, setUsername] = useState('')
@@ -25,8 +26,8 @@ export default function RegisterPage() {
       await authApi.register({ username, email, password })
       navigate('/login')
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setError(msg || '注册失败')
+      const norm = formatApiError(err, { fallbackTitle: '注册失败', fallbackMessage: '注册失败' })
+      setError(toToastMessage(norm))
     } finally {
       setLoading(false)
     }

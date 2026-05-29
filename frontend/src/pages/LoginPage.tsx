@@ -3,6 +3,7 @@ import { useNavigate, Link } from 'react-router-dom'
 import { authApi } from '@/services'
 import { useAuthStore } from '@/stores/auth'
 import { Button } from '@/components/ui'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 
 export default function LoginPage() {
   const [username, setUsername] = useState('')
@@ -24,8 +25,8 @@ export default function LoginPage() {
       setUser(me.data)
       navigate('/')
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setError(msg || '登录失败')
+      const norm = formatApiError(err, { fallbackTitle: '登录失败', fallbackMessage: '登录失败' })
+      setError(toToastMessage(norm))
     } finally {
       setLoading(false)
     }

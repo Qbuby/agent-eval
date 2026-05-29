@@ -7,6 +7,7 @@ import {
   evaluationApi,
   projectsApi,
 } from '@/services'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import type {
   BenchmarkCase,
   Project,
@@ -1134,6 +1135,5 @@ function fmtTime(iso: string | null): string {
 }
 
 function extractError(err: unknown): string {
-  const e = err as { response?: { data?: { detail?: string } }; message?: string }
-  return e?.response?.data?.detail || e?.message || '未知错误'
+  return toToastMessage(formatApiError(err, { fallbackMessage: '未知错误' }))
 }

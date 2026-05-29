@@ -4,6 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useConfirm, useToast } from '@/components/ui'
 import { datasetsApi, candidatesApi, projectsApi } from '@/services'
 import type { CandidateCase } from '@/services/benchmark'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 
 const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
   pending: { label: '暂存', cls: 'badge badge-warning' },
@@ -282,9 +283,8 @@ export default function DatasetDetailPage() {
                           queryClient.invalidateQueries({ queryKey: ['candidates'] })
                           toast.success('样例已删除')
                         } catch (err) {
-                          const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
-                            || (err as Error)?.message || '未知错误'
-                          toast.error(msg, '删除失败')
+                          const norm = formatApiError(err, { fallbackTitle: '删除失败' })
+                          toast.error(toToastMessage(norm), '删除失败')
                         } finally {
                           setDeletingId(null)
                         }

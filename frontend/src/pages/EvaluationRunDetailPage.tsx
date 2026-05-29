@@ -8,10 +8,11 @@ import {
 import { evaluationApi, tracesApi } from '@/services'
 import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
-import { Button, Drawer } from '@/components/ui'
+import { Button, Drawer, ErrorCard } from '@/components/ui'
 import {
   getScoreMeta, isPassing, directionMark, tone,
 } from '@/lib/scoreSemantics'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 
 export default function EvaluationRunDetailPage() {
   const { runId } = useParams<{ runId: string }>()
@@ -174,9 +175,11 @@ export default function EvaluationRunDetailPage() {
         </div>
       )}
       {langfusePullMutation.isError && (
-        <div className="mb-3 text-[12px] text-negative border border-negative/30 bg-negative/5 rounded-md px-3 py-2">
-          拉取失败：{(langfusePullMutation.error as { response?: { data?: { detail?: string } } })
-            ?.response?.data?.detail || (langfusePullMutation.error as Error)?.message || 'unknown'}
+        <div className="mb-3">
+          <ErrorCard
+            error={formatApiError(langfusePullMutation.error, { fallbackTitle: '拉取失败' })}
+            variant="compact"
+          />
         </div>
       )}
 
@@ -189,9 +192,11 @@ export default function EvaluationRunDetailPage() {
         </div>
       )}
       {reaggregateMutation.isError && (
-        <div className="mb-3 text-[12px] text-negative border border-negative/30 bg-negative/5 rounded-md px-3 py-2">
-          重算失败：{(reaggregateMutation.error as { response?: { data?: { detail?: string } } })
-            ?.response?.data?.detail || (reaggregateMutation.error as Error)?.message || 'unknown'}
+        <div className="mb-3">
+          <ErrorCard
+            error={formatApiError(reaggregateMutation.error, { fallbackTitle: '重算失败' })}
+            variant="compact"
+          />
         </div>
       )}
 
@@ -299,8 +304,7 @@ export default function EvaluationRunDetailPage() {
         })()}
         {backfillMutation.isError && (
           <div className="mt-2 text-[11px] text-negative">
-            {(backfillMutation.error as { response?: { data?: { detail?: string } } })
-              ?.response?.data?.detail || '查询失败'}
+            {toToastMessage(formatApiError(backfillMutation.error, { fallbackMessage: '查询失败' }))}
           </div>
         )}
       </section>
@@ -578,8 +582,8 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
       })
       setNodeCache(prev => ({ ...prev, [childId]: { loading: false, data: res.data } }))
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setNodeCache(prev => ({ ...prev, [childId]: { loading: false, error: msg || '加载失败' } }))
+      const msg = toToastMessage(formatApiError(err, { fallbackMessage: '加载失败' }))
+      setNodeCache(prev => ({ ...prev, [childId]: { loading: false, error: msg } }))
     }
   }, [project])
 

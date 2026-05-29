@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Button, useConfirm, useToast } from '@/components/ui'
 import { datasetsApi } from '@/services'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { CreateDatasetRequest } from '@/types'
 
 export default function DatasetsPage() {
@@ -181,9 +182,8 @@ export default function DatasetsPage() {
                   await deleteMutation.mutateAsync(ds.name)
                   toast.success('数据集已删除')
                 } catch (err) {
-                  const msg = (err as { response?: { data?: { detail?: string } }; message?: string })?.response?.data?.detail
-                    || (err as Error)?.message || '未知错误'
-                  toast.error(msg, '删除失败')
+                  const norm = formatApiError(err, { fallbackTitle: '删除失败' })
+                  toast.error(toToastMessage(norm), '删除失败')
                 } finally {
                   setDeletingName(null)
                 }
