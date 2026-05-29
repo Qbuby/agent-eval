@@ -18,6 +18,8 @@ import EvaluationPage from '@/pages/EvaluationPage'
 import EvaluationRunDetailPage from '@/pages/EvaluationRunDetailPage'
 import EvaluationComparePage from '@/pages/EvaluationComparePage'
 import EvaluatorsPage from '@/pages/EvaluatorsPage'
+import EvaluatorComparePage from '@/pages/EvaluatorComparePage'
+import EvaluatorProvidersPage from '@/pages/EvaluatorProvidersPage'
 import RequestLogPage from '@/pages/RequestLogPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -54,6 +56,8 @@ export default function App() {
               <Route path="evaluation/compare" element={<EvaluationComparePage />} />
               <Route path="evaluation/runs/:runId" element={<EvaluationRunDetailPage />} />
               <Route path="evaluators" element={<EvaluatorsPage />} />
+              <Route path="evaluators/compare" element={<EvaluatorComparePage />} />
+              <Route path="evaluator-providers" element={<EvaluatorProvidersPage />} />
               <Route path="auto-collect" element={<AutoCollectPage />} />
               <Route path="config" element={<ConfigPage />} />
               <Route path="audit" element={<AuditPage />} />

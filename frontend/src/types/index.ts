@@ -377,8 +377,19 @@ export interface EvaluatorInstance {
   description: string | null
   params: Record<string, unknown>
   is_active: boolean
+  current_version_id?: string | null
   created_at: string | null
   updated_at: string | null
+}
+
+export interface EvaluatorVersion {
+  id: string
+  evaluator_id: string
+  version_number: number
+  params: Record<string, unknown>
+  description: string | null
+  created_by: string | null
+  created_at: string | null
 }
 
 export interface CreateEvaluatorRequest {
@@ -530,6 +541,93 @@ export interface BuiltinEvaluator {
   name: string
   description: string
   params_schema: Record<string, unknown>
+}
+
+// ─── Evaluator Providers (LLM-judge endpoints) ───
+
+export type ProviderType =
+  | 'openai'
+  | 'openai_compatible'
+  | 'anthropic'
+  | 'deepseek'
+  | 'azure'
+  | 'custom'
+
+export interface EvaluatorProvider {
+  id: string
+  name: string
+  provider_type: string
+  base_url: string | null
+  default_model: string | null
+  extra_config: Record<string, unknown>
+  is_active: boolean
+  has_api_key: boolean
+  api_key_masked: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface CreateEvaluatorProviderRequest {
+  name: string
+  provider_type: string
+  base_url?: string | null
+  api_key?: string | null
+  default_model?: string | null
+  extra_config?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface UpdateEvaluatorProviderRequest {
+  name?: string
+  provider_type?: string
+  base_url?: string | null
+  // omit: keep existing; "": clear; non-empty: replace
+  api_key?: string | null
+  default_model?: string | null
+  extra_config?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface TestProviderResponse {
+  ok: boolean
+  latency_ms: number | null
+  detail: string
+  models: string[]
+}
+
+export interface ProviderModelsResponse {
+  ok: boolean
+  models: string[]
+  detail: string
+}
+
+// ─── Configurable judge dry-run ───
+
+export interface DryRunRequest {
+  provider_id?: string | null
+  params: Record<string, unknown>
+  input: string
+  output: string
+  expected_output?: string | null
+  metadata?: Record<string, unknown> | null
+}
+
+export interface DryRunScoreItem {
+  name: string
+  value: number
+  reason: string
+  // 模型原始输出（数值/布尔/类别名），UI 在归一分旁展示便于核对
+  raw_value?: number | boolean | string | null
+}
+
+export interface DryRunResponse {
+  // 单分数范式：scores 至多一个元素
+  scores: DryRunScoreItem[]
+  model: string
+  usage: Record<string, number>
+  raw_content: string
+  rendered_messages: Array<{ role: string; content: string }>
+  error: string | null
 }
 
 export interface RequestLogEntry {

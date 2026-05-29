@@ -33,6 +33,7 @@ const NAV_GROUPS: NavGroup[] = [
   {
     title: '系统',
     items: [
+      { to: '/evaluator-providers', label: 'Judge Providers', icon: 'key' },
       { to: '/config', label: '配置', icon: 'settings' },
       { to: '/audit', label: '审计日志', icon: 'file' },
       { to: '/request-log', label: '接口日志', icon: 'pulse' },
@@ -130,6 +131,13 @@ function NavIcon({ name }: { name: string }) {
       return (
         <svg {...props}>
           <path d="M1.5 8h2.5L5.5 4.5l3 7L10 7h4" />
+        </svg>
+      )
+    case 'key':
+      return (
+        <svg {...props}>
+          <circle cx="5" cy="11" r="2.5" />
+          <path d="M7 9.5l5.5-5.5M11 6l1.5 1.5M9.5 7.5L11 9" />
         </svg>
       )
     default:

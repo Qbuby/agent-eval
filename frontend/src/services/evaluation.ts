@@ -2,11 +2,14 @@ import api from './client'
 import type {
   BuiltinEvaluator,
   CreateEvaluatorRequest,
+  DryRunRequest,
+  DryRunResponse,
   EvalCaseSourceSummary,
   EvalResultsPage,
   EvalRunDetail,
   EvalRunsPage,
   EvaluatorInstance,
+  EvaluatorVersion,
   RunDetail,
   StartEvalRequest,
   StartEvalResponse,
@@ -34,6 +37,23 @@ export const evaluationApi = {
   },
   deleteEvaluator(id: string) {
     return api.delete<{ id: string; deleted: boolean }>(`/eval/evaluators/${id}`)
+  },
+  dryRunEvaluator(id: string, data: DryRunRequest) {
+    return api.post<DryRunResponse>(`/eval/evaluators/${id}/dry-run`, data)
+  },
+  listEvaluatorVersions(id: string) {
+    return api.get<EvaluatorVersion[]>(`/eval/evaluators/${id}/versions`)
+  },
+  createEvaluatorVersion(
+    id: string,
+    data: { params: Record<string, unknown>; description?: string | null; activate?: boolean },
+  ) {
+    return api.post<EvaluatorVersion>(`/eval/evaluators/${id}/versions`, data)
+  },
+  activateEvaluatorVersion(id: string, versionId: string) {
+    return api.post<EvaluatorInstance>(
+      `/eval/evaluators/${id}/versions/${versionId}/activate`,
+    )
   },
 
   // ── case file upload ──
