@@ -8,17 +8,21 @@
 #   3. backend    ─ FastAPI 后端（依赖 migrate 完成）
 #   4. frontend   ─ Nginx 静态资源 + /api 反代到 backend
 #
-# 启动方式：
-#   docker compose up -d --build
+# 一步部署：
+#   1) cp .env.example .env  并填写 AUTH_SECRET_KEY、SECURITY_FERNET_KEY、
+#      LANGSMITH_API_KEY、LANGFUSE_*（Langfuse 不用可留空）
+#   2) docker compose up -d --build
 #
 # 访问入口：
 #   前端 UI:  http://localhost
 #   后端 API: http://localhost:8000
 #
 # 环境变量来源：
-#   - .env 文件被 backend 服务通过 env_file 加载（含 LLM/LangSmith key）
-#   - DB_HOST/DB_PORT 在 environment: 段被强制覆盖为容器内地址
+#   - .env 文件被 migrate / backend 通过 env_file 加载（DB / Auth / Crypto / LLM / Langfuse / LangSmith）
+#   - DB_HOST/DB_PORT 在 environment: 段被强制覆盖为容器内 DNS（postgres:5432）
 #   - 修改 PG 密码后需要 `docker compose down -v` 清掉 volume 才能生效
+#   - SECURITY_FERNET_KEY 必填，缺失时 evaluator-providers 接口会 503；
+#     生成方式见 .env.example
 # ─────────────────────────────────────────────────────────────────────
 
 services:
@@ -53,10 +57,11 @@ services:
   #   后端代码里有 SQLAlchemy ORM 模型（src/agent_eval/db_models/tables.py），
   #   定义了 dataset_versions / test_cases / test_runs / test_results /
   #   evaluation_scores / optimizations / loop_control_log / users /
-  #   projects / candidate_cases / benchmark_cases / audit_logs / ... 等 22 张表。
+  #   projects / candidate_cases / benchmark_cases / audit_logs /
+  #   evaluator_configs / evaluator_versions / evaluator_providers / ... 等数十张表。
   #
   #   这些表必须存在于 PG 中后端才能工作。alembic 是「数据库版本控制」工具，
-  #   通过 alembic/versions/ 下的迁移脚本（0001 → 0008）按顺序执行，
+  #   通过 alembic/versions/ 下的迁移脚本（0001 → 当前 head 0015）按顺序执行，
   #   把空数据库一步步建成当前 schema。
   #
   # 这个服务做什么？
@@ -80,6 +85,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: agent-eval-migrate
+    env_file:
+      - .env
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
@@ -95,9 +102,11 @@ services:
 
   # ─────────────────────────────────────────────────────────────────
   # backend：FastAPI + uvicorn
-  #   - env_file 加载 .env 里的 LLM_API_KEY / LANGSMITH_API_KEY 等
+  #   - env_file 加载 .env 里的 LLM / LangSmith / Langfuse / Crypto key
   #   - environment 段覆盖 DB_HOST/DB_PORT，把 .env 里的 localhost 改成
   #     compose 内部 DNS 名 postgres
+  #   - SECURITY_FERNET_KEY 必填：evaluator-providers 接口落库 API key
+  #     时调用 cryptography.Fernet 加密，缺失会 503。生成方式见 .env.example。
   #   - depends_on:
   #       postgres healthy   → PG 可连
   #       migrate completed  → schema 就位
@@ -112,6 +121,14 @@ services:
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
+      # 下列 3 个变量虽然 env_file 已加载，这里显式列出方便排查；
+      # 在 shell 里 export 同名变量可临时覆盖 .env 内容。
+      # SECURITY_FERNET_KEY 留空时 evaluator-providers 接口会 503，
+      # 但 compose 启动不会失败 —— 留 :- 默认空，方便先把库迁了再补 key。
+      SECURITY_FERNET_KEY: ${SECURITY_FERNET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
     ports:
       - "8000:8000"
     # 让容器内代码能访问宿主机服务（被测 agent 通常跑在宿主机上，
@@ -120,6 +137,13 @@ services:
     # Linux 上 Docker Engine ≥ 20.10 也能解析 host-gateway。
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # judge / agent 调用走外网域名（如 kiro.aidong-ai.com），
+    # 宿主 /etc/resolv.conf 在某些 Docker Desktop / WSL 环境下
+    # 不会被容器继承，导致 "Temporary failure in name resolution"。
+    # 显式指定公共 DNS 兜底。
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     depends_on:
       postgres:
         condition: service_healthy
