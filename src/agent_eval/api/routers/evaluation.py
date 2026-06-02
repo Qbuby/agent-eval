@@ -335,6 +335,19 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
         results = await repo.get_results_by_run(run_uuid)
         scores_by_result = await repo.get_scores_by_run(run_uuid)
 
+        # Expected answers live on the benchmark cases, not on the result rows
+        # (the runner computes them for scoring but doesn't persist them). Batch
+        # load reference_answer for every benchmark_case_id seen so the export /
+        # detail view can show 期望答案 alongside 生成答案. Upload-sourced runs
+        # have no benchmark_case_id, so their expected answer can't be recovered.
+        bench_ids = {r.benchmark_case_id for r in results if r.benchmark_case_id}
+        expected_by_case: dict[Any, str] = {}
+        if bench_ids:
+            bench_rows = (await session.execute(
+                select(BenchmarkCaseRow).where(BenchmarkCaseRow.id.in_(bench_ids))
+            )).scalars().all()
+            expected_by_case = {b.id: (b.reference_answer or "") for b in bench_rows}
+
     dims: set[str] = set()
     rows: list[dict[str, Any]] = []
     for r in sorted(results, key=lambda x: x.created_at or x.id.hex):
@@ -345,6 +358,7 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
             "benchmark_case_id": str(r.benchmark_case_id) if r.benchmark_case_id else None,
             "test_case_id": str(r.test_case_id) if r.test_case_id else None,
             "question": r.question,
+            "expected_output": expected_by_case.get(r.benchmark_case_id, ""),
             "status": r.status,
             "actual_output": r.actual_output,
             "latency_ms": r.latency_ms,
@@ -378,8 +392,9 @@ async def export_run_results(run_id: str, format: str = Query("csv")):
         ExportColumn("id", "结果 ID"),
         ExportColumn("benchmark_case_id", "基准用例 ID"),
         ExportColumn("question", "问题"),
+        ExportColumn("expected_output", "期望答案"),
         ExportColumn("status", "状态"),
-        ExportColumn("actual_output", "实际输出"),
+        ExportColumn("actual_output", "生成答案"),
         ExportColumn("latency_ms", "时延(ms)"),
         ExportColumn("prompt_tokens", "输入 token"),
         ExportColumn("completion_tokens", "输出 token"),
@@ -494,8 +509,9 @@ async def export_runs_summary(req: ExportRunsSummaryRequest):
         ExportColumn("id", "结果 ID"),
         ExportColumn("benchmark_case_id", "基准用例 ID"),
         ExportColumn("question", "问题"),
+        ExportColumn("expected_output", "期望答案"),
         ExportColumn("status", "状态"),
-        ExportColumn("actual_output", "实际输出"),
+        ExportColumn("actual_output", "生成答案"),
         ExportColumn("latency_ms", "时延(ms)"),
         ExportColumn("prompt_tokens", "输入 token"),
         ExportColumn("completion_tokens", "输出 token"),
