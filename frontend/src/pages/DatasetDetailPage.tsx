@@ -1,7 +1,7 @@
 import { useId, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Button, Dialog, useConfirm, useToast } from '@/components/ui'
+import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/ui'
 import { datasetsApi, candidatesApi, projectsApi } from '@/services'
 import type { CandidateCase } from '@/services/benchmark'
 import { formatApiError, toToastMessage } from '@/lib/errors'
@@ -184,6 +184,20 @@ export default function DatasetDetailPage() {
           <option value="rejected">已拒绝</option>
         </select>
         <div className="flex-1" />
+        <ExportMenu
+          disabled={!name}
+          onExport={async (format) => {
+            if (!name) return
+            try {
+              await candidatesApi.exportCases(
+                { dataset_name: name, status: statusFilter || undefined, search: search || undefined },
+                format,
+              )
+            } catch (e) {
+              toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '导出失败' })))
+            }
+          }}
+        />
         <Button variant="secondary" size="sm" onClick={() => setShowAddModal(true)}>
           手动添加
         </Button>

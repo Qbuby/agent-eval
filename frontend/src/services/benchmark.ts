@@ -1,4 +1,5 @@
 import api from './client'
+import { triggerExport, type ExportFormat } from '@/lib/download'
 
 export interface Project {
   id: string
@@ -119,6 +120,18 @@ export const benchmarkApi = {
   export(projectId: string, categoryId?: string) {
     return api.get(`/benchmark/${projectId}/export`, { params: categoryId ? { category_id: categoryId } : undefined })
   },
+  exportCases(
+    projectId: string,
+    params: { category_id?: string; tag?: string; search?: string; status?: string },
+    format: ExportFormat,
+  ) {
+    return triggerExport({
+      url: `/benchmark/${projectId}/cases/export`,
+      params: { ...params, format },
+      format,
+      fallbackName: `benchmark_${projectId.slice(0, 8)}_cases`,
+    })
+  },
   listVersions(projectId: string) {
     return api.get(`/benchmark/${projectId}/versions`)
   },
@@ -136,6 +149,17 @@ export const benchmarkApi = {
 export const candidatesApi = {
   list(params?: { status?: string; project_id?: string; dataset_name?: string; source?: string; search?: string; page?: number; page_size?: number }) {
     return api.get<PaginatedResponse<CandidateCase>>('/candidates', { params })
+  },
+  exportCases(
+    params: { status?: string; project_id?: string; dataset_name?: string; source?: string; search?: string },
+    format: ExportFormat,
+  ) {
+    return triggerExport({
+      url: '/candidates/export',
+      params: { ...params, format },
+      format,
+      fallbackName: 'candidates',
+    })
   },
   create(data: { question: string; answer?: string; project_id?: string; dataset_name?: string; tags?: string[]; source?: string }) {
     return api.post<{ id: string; status: string }>('/candidates', data)

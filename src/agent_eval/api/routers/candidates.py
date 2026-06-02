@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
+from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import BenchmarkCaseRow, CandidateCaseRow
 
@@ -82,6 +83,52 @@ async def list_candidates(
         "page": page,
         "page_size": page_size,
     }
+
+
+@router.get("/export")
+async def export_candidates(
+    status: str | None = Query(None),
+    project_id: str | None = Query(None),
+    dataset_name: str | None = Query(None),
+    source: str | None = Query(None),
+    search: str | None = Query(None),
+    format: str = Query("csv"),
+):
+    """Export all candidate cases matching the current filters (no pagination)."""
+    validate_format(format)
+    async with async_session_factory() as session:
+        stmt = select(CandidateCaseRow)
+        if status:
+            stmt = stmt.where(CandidateCaseRow.status == status)
+        if project_id:
+            stmt = stmt.where(CandidateCaseRow.project_id == project_id)
+        if dataset_name:
+            stmt = stmt.where(CandidateCaseRow.dataset_name == dataset_name)
+        if source:
+            stmt = stmt.where(CandidateCaseRow.source == source)
+        if search:
+            stmt = stmt.where(CandidateCaseRow.question.ilike(f"%{search}%"))
+        stmt = stmt.order_by(CandidateCaseRow.created_at.desc())
+        result = await session.execute(stmt)
+        cases = result.scalars().all()
+
+    rows = [_candidate_to_dict(c) for c in cases]
+    columns = [
+        ExportColumn("id", "ID"),
+        ExportColumn("question", "问题"),
+        ExportColumn("answer", "答案"),
+        ExportColumn("key_points", "关键点"),
+        ExportColumn("negative_points", "负向点"),
+        ExportColumn("tags", "标签"),
+        ExportColumn("source", "来源"),
+        ExportColumn("status", "状态"),
+        ExportColumn("project_id", "项目 ID"),
+        ExportColumn("langsmith_example_id", "LangSmith 样例 ID"),
+        ExportColumn("reviewed_at", "审核时间"),
+        ExportColumn("created_at", "创建时间"),
+        ExportColumn("updated_at", "更新时间"),
+    ]
+    return build_export_response(rows, columns, format, "candidates")
 
 
 @router.post("")

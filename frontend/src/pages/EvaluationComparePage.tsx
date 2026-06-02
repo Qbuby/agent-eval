@@ -5,8 +5,9 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from 'recharts'
 import { evaluationApi } from '@/services'
-import { Drawer } from '@/components/ui'
+import { Drawer, ExportMenu } from '@/components/ui'
 import { directionMark, getScoreMeta, isPassing, tone } from '@/lib/scoreSemantics'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { EvalResultRow, EvalRunDetail, EvalResultsPage } from '@/types'
 
 // Token-driven bar palette — pulls from CSS vars so light/dark theme stays in sync.
@@ -89,6 +90,7 @@ export default function EvaluationComparePage() {
   const [alignKey, setAlignKey] = useState<AlignKey>('case_id')
   const [selectedAlignKey, setSelectedAlignKey] = useState<string | null>(null)
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
+  const [exportError, setExportError] = useState<string | null>(null)
 
   // 切换对齐键后，旧的 selected key 失效（case_id ≠ 问题文本哈希）
   useEffect(() => {
@@ -157,9 +159,27 @@ export default function EvaluationComparePage() {
         ← 评估列表
       </Link>
       <header className="mb-6">
-        <div className="page-eyebrow">评估</div>
-        <h1 className="page-title">运行对比</h1>
-        <p className="page-subtitle">{ids.length} 个运行 · 维度分 · 成本 · 通过率 · 样例对齐</p>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="page-eyebrow">评估</div>
+            <h1 className="page-title">运行对比</h1>
+            <p className="page-subtitle">{ids.length} 个运行 · 维度分 · 成本 · 通过率 · 样例对齐</p>
+          </div>
+          {ids.length > 0 && (
+            <ExportMenu
+              label="导出对比"
+              onExport={async (format) => {
+                try {
+                  await evaluationApi.exportCompare(ids, format, alignKey)
+                  setExportError(null)
+                } catch (e) {
+                  setExportError(toToastMessage(formatApiError(e)))
+                }
+              }}
+            />
+          )}
+        </div>
+        {exportError && <p className="text-[12px] text-negative mt-2">{exportError}</p>}
       </header>
 
       {loading && <div className="text-[12px] text-text-tertiary py-10 text-center">加载中…</div>}

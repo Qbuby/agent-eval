@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
     BenchmarkCaseRow, BenchmarkVersionRow, CandidateCaseRow, CategoryRow,
@@ -90,6 +91,51 @@ async def list_benchmark_cases(
         "page": page,
         "page_size": page_size,
     }
+
+
+@router.get("/{project_id}/cases/export")
+async def export_benchmark_cases(
+    project_id: str,
+    category_id: str | None = Query(None),
+    tag: str | None = Query(None),
+    search: str | None = Query(None),
+    status: str = Query("active"),
+    format: str = Query("csv"),
+):
+    """Export all benchmark cases matching the current filters (no pagination)."""
+    validate_format(format)
+    async with async_session_factory() as session:
+        stmt = select(BenchmarkCaseRow).where(
+            BenchmarkCaseRow.project_id == project_id,
+            BenchmarkCaseRow.status == status,
+        )
+        if category_id:
+            stmt = stmt.where(BenchmarkCaseRow.category_id == category_id)
+        if tag:
+            stmt = stmt.where(BenchmarkCaseRow.tags.any(tag))
+        if search:
+            stmt = stmt.where(BenchmarkCaseRow.question.ilike(f"%{search}%"))
+        stmt = stmt.order_by(BenchmarkCaseRow.created_at.desc())
+        result = await session.execute(stmt)
+        cases = result.scalars().all()
+
+    rows = [_case_to_dict(c) for c in cases]
+    columns = [
+        ExportColumn("id", "ID"),
+        ExportColumn("question", "问题"),
+        ExportColumn("reference_answer", "参考答案"),
+        ExportColumn("key_points", "关键点"),
+        ExportColumn("negative_points", "负向点"),
+        ExportColumn("tags", "标签"),
+        ExportColumn("difficulty", "难度"),
+        ExportColumn("extra_fields", "扩展字段"),
+        ExportColumn("source", "来源"),
+        ExportColumn("status", "状态"),
+        ExportColumn("category_id", "分类 ID"),
+        ExportColumn("created_at", "创建时间"),
+        ExportColumn("updated_at", "更新时间"),
+    ]
+    return build_export_response(rows, columns, format, f"benchmark_{project_id[:8]}_cases")
 
 
 @router.post("/{project_id}/cases")

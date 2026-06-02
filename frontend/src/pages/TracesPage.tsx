@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef, memo } from 'react'
-import { useToast } from '@/components/ui'
+import { useToast, ExportMenu } from '@/components/ui'
 import { tracesApi, datasetsApi } from '@/services'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { ListRunsRequest, RunSummary, Dataset, RunDetail, RunChildMeta } from '@/types'
@@ -502,6 +502,20 @@ export default function TracesPage() {
           >
             清空
           </button>
+        )}
+        {allRuns.length > 0 && (
+          <ExportMenu
+            size="md"
+            onExport={async (format) => {
+              try {
+                // Export the rows currently loaded + filtered/sorted on screen,
+                // not a fresh full pull from LangSmith.
+                await tracesApi.exportRuns(filteredRuns, format)
+              } catch (e) {
+                toast.error(toToastMessage(formatApiError(e)))
+              }
+            }}
+          />
         )}
         {allRuns.length > 0 && allRuns.some(r => !r.model_name || r.first_tool_call_s == null) && (
           <button

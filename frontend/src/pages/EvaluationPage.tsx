@@ -1,13 +1,14 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Button, useConfirm, useToast } from '@/components/ui'
+import { Button, useConfirm, useToast, ExportMenu } from '@/components/ui'
 import {
   benchmarkApi,
   evaluationApi,
   projectsApi,
 } from '@/services'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import type { ExportFormat } from '@/lib/download'
 import type {
   BenchmarkCase,
   Project,
@@ -184,6 +185,16 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
             >
               对比所选（{selected.size}）
             </Button>
+            <ExportMenu
+              label={`导出所选（${selected.size}）`}
+              onExport={async (format: ExportFormat) => {
+                try {
+                  await evaluationApi.exportRunsSummary(Array.from(selected), format)
+                } catch (e) {
+                  toast.error(toToastMessage(formatApiError(e)), '导出失败')
+                }
+              }}
+            />
             <button
               onClick={() => setSelected(new Set())}
               className="text-[11px] text-text-tertiary hover:text-text-primary transition-colors"

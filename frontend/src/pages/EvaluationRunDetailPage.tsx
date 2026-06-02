@@ -8,11 +8,13 @@ import {
 import { evaluationApi, tracesApi } from '@/services'
 import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
-import { Button, Drawer, ErrorCard } from '@/components/ui'
+import { Button, Drawer, ErrorCard, ExportMenu } from '@/components/ui'
 import {
   getScoreMeta, isPassing, directionMark, tone,
 } from '@/lib/scoreSemantics'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import type { NormalizedError } from '@/lib/errors'
+import type { ExportFormat } from '@/lib/download'
 
 export default function EvaluationRunDetailPage() {
   const { runId } = useParams<{ runId: string }>()
@@ -32,6 +34,7 @@ export default function EvaluationRunDetailPage() {
 
   const [resultsPage] = useState(1)
   const resultsPageSize = 50
+  const [exportError, setExportError] = useState<NormalizedError | null>(null)
   const resultsQuery = useQuery({
     queryKey: ['eval-results', runId, resultsPage],
     queryFn: () =>
@@ -147,6 +150,18 @@ export default function EvaluationRunDetailPage() {
           <Button variant="secondary" size="sm" onClick={() => navigate(`/evaluation/compare?ids=${runId}`)}>
             加入对比
           </Button>
+          <ExportMenu
+            disabled={!runId}
+            onExport={async (format: ExportFormat) => {
+              if (!runId) return
+              try {
+                await evaluationApi.exportResults(runId, format)
+                setExportError(null)
+              } catch (e) {
+                setExportError(formatApiError(e))
+              }
+            }}
+          />
           <Button
             variant="secondary"
             size="sm"
@@ -413,6 +428,11 @@ export default function EvaluationRunDetailPage() {
             </a>
           )}
         </div>
+        {exportError && (
+          <div className="mb-2">
+            <ErrorCard error={exportError} />
+          </div>
+        )}
         <div className="table-card">
           <table className="table-base">
             <thead>
@@ -1049,12 +1069,14 @@ function CotStepRow({ step, index, last }: { step: CotStep; index: number; last:
     step.args == null ? '' : typeof step.args === 'string' ? step.args : JSON.stringify(step.args, null, 2)
   const outStr =
     step.output == null ? '' : typeof step.output === 'string' ? step.output : JSON.stringify(step.output, null, 2)
+  const failed = isToolCallError(step)
   return (
-    <div className={`px-3 py-2 bg-warning/5 ${border}`}>
+    <div className={`px-3 py-2 ${failed ? 'bg-negative/5' : 'bg-warning/5'} ${border}`}>
       <div className="flex items-center gap-2 mb-1">
         <span className="text-[10px] text-text-tertiary tabular-nums w-5 text-right">{index + 1}</span>
         <span className="badge badge-warning">工具</span>
         <span className="text-[11px] font-mono">{step.tool_name || '?'}</span>
+        <ToolResultBadge failed={failed} />
         {dur && <span className="text-[10px] text-text-tertiary tabular-nums">{dur}</span>}
         <button
           type="button"
@@ -1085,18 +1107,33 @@ function CotStepRow({ step, index, last }: { step: CotStep; index: number; last:
 }
 
 
+// 判定单次工具调用是否失败。口径对齐后端 evaluation.py / langfuse_runner.py：
+// output 为 dict 时看 error / isError 是否 truthy；为字符串时看是否以 "error" 开头。
+function isToolCallError(call: { output?: unknown }): boolean {
+  const out = call.output
+  if (out && typeof out === 'object' && !Array.isArray(out)) {
+    const o = out as Record<string, unknown>
+    return Boolean(o.error) || Boolean(o.isError)
+  }
+  if (typeof out === 'string') {
+    return out.trim().toLowerCase().startsWith('error')
+  }
+  return false
+}
+
+function ToolResultBadge({ failed }: { failed: boolean }) {
+  return failed
+    ? <span className="badge badge-negative" title="工具调用失败">失败</span>
+    : <span className="badge badge-positive" title="工具调用成功">成功</span>
+}
+
 function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
   const grouped: Record<string, { count: number; errors: number }> = {}
   for (const c of calls) {
     const name = (c.tool_name || c.name || 'unknown') as string
     const slot = grouped[name] ?? (grouped[name] = { count: 0, errors: 0 })
     slot.count++
-    const out = c.output
-    if (typeof out === 'object' && out && (('error' in out) || ('isError' in out))) {
-      slot.errors++
-    } else if (typeof out === 'string' && out.toLowerCase().startsWith('error')) {
-      slot.errors++
-    }
+    if (isToolCallError(c)) slot.errors++
   }
   const entries = Object.entries(grouped).sort((a, b) => b[1].count - a[1].count)
 
@@ -1127,8 +1164,9 @@ function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
           <summary className="text-[10px] text-text-tertiary cursor-pointer">展开全部调用详情</summary>
           <div className="mt-1 max-h-[200px] overflow-y-auto">
             {calls.map((c, i) => (
-              <div key={i} className="flex gap-2 py-0.5 border-b border-separator last:border-0">
+              <div key={i} className="flex items-center gap-2 py-0.5 border-b border-separator last:border-0">
                 <span className="text-[10px] text-text-tertiary w-4 text-right">{i + 1}</span>
+                <ToolResultBadge failed={isToolCallError(c)} />
                 <span className="font-mono text-[10px]">{(c.tool_name || c.name || '?') as string}</span>
                 {c.args != null && (
                   <span className="text-[10px] text-text-tertiary truncate max-w-[200px]">

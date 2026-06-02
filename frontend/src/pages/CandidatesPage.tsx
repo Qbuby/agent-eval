@@ -1,6 +1,6 @@
 import { useId, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Button, Dialog, useToast, useConfirm } from '@/components/ui'
+import { Button, Dialog, useToast, useConfirm, ExportMenu } from '@/components/ui'
 import { candidatesApi, projectsApi, type CandidateCase } from '@/services/benchmark'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 
@@ -163,6 +163,18 @@ export default function CandidatesPage() {
           <option value="rejected">已拒绝</option>
         </select>
         <div className="flex-1" />
+        <ExportMenu
+          onExport={async (format) => {
+            try {
+              await candidatesApi.exportCases(
+                { status: statusFilter || undefined, search: search || undefined },
+                format,
+              )
+            } catch (e) {
+              toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '导出失败' })))
+            }
+          }}
+        />
         <Button onClick={() => setShowLangSmithImport(true)} variant="secondary" size="md">
           从 LangSmith 导入
         </Button>

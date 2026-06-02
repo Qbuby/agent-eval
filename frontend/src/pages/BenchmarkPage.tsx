@@ -1,7 +1,7 @@
 import { Fragment, useId, useState, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Button, Dialog, useConfirm, useToast } from '@/components/ui'
+import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/ui'
 import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn } from '@/services/benchmark'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 
@@ -219,6 +219,21 @@ export default function BenchmarkPage() {
           + 类别
         </button>
         <div className="flex-1" />
+        <ExportMenu
+          disabled={!projectId}
+          onExport={async (format) => {
+            if (!projectId) return
+            try {
+              await benchmarkApi.exportCases(
+                projectId,
+                { search: search || undefined, category_id: categoryFilter || undefined, status: 'active' },
+                format,
+              )
+            } catch (e) {
+              toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '导出失败' })))
+            }
+          }}
+        />
         <Button variant="secondary" size="sm" onClick={() => setShowImport(true)}>
           导入文件
         </Button>
