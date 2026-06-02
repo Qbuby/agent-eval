@@ -48,8 +48,8 @@ async function main() {
   await rowCheckboxes.nth(1).check()
   log('checked 2 rows')
 
-  // The "导出所选（2）" ExportMenu should now be visible.
-  const exportBtn = page.getByRole('button', { name: /导出所选/ }).first()
+  // The "导出明细（2）" ExportMenu should now be visible.
+  const exportBtn = page.getByRole('button', { name: /导出明细/ }).first()
   await exportBtn.waitFor({ state: 'visible', timeout: 5000 })
 
   for (const [fmt, opt] of [['csv','CSV (.csv)'],['xlsx','Excel (.xlsx)'],['json','JSON (.json)']]) {

@@ -460,82 +460,61 @@ class ExportRunsSummaryRequest(BaseModel):
     format: str = "csv"
 
 
-def _run_summary_export_row(row: Any) -> dict[str, Any]:
-    """One run → a flat summary dict, mirroring the history list's RunRow.
-
-    Pass rate and avg latency are derived the same way the frontend does
-    (summary_scores.counts / cost_success|cost_failure) so the exported file
-    matches what the user sees in the table.
-    """
-    scores = row.summary_scores or {}
-    counts = scores.get("counts") or {}
-    total = counts.get("total")
-    passed = counts.get("passed")
-    pass_rate = None
-    if isinstance(total, (int, float)) and total > 0 and isinstance(passed, (int, float)):
-        pass_rate = round(passed / total * 100, 1)
-    cost_success = scores.get("cost_success") or {}
-    cost_failure = scores.get("cost_failure") or {}
-    avg_latency = cost_success.get("avg_latency_ms")
-    if avg_latency is None:
-        avg_latency = cost_failure.get("avg_latency_ms")
-
-    agent = row.agent_config or {}
-    return {
-        "id": str(row.id),
-        "status": row.status,
-        "agent": agent.get("model") or agent.get("type") or "",
-        "agent_url": agent.get("url") or "",
-        "run_name": row.langfuse_run_name or "",
-        "langsmith_project": row.langsmith_project or "",
-        "total_cases": total,
-        "passed": passed,
-        "pass_rate": pass_rate,
-        "avg_latency_ms": round(avg_latency) if isinstance(avg_latency, (int, float)) else None,
-        "started_at": row.started_at,
-        "finished_at": row.finished_at,
-    }
-
-
 @router.post("/runs/export-summary")
 async def export_runs_summary(req: ExportRunsSummaryRequest):
-    """Export the selected run-history rows (one row per run) as csv/json/xlsx.
+    """Export per-sample results for the selected runs as csv/json/xlsx.
 
-    Mirrors the run-history table: the frontend posts the run ids the user
-    checked (which may span pages), and we reload each from the DB so the file
-    isn't limited to the rows currently in memory.
+    The columns match the single-run detail export (`/runs/{id}/results/export`)
+    so the batch file is just those rows concatenated across runs — with two
+    leading columns (run id + run name) marking which run each row came from.
+    The frontend posts the run ids the user checked (which may span pages), and
+    we reload each from the DB so the file isn't limited to rows in memory.
     """
     validate_format(req.format)
     if not req.run_ids:
         raise HTTPException(status_code=400, detail="run_ids is required")
 
+    all_dims: set[str] = set()
     rows: list[dict[str, Any]] = []
-    async with async_session_factory() as session:
-        repo = Repository(session)
-        for run_id in req.run_ids:
-            try:
-                run_uuid = uuid.UUID(run_id)
-            except ValueError:
-                continue
-            row = await repo.get_test_run(run_uuid)
-            if row is not None:
-                rows.append(_run_summary_export_row(row))
+    for run_id in req.run_ids:
+        try:
+            run_uuid = uuid.UUID(run_id)
+        except ValueError:
+            continue
+        run_row, run_rows, dims = await _collect_run_results(run_uuid)
+        all_dims.update(dims)
+        run_name = getattr(run_row, "langfuse_run_name", None) or run_id[:8]
+        for r in run_rows:
+            rows.append({"run_id": run_id, "run_name": run_name, **r})
 
+    # Same columns as the single-run detail export, prefixed with run id / name.
     columns = [
-        ExportColumn("id", "运行 ID"),
-        ExportColumn("status", "状态"),
-        ExportColumn("agent", "智能体"),
-        ExportColumn("agent_url", "智能体 URL"),
+        ExportColumn("run_id", "运行 ID"),
         ExportColumn("run_name", "运行名"),
-        ExportColumn("langsmith_project", "LangSmith 项目"),
-        ExportColumn("total_cases", "样例总数"),
-        ExportColumn("passed", "通过数"),
-        ExportColumn("pass_rate", "通过率(%)"),
-        ExportColumn("avg_latency_ms", "平均时延(ms)"),
-        ExportColumn("started_at", "启动时间"),
-        ExportColumn("finished_at", "完成时间"),
+        ExportColumn("id", "结果 ID"),
+        ExportColumn("benchmark_case_id", "基准用例 ID"),
+        ExportColumn("question", "问题"),
+        ExportColumn("status", "状态"),
+        ExportColumn("actual_output", "实际输出"),
+        ExportColumn("latency_ms", "时延(ms)"),
+        ExportColumn("prompt_tokens", "输入 token"),
+        ExportColumn("completion_tokens", "输出 token"),
+        ExportColumn("total_tokens", "总 token"),
+        ExportColumn("cache_creation_tokens", "缓存写入 token"),
+        ExportColumn("cache_read_tokens", "缓存命中 token"),
+        ExportColumn("tool_call_count", "工具调用数"),
+        ExportColumn("first_thinking_token_ms", "首思考 token(ms)"),
+        ExportColumn("first_answer_token_ms", "首答案 token(ms)"),
+        ExportColumn("attempts_made", "尝试次数"),
+        ExportColumn("actual_tool_calls", "工具调用明细"),
+        ExportColumn("error_message", "错误信息"),
+        ExportColumn("langfuse_trace_id", "Langfuse Trace"),
     ]
-    return build_export_response(rows, columns, req.format, "eval_runs")
+    # One column per score dimension (union across all selected runs).
+    for d in sorted(all_dims):
+        columns.append(ExportColumn(f"score::{d}", f"分数·{d}"))
+
+    return build_export_response(rows, columns, req.format, "eval_runs_results")
 
 
 @router.post("/runs/{run_id}/stop")

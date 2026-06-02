@@ -186,7 +186,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
               对比所选（{selected.size}）
             </Button>
             <ExportMenu
-              label={`导出所选（${selected.size}）`}
+              label={`导出明细（${selected.size}）`}
               onExport={async (format: ExportFormat) => {
                 try {
                   await evaluationApi.exportRunsSummary(Array.from(selected), format)

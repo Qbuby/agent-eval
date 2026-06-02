@@ -121,14 +121,15 @@ export const evaluationApi = {
       fallbackName: 'eval_compare',
     })
   },
-  // Batch-export the selected run-history rows (one summary row per run).
+  // Batch-export per-sample results for the selected runs (same columns as the
+  // single-run detail export, concatenated across runs).
   exportRunsSummary(runIds: string[], format: ExportFormat) {
     return triggerExport({
       method: 'post',
       url: '/eval/runs/export-summary',
       data: { run_ids: runIds, format },
       format,
-      fallbackName: 'eval_runs',
+      fallbackName: 'eval_runs_results',
     })
   },
   getResultTrace(resultId: string, project?: string) {
