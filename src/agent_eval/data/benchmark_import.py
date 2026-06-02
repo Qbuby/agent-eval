@@ -28,6 +28,7 @@ import csv
 import io
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,13 +41,27 @@ VEHICLE_MODEL_PATTERN = re.compile(
 )
 
 COLUMN_ALIASES: dict[str, list[str]] = {
-    "question": ["question", "问题", "q", "query", "input", "输入"],
+    "question": [
+        "question", "问题", "q", "query", "input", "输入",
+        "prompt", "用户问题", "提问", "用户输入", "问句", "题目", "instruction",
+    ],
     "input": ["input", "输入", "问题", "question", "请求体"],
-    "expected_output": ["expected_output", "expected", "预期", "预期结果", "答案"],
+    "expected_output": [
+        "expected_output", "expected", "预期", "预期结果", "答案", "期望输出", "正确答案",
+    ],
     "expected_answer_url": ["expected_answer_url", "url", "expected_keywords", "链接"],
-    "expected_answer": ["expected_answer", "answer", "答案", "参考答案", "reference_answer"],
+    "expected_answer": [
+        "expected_answer", "answer", "答案", "参考答案", "reference_answer",
+        "标准答案", "参考回答", "gold", "gold_answer", "ground_truth", "label",
+        "期望答案", "正确答案", "reference", "golden", "golden_answer",
+    ],
     "reference_response": ["reference_response", "response", "回答", "回复"],
-    "reference_answer": ["reference_answer", "answer", "答案", "参考答案"],
+    "reference_answer": [
+        "reference_answer", "answer", "答案", "参考答案",
+        "标准答案", "参考回答", "gold", "gold_answer", "golden", "golden_answer",
+        "ground_truth", "期望答案", "正确答案", "reference",
+        "expected_answer", "expected_output",
+    ],
     "error_code": ["error_code", "errorcode", "故障码", "错误码", "ErrorCode"],
     "truck_model": ["truck_model", "truckmodel", "车型", "model", "TruckModel"],
     "success": ["success", "成功", "是否成功", "result"],
@@ -141,6 +156,170 @@ def _parse_xlsx(content: bytes) -> tuple[list[str], list[dict[str, Any]]]:
             continue
         rows.append(dict(zip(raw_headers, row)))
     return raw_headers, rows
+
+
+# ── Streaming API ─────────────────────────────────────────────────────────
+# parse_upload_file (above) materializes every row into a list — fine for
+# small files / preview, but OOMs on large uploads. iter_upload_rows returns
+# (headers, lazy_row_iterator) so the import endpoint can consume row-by-row
+# and commit in batches without holding the whole file in memory.
+
+def iter_upload_rows(
+    content: bytes, filename: str
+) -> tuple[list[str], Iterator[dict[str, Any]]]:
+    """Return (headers, row_iterator). The iterator yields one dict per row,
+    lazily where the format allows (xlsx read-only, csv DictReader, jsonl).
+    Standard (non-line) JSON must be fully parsed, so it falls back to a list
+    iterator — JSON's structure makes true streaming impractical."""
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+    if ext == "csv":
+        return _iter_csv(content)
+    elif ext == "jsonl":
+        return _iter_jsonl(content)
+    elif ext == "json":
+        # Standard JSON can't be streamed structurally; reuse the eager parser
+        # but hand back an iterator so callers have one code path.
+        headers, rows = _parse_json(content)
+        return headers, iter(rows)
+    elif ext in ("xlsx", "xls"):
+        return _iter_xlsx(content)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+
+def _iter_csv(content: bytes) -> tuple[list[str], Iterator[dict[str, Any]]]:
+    text = content.decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    headers = list(reader.fieldnames or [])
+
+    def gen() -> Iterator[dict[str, Any]]:
+        for row in reader:
+            yield dict(row)
+
+    return headers, gen()
+
+
+def _iter_jsonl(content: bytes) -> tuple[list[str], Iterator[dict[str, Any]]]:
+    text = content.decode("utf-8-sig")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    headers: list[str] = []
+    if lines:
+        try:
+            headers = list(json.loads(lines[0]).keys())
+        except (json.JSONDecodeError, AttributeError):
+            headers = []
+
+    def gen() -> Iterator[dict[str, Any]]:
+        for ln in lines:
+            try:
+                obj = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+    return headers, gen()
+
+
+def _iter_xlsx(content: bytes) -> tuple[list[str], Iterator[dict[str, Any]]]:
+    # read_only=True streams rows without loading the whole sheet into memory.
+    wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+    ws = wb.active
+    row_iter = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(row_iter)
+    except StopIteration:
+        wb.close()
+        return [], iter(())
+    raw_headers = [str(c or "").strip() for c in header_row]
+
+    def gen() -> Iterator[dict[str, Any]]:
+        try:
+            for row in row_iter:
+                if not any(cell is not None for cell in row):
+                    continue
+                yield dict(zip(raw_headers, row))
+        finally:
+            wb.close()
+
+    return raw_headers, gen()
+
+
+def auto_detect_field_mapping(headers: list[str]) -> dict[str, str | None]:
+    """Suggest which source column maps to question / reference_answer,
+    independent of any category schema. Tries exact (case-insensitive) match
+    first, then the alias table. Returns {"question": <col or None>,
+    "reference_answer": <col or None>}.
+
+    The answer column avoids reusing the one already picked for question (e.g.
+    when a sloppy header matches both alias lists)."""
+    source_lower = {h.lower().strip(): h for h in headers if h}
+
+    def match(target: str) -> str | None:
+        if target in source_lower:
+            return source_lower[target]
+        for alias in COLUMN_ALIASES.get(target, []):
+            if alias.lower() in source_lower:
+                return source_lower[alias.lower()]
+        return None
+
+    q = match("question")
+    a = match("reference_answer")
+    if a is not None and a == q:
+        # Don't map the same column to both; let the answer fall through.
+        a = None
+    return {"question": q, "reference_answer": a}
+
+
+def resolve_question_answer(
+    row: dict[str, Any],
+    *,
+    question_column: str | None = None,
+    answer_column: str | None = None,
+    schema_columns: list[dict] | None = None,
+    field_mapping: dict[str, str] | None = None,
+) -> tuple[str | None, str | None]:
+    """Extract (question, reference_answer) from a row.
+
+    Precedence: explicit column override (from the UI) > category schema
+    mapping > alias/hardcoded fallback. Override wins so the user can always
+    correct a wrong auto-detection."""
+    schema_columns = schema_columns or []
+    field_mapping = field_mapping or {}
+
+    # Question
+    question: str | None = None
+    if question_column and question_column in row and row[question_column] not in (None, ""):
+        question = str(row[question_column]).strip()
+    else:
+        question = get_question_from_row(row, schema_columns, field_mapping)
+
+    # Answer
+    answer: str | None = None
+    if answer_column and answer_column in row and row[answer_column] not in (None, ""):
+        answer = str(row[answer_column]).strip()
+    else:
+        answer = get_answer_from_row(row, schema_columns, field_mapping)
+
+    return (question or None), (answer or None)
+
+
+def collect_sample_values(
+    rows: list[dict[str, Any]], headers: list[str], limit: int = 3
+) -> dict[str, list[str]]:
+    """For the preview UI: first `limit` non-empty values per column, so the
+    user can eyeball which column holds the question vs. the answer."""
+    samples: dict[str, list[str]] = {h: [] for h in headers if h}
+    for row in rows[:limit]:
+        for h in headers:
+            if not h:
+                continue
+            val = row.get(h)
+            if val is not None and str(val).strip():
+                s = str(val).strip()
+                samples[h].append(s[:200])
+    return samples
 
 
 def auto_match_columns(

@@ -74,6 +74,26 @@ export interface PaginatedResponse<T> {
   page_size: number
 }
 
+export interface ImportPreview {
+  file: string
+  total_rows: number
+  source_headers: string[]
+  field_mapping: Record<string, string>
+  suggested_mapping: { question: string | null; reference_answer: string | null }
+  sample_values: Record<string, string[]>
+  schema_columns: SchemaColumn[]
+  preview: { question: string | null; reference_answer: string | null; extra_fields: Record<string, unknown> | null; has_answer: boolean }[]
+}
+
+export interface ImportResult {
+  file: string
+  total: number
+  imported_to_benchmark: number
+  pending_in_staging: number
+  skipped: number
+  field_mapping: Record<string, string> | null
+}
+
 export const projectsApi = {
   list() {
     return api.get<Project[]>('/projects')
@@ -108,13 +128,32 @@ export const benchmarkApi = {
   deleteCase(caseId: string) {
     return api.delete(`/benchmark/cases/${caseId}`)
   },
-  importFile(projectId: string, file: File, categoryId?: string) {
+  importPreview(projectId: string, file: File, opts?: { categoryId?: string; questionColumn?: string; answerColumn?: string }) {
     const formData = new FormData()
     formData.append('file', file)
-    const params = categoryId ? { category_id: categoryId } : undefined
-    return api.post<{ file: string; total: number; imported_to_benchmark: number; pending_in_staging: number }>(
+    const params: Record<string, string | number> = { max_rows: 5 }
+    if (opts?.categoryId) params.category_id = opts.categoryId
+    if (opts?.questionColumn) params.question_column = opts.questionColumn
+    if (opts?.answerColumn) params.answer_column = opts.answerColumn
+    return api.post<ImportPreview>(
+      `/benchmark/${projectId}/import/preview`, formData,
+      { headers: { 'Content-Type': 'multipart/form-data' }, params },
+    )
+  },
+  importFile(
+    projectId: string,
+    file: File,
+    opts?: { categoryId?: string; questionColumn?: string; answerColumn?: string },
+  ) {
+    const formData = new FormData()
+    formData.append('file', file)
+    const params: Record<string, string> = {}
+    if (opts?.categoryId) params.category_id = opts.categoryId
+    if (opts?.questionColumn) params.question_column = opts.questionColumn
+    if (opts?.answerColumn) params.answer_column = opts.answerColumn
+    return api.post<ImportResult>(
       `/benchmark/${projectId}/import`, formData,
-      { headers: { 'Content-Type': 'multipart/form-data' }, params }
+      { headers: { 'Content-Type': 'multipart/form-data' }, params: Object.keys(params).length ? params : undefined }
     )
   },
   export(projectId: string, categoryId?: string) {

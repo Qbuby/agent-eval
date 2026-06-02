@@ -2,7 +2,7 @@ import { Fragment, useId, useState, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/ui'
-import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn } from '@/services/benchmark'
+import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn, type ImportPreview } from '@/services/benchmark'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 
 export default function BenchmarkPage() {
@@ -29,6 +29,17 @@ export default function BenchmarkPage() {
   const [editCase, setEditCase] = useState<BenchmarkCase | null>(null)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [importCategoryId, setImportCategoryId] = useState('')
+  // Two-step import: after picking a file we preview it (detected columns +
+  // suggested question/answer mapping + samples), let the user confirm or
+  // override the mapping, then import.
+  const [importPreview, setImportPreview] = useState<ImportPreview | null>(null)
+  const [importQuestionCol, setImportQuestionCol] = useState('')
+  const [importAnswerCol, setImportAnswerCol] = useState('')
+  const [importFileName, setImportFileName] = useState('')
+  // Hold the picked File in state: the <input type=file> is unmounted once we
+  // switch to the preview step (conditional render), so fileRef would be null
+  // at confirm time. Keeping the File here makes confirm-import reliable.
+  const [importFile, setImportFile] = useState<File | null>(null)
   const [newQuestion, setNewQuestion] = useState('')
   const [newAnswer, setNewAnswer] = useState('')
   const [newKeyPoints, setNewKeyPoints] = useState('')
@@ -74,17 +85,48 @@ export default function BenchmarkPage() {
     )
   }, [categorySchema])
 
+  // Step 1: preview a picked file — detect columns + suggested mapping.
+  const previewMutation = useMutation({
+    mutationFn: (file: File) =>
+      benchmarkApi.importPreview(projectId!, file, { categoryId: importCategoryId || undefined }).then(r => r.data),
+    onSuccess: (data) => {
+      setImportPreview(data)
+      // Default the column pickers to the auto-detected suggestion.
+      setImportQuestionCol(data.suggested_mapping.question || '')
+      setImportAnswerCol(data.suggested_mapping.reference_answer || '')
+    },
+    onError: (e) => toast.error(toToastMessage(formatApiError(e)), '预览失败'),
+  })
+
+  // Step 2: import with the (possibly overridden) column mapping.
   const importMutation = useMutation({
-    mutationFn: (file: File) => benchmarkApi.importFile(projectId!, file, importCategoryId || undefined),
+    mutationFn: (file: File) => benchmarkApi.importFile(projectId!, file, {
+      categoryId: importCategoryId || undefined,
+      questionColumn: importQuestionCol || undefined,
+      answerColumn: importAnswerCol || undefined,
+    }),
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })
-      setShowImport(false)
+      closeImport()
+      const d = res.data
+      const skippedNote = d.skipped ? `，跳过 ${d.skipped} 行（无问题）` : ''
       toast.success(
-        `${res.data.imported_to_benchmark} 条入库，${res.data.pending_in_staging} 条进入暂存区`,
+        `${d.imported_to_benchmark} 条入库，${d.pending_in_staging} 条进入暂存区${skippedNote}`,
         '导入完成',
       )
     },
+    onError: (e) => toast.error(toToastMessage(formatApiError(e)), '导入失败'),
   })
+
+  const closeImport = () => {
+    setShowImport(false)
+    setImportPreview(null)
+    setImportQuestionCol('')
+    setImportAnswerCol('')
+    setImportFileName('')
+    setImportFile(null)
+    if (fileRef.current) fileRef.current.value = ''
+  }
 
   const createMutation = useMutation({
     mutationFn: () => benchmarkApi.createCase(projectId!, {
@@ -395,44 +437,124 @@ export default function BenchmarkPage() {
 
       <Dialog
         open={showImport}
-        onClose={() => setShowImport(false)}
+        onClose={closeImport}
         title="导入文件"
-        width={460}
+        width={720}
         footer={
           <>
-            <Button variant="secondary" size="md" onClick={() => setShowImport(false)}>取消</Button>
-            <Button
-              variant="primary"
-              size="md"
-              loading={importMutation.isPending}
-              onClick={() => { const f = fileRef.current?.files?.[0]; if (f) importMutation.mutate(f) }}
-            >
-              开始导入
-            </Button>
+            <Button variant="secondary" size="md" onClick={closeImport}>取消</Button>
+            {!importPreview ? (
+              <Button
+                variant="primary"
+                size="md"
+                loading={previewMutation.isPending}
+                onClick={() => { const f = fileRef.current?.files?.[0]; if (f) { setImportFile(f); setImportFileName(f.name); previewMutation.mutate(f) } }}
+              >
+                下一步：识别字段
+              </Button>
+            ) : (
+              <Button
+                variant="primary"
+                size="md"
+                disabled={!importQuestionCol || !importFile}
+                loading={importMutation.isPending}
+                onClick={() => { if (importFile) importMutation.mutate(importFile) }}
+              >
+                确认并导入（{importPreview.total_rows} 行）
+              </Button>
+            )}
           </>
         }
       >
-        <p className="text-[12px] text-text-secondary mb-4">
-          支持 CSV、JSON、XLSX 格式。需包含 question 列，可选 reference_answer、key_points、negative_points 列。
-        </p>
-        <div className="space-y-4">
-          <div>
-            <label htmlFor={importCategoryFieldId} className="field-label">目标类别</label>
-            <select
-              id={importCategoryFieldId}
-              value={importCategoryId}
-              onChange={e => setImportCategoryId(e.target.value)}
-              className="input"
+        {!importPreview ? (
+          <>
+            <p className="text-[12px] text-text-secondary mb-4">
+              支持 CSV、JSON/JSONL、Excel(.xlsx) 格式，可处理大体量文件。上传后会自动识别问题与期望答案列，并允许你手动调整。
+            </p>
+            <div className="space-y-4">
+              <div>
+                <label htmlFor={importCategoryFieldId} className="field-label">目标类别</label>
+                <select
+                  id={importCategoryFieldId}
+                  value={importCategoryId}
+                  onChange={e => setImportCategoryId(e.target.value)}
+                  className="input"
+                >
+                  <option value="">不指定类别</option>
+                  {categories?.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              </div>
+              <div>
+                <label htmlFor={importFileId} className="field-label">选择文件</label>
+                <input id={importFileId} ref={fileRef} type="file" accept=".csv,.json,.jsonl,.xlsx,.xls" className="text-[12px]" />
+              </div>
+            </div>
+          </>
+        ) : (
+          <div className="space-y-4">
+            <p className="text-[12px] text-text-secondary">
+              文件 <span className="font-medium text-text-primary">{importFileName}</span> 共 {importPreview.total_rows} 行，
+              识别到 {importPreview.source_headers.length} 列。请确认问题列与期望答案列。
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="field-label">问题列 <span className="text-action-danger">*</span></label>
+                <select value={importQuestionCol} onChange={e => setImportQuestionCol(e.target.value)} className="input">
+                  <option value="">— 选择列 —</option>
+                  {importPreview.source_headers.map(h => <option key={h} value={h}>{h}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="field-label">期望答案列（可选）</label>
+                <select value={importAnswerCol} onChange={e => setImportAnswerCol(e.target.value)} className="input">
+                  <option value="">— 不指定 —</option>
+                  {importPreview.source_headers.map(h => <option key={h} value={h}>{h}</option>)}
+                </select>
+              </div>
+            </div>
+            {!importQuestionCol && (
+              <p className="text-[11px] text-action-danger">未能自动识别问题列，请手动选择。</p>
+            )}
+            <div>
+              <div className="field-label mb-1">列预览（前 3 行样例）</div>
+              <div className="border border-border rounded-md overflow-auto max-h-[260px]">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-fill/5 sticky top-0">
+                    <tr>
+                      {importPreview.source_headers.map(h => (
+                        <th key={h} className={`text-left px-2 py-1 font-medium whitespace-nowrap ${
+                          h === importQuestionCol ? 'text-accent' : h === importAnswerCol ? 'text-positive' : 'text-text-secondary'
+                        }`}>
+                          {h}
+                          {h === importQuestionCol && ' · 问题'}
+                          {h === importAnswerCol && ' · 答案'}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[0, 1, 2].map(i => (
+                      <tr key={i} className="border-t border-separator">
+                        {importPreview.source_headers.map(h => (
+                          <td key={h} className="px-2 py-1 align-top text-text-secondary max-w-[200px] truncate">
+                            {importPreview.sample_values[h]?.[i] ?? ''}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => { setImportPreview(null); setImportQuestionCol(''); setImportAnswerCol(''); setImportFile(null); if (fileRef.current) fileRef.current.value = '' }}
+              className="text-[11px] text-text-tertiary hover:text-text-primary transition-colors"
             >
-              <option value="">不指定类别</option>
-              {categories?.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-            </select>
+              ‹ 重新选择文件
+            </button>
           </div>
-          <div>
-            <label htmlFor={importFileId} className="field-label">选择文件</label>
-            <input id={importFileId} ref={fileRef} type="file" accept=".csv,.json,.jsonl,.xlsx,.xls" className="text-[12px]" />
-          </div>
-        </div>
+        )}
       </Dialog>
 
       <Dialog

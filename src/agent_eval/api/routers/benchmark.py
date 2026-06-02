@@ -17,8 +17,9 @@ from agent_eval.db_models.tables import (
     ImportBatchRow, ProjectRow,
 )
 from agent_eval.data.benchmark_import import (
-    auto_match_columns, get_answer_from_row, get_question_from_row,
-    parse_upload_file, resolve_extra_fields,
+    auto_detect_field_mapping, auto_match_columns, collect_sample_values,
+    get_answer_from_row, get_question_from_row, iter_upload_rows,
+    parse_upload_file, resolve_extra_fields, resolve_question_answer,
 )
 
 router = APIRouter(prefix="/api/benchmark", tags=["benchmark"])
@@ -207,12 +208,15 @@ async def import_file(
     project_id: str,
     file: UploadFile = File(...),
     category_id: str | None = Query(None),
+    question_column: str | None = Query(None, description="手动指定问题列（覆盖自动识别）"),
+    answer_column: str | None = Query(None, description="手动指定期望答案列（覆盖自动识别）"),
 ):
-    """Import benchmark cases from CSV, JSON, or XLSX file.
+    """Import benchmark cases from CSV, JSON/JSONL, or XLSX file.
 
-    If the target category has a schema_config, fields are mapped according to
-    the schema rules. Extra fields beyond question/reference_answer are stored
-    in the extra_fields JSONB column.
+    Streams the file row-by-row and commits in batches so large uploads don't
+    OOM or build one huge transaction. Field detection precedence:
+    explicit question_column/answer_column (from the UI) > category schema
+    mapping > alias/hardcoded fallback.
 
     When a category_id is specified, all records go directly into benchmark_cases
     (reference_answer may be null, to be filled later). Only when no category is
@@ -223,16 +227,19 @@ async def import_file(
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
     try:
-        source_headers, rows = parse_upload_file(content, filename)
+        source_headers, row_iter = iter_upload_rows(content, filename)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    if not rows:
-        raise HTTPException(status_code=400, detail="File is empty")
-
-    # Load category schema_config if available
+    # Load category schema_config if available (for extra_fields + mapping).
     schema_columns: list[dict] = []
     field_mapping: dict[str, str] = {}
+
+    BATCH_SIZE = 500
+    imported = 0
+    pending = 0
+    skipped = 0
+    pending_batch: list[Any] = []
 
     async with async_session_factory() as session:
         if category_id:
@@ -244,15 +251,23 @@ async def import_file(
                 schema_columns = category.schema_config.get("columns", [])
                 field_mapping = auto_match_columns(source_headers, schema_columns)
 
-        imported = 0
-        pending = 0
+        async def flush_batch() -> None:
+            if pending_batch:
+                session.add_all(pending_batch)
+                await session.flush()
+                pending_batch.clear()
 
-        for row_data in rows:
-            question = get_question_from_row(row_data, schema_columns, field_mapping)
+        for row_data in row_iter:
+            question, ref_answer = resolve_question_answer(
+                row_data,
+                question_column=question_column,
+                answer_column=answer_column,
+                schema_columns=schema_columns,
+                field_mapping=field_mapping,
+            )
             if not question:
+                skipped += 1
                 continue
-
-            ref_answer = get_answer_from_row(row_data, schema_columns, field_mapping)
 
             # Resolve extra fields from schema
             extra_fields = None
@@ -270,7 +285,7 @@ async def import_file(
             # 指定了 category 时直接入库 benchmark_cases（答案可为空，后续补充）
             # 未指定 category 且无答案时进入暂存区
             if category_id or ref_answer:
-                case_row = BenchmarkCaseRow(
+                pending_batch.append(BenchmarkCaseRow(
                     project_id=project_id,
                     category_id=category_id,
                     question=question,
@@ -281,20 +296,36 @@ async def import_file(
                     difficulty=difficulty,
                     extra_fields=extra_fields,
                     source="file_imported",
-                )
-                session.add(case_row)
+                ))
                 imported += 1
             else:
-                candidate_row = CandidateCaseRow(
+                pending_batch.append(CandidateCaseRow(
                     project_id=project_id,
                     source="file_imported",
                     question=question,
                     tags=tags,
                     extra_metadata=extra_fields,
                     status="pending",
-                )
-                session.add(candidate_row)
+                ))
                 pending += 1
+
+            if len(pending_batch) >= BATCH_SIZE:
+                await flush_batch()
+
+        await flush_batch()
+
+        if imported + pending == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No importable rows (file empty or no question column matched; skipped {skipped})",
+            )
+
+        # The actual mapping used, for UI feedback.
+        used_mapping = dict(field_mapping)
+        if question_column:
+            used_mapping["question"] = question_column
+        if answer_column:
+            used_mapping["reference_answer"] = answer_column
 
         batch_row = ImportBatchRow(
             project_id=project_id,
@@ -312,7 +343,8 @@ async def import_file(
         "total": imported + pending,
         "imported_to_benchmark": imported,
         "pending_in_staging": pending,
-        "field_mapping": field_mapping if schema_columns else None,
+        "skipped": skipped,
+        "field_mapping": used_mapping or None,
     }
 
 
@@ -441,11 +473,15 @@ async def preview_import(
     project_id: str,
     file: UploadFile = File(...),
     category_id: str | None = Query(None),
-    max_rows: int = Query(5, ge=1, le=20),
+    max_rows: int = Query(5, ge=1, le=50),
+    question_column: str | None = Query(None),
+    answer_column: str | None = Query(None),
 ):
-    """Preview how a file would be imported with the category's schema mapping.
+    """Preview how a file would be imported.
 
-    Returns the auto-detected field mapping and a sample of converted rows.
+    Returns the detected source columns, an auto-suggested question/answer
+    mapping (independent of category schema), per-column sample values, and a
+    sample of converted rows honoring any manual column override.
     """
     content = await file.read()
     filename = file.filename or "unknown"
@@ -468,10 +504,25 @@ async def preview_import(
                 schema_columns = category.schema_config.get("columns", [])
                 field_mapping = auto_match_columns(source_headers, schema_columns)
 
+    # Schema-independent auto-detection of question / answer columns.
+    suggested_mapping = auto_detect_field_mapping(source_headers)
+    sample_values = collect_sample_values(rows, source_headers, limit=3)
+
+    # For the preview rows, honor an explicit override if given; otherwise fall
+    # back to the auto-suggested columns so the sample isn't blank when columns
+    # use non-standard names (e.g. 用户问题 / 标准答案) the hardcoded fallback misses.
+    eff_question_col = question_column or suggested_mapping.get("question")
+    eff_answer_col = answer_column or suggested_mapping.get("reference_answer")
+
     preview_rows = []
     for row_data in rows[:max_rows]:
-        question = get_question_from_row(row_data, schema_columns, field_mapping)
-        answer = get_answer_from_row(row_data, schema_columns, field_mapping)
+        question, answer = resolve_question_answer(
+            row_data,
+            question_column=eff_question_col,
+            answer_column=eff_answer_col,
+            schema_columns=schema_columns,
+            field_mapping=field_mapping,
+        )
         extra = resolve_extra_fields(row_data, schema_columns, field_mapping, filename) if schema_columns else None
 
         preview_rows.append({
@@ -486,6 +537,8 @@ async def preview_import(
         "total_rows": len(rows),
         "source_headers": source_headers,
         "field_mapping": field_mapping,
+        "suggested_mapping": suggested_mapping,
+        "sample_values": sample_values,
         "schema_columns": schema_columns,
         "preview": preview_rows,
     }
