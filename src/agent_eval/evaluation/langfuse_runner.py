@@ -799,6 +799,7 @@ async def _execute_run(
                         uuid.UUID(run_id),
                         benchmark_case_id=bench_id,
                         question=res["question"],
+                        expected_output=res.get("expected_output") or None,
                         thread_id=res["thread_id"],
                         actual_output=res["actual_output"],
                         actual_tool_calls=res["actual_tool_calls"] or None,

@@ -120,6 +120,11 @@ class TestResultRow(Base):
     )
 
     question: Mapped[str | None] = mapped_column(Text)
+    # Expected/reference answer, snapshotted at run time from the case source
+    # (benchmark reference_answer or uploaded expected_output). Persisted here
+    # so the export/detail view always has it, independent of whether the
+    # originating case still exists. NULL on rows created before 0016.
+    expected_output: Mapped[str | None] = mapped_column(Text)
     thread_id: Mapped[str | None] = mapped_column(Text)
     langsmith_run_id: Mapped[str | None] = mapped_column(Text)
 

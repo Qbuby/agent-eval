@@ -358,7 +358,13 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
             "benchmark_case_id": str(r.benchmark_case_id) if r.benchmark_case_id else None,
             "test_case_id": str(r.test_case_id) if r.test_case_id else None,
             "question": r.question,
-            "expected_output": expected_by_case.get(r.benchmark_case_id, ""),
+            # Prefer the value snapshotted on the result row (migration 0016+).
+            # Fall back to the benchmark case's reference_answer for older rows
+            # that predate the column but still have a benchmark_case_id.
+            "expected_output": (
+                getattr(r, "expected_output", None)
+                or expected_by_case.get(r.benchmark_case_id, "")
+            ),
             "status": r.status,
             "actual_output": r.actual_output,
             "latency_ms": r.latency_ms,
