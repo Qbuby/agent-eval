@@ -168,3 +168,46 @@ def test_build_payload_generic_preserves_template():
     assert payload["model"] == "gpt-4"
     assert payload["seed"] == 7
     assert "conversation_id" in payload  # auto-added
+
+
+# ─── shared-client ownership (high-concurrency connection pooling) ──────────
+# When _execute_run injects one pooled client for the whole run, a single
+# case's adapter.close() MUST NOT close it — otherwise the second case reuses
+# a closed client and the whole run fails. Conversely, an adapter that built
+# its own client (CLI / tests) must close it to avoid leaking connections.
+
+import asyncio  # noqa: E402
+
+import httpx  # noqa: E402
+
+from agent_eval.evaluation.agent_adapter import OpenAICompatibleAdapter  # noqa: E402
+
+
+def test_injected_client_not_closed_by_adapter():
+    async def _run():
+        shared = httpx.AsyncClient()
+        try:
+            for cls, kwargs in (
+                (OpenAICompatibleAdapter, {"base_url": "http://x"}),
+                (SSEStreamAdapter, {"url": "http://x", "mode": "langgraph_v2"}),
+            ):
+                ad = cls(client=shared, **kwargs)
+                assert ad._client is shared
+                assert ad._owns_client is False
+                await ad.close()
+                assert not shared.is_closed, f"{cls.__name__}.close() closed the shared client"
+        finally:
+            await shared.aclose()
+
+    asyncio.run(_run())
+
+
+def test_owned_client_closed_by_adapter():
+    async def _run():
+        ad = OpenAICompatibleAdapter(base_url="http://x")
+        assert ad._owns_client is True
+        inner = ad._client
+        await ad.close()
+        assert inner.is_closed, "owned client should be closed by adapter.close()"
+
+    asyncio.run(_run())

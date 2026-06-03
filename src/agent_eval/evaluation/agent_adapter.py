@@ -27,6 +27,7 @@ class OpenAICompatibleAdapter:
         model: str = "default",
         timeout: float = 120,
         extra_headers: dict[str, str] | None = None,
+        client: httpx.AsyncClient | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -36,14 +37,23 @@ class OpenAICompatibleAdapter:
             headers["Authorization"] = f"Bearer {api_key}"
         if extra_headers:
             headers.update(extra_headers)
-        self._client = httpx.AsyncClient(headers=headers, timeout=timeout)
+        # Per-request headers. When a shared client is injected (high-concurrency
+        # runs reuse one pooled client), headers go on each request rather than
+        # the client, since one client serves many adapters.
+        self._headers = headers
+        if client is not None:
+            self._client = client
+            self._owns_client = False
+        else:
+            self._client = httpx.AsyncClient(headers=headers, timeout=timeout)
+            self._owns_client = True
 
     async def invoke(self, messages: list[dict[str, Any]]) -> AgentResponse:
         url = f"{self.base_url}/chat/completions"
         payload = {"model": self.model, "messages": messages, "stream": False}
 
         start = time.perf_counter()
-        resp = await self._client.post(url, json=payload)
+        resp = await self._client.post(url, json=payload, headers=self._headers)
         latency_ms = (time.perf_counter() - start) * 1000
         resp.raise_for_status()
 
@@ -58,7 +68,8 @@ class OpenAICompatibleAdapter:
         )
 
     async def close(self):
-        await self._client.aclose()
+        if self._owns_client:
+            await self._client.aclose()
 
 
 class SSEStreamAdapter:
@@ -95,6 +106,7 @@ class SSEStreamAdapter:
         mode: str = "generic",
         thread_id: str | None = None,
         language: str = "请用中文回复",
+        client: httpx.AsyncClient | None = None,
     ):
         self.url = url
         self.timeout = timeout
@@ -105,7 +117,16 @@ class SSEStreamAdapter:
         req_headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if headers:
             req_headers.update(headers)
-        self._client = httpx.AsyncClient(headers=req_headers, timeout=timeout)
+        self._headers = req_headers
+        # Reuse an injected pooled client on high-concurrency runs; otherwise
+        # own a private client (CLI / tests). Headers are applied per-request
+        # so a shared client can serve many adapters with different auth.
+        if client is not None:
+            self._client = client
+            self._owns_client = False
+        else:
+            self._client = httpx.AsyncClient(headers=req_headers, timeout=timeout)
+            self._owns_client = True
 
     def _build_payload(self, question: str) -> dict[str, Any]:
         if self.mode == "langgraph_v2":
@@ -172,7 +193,7 @@ class SSEStreamAdapter:
         usage_seen = False
 
         start = time.perf_counter()
-        async with self._client.stream("POST", self.url, json=payload) as resp:
+        async with self._client.stream("POST", self.url, json=payload, headers=self._headers) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line or not line.startswith("data:"):
@@ -405,4 +426,5 @@ class SSEStreamAdapter:
         return False
 
     async def close(self):
-        await self._client.aclose()
+        if self._owns_client:
+            await self._client.aclose()

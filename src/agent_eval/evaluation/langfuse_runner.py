@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from langfuse import Langfuse  # kept for optional remote write; unused otherwise
 from sqlalchemy import select
 
@@ -189,7 +191,12 @@ def request_stop(run_id: str) -> bool:
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
+def _make_adapter(
+    agent_cfg: dict,
+    *,
+    thread_id: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> Any:
     """Build the HTTP adapter for one case.
 
     - ``type='sse'`` defaults to LangGraph v2 payload/event shape (the production
@@ -198,6 +205,11 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
       (even though agent-side id rewriting may change what LangSmith records).
     - ``type='openai'`` for OpenAI-compatible /v1/chat/completions.
     - ``type='sse_generic'`` for the legacy templated SSE behaviour.
+
+    ``client`` lets the caller inject one shared, connection-pooled
+    ``httpx.AsyncClient`` for the whole run so 20 concurrent cases reuse
+    keepalive connections (and one DNS lookup) instead of each opening a
+    fresh client — the dominant cause of burst DNS failures / agent_unreachable.
     """
     t = agent_cfg.get("type", "sse")
     if t == "openai":
@@ -207,6 +219,7 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
             model=agent_cfg.get("model", "default"),
             timeout=float(agent_cfg.get("timeout", 120.0)),
             extra_headers=agent_cfg.get("headers") or None,
+            client=client,
         )
     if t in ("sse", "sse_langgraph"):
         return SSEStreamAdapter(
@@ -216,6 +229,7 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
             mode="langgraph_v2",
             thread_id=thread_id,
             language=agent_cfg.get("language", "请用中文回复"),
+            client=client,
         )
     if t == "sse_generic":
         return SSEStreamAdapter(
@@ -224,6 +238,7 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
             payload_template=agent_cfg.get("payload_template"),
             timeout=float(agent_cfg.get("timeout", 120.0)),
             mode="generic",
+            client=client,
         )
     raise ValueError(f"unknown agent type: {t!r}")
 
@@ -373,6 +388,15 @@ _TRANSIENT_HINTS = (
     "bad gateway", "service unavailable", "gateway timeout",
     "502", "503", "504",
     "timed out", "timeout",
+    # DNS resolution failures under burst concurrency inside containers.
+    # httpx surfaces these as ConnectError with these substrings; they are
+    # transient (the resolver recovers once the burst subsides), so they
+    # MUST be retried — previously they matched no hint and failed terminally.
+    "temporary failure in name resolution",
+    "name or service not known",
+    "failed to resolve",
+    "nodename nor servname",
+    "eai_again",
 )
 
 
@@ -382,6 +406,16 @@ def _classify_agent_error(err: Exception) -> str:
     if "502" in s or "bad gateway" in s or "503" in s or "service unavailable" in s:
         return "agent_unreachable"
     if "all connection attempts failed" in s or "connection refused" in s or "connection reset" in s:
+        return "agent_unreachable"
+    # DNS failures mean we never reached the agent — same bucket as a refused
+    # connection so the UI renders it as infra (neutral), not a wrong answer.
+    if (
+        "temporary failure in name resolution" in s
+        or "name or service not known" in s
+        or "failed to resolve" in s
+        or "nodename nor servname" in s
+        or "eai_again" in s
+    ):
         return "agent_unreachable"
     if "504" in s or "timed out" in s or "timeout" in s or "gateway timeout" in s:
         return "agent_timeout"
@@ -509,7 +543,11 @@ async def _invoke_with_retry(
                 "agent transient err on attempt %d/%d (%s); backing off %.1fs",
                 attempt, total_attempts, type(e).__name__, backoff,
             )
-            cancelled = await _sleep_with_cancel(backoff, cancel_event)
+            # Jitter the sleep so 20 concurrent cases that all failed in the
+            # same burst don't wake and retry in lockstep into the same
+            # congestion window. Full jitter over [0, backoff].
+            jittered = backoff * (0.5 + random.random() * 0.5)
+            cancelled = await _sleep_with_cancel(jittered, cancel_event)
             if cancelled:
                 setattr(e, "_eval_attempts_made", attempt)
                 raise
@@ -525,6 +563,7 @@ async def _run_one_case(
     evaluator_specs: list[dict[str, Any]],
     cancel_event: asyncio.Event | None = None,
     retry_policy: _RetryPolicy | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Execute one case end-to-end. ``case`` is the normalized dict from
     ``_normalize_cases_for_runner``: {id, name, question, expected_output,
@@ -544,7 +583,7 @@ async def _run_one_case(
     # (start_time, question text) instead.
     thread_id = f"eval-{case.get('name','case')}-{uuid.uuid4().hex[:8]}"
 
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id)
+    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
     messages = [{"role": "user", "content": question}]
     if retry_policy is None:
         retry_policy = _retry_policy_from_cfg(agent_cfg)
@@ -758,6 +797,23 @@ async def _execute_run(
     sem = asyncio.Semaphore(max(1, concurrency))
     per_case_results: list[dict[str, Any]] = []
 
+    # One shared, connection-pooled client for the whole run. Without this each
+    # case opened its own httpx.AsyncClient with an unbounded pool, so 20
+    # concurrent cases meant 20 independent connection pools and a burst of
+    # simultaneous DNS lookups — the container's resolver drops these under
+    # load ("Temporary failure in name resolution"), surfacing as spurious
+    # agent_unreachable. Capping connections at the concurrency level and
+    # reusing keepalive connections removes both the DNS burst and the
+    # connection churn. keepalive_expiry is generous because agent calls can
+    # take tens of seconds (multi-step LangGraph) between requests on a slot.
+    limits = httpx.Limits(
+        max_connections=max(1, concurrency),
+        max_keepalive_connections=max(1, concurrency),
+        keepalive_expiry=120.0,
+    )
+    agent_timeout = float(agent_cfg.get("timeout", 120.0))
+    http_client = httpx.AsyncClient(limits=limits, timeout=agent_timeout)
+
     async def _do_one(case: dict[str, Any]):
         if cancel_event.is_set():
             return
@@ -771,6 +827,7 @@ async def _execute_run(
                     evaluator_specs=evaluator_specs,
                     cancel_event=cancel_event,
                     retry_policy=retry_policy,
+                    http_client=http_client,
                 )
             except Exception as e:
                 logger.exception("case %s crashed during run: %s", case.get("id"), e)
@@ -831,6 +888,12 @@ async def _execute_run(
     try:
         await asyncio.gather(*[_do_one(c) for c in cases])
     finally:
+        # Close the shared client before aggregation so its connections are
+        # released even if aggregation/backfill below raises.
+        try:
+            await http_client.aclose()
+        except Exception:
+            pass
         # Aggregate
         succ = [r for r in per_case_results if r["status"] == "pass"]
         fail = [r for r in per_case_results if r["status"] != "pass"]
