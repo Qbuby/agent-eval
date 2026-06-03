@@ -22,10 +22,36 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    from agent_eval.db_models.tables import Base
+    """Bring the database schema up to date by running Alembic migrations.
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    This used to call ``Base.metadata.create_all``, which built tables directly
+    from the ORM and bypassed Alembic entirely. That bypass let the models and
+    the migration chain drift apart (see migration 0017's docstring). Now it
+    runs ``alembic upgrade head`` so the CLI ``init-db`` command and production
+    deploys take the *same* path and the ``alembic_version`` bookkeeping stays
+    correct.
+
+    Alembic is synchronous; we run it in a thread so this stays an async API.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    # db.py lives at src/agent_eval/db.py → project root is parents[2],
+    # which is also /app inside the container image.
+    root = Path(__file__).resolve().parents[2]
+
+    def _upgrade() -> None:
+        cfg = Config(str(root / "alembic.ini"))
+        # script_location in the ini is relative; anchor it to the project
+        # root so this works regardless of the process's cwd. env.py builds
+        # the sync DB URL from DB_* env vars.
+        cfg.set_main_option("script_location", str(root / "alembic"))
+        command.upgrade(cfg, "head")
+
+    await asyncio.to_thread(_upgrade)
 
 
 async def close_db() -> None:
