@@ -110,8 +110,9 @@ export default function BenchmarkPage() {
       closeImport()
       const d = res.data
       const skippedNote = d.skipped ? `，跳过 ${d.skipped} 行（无问题）` : ''
+      const dupNote = d.duplicates ? `，跳过 ${d.duplicates} 行（重复）` : ''
       toast.success(
-        `${d.imported_to_benchmark} 条入库，${d.pending_in_staging} 条进入暂存区${skippedNote}`,
+        `${d.imported_to_benchmark} 条入库，${d.pending_in_staging} 条进入暂存区${skippedNote}${dupNote}`,
         '导入完成',
       )
     },

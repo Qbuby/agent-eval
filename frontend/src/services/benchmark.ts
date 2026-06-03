@@ -91,6 +91,7 @@ export interface ImportResult {
   imported_to_benchmark: number
   pending_in_staging: number
   skipped: number
+  duplicates: number
   field_mapping: Record<string, string> | null
 }
 

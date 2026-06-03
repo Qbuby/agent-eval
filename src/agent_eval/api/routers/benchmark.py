@@ -239,6 +239,7 @@ async def import_file(
     imported = 0
     pending = 0
     skipped = 0
+    duplicates = 0
     pending_batch: list[Any] = []
 
     async with async_session_factory() as session:
@@ -250,6 +251,28 @@ async def import_file(
             if category and category.schema_config:
                 schema_columns = category.schema_config.get("columns", [])
                 field_mapping = auto_match_columns(source_headers, schema_columns)
+
+        # Dedup by question text within the same project. Pre-load existing
+        # questions (active benchmark cases + pending candidates) into a set so
+        # each row is an O(1) check instead of a per-row query; `seen` then
+        # also catches duplicates within the uploaded file itself. Comparison
+        # is on the stripped text (same normalization resolve_question_answer
+        # applies).
+        existing_q = await session.execute(
+            select(BenchmarkCaseRow.question).where(
+                BenchmarkCaseRow.project_id == project_id
+            )
+        )
+        existing_c = await session.execute(
+            select(CandidateCaseRow.question).where(
+                CandidateCaseRow.project_id == project_id
+            )
+        )
+        seen: set[str] = {
+            (q or "").strip()
+            for q in [*existing_q.scalars().all(), *existing_c.scalars().all()]
+            if q and q.strip()
+        }
 
         async def flush_batch() -> None:
             if pending_batch:
@@ -268,6 +291,12 @@ async def import_file(
             if not question:
                 skipped += 1
                 continue
+
+            # Skip duplicates (already in DB, or seen earlier in this file).
+            if question in seen:
+                duplicates += 1
+                continue
+            seen.add(question)
 
             # Resolve extra fields from schema
             extra_fields = None
@@ -314,10 +343,17 @@ async def import_file(
 
         await flush_batch()
 
-        if imported + pending == 0:
+        # Only error when nothing was recognized at all. "All rows are
+        # duplicates" is a normal re-upload case, not an error — return 200
+        # with the duplicates count so the UI shows the friendly "跳过 N 行
+        # (重复)" toast instead of a red failure.
+        if imported + pending + duplicates == 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"No importable rows (file empty or no question column matched; skipped {skipped})",
+                detail=(
+                    f"No importable rows (file empty or no question column "
+                    f"matched; skipped {skipped})"
+                ),
             )
 
         # The actual mapping used, for UI feedback.
@@ -344,6 +380,7 @@ async def import_file(
         "imported_to_benchmark": imported,
         "pending_in_staging": pending,
         "skipped": skipped,
+        "duplicates": duplicates,
         "field_mapping": used_mapping or None,
     }
 
