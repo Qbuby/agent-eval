@@ -80,7 +80,7 @@ export interface AddCasesRequest {
 
 export interface GenerateScenarioRequest {
   dataset: string
-  test_scenario: string
+  test_scenario?: string
   case_category?: string
   count?: number
   context?: string

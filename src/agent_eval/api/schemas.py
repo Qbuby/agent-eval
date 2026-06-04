@@ -66,8 +66,8 @@ class BatchDeleteRequest(BaseModel):
 class GenerateScenarioRequest(BaseModel):
     dataset: str
     test_scenario: str = Field(
-        description="测试场景: faithfulness, context_recall, answer_relevancy, "
-        "context_precision, context_relevancy, hallucination"
+        default="",
+        description="测试场景/主题（可选，自由文本）。留空则让 agent 围绕其核心领域能力自由出题",
     )
     case_category: str = Field(
         default="normal",

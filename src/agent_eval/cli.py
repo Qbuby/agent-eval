@@ -657,25 +657,32 @@ generate_app = typer.Typer(name="generate", help="LLM-powered test case generati
 dataset_app.add_typer(generate_app)
 
 
-def _get_llm():
-    from langchain_openai import ChatOpenAI
-    from agent_eval.config import settings
-
-    kwargs: dict[str, Any] = {
-        "model": settings.llm.model,
-        "temperature": settings.llm.temperature,
-        "max_tokens": settings.llm.max_tokens,
-    }
-    if settings.llm.api_key:
-        kwargs["api_key"] = settings.llm.api_key
-    if settings.llm.base_url:
-        kwargs["base_url"] = settings.llm.base_url
-    return ChatOpenAI(**kwargs)
-
-
 def _get_case_generator():
+    """Build a CaseGenerator backed by an agent endpoint.
+
+    Cases are now authored by the agent under test (KG-grounded), not a bare
+    LLM. The CLI is a local dev tool with no DB config, so it targets the
+    OpenAI-compatible endpoint from env settings (TARGET_AGENT_URL overrides
+    LLM base_url) — the API server sources target_agent.* from the DB instead.
+    """
+    import os
+    from agent_eval.config import settings
     from agent_eval.data.case_generator import CaseGenerator
-    return CaseGenerator(llm=_get_llm())
+    from agent_eval.evaluation.agent_adapter import OpenAICompatibleAdapter
+
+    base_url = os.getenv("TARGET_AGENT_URL") or settings.llm.base_url
+    if not base_url:
+        raise typer.BadParameter(
+            "no agent endpoint configured: set TARGET_AGENT_URL "
+            "(or LLM base_url) to the agent under test"
+        )
+    adapter = OpenAICompatibleAdapter(
+        base_url=base_url,
+        api_key=os.getenv("TARGET_AGENT_API_KEY") or settings.llm.api_key or "",
+        model=settings.llm.model,
+        timeout=float(os.getenv("TARGET_AGENT_TIMEOUT") or 120.0),
+    )
+    return CaseGenerator(adapter=adapter)
 
 
 def _preview_cases(cases: list, title: str = "Generated cases") -> None:

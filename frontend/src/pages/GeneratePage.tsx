@@ -5,25 +5,15 @@ import { Button } from '@/components/ui'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { TestCase } from '@/types'
 
-type Scenario = 'faithfulness' | 'context_recall' | 'answer_relevancy' | 'context_precision' | 'context_relevancy' | 'hallucination'
 type Category = 'normal' | 'bad_case' | 'edge_case'
 
 interface GenerateForm {
   dataset: string
-  scenario: Scenario | ''
+  scenario: string
   category: Category | ''
   count: number
   context: string
 }
-
-const SCENARIOS: { value: Scenario; label: string }[] = [
-  { value: 'faithfulness', label: '忠实度 (Faithfulness)' },
-  { value: 'context_recall', label: '上下文召回率 (Context Recall)' },
-  { value: 'answer_relevancy', label: '答案相关性 (Answer Relevancy)' },
-  { value: 'context_precision', label: '上下文精准度 (Context Precision)' },
-  { value: 'context_relevancy', label: '上下文相关性 (Context Relevancy)' },
-  { value: 'hallucination', label: '幻觉率 (Hallucination)' },
-]
 
 const CATEGORIES: { value: Category; label: string }[] = [
   { value: 'normal', label: '正常 Case (Normal)' },
@@ -129,19 +119,18 @@ export default function GeneratePage() {
           </div>
 
           <div>
-            <label htmlFor="gen-scenario" className="field-label">测试场景</label>
-            <select
+            <label htmlFor="gen-scenario" className="field-label">测试场景 / 主题（可选）</label>
+            <input
               id="gen-scenario"
+              type="text"
               value={form.scenario}
-              onChange={(e) => setForm({ ...form, scenario: e.target.value as Scenario })}
-              required
+              onChange={(e) => setForm({ ...form, scenario: e.target.value })}
+              placeholder="留空则由智能体围绕其核心领域能力自由出题"
               className="input"
-            >
-              <option value="">选择场景</option>
-              {SCENARIOS.map((s) => (
-                <option key={s.value} value={s.value}>{s.label}</option>
-              ))}
-            </select>
+            />
+            <p className="mt-1 text-[11px] text-text-tertiary">
+              样例由被测智能体基于自身知识图谱生成，填写场景可聚焦特定主题
+            </p>
           </div>
 
           <div>
