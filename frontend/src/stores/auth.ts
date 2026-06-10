@@ -12,6 +12,10 @@ interface AuthState {
   isAuthenticated: () => boolean
   role: () => string | null
   isAdmin: () => boolean
+  // 是否外部客户（external_customer 角色）—— 入口反转用来决定落地页与导航分组
+  isExternal: () => boolean
+  // 当前用户所属租户 id（未登录返回 null）
+  tenantId: () => string | null
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -26,6 +30,8 @@ export const useAuthStore = create<AuthState>()(
       isAuthenticated: () => !!get().accessToken,
       role: () => get().user?.role ?? null,
       isAdmin: () => get().user?.role === 'admin',
+      isExternal: () => get().user?.role === 'external_customer',
+      tenantId: () => get().user?.tenant_id ?? null,
     }),
     { name: 'agent-eval-auth' },
   ),

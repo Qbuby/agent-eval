@@ -5,16 +5,25 @@ import { clsx } from 'clsx'
 import { ThemeToggle } from '@/components/ui'
 
 type NavItem = { to: string; label: string; icon: string }
-type NavGroup = { title?: string; items: NavItem[]; adminOnly?: boolean }
+// internalOnly: 仅内部角色可见（external_customer 隐藏）；adminOnly: 仅 admin 可见。
+// 入口反转后用 role 判定分组可见性，而不只是 adminOnly：外部客户只看到 portal 分组。
+type NavGroup = { title?: string; items: NavItem[]; adminOnly?: boolean; internalOnly?: boolean }
 
 // HIG sidebar: items grouped by purpose, with section captions in
 // SF "Footnote" style (uppercase tracking, tertiary color).
 const NAV_GROUPS: NavGroup[] = [
   {
+    // 外部客户 portal 入口：external_customer 唯一可见分组；内部角色也能看到便于排查。
+    title: '客户门户',
+    items: [{ to: '/portal', label: '样例评审', icon: 'inbox' }],
+  },
+  {
+    internalOnly: true,
     items: [{ to: '/dashboard', label: '仪表盘', icon: 'grid' }],
   },
   {
     title: '数据',
+    internalOnly: true,
     items: [
       { to: '/datasets', label: '备选数据集', icon: 'list' },
       { to: '/projects', label: '基准测试集', icon: 'target' },
@@ -23,6 +32,7 @@ const NAV_GROUPS: NavGroup[] = [
   },
   {
     title: '运行',
+    internalOnly: true,
     items: [
       { to: '/traces', label: '调用轨迹', icon: 'activity' },
       { to: '/evaluators', label: '评估器', icon: 'beaker' },
@@ -34,6 +44,8 @@ const NAV_GROUPS: NavGroup[] = [
     title: '系统',
     adminOnly: true,
     items: [
+      { to: '/admin/tenants', label: '租户管理', icon: 'users' },
+      { to: '/feedback', label: '客户反馈', icon: 'inbox' },
       { to: '/evaluator-providers', label: 'Judge Providers', icon: 'key' },
       { to: '/config', label: '配置', icon: 'settings' },
       { to: '/audit', label: '审计日志', icon: 'file' },
@@ -141,6 +153,22 @@ function NavIcon({ name }: { name: string }) {
           <path d="M7 9.5l5.5-5.5M11 6l1.5 1.5M9.5 7.5L11 9" />
         </svg>
       )
+    case 'inbox':
+      return (
+        <svg {...props}>
+          <path d="M2 9.5l1.8-5a1 1 0 0 1 1-.7h6.4a1 1 0 0 1 1 .7l1.8 5" />
+          <path d="M2 9.5h3.2l.9 1.5h3.8l.9-1.5H14v3a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z" />
+        </svg>
+      )
+    case 'users':
+      return (
+        <svg {...props}>
+          <circle cx="6" cy="6" r="2.3" />
+          <path d="M2.5 13a3.5 3.5 0 0 1 7 0" />
+          <path d="M10.5 4.2a2.3 2.3 0 0 1 0 4.1" />
+          <path d="M11 9.6a3.5 3.5 0 0 1 2.5 3.4" />
+        </svg>
+      )
     default:
       return null
   }
@@ -151,7 +179,13 @@ export default function Layout() {
   const navigate = useNavigate()
 
   const isAdmin = user?.role === 'admin'
-  const visibleGroups = NAV_GROUPS.filter((group) => !group.adminOnly || isAdmin)
+  // external_customer 只看到 portal 分组：internalOnly 分组对其隐藏，adminOnly 仍只给 admin。
+  const isExternal = user?.role === 'external_customer'
+  const visibleGroups = NAV_GROUPS.filter((group) => {
+    if (group.adminOnly && !isAdmin) return false
+    if (group.internalOnly && isExternal) return false
+    return true
+  })
 
   const handleLogout = () => {
     logout()

@@ -21,6 +21,10 @@ export interface User {
   email: string
   role: string
   is_active: boolean
+  // 多租户：用户所属租户 id；内部用户挂默认内部租户（与后端 UserRow.tenant_id 对齐）
+  tenant_id: string
+  // 是否超级管理员（内部 admin）；为 true 时后端跨租户可见
+  is_superadmin: boolean
   created_at: string
   updated_at: string
 }
