@@ -243,3 +243,44 @@ class TestGenerateMutations:
         prompt = _prompt_of(adapter)
         assert "Help me log in" in prompt
         assert "original-case" in prompt
+
+
+class TestJsonRepair:
+    """LLM-authored JSON often has unescaped double quotes inside string
+    values (the dominant real-world failure: 查询"驱动轮"配件) and trailing
+    commas. _extract_json must repair these rather than yield 0 cases."""
+
+    def test_bare_quotes_inside_string_value(self):
+        # mirrors the real agent reply that produced generated:0
+        bad = (
+            '[{"name": "配件查询", '
+            '"description": "考察BOM查询", '
+            '"input_messages": [{"role": "user", "content": "查驱动轮"}], '
+            '"expected_output": "应通过bom_parts_by_name查询"驱动轮"配件，再返回物料号", '
+            '"expected_output_criteria": ["调用了工具"], '
+            '"tags": ["BOM"]}]'
+        )
+        gen = CaseGenerator(adapter=MagicMock())
+        cases = gen._parse_cases(bad, source="auto_generated")
+        assert len(cases) == 1
+        assert cases[0].name == "配件查询"
+        # the inner quoted phrase survives in expected_output
+        assert "驱动轮" in (cases[0].expected_output or "")
+
+    def test_trailing_comma(self):
+        bad = '[{"name": "a", "input_messages": [{"role":"user","content":"x"}],},]'
+        gen = CaseGenerator(adapter=MagicMock())
+        cases = gen._parse_cases(bad, source="auto_generated")
+        assert len(cases) == 1
+        assert cases[0].name == "a"
+
+    def test_valid_json_untouched_by_repair(self):
+        # repair must never corrupt already-valid JSON
+        gen = CaseGenerator(adapter=MagicMock())
+        cases = gen._parse_cases(VALID_JSON_RESPONSE, source="auto_generated")
+        assert len(cases) == 2
+        assert cases[0].name == "test-case-1"
+
+    def test_unrepairable_returns_empty(self):
+        gen = CaseGenerator(adapter=MagicMock())
+        assert gen._parse_cases("总之这是一段没有任何结构的纯中文回复。", source="auto_generated") == []

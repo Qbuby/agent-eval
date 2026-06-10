@@ -256,36 +256,93 @@ class CaseGenerator:
         """Best-effort extraction of a JSON array/object from an agent reply.
 
         Agents (unlike a tightly-prompted LLM) frequently wrap the payload in
-        prose ("好的，以下是测试题：…") and/or a ```json fence. We try, in order:
-        1. the whole stripped text, 2. the content of a ``` fenced block,
-        3. the first top-level [...] / {...} substring. Returns the parsed
-        object, or None if nothing parses."""
+        prose ("好的，以下是测试题：…") and/or a ```json fence. For each
+        candidate (whole text → fenced block → first [...]/{...} substring) we
+        try a strict ``json.loads`` first, then a lenient repair pass that fixes
+        the JSON errors LLMs commonly emit — most importantly unescaped double
+        quotes inside string values (observed: 查询"驱动轮"配件) and trailing
+        commas. Returns the parsed object, or None if nothing parses."""
         if not content:
             return None
         text = content.strip()
 
-        # 1. straight parse (covers a clean JSON-only reply)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        # 2. fenced code block ```json ... ``` (anywhere in the text)
         import re
+
+        candidates: list[str] = [text]
         fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
         if fence:
-            try:
-                return json.loads(fence.group(1).strip())
-            except json.JSONDecodeError:
-                pass
-
-        # 3. first balanced [...] array, else first {...} object
+            candidates.append(fence.group(1).strip())
         for open_ch, close_ch in (("[", "]"), ("{", "}")):
             start = text.find(open_ch)
             end = text.rfind(close_ch)
             if start != -1 and end != -1 and end > start:
+                candidates.append(text[start : end + 1])
+
+        for cand in candidates:
+            # strict first — never let the repair pass touch valid JSON
+            try:
+                return json.loads(cand)
+            except json.JSONDecodeError:
+                pass
+            repaired = CaseGenerator._repair_json(cand)
+            if repaired is not None and repaired != cand:
                 try:
-                    return json.loads(text[start : end + 1])
+                    return json.loads(repaired)
                 except json.JSONDecodeError:
-                    continue
+                    pass
         return None
+
+    @staticmethod
+    def _repair_json(s: str) -> str | None:
+        """Repair the JSON mistakes LLMs commonly make, without a 3rd-party dep.
+
+        Handles:
+        * trailing commas before ] or }
+        * bare (unescaped) double quotes inside string values — the dominant
+          failure (e.g. ``"...查询"驱动轮"配件..."``). We scan char-by-char
+          tracking string state; a `"` seen inside a string that is NOT a
+          legitimate closer (i.e. not followed by a structural char
+          , : ] } or EOF) is escaped to ``\\"``.
+
+        Returns the repaired string, or None if the input doesn't look like JSON.
+        """
+        if not s:
+            return None
+        out: list[str] = []
+        in_str = False
+        escaped = False
+        n = len(s)
+        for i, ch in enumerate(s):
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                if not in_str:
+                    in_str = True
+                    out.append(ch)
+                else:
+                    # look ahead past whitespace for the next non-space char
+                    j = i + 1
+                    while j < n and s[j] in " \t\r\n":
+                        j += 1
+                    nxt = s[j] if j < n else ""
+                    if nxt in ",:]}" or nxt == "":
+                        # legitimate string close
+                        in_str = False
+                        out.append(ch)
+                    else:
+                        # bare quote inside a string value → escape it
+                        out.append('\\"')
+                continue
+            out.append(ch)
+
+        repaired = "".join(out)
+        # drop trailing commas:  , ]  /  , }
+        import re
+        repaired = re.sub(r",(\s*[\]}])", r"\1", repaired)
+        return repaired
