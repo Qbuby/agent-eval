@@ -129,14 +129,20 @@ services:
       LANGFUSE_HOST: ${LANGFUSE_HOST:-}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      # 显式覆盖被测 agent 所在宿主网关。留空时 entrypoint 自动探测
+      # （WSL 宿主 resolv.conf nameserver → 默认路由）。非 WSL / 特殊网络
+      # 可在此写死，例如 AGENT_HOST_GATEWAY=172.16.100.211。
+      AGENT_HOST_GATEWAY: ${AGENT_HOST_GATEWAY:-}
     ports:
       - "8000:8000"
-    # 让容器内代码能访问宿主机服务（被测 agent 通常跑在宿主机上，
-    # 例如 http://localhost:18096）。前端 UI 配置 agent URL 时用
-    # http://host.docker.internal:<port>/... 替代 http://localhost:<port>/...
-    # Linux 上 Docker Engine ≥ 20.10 也能解析 host-gateway。
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # 被测 agent 跑在 Windows 宿主上（SSH 隧道 0.0.0.0:18094）。本栈是
+    # WSL2 原生 Docker，compose 的 host-gateway 会把 host.docker.internal
+    # 错误解析到 docker 网桥（WSL VM），连不到 Windows 宿主。改为：把宿主
+    # 的 /etc/resolv.conf 挂进来，entrypoint 读其 nameserver（= WSL→Windows
+    # 宿主网关，WSL 重启会自动更新）注入为 host.docker.internal。配置页
+    # 与评估统一用 http://host.docker.internal:18094/... 这个稳定名字。
+    volumes:
+      - /etc/resolv.conf:/run/host-resolv.conf:ro
     # judge / agent 调用走外网域名（如 kiro.aidong-ai.com），
     # 宿主 /etc/resolv.conf 在某些 Docker Desktop / WSL 环境下
     # 不会被容器继承，导致 "Temporary failure in name resolution"。

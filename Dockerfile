@@ -33,9 +33,17 @@ COPY alembic ./alembic
 RUN find /app/alembic -type d -name __pycache__ -prune -exec rm -rf {} + && \
     find /app/alembic -type f -name '*.pyc' -delete
 
+# Entrypoint resolves the WSL→Windows host gateway and injects it as
+# host.docker.internal so the backend can reach the agent tunnel on the
+# Windows host (see scripts/docker-entrypoint.sh for the full rationale).
+COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
+    chmod +x /app/scripts/docker-entrypoint.sh
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://localhost:8000/health || exit 1
 
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
 CMD ["uvicorn", "agent_eval.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
