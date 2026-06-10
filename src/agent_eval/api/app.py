@@ -8,8 +8,9 @@ from fastapi.responses import JSONResponse
 
 from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
-    admin, auth, benchmark, candidates, cases, config, datasets, evaluation,
-    evaluator_providers, generate, governance, projects, routing, scheduler, traces,
+    admin, admin_tenants, auth, benchmark, candidates, cases, config, datasets, evaluation,
+    evaluator_providers, feedback_review, generate, governance, portal, projects, routing,
+    scheduler, traces,
 )
 from agent_eval.config import settings
 from agent_eval.logging_config import setup_logging
@@ -109,6 +110,12 @@ def create_app() -> FastAPI:
     app.include_router(evaluation.router)
     app.include_router(evaluator_providers.router)
     app.include_router(admin.router)
+    # 多租户 + 外部客户 Portal 三个新模块：admin 后台开户、客户 portal、内部反馈展示。
+    # 各 router 已自带 prefix 与角色门禁（admin_tenants/feedback_review 挂 require_role(ROLE_ADMIN)，
+    # portal 挂 get_current_user），此处仅接线注册。
+    app.include_router(admin_tenants.router)
+    app.include_router(portal.router)
+    app.include_router(feedback_review.router)
 
     @app.get("/health")
     async def health():

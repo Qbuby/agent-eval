@@ -17,7 +17,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
 
-def create_access_token(user_id: uuid.UUID, role: str) -> str:
+def create_access_token(
+    user_id: uuid.UUID, role: str, tenant_id: uuid.UUID | None = None
+) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.auth.access_token_expire_minutes
     )
@@ -27,6 +29,11 @@ def create_access_token(user_id: uuid.UUID, role: str) -> str:
         "exp": expire,
         "type": "access",
     }
+    # tenant_id 作为可选 claim：调用方（auth router 的 login/refresh）传入后
+    # 写进 token，便于将来无需查库即可恢复租户上下文。可选参数保持后向兼容，
+    # 现有调用点不传也能工作（租户上下文目前由 get_current_user 查库设置）。
+    if tenant_id is not None:
+        payload["tenant_id"] = str(tenant_id)
     return jwt.encode(payload, settings.auth.secret_key, algorithm=settings.auth.algorithm)
 
 

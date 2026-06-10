@@ -12,6 +12,11 @@ from agent_eval.auth.security import decode_access_token
 from agent_eval.config import settings
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import UserRow
+from agent_eval.db_models.tenant_context import (
+    TenantContext,
+    reset_tenant_context,
+    set_tenant_context,
+)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 
@@ -31,9 +36,20 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def get_current_user(
     token: str | None = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db),
-) -> UserRow | None:
+) -> AsyncGenerator[UserRow | None, None]:
+    """解析当前用户，并把租户上下文写进 ContextVar 供事件监听器使用。
+
+    设计成 yield 依赖（而非普通 return）是为了在请求结束时 reset ContextVar：
+    FastAPI 会在响应发出后执行 yield 之后的代码。这样租户上下文严格随请求
+    生命周期，不会泄漏到复用同一 worker 任务的下一个请求，也无需改 app.py
+    加中间件。set 返回的 token 用来精确还原到设置前的值。
+
+    auth 关闭时返回 None 且**不设**上下文 —— 监听器据此旁路过滤，保持
+    dev「关 auth = 看全部」的行为。
+    """
     if not settings.auth.enabled:
-        return None
+        yield None
+        return
 
     if token is None:
         raise HTTPException(
@@ -59,7 +75,14 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or inactive",
         )
-    return user
+
+    # 设置租户上下文：监听器读它做读过滤 / 写盖章。superadmin（内部 admin）
+    # 跨租户可见，靠监听器对 superadmin 旁路实现。
+    ctx_token = set_tenant_context(TenantContext(user.tenant_id, user.is_superadmin))
+    try:
+        yield user
+    finally:
+        reset_tenant_context(ctx_token)
 
 
 async def require_admin(user: UserRow | None = Depends(get_current_user)) -> UserRow:
@@ -105,3 +128,8 @@ def require_role(*allowed_roles: str) -> Callable[[UserRow | None], Awaitable[Us
         return user
 
     return _require_role
+
+
+# Portal 写操作的便捷依赖：外部客户 + 内部 admin 都放行（admin 便于测试/代操作）。
+# 等价于 require_role(ROLE_EXTERNAL, ROLE_ADMIN)，给 portal 路由复用。
+require_external = require_role(ROLE_EXTERNAL, ROLE_ADMIN)

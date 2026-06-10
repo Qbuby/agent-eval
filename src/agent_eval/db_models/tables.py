@@ -17,6 +17,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from agent_eval.db_models.tenant_context import INTERNAL_TENANT_ID
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -30,7 +32,28 @@ class Base(DeclarativeBase):
     pass
 
 
-class DatasetVersionRow(Base):
+class TenantMixin:
+    """给「客户可分离数据」表挂租户列。
+
+    继承它的表会被 db.py 注册的事件监听器自动过滤（读）/盖章（写）：
+    - 读：非 superadmin 且有租户上下文时，查询自动加 ``tenant_id == ctx``。
+    - 写：新行 tenant_id 为空时，由 before_flush 补当前租户或内部 sentinel。
+
+    所以业务代码通常无需手写 tenant_id，靠监听器兜底。default 给
+    INTERNAL_TENANT_ID 是双保险：即便监听器未触发（极端情况），也不会写出
+    NULL 违反 NOT NULL 约束。
+    """
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id"),
+        nullable=False,
+        index=True,
+        default=INTERNAL_TENANT_ID,
+    )
+
+
+class DatasetVersionRow(Base, TenantMixin):
     __tablename__ = "dataset_versions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -40,7 +63,7 @@ class DatasetVersionRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class TestCaseRow(Base):
+class TestCaseRow(Base, TenantMixin):
     __tablename__ = "test_cases"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -72,7 +95,7 @@ class TestCaseRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class TestRunRow(Base):
+class TestRunRow(Base, TenantMixin):
     __tablename__ = "test_runs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -104,7 +127,7 @@ class TestRunRow(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class TestResultRow(Base):
+class TestResultRow(Base, TenantMixin):
     __tablename__ = "test_results"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -167,7 +190,7 @@ class TestResultRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class EvaluationScoreRow(Base):
+class EvaluationScoreRow(Base, TenantMixin):
     __tablename__ = "evaluation_scores"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -183,7 +206,7 @@ class EvaluationScoreRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class OptimizationRow(Base):
+class OptimizationRow(Base, TenantMixin):
     __tablename__ = "optimizations"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -212,6 +235,17 @@ class UserRow(Base):
     hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # users 表本身不挂 TenantMixin（admin 要跨租户管用户，不能被过滤），
+    # 但每个用户归属一个租户：外部客户落自己的租户，内部用户落 sentinel。
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id"),
+        nullable=False,
+        index=True,
+        default=INTERNAL_TENANT_ID,
+    )
+    # superadmin = 内部 admin，监听器对其读查询不注入租户过滤（全租户可见）。
+    is_superadmin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -245,7 +279,7 @@ class SystemConfigRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class RoutingRuleRow(Base):
+class RoutingRuleRow(Base, TenantMixin):
     __tablename__ = "routing_rules"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -263,7 +297,7 @@ class RoutingRuleRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class RoutingLogRow(Base):
+class RoutingLogRow(Base, TenantMixin):
     __tablename__ = "routing_logs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -278,7 +312,7 @@ class RoutingLogRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class DatasetMetadataRow(Base):
+class DatasetMetadataRow(Base, TenantMixin):
     __tablename__ = "dataset_metadata"
     __table_args__ = (
         UniqueConstraint("dataset_name", name="uq_dataset_metadata_name"),
@@ -294,7 +328,7 @@ class DatasetMetadataRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class AuditLogRow(Base):
+class AuditLogRow(Base, TenantMixin):
     __tablename__ = "audit_logs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -308,7 +342,7 @@ class AuditLogRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
 
 
-class ExampleFingerprintRow(Base):
+class ExampleFingerprintRow(Base, TenantMixin):
     __tablename__ = "example_fingerprints"
     __table_args__ = (
         UniqueConstraint("dataset_name", "fingerprint", name="uq_dataset_fingerprint"),
@@ -321,7 +355,7 @@ class ExampleFingerprintRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class TraceWatchCursorRow(Base):
+class TraceWatchCursorRow(Base, TenantMixin):
     __tablename__ = "trace_watch_cursors"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -337,7 +371,7 @@ class TraceWatchCursorRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class LoopControlLogRow(Base):
+class LoopControlLogRow(Base, TenantMixin):
     __tablename__ = "loop_control_log"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -364,7 +398,7 @@ class LoopControlLogRow(Base):
 # ---------------------------------------------------------------------------
 
 
-class ProjectRow(Base):
+class ProjectRow(Base, TenantMixin):
     __tablename__ = "projects"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -374,7 +408,7 @@ class ProjectRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class CategoryRow(Base):
+class CategoryRow(Base, TenantMixin):
     __tablename__ = "categories"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -391,7 +425,7 @@ class CategoryRow(Base):
     )
 
 
-class BenchmarkVersionRow(Base):
+class BenchmarkVersionRow(Base, TenantMixin):
     __tablename__ = "benchmark_versions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -408,7 +442,7 @@ class BenchmarkVersionRow(Base):
     )
 
 
-class BenchmarkCaseRow(Base):
+class BenchmarkCaseRow(Base, TenantMixin):
     __tablename__ = "benchmark_cases"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -436,7 +470,7 @@ class BenchmarkCaseRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class CandidateCaseRow(Base):
+class CandidateCaseRow(Base, TenantMixin):
     __tablename__ = "candidate_cases"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -459,7 +493,7 @@ class CandidateCaseRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class ImportBatchRow(Base):
+class ImportBatchRow(Base, TenantMixin):
     __tablename__ = "import_batches"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -475,7 +509,7 @@ class ImportBatchRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class EvalCaseSourceRow(Base):
+class EvalCaseSourceRow(Base, TenantMixin):
     """Ephemeral per-upload case list (user-provided JSON/JSONL file).
 
     One row per upload. The ``cases`` JSONB is a list of
@@ -493,7 +527,7 @@ class EvalCaseSourceRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class EvaluatorConfigRow(Base):
+class EvaluatorConfigRow(Base, TenantMixin):
     """Named reusable evaluator instances.
 
     Originally each row carried evaluator_type + params and ran a local
@@ -527,7 +561,7 @@ class EvaluatorConfigRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class EvaluatorVersionRow(Base):
+class EvaluatorVersionRow(Base, TenantMixin):
     """Append-only snapshot of an evaluator's config at a point in time.
 
     Each save through the configurable-judge editor writes a new row;
@@ -560,7 +594,7 @@ class EvaluatorVersionRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class EvaluatorProviderRow(Base):
+class EvaluatorProviderRow(Base, TenantMixin):
     """LLM-judge provider credential record.
 
     A row represents one usable LLM endpoint (OpenAI / Anthropic / DeepSeek /
@@ -587,3 +621,92 @@ class EvaluatorProviderRow(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+# ---------------------------------------------------------------------------
+# 多租户 + 外部客户 Portal 表
+# ---------------------------------------------------------------------------
+
+
+class TenantRow(Base):
+    """租户。内部租户是固定 sentinel（id=INTERNAL_TENANT_ID），存量数据全挂它。
+
+    tenants 本身不挂 TenantMixin —— 它是隔离的「维度表」，不能被自身过滤
+    （否则普通租户连自己所属的 tenant 行都查不到，admin 也管不了别家）。
+    """
+
+    __tablename__ = "tenants"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class PortalSampleBatchRow(Base, TenantMixin):
+    """外部客户一次 xlsx 上传 = 一个批次。tenant_id 由监听器自动盖章。"""
+
+    __tablename__ = "portal_sample_batches"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(Text, nullable=False)  # 来自文件名
+    uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class PortalSampleRow(Base, TenantMixin):
+    """解析后的单条 QA 样例。其余 xlsx 列进 extra（JSONB）。"""
+
+    __tablename__ = "portal_samples"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("portal_sample_batches.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    row_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str | None] = mapped_column(Text)
+    extra: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class SampleFeedbackRow(Base, TenantMixin):
+    """客户对单条样例的手动打分 + 意见。一个用户对一个 sample 一条。"""
+
+    __tablename__ = "sample_feedbacks"
+    __table_args__ = (
+        UniqueConstraint("sample_id", "rated_by", name="uq_sample_feedback_sample_rater"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    sample_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("portal_samples.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    rated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    overall: Mapped[int | None] = mapped_column(Integer)  # 总体 1-5
+    # 维度→分，如 {relevance, difficulty, answer_accuracy}
+    scores: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    comment: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
