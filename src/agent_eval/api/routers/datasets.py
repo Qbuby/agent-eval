@@ -13,12 +13,18 @@ from agent_eval.api.schemas import (
     DatasetStatsResponse,
     VersionResponse,
 )
+from agent_eval.auth.dependencies import ROLE_ADMIN, get_current_user, require_role
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import CandidateCaseRow, DatasetMetadataRow
 from agent_eval.governance.helpers import log_audit
 
-router = APIRouter(prefix="/api/datasets", tags=["datasets"])
+# All dataset endpoints require an authenticated user (login-only baseline).
+router = APIRouter(
+    prefix="/api/datasets",
+    tags=["datasets"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 async def _get_source_project(dataset_name: str) -> str | None:
@@ -131,7 +137,7 @@ async def get_dataset(
     )
 
 
-@router.delete("/{name}")
+@router.delete("/{name}", dependencies=[Depends(require_role(ROLE_ADMIN))])
 async def delete_dataset(
     name: str,
     mgr: DatasetManager = Depends(get_manager),

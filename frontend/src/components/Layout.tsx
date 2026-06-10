@@ -5,7 +5,7 @@ import { clsx } from 'clsx'
 import { ThemeToggle } from '@/components/ui'
 
 type NavItem = { to: string; label: string; icon: string }
-type NavGroup = { title?: string; items: NavItem[] }
+type NavGroup = { title?: string; items: NavItem[]; adminOnly?: boolean }
 
 // HIG sidebar: items grouped by purpose, with section captions in
 // SF "Footnote" style (uppercase tracking, tertiary color).
@@ -32,6 +32,7 @@ const NAV_GROUPS: NavGroup[] = [
   },
   {
     title: '系统',
+    adminOnly: true,
     items: [
       { to: '/evaluator-providers', label: 'Judge Providers', icon: 'key' },
       { to: '/config', label: '配置', icon: 'settings' },
@@ -149,6 +150,9 @@ export default function Layout() {
   const { user, logout } = useAuthStore()
   const navigate = useNavigate()
 
+  const isAdmin = user?.role === 'admin'
+  const visibleGroups = NAV_GROUPS.filter((group) => !group.adminOnly || isAdmin)
+
   const handleLogout = () => {
     logout()
     navigate('/login')
@@ -175,7 +179,7 @@ export default function Layout() {
 
         {/* Nav */}
         <nav className="flex-1 overflow-y-auto px-2.5 pb-3" aria-label="主导航">
-          {NAV_GROUPS.map((group, gi) => (
+          {visibleGroups.map((group, gi) => (
             <div key={gi} className={gi === 0 ? '' : 'mt-4'}>
               {group.title && (
                 <div className="px-2.5 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-text-tertiary">

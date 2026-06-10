@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 from agent_eval.api.dependencies import get_extractor, get_manager
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.auth.dependencies import get_current_user
 from agent_eval.api.schemas import (
     ExtractRequest,
     FillModelsRequest,
@@ -19,7 +20,7 @@ from agent_eval.api.schemas import (
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.data.trace_extractor import TraceExtractor
 
-router = APIRouter(prefix="/api/traces", tags=["traces"])
+router = APIRouter(prefix="/api/traces", tags=["traces"], dependencies=[Depends(get_current_user)])
 
 
 @router.post("/runs")

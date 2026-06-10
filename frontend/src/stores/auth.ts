@@ -10,6 +10,8 @@ interface AuthState {
   setUser: (user: User) => void
   logout: () => void
   isAuthenticated: () => boolean
+  role: () => string | null
+  isAdmin: () => boolean
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -22,6 +24,8 @@ export const useAuthStore = create<AuthState>()(
       setUser: (user) => set({ user }),
       logout: () => set({ accessToken: null, refreshToken: null, user: null }),
       isAuthenticated: () => !!get().accessToken,
+      role: () => get().user?.role ?? null,
+      isAdmin: () => get().user?.role === 'admin',
     }),
     { name: 'agent-eval-auth' },
   ),

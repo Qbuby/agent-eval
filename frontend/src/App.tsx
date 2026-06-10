@@ -28,6 +28,15 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+// Role-aware guard. Renders children only when the current user's role is in
+// `roles`; otherwise redirects to the dashboard. Assumes it is nested under
+// ProtectedRoute, so the user is already authenticated here.
+function RoleRoute({ roles, children }: { roles: string[]; children: React.ReactNode }) {
+  const role = useAuthStore((s) => s.role)
+  if (!roles.includes(role() ?? '')) return <Navigate to="/dashboard" replace />
+  return <>{children}</>
+}
+
 export default function App() {
   return (
     <ToastProvider>
@@ -57,11 +66,39 @@ export default function App() {
               <Route path="evaluation/runs/:runId" element={<EvaluationRunDetailPage />} />
               <Route path="evaluators" element={<EvaluatorsPage />} />
               <Route path="evaluators/compare" element={<EvaluatorComparePage />} />
-              <Route path="evaluator-providers" element={<EvaluatorProvidersPage />} />
               <Route path="auto-collect" element={<AutoCollectPage />} />
-              <Route path="config" element={<ConfigPage />} />
-              <Route path="audit" element={<AuditPage />} />
-              <Route path="request-log" element={<RequestLogPage />} />
+              <Route
+                path="config"
+                element={
+                  <RoleRoute roles={['admin']}>
+                    <ConfigPage />
+                  </RoleRoute>
+                }
+              />
+              <Route
+                path="audit"
+                element={
+                  <RoleRoute roles={['admin']}>
+                    <AuditPage />
+                  </RoleRoute>
+                }
+              />
+              <Route
+                path="request-log"
+                element={
+                  <RoleRoute roles={['admin']}>
+                    <RequestLogPage />
+                  </RoleRoute>
+                }
+              />
+              <Route
+                path="evaluator-providers"
+                element={
+                  <RoleRoute roles={['admin']}>
+                    <EvaluatorProvidersPage />
+                  </RoleRoute>
+                }
+              />
             </Route>
           </Routes>
         </BrowserRouter>

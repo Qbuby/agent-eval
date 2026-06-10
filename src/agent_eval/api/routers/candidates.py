@@ -3,15 +3,26 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.auth.dependencies import (
+    ROLE_ADMIN,
+    get_current_user,
+    require_role,
+)
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import BenchmarkCaseRow, CandidateCaseRow
 
-router = APIRouter(prefix="/api/candidates", tags=["candidates"])
+# Router-level login gate: every endpoint requires an authenticated user.
+# Preserves the auth.enabled bypass; destructive candidate deletion requires admin.
+router = APIRouter(
+    prefix="/api/candidates",
+    tags=["candidates"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 class CandidateCreate(BaseModel):
@@ -185,7 +196,7 @@ async def update_candidate(case_id: str, req: CandidateUpdate):
     return {"updated": case_id, "status": row.status}
 
 
-@router.delete("/{case_id}")
+@router.delete("/{case_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
 async def delete_candidate(case_id: str):
     async with async_session_factory() as session:
         result = await session.execute(select(CandidateCaseRow).where(CandidateCaseRow.id == case_id))

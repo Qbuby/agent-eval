@@ -7,12 +7,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.schemas import AddCasesRequest, BatchDeleteRequest, TestCaseInput
+from agent_eval.auth.dependencies import ROLE_ADMIN, get_current_user, require_role
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.data.schemas import validate_and_parse
 from agent_eval.governance.helpers import log_audit
 from agent_eval.models.test_case import TestCase
 
-router = APIRouter(tags=["cases"])
+# All case endpoints require an authenticated user (login-only baseline).
+router = APIRouter(tags=["cases"], dependencies=[Depends(get_current_user)])
 
 
 @router.get("/api/datasets/{name}/cases")
@@ -91,7 +93,7 @@ async def update_case(
     return {"updated": example_id}
 
 
-@router.delete("/api/cases/{example_id}")
+@router.delete("/api/cases/{example_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
 async def delete_case(
     example_id: str,
     mgr: DatasetManager = Depends(get_manager),
@@ -101,7 +103,7 @@ async def delete_case(
     return {"deleted": example_id}
 
 
-@router.post("/api/cases/batch-delete")
+@router.post("/api/cases/batch-delete", dependencies=[Depends(require_role(ROLE_ADMIN))])
 async def batch_delete_cases(
     req: BatchDeleteRequest,
     mgr: DatasetManager = Depends(get_manager),

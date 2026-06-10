@@ -11,6 +11,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.auth.dependencies import (
+    ROLE_ADMIN,
+    get_current_user,
+    require_role,
+)
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
     BenchmarkCaseRow, BenchmarkVersionRow, CandidateCaseRow, CategoryRow,
@@ -22,7 +27,13 @@ from agent_eval.data.benchmark_import import (
     parse_upload_file, resolve_extra_fields, resolve_question_answer,
 )
 
-router = APIRouter(prefix="/api/benchmark", tags=["benchmark"])
+# Router-level login gate: every endpoint requires an authenticated user.
+# Preserves the auth.enabled bypass; destructive case deletion requires admin.
+router = APIRouter(
+    prefix="/api/benchmark",
+    tags=["benchmark"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 class BenchmarkCaseCreate(BaseModel):
@@ -191,7 +202,7 @@ async def update_benchmark_case(case_id: str, req: BenchmarkCaseUpdate):
     return {"updated": case_id}
 
 
-@router.delete("/cases/{case_id}")
+@router.delete("/cases/{case_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
 async def delete_benchmark_case(case_id: str):
     async with async_session_factory() as session:
         result = await session.execute(select(BenchmarkCaseRow).where(BenchmarkCaseRow.id == case_id))

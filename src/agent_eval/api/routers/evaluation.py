@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from agent_eval.api.dependencies import get_extractor
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.auth.dependencies import get_current_user
 from agent_eval.api.schemas import (
     BuiltinEvaluator,
     CreateEvaluatorRequest,
@@ -50,7 +51,7 @@ from agent_eval.evaluation.langfuse_runner import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/eval", tags=["eval"])
+router = APIRouter(prefix="/api/eval", tags=["eval"], dependencies=[Depends(get_current_user)])
 
 
 @router.get("/evaluators/builtin", response_model=list[BuiltinEvaluator])
