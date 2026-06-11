@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.schemas import AddCasesRequest, BatchDeleteRequest, TestCaseInput
-from agent_eval.auth.dependencies import ROLE_ADMIN, get_current_user, require_role
+from agent_eval.auth.dependencies import (
+    ROLE_ADMIN,
+    require_internal,
+    require_role,
+)
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.data.schemas import validate_and_parse
 from agent_eval.governance.helpers import log_audit
-from agent_eval.models.test_case import TestCase
 
-# All case endpoints require an authenticated user (login-only baseline).
-router = APIRouter(tags=["cases"], dependencies=[Depends(get_current_user)])
+# All case endpoints require an internal role (admin|user); external_customer -> 403.
+router = APIRouter(tags=["cases"], dependencies=[Depends(require_internal())])
 
 
 @router.get("/api/datasets/{name}/cases")

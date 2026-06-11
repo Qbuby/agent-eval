@@ -1,29 +1,27 @@
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
 from agent_eval.auth.dependencies import (
     ROLE_ADMIN,
-    get_current_user,
+    require_internal,
     require_role,
 )
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
     BenchmarkCaseRow, BenchmarkVersionRow, CandidateCaseRow, CategoryRow,
-    ImportBatchRow, ProjectRow,
+    ImportBatchRow,
 )
 from agent_eval.data.benchmark_import import (
     auto_detect_field_mapping, auto_match_columns, collect_sample_values,
-    get_answer_from_row, get_question_from_row, iter_upload_rows,
+    iter_upload_rows,
     parse_upload_file, resolve_extra_fields, resolve_question_answer,
 )
 
@@ -32,7 +30,7 @@ from agent_eval.data.benchmark_import import (
 router = APIRouter(
     prefix="/api/benchmark",
     tags=["benchmark"],
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_internal())],
 )
 
 

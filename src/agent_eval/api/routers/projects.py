@@ -1,25 +1,25 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_eval.auth.dependencies import (
     ROLE_ADMIN,
-    get_current_user,
+    require_internal,
     require_role,
 )
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import BenchmarkCaseRow, CategoryRow, ProjectRow
 
-# Router-level login gate: every endpoint requires an authenticated user.
-# Preserves the auth.enabled bypass (get_current_user returns None when auth is
+# Router-level gate: every endpoint requires an internal role (admin|user).
+# external_customer gets a clean 403 instead of empty tenant-filtered results.
+# Preserves the auth.enabled bypass (require_role returns None when auth is
 # disabled). Destructive writes additionally require admin via require_role.
 router = APIRouter(
     prefix="/api/projects",
     tags=["projects"],
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_internal())],
 )
 
 

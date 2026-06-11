@@ -6,11 +6,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from agent_eval.auth.dependencies import get_current_user, require_admin
+from agent_eval.auth.dependencies import get_current_user, require_admin, require_internal
 from agent_eval.config_service import ConfigService, config_service
 from agent_eval.db_models.tables import UserRow
 
-router = APIRouter(prefix="/api/config", tags=["config"])
+router = APIRouter(prefix="/api/config", tags=["config"], dependencies=[Depends(require_internal())])
 
 
 class ConfigOption(BaseModel):

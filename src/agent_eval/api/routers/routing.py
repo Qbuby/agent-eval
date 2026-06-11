@@ -5,15 +5,15 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from agent_eval.auth.dependencies import get_current_user
+from agent_eval.auth.dependencies import get_current_user, require_internal
 from agent_eval.db import get_session
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import UserRow
 from agent_eval.governance.helpers import log_audit
 
-router = APIRouter(prefix="/api/routing", tags=["routing"])
+router = APIRouter(prefix="/api/routing", tags=["routing"], dependencies=[Depends(require_internal())])
 
 
 class RoutingConditions(BaseModel):

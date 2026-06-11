@@ -3,13 +3,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from agent_eval.auth.dependencies import ROLE_ADMIN, get_current_user, require_role
+from agent_eval.auth.dependencies import ROLE_ADMIN, require_internal, require_role
 from agent_eval.scheduler.service import SchedulerService
 
 router = APIRouter(
     prefix="/api/scheduler",
     tags=["scheduler"],
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_internal())],
 )
 
 _scheduler: SchedulerService | None = None

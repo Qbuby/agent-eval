@@ -34,12 +34,26 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+// 越权落地：external_customer 不该看到任何内部页，弹回 portal；内部角色弹回 dashboard。
+function roleFallback(isExternal: boolean): string {
+  return isExternal ? '/portal' : '/dashboard'
+}
+
 // Role-aware guard. Renders children only when the current user's role is in
-// `roles`; otherwise redirects to the dashboard. Assumes it is nested under
+// `roles`; otherwise redirects by role. Assumes it is nested under
 // ProtectedRoute, so the user is already authenticated here.
 function RoleRoute({ roles, children }: { roles: string[]; children: React.ReactNode }) {
   const role = useAuthStore((s) => s.role)
-  if (!roles.includes(role() ?? '')) return <Navigate to="/dashboard" replace />
+  const isExternal = useAuthStore((s) => s.isExternal)
+  if (!roles.includes(role() ?? '')) return <Navigate to={roleFallback(isExternal())} replace />
+  return <>{children}</>
+}
+
+// 内部功能门禁：仅 admin|user 可达；external_customer 越权改 URL 进来时弹回 portal。
+// 嵌套在 ProtectedRoute 下，到此处已确保登录。
+function InternalRoute({ children }: { children: React.ReactNode }) {
+  const role = useAuthStore((s) => s.role)
+  if (!['admin', 'user'].includes(role() ?? '')) return <Navigate to="/portal" replace />
   return <>{children}</>
 }
 
@@ -71,19 +85,19 @@ export default function App() {
                   external_customer 默认落地于此，admin 也可访问便于排查 */}
               <Route path="portal" element={<PortalBatchesPage />} />
               <Route path="portal/batches/:batchId" element={<PortalBatchDetailPage />} />
-              <Route path="dashboard" element={<DashboardPage />} />
-              <Route path="datasets" element={<DatasetsPage />} />
-              <Route path="datasets/:name" element={<DatasetDetailPage />} />
-              <Route path="projects" element={<ProjectsPage />} />
-              <Route path="benchmark/:projectId" element={<BenchmarkPage />} />
-              <Route path="generate" element={<GeneratePage />} />
-              <Route path="traces" element={<TracesPage />} />
-              <Route path="evaluation" element={<EvaluationPage />} />
-              <Route path="evaluation/compare" element={<EvaluationComparePage />} />
-              <Route path="evaluation/runs/:runId" element={<EvaluationRunDetailPage />} />
-              <Route path="evaluators" element={<EvaluatorsPage />} />
-              <Route path="evaluators/compare" element={<EvaluatorComparePage />} />
-              <Route path="auto-collect" element={<AutoCollectPage />} />
+              <Route path="dashboard" element={<InternalRoute><DashboardPage /></InternalRoute>} />
+              <Route path="datasets" element={<InternalRoute><DatasetsPage /></InternalRoute>} />
+              <Route path="datasets/:name" element={<InternalRoute><DatasetDetailPage /></InternalRoute>} />
+              <Route path="projects" element={<InternalRoute><ProjectsPage /></InternalRoute>} />
+              <Route path="benchmark/:projectId" element={<InternalRoute><BenchmarkPage /></InternalRoute>} />
+              <Route path="generate" element={<InternalRoute><GeneratePage /></InternalRoute>} />
+              <Route path="traces" element={<InternalRoute><TracesPage /></InternalRoute>} />
+              <Route path="evaluation" element={<InternalRoute><EvaluationPage /></InternalRoute>} />
+              <Route path="evaluation/compare" element={<InternalRoute><EvaluationComparePage /></InternalRoute>} />
+              <Route path="evaluation/runs/:runId" element={<InternalRoute><EvaluationRunDetailPage /></InternalRoute>} />
+              <Route path="evaluators" element={<InternalRoute><EvaluatorsPage /></InternalRoute>} />
+              <Route path="evaluators/compare" element={<InternalRoute><EvaluatorComparePage /></InternalRoute>} />
+              <Route path="auto-collect" element={<InternalRoute><AutoCollectPage /></InternalRoute>} />
               <Route
                 path="config"
                 element={

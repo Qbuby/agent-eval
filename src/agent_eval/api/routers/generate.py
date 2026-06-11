@@ -6,17 +6,17 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from agent_eval.api.dependencies import get_generator, get_manager
 from agent_eval.api.schemas import GenerateMutateRequest, GenerateScenarioRequest
-from agent_eval.auth.dependencies import get_current_user
+from agent_eval.auth.dependencies import require_internal
 from agent_eval.data.case_generator import CaseGenerator
 from agent_eval.data.dataset_manager import DatasetManager
 
-# Generation is a heavy operation but only requires being logged in for now:
-# external customers may use it later, so we deliberately do NOT restrict it to
-# admins. Router-level dependency makes anonymous access impossible.
+# Generation is a heavy operation restricted to internal roles (admin|user);
+# external customers get a clean 403. Router-level dependency also blocks
+# anonymous access.
 router = APIRouter(
     prefix="/api/generate",
     tags=["generate"],
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_internal())],
 )
 
 

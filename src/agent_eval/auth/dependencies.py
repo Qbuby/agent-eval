@@ -86,6 +86,11 @@ async def get_current_user(
 
 
 async def require_admin(user: UserRow | None = Depends(get_current_user)) -> UserRow:
+    # auth 关闭（dev 模式）旁路：get_current_user 已返回 None，这里若继续走
+    # 会因 user is None 抛 401，破坏「关 auth = 全放行」的 dev 行为。统一在取
+    # user.role 之前放行，与 get_current_user 的旁路保持一致。
+    if not settings.auth.enabled:
+        return None
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     if user.role != "admin":
@@ -97,10 +102,11 @@ def require_role(*allowed_roles: str) -> Callable[[UserRow | None], Awaitable[Us
     """Build a dependency that requires an authenticated user whose role is one
     of ``allowed_roles``.
 
-    Mirrors ``require_admin`` semantics: when ``settings.auth.enabled`` is False,
-    ``get_current_user`` returns None and we raise 401 (same as ``require_admin``)
-    rather than silently passing. When the user is authenticated but their role
-    is not allowed, we raise 403.
+    Mirrors ``require_admin`` semantics: when ``settings.auth.enabled`` is False
+    (dev 模式) the dependency passes through (returns None), consistent with
+    ``get_current_user`` 的旁路. When auth is enabled but the user is missing we
+    raise 401, and when the user is authenticated but their role is not allowed
+    we raise 403.
 
     Usage::
 
@@ -116,6 +122,11 @@ def require_role(*allowed_roles: str) -> Callable[[UserRow | None], Awaitable[Us
     """
 
     async def _require_role(user: UserRow | None = Depends(get_current_user)) -> UserRow:
+        # auth 关闭（dev 模式）旁路：get_current_user 已返回 None，必须在取
+        # user.role 之前放行，否则下面 user is None 会抛 401，破坏 dev 模式。
+        # 与 require_admin / get_current_user 的旁路保持一致。
+        if not settings.auth.enabled:
+            return None
         if user is None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated"
@@ -128,6 +139,26 @@ def require_role(*allowed_roles: str) -> Callable[[UserRow | None], Awaitable[Us
         return user
 
     return _require_role
+
+
+def require_internal() -> Callable[[UserRow | None], Awaitable[UserRow]]:
+    """内部角色门禁（admin | user）的便捷依赖工厂。
+
+    返回 ``require_role(ROLE_ADMIN, ROLE_USER)`` 生成的依赖函数：内部超管
+    （admin）和内部普通用户（user）放行，**external_customer 会拿到 403**。
+    用于把各内部 router 的 router 级 ``dependencies`` 从「只验登录」收紧为
+    「内部角色」，堵住外部客户带 token GET 内部 API 的越权漏洞。
+
+    语义与 ``require_role`` 完全一致：auth 关闭（dev 模式）时统一放行
+    （内层依赖在取 user.role 之前返回 None），不破坏「关 auth = 全放行」。
+
+    用法（注意是工厂，需调用一次拿到依赖函数）::
+
+        from agent_eval.auth.dependencies import require_internal
+
+        router = APIRouter(dependencies=[Depends(require_internal())])
+    """
+    return require_role(ROLE_ADMIN, ROLE_USER)
 
 
 # Portal 写操作的便捷依赖：外部客户 + 内部 admin 都放行（admin 便于测试/代操作）。

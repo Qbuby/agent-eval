@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
@@ -13,17 +12,17 @@ from agent_eval.api.schemas import (
     DatasetStatsResponse,
     VersionResponse,
 )
-from agent_eval.auth.dependencies import ROLE_ADMIN, get_current_user, require_role
+from agent_eval.auth.dependencies import ROLE_ADMIN, require_internal, require_role
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import CandidateCaseRow, DatasetMetadataRow
 from agent_eval.governance.helpers import log_audit
 
-# All dataset endpoints require an authenticated user (login-only baseline).
+# All dataset endpoints require an internal role (admin|user); external_customer → 403.
 router = APIRouter(
     prefix="/api/datasets",
     tags=["datasets"],
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(require_internal())],
 )
 
 
