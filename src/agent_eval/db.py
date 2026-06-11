@@ -1,7 +1,7 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from sqlalchemy import bindparam, event
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, with_loader_criteria
 
@@ -36,23 +36,27 @@ def _tenant_read_filter(orm_execute_state) -> None:
       注入过滤，后台查询会被过滤成空集甚至误判，必须放行（superadmin 等效）。
     - ctx.superadmin：内部 admin 跨租户可见。
 
-    租户值通过 bindparam + .params() 在**每次执行时**注入，而不是闭包捕获：
-    with_loader_criteria 的 lambda 受 SQLAlchemy「lambda SQL」缓存约束，只按类
-    编译一次；若直接闭包捕获 ctx.tenant_id，会把第一个租户的 id 固化进缓存、
-    泄漏给后续别的租户。lambda 仅作结构模板，动态值走 bindparam 才安全。
+    租户值通过闭包局部变量 ``tid`` 注入：with_loader_criteria 的 lambda 受
+    SQLAlchemy「lambda SQL」缓存约束（按类只编译一次结构），但该系统会**自动追踪
+    lambda 的闭包变量**并将其作为 bindparam 在每次执行时重新绑定 —— 这正是官方
+    多租户 do_orm_execute recipe 的写法，既不会把某个租户的 id 固化进缓存泄漏给
+    别的租户，也不会触发 .params() 对 LoaderCriteriaOption 的克隆（后者不支持
+    克隆，会 AttributeError: 'LoaderCriteriaOption' object has no attribute
+    '__dict__'）。
     """
     if not orm_execute_state.is_select:
         return
     ctx = get_tenant_context()
     if ctx is None or ctx.superadmin:
         return
+    tid = ctx.tenant_id
     orm_execute_state.statement = orm_execute_state.statement.options(
         with_loader_criteria(
             TenantMixin,
-            lambda cls: cls.tenant_id == bindparam("_tenant_filter_id"),
+            lambda cls: cls.tenant_id == tid,
             include_aliases=True,
         )
-    ).params(_tenant_filter_id=ctx.tenant_id)
+    )
 
 
 @event.listens_for(Session, "before_flush")

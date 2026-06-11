@@ -233,7 +233,7 @@ class UserRow(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     email: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
-    role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # users 表本身不挂 TenantMixin（admin 要跨租户管用户，不能被过滤），
     # 但每个用户归属一个租户：外部客户落自己的租户，内部用户落 sentinel。
