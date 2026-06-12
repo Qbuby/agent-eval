@@ -26,6 +26,7 @@ import PortalBatchesPage from '@/pages/portal/PortalBatchesPage'
 import PortalBatchDetailPage from '@/pages/portal/PortalBatchDetailPage'
 // 内部 admin 租户管理 + 客户反馈回流展示
 import TenantsPage from '@/pages/admin/TenantsPage'
+import EntryCodesPage from '@/pages/admin/EntryCodesPage'
 import FeedbackReviewPage from '@/pages/FeedbackReviewPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -136,6 +137,15 @@ export default function App() {
                 element={
                   <RoleRoute roles={['admin']}>
                     <TenantsPage />
+                  </RoleRoute>
+                }
+              />
+              {/* 注册入口码管理（内部 admin 专属） */}
+              <Route
+                path="admin/entry-codes"
+                element={
+                  <RoleRoute roles={['admin']}>
+                    <EntryCodesPage />
                   </RoleRoute>
                 }
               />

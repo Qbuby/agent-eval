@@ -10,6 +10,8 @@ class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
+    # 入口码：决定注册者落到哪个租户、拿什么角色。首个用户（系统初始化）可免码。
+    entry_code: str | None = Field(default=None, max_length=64)
 
 
 class LoginRequest(BaseModel):

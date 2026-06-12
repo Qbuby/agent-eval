@@ -7,6 +7,8 @@ export interface RegisterRequest {
   username: string
   email: string
   password: string
+  // 入口码：非首个用户注册时必填，决定所属租户与角色（首个用户为内部超管，免码）
+  entry_code?: string
 }
 
 export interface TokenResponse {

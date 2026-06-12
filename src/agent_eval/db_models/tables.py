@@ -710,3 +710,32 @@ class SampleFeedbackRow(Base, TenantMixin):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+class EntryCodeRow(Base):
+    """注册入口码：用户注册时凭码绑定到某租户并获得指定角色。
+
+    像 TenantRow 一样**不挂 TenantMixin** —— 注册发生在 pre-auth（还没有租户
+    上下文），监听器若对其注入过滤会查不到任何码；且内部 admin 要跨租户管理所有
+    码。code 为明文（admin 需查看并分发给客户，不同于密码的 bcrypt 哈希）。
+    """
+
+    __tablename__ = "entry_codes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # 凭此码注册的用户落到哪个租户（内部码指向 INTERNAL_TENANT_ID）
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, default=INTERNAL_TENANT_ID
+    )
+    # 凭此码注册的用户角色：user / external_customer / admin
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
+    label: Mapped[str | None] = mapped_column(String(128))  # 人类描述，如「中力客户入口」
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

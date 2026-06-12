@@ -45,6 +45,7 @@ const NAV_GROUPS: NavGroup[] = [
     adminOnly: true,
     items: [
       { to: '/admin/tenants', label: '租户管理', icon: 'users' },
+      { to: '/admin/entry-codes', label: '入口码', icon: 'key' },
       { to: '/feedback', label: '客户反馈', icon: 'inbox' },
       { to: '/evaluator-providers', label: 'Judge Providers', icon: 'key' },
       { to: '/config', label: '配置', icon: 'settings' },

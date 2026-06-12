@@ -9,6 +9,7 @@ export default function RegisterPage() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
+  const [entryCode, setEntryCode] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -23,7 +24,7 @@ export default function RegisterPage() {
     setError('')
     setLoading(true)
     try {
-      await authApi.register({ username, email, password })
+      await authApi.register({ username, email, password, entry_code: entryCode || undefined })
       navigate('/login')
     } catch (err: unknown) {
       const norm = formatApiError(err, { fallbackTitle: '注册失败', fallbackMessage: '注册失败' })
@@ -107,6 +108,19 @@ export default function RegisterPage() {
                 required
                 placeholder="再次输入密码"
                 autoComplete="new-password"
+                className="input"
+              />
+            </div>
+
+            <div>
+              <label htmlFor="entry-code" className="field-label">入口码</label>
+              <input
+                id="entry-code"
+                type="text"
+                value={entryCode}
+                onChange={(e) => setEntryCode(e.target.value)}
+                placeholder="由管理员提供的注册入口码"
+                autoComplete="off"
                 className="input"
               />
             </div>
