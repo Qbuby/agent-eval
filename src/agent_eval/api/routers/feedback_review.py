@@ -74,6 +74,30 @@ class FeedbackBatchListResponse(BaseModel):
     batches: list[FeedbackBatchSummary]
 
 
+class FeedbackSampleRowItem(BaseModel):
+    """批次下钻样例列表的轻量行（含该样例反馈聚合）。"""
+
+    id: uuid.UUID
+    row_index: int
+    question: str
+    answer: str | None = None
+    feedback_count: int
+    avg_overall: float | None = None
+
+
+class FeedbackBatchSamplesResponse(BaseModel):
+    """某批次下的分页样例（含每条样例的反馈聚合）。"""
+
+    batch_id: uuid.UUID
+    batch_name: str | None = None
+    tenant_id: uuid.UUID
+    tenant_name: str | None = None
+    total: int
+    page: int
+    page_size: int
+    samples: list[FeedbackSampleRowItem]
+
+
 class SampleFeedbackDetail(BaseModel):
     """单条客户反馈明细。"""
 
@@ -210,6 +234,92 @@ async def list_feedback_batches(
         tenant_id=tenant_id,
         returned=len(batches),
         batches=batches,
+    )
+
+
+@router.get(
+    "/batches/{batch_id}/samples", response_model=FeedbackBatchSamplesResponse
+)
+async def list_batch_samples(
+    batch_id: uuid.UUID,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+) -> FeedbackBatchSamplesResponse:
+    """某批次下的分页样例，每条附其反馈数与平均总体分。
+
+    从批次下钻到样例的中间层：批次列表 → 本端点 → 单样例反馈明细。
+    """
+    async with async_session_factory() as session:
+        # 批次本体 + 租户名（superadmin 不被过滤，跨租户可读）
+        batch_stmt = (
+            select(
+                PortalSampleBatchRow.name.label("batch_name"),
+                PortalSampleBatchRow.tenant_id.label("tenant_id"),
+                TenantRow.name.label("tenant_name"),
+            )
+            .outerjoin(TenantRow, TenantRow.id == PortalSampleBatchRow.tenant_id)
+            .where(PortalSampleBatchRow.id == batch_id)
+        )
+        batch_row = (await session.execute(batch_stmt)).first()
+        if batch_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Batch not found"
+            )
+        batch_name, tenant_id, tenant_name = batch_row
+
+        total = (
+            await session.execute(
+                select(func.count(PortalSampleRow.id)).where(
+                    PortalSampleRow.batch_id == batch_id
+                )
+            )
+        ).scalar_one()
+
+        # 每样例的反馈聚合
+        fb_sq = (
+            select(
+                SampleFeedbackRow.sample_id.label("sample_id"),
+                func.count(SampleFeedbackRow.id).label("feedback_count"),
+                func.avg(SampleFeedbackRow.overall).label("avg_overall"),
+            )
+            .group_by(SampleFeedbackRow.sample_id)
+            .subquery()
+        )
+        stmt = (
+            select(
+                PortalSampleRow,
+                fb_sq.c.feedback_count,
+                fb_sq.c.avg_overall,
+            )
+            .outerjoin(fb_sq, fb_sq.c.sample_id == PortalSampleRow.id)
+            .where(PortalSampleRow.batch_id == batch_id)
+            .order_by(PortalSampleRow.row_index.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        rows = (await session.execute(stmt)).all()
+
+    samples = [
+        FeedbackSampleRowItem(
+            id=sample.id,
+            row_index=sample.row_index,
+            question=sample.question,
+            answer=sample.answer,
+            feedback_count=int(feedback_count or 0),
+            avg_overall=_round(avg_overall),
+        )
+        for sample, feedback_count, avg_overall in rows
+    ]
+
+    return FeedbackBatchSamplesResponse(
+        batch_id=batch_id,
+        batch_name=batch_name,
+        tenant_id=tenant_id,
+        tenant_name=tenant_name,
+        total=int(total or 0),
+        page=page,
+        page_size=page_size,
+        samples=samples,
     )
 
 
