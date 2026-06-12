@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Button, Drawer, SkeletonRow, ErrorCard } from '@/components/ui'
 import { formatApiError } from '@/lib/errors'
 import { feedbackReviewApi } from '@/services/feedbackReview'
+import MarkdownView from '@/components/MarkdownView'
 import type {
   FeedbackBatchSummary,
   FeedbackSampleRow,
@@ -368,15 +369,15 @@ function SampleFeedbackDrawer({
           {/* 样例本体 */}
           <div>
             <div className="field-label">问题</div>
-            <div className="bg-fill/5 rounded-md p-3 text-[12px] text-text-primary whitespace-pre-wrap break-words">
-              {data.question}
+            <div className="bg-fill/5 rounded-md p-3">
+              <MarkdownView text={data.question} />
             </div>
           </div>
           {data.answer != null && (
             <div>
               <div className="field-label">答案</div>
-              <div className="bg-fill/5 rounded-md p-3 text-[12px] text-text-primary whitespace-pre-wrap break-words">
-                {data.answer}
+              <div className="bg-fill/5 rounded-md p-3">
+                <MarkdownView text={data.answer} />
               </div>
             </div>
           )}

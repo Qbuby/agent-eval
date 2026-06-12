@@ -404,6 +404,67 @@ body {
   .dark .material {
     background: rgb(var(--surface) / 0.62);
   }
+
+  /* Markdown 渲染容器 — 用于 portal 样例的问题/答案（react-markdown + remark-gfm）。
+     风格参考 xlsx_to_html.py（GitHub 风格表格/代码/引用/标题），但全部走项目设计
+     token（text-primary/border/fill/accent…）以保持主题一致并自动支持暗色模式。 */
+  .markdown-body {
+    @apply text-[13px] leading-relaxed text-text-primary break-words;
+  }
+  .markdown-body > :first-child { margin-top: 0; }
+  .markdown-body > :last-child { margin-bottom: 0; }
+  .markdown-body p { @apply my-2; }
+  .markdown-body h1,
+  .markdown-body h2,
+  .markdown-body h3 {
+    @apply font-semibold text-text-primary mt-4 mb-2 pb-1 border-b border-separator;
+  }
+  .markdown-body h1 { @apply text-[18px]; }
+  .markdown-body h2 { @apply text-[16px]; }
+  .markdown-body h3 { @apply text-[14px] border-b-0 pb-0; }
+  .markdown-body h4,
+  .markdown-body h5,
+  .markdown-body h6 { @apply font-semibold text-text-primary mt-3 mb-1.5 text-[13px]; }
+  .markdown-body ul { @apply list-disc pl-5 my-2 space-y-0.5; }
+  .markdown-body ol { @apply list-decimal pl-5 my-2 space-y-0.5; }
+  .markdown-body li { @apply leading-relaxed; }
+  .markdown-body a { @apply text-accent hover:underline; }
+  .markdown-body strong { @apply font-semibold text-text-primary; }
+  .markdown-body hr { @apply my-4 border-0 border-t border-separator; }
+  /* 表格 — 横向可滚，斑马纹用 fill token */
+  .markdown-body table {
+    @apply block w-max max-w-full overflow-x-auto my-3 text-[12px]
+           border border-border rounded-md border-separate;
+    border-spacing: 0;
+  }
+  .markdown-body th,
+  .markdown-body td {
+    @apply px-3 py-1.5 text-left align-top border-b border-r border-separator;
+  }
+  .markdown-body tr > *:last-child { border-right: 0; }
+  .markdown-body tbody tr:last-child > * { border-bottom: 0; }
+  .markdown-body th { @apply bg-fill/5 font-semibold text-text-primary; }
+  .markdown-body tbody tr:nth-child(even) td { @apply bg-fill/[0.03]; }
+  /* 代码 */
+  .markdown-body code {
+    @apply bg-fill/10 px-1.5 py-0.5 rounded text-[12px] font-mono;
+  }
+  .markdown-body pre {
+    @apply bg-fill/[0.06] border border-border rounded-md p-3 my-3 overflow-x-auto text-[12px];
+  }
+  .markdown-body pre code { @apply bg-transparent p-0; }
+  /* 引用 */
+  .markdown-body blockquote {
+    @apply border-l-[3px] border-border pl-3 my-3 text-text-secondary;
+  }
+  /* 图片 — 受控尺寸 + 占位底 */
+  .markdown-body img {
+    @apply max-w-full h-auto my-2 rounded-md border border-separator bg-fill/5;
+  }
+  /* citation 上标 — 对齐 xlsx_to_html.py 的 .cite */
+  .markdown-body sup.cite {
+    @apply text-[10px] text-text-tertiary bg-fill/10 px-1 py-0.5 rounded mx-0.5 font-medium align-super;
+  }
 }
 
 @layer utilities {
