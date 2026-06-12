@@ -268,8 +268,17 @@ async def list_users(
 
 
 @router.patch("/users/{user_id}", response_model=UserResponse)
-async def update_user(user_id: uuid.UUID, body: UserUpdateRequest):
-    """启停 / 改角色 / 重置密码。"""
+async def update_user(
+    user_id: uuid.UUID,
+    body: UserUpdateRequest,
+    admin: UserRow = Depends(require_role(ROLE_ADMIN)),
+):
+    """启停 / 改角色 / 重置密码。
+
+    两道自锁防护：
+    1. 不能改自己的启停状态或角色（admin 把自己停用/降级会直接锁死登录；改密码允许）。
+    2. 不能停用或降级「最后一个活跃 admin」（否则系统再无人可管理）。
+    """
     async with async_session_factory() as session:
         result = await session.execute(select(UserRow).where(UserRow.id == user_id))
         user = result.scalar_one_or_none()
@@ -277,6 +286,36 @@ async def update_user(user_id: uuid.UUID, body: UserUpdateRequest):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
             )
+
+        # 这两个操作会改变「该用户是否为活跃 admin」，是自锁/锁死系统的风险点。
+        deactivating = body.is_active is False and user.is_active
+        demoting = body.role is not None and body.role != ROLE_ADMIN and user.role == ROLE_ADMIN
+
+        # 防护 1：禁止改自己的启停 / 角色（admin 在登录态下 admin 不为 None）。
+        if admin is not None and admin.id == user.id:
+            if body.is_active is not None and body.is_active != user.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="不能修改自己的启用状态",
+                )
+            if body.role is not None and body.role != user.role:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="不能修改自己的角色",
+                )
+
+        # 防护 2：禁止停用或降级最后一个活跃 admin。
+        if deactivating or demoting:
+            active_admins = await session.execute(
+                select(func.count(UserRow.id)).where(
+                    UserRow.role == ROLE_ADMIN, UserRow.is_active == True  # noqa: E712
+                )
+            )
+            if active_admins.scalar_one() <= 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="不能停用或降级最后一个活跃管理员",
+                )
 
         if body.is_active is not None:
             user.is_active = body.is_active
