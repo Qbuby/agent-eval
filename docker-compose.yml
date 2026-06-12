@@ -94,10 +94,19 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_NAME: ${DB_NAME:-agent_eval}
       AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-change-me-in-production}
+      # 数据 seed 还原路径（容器内）。SEED_DISABLE=1 可强制跳过还原，只建结构。
+      SEED_FILE: /app/deploy/seed/seed.sql
+      SEED_DISABLE: ${SEED_DISABLE:-}
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["alembic", "upgrade", "head"]
+    volumes:
+      # 数据 seed 只读挂载。NOT baked into the image：内含密码哈希 /
+      # Fernet 加密的 provider key / 明文入口码。部署时把 deploy/seed/seed.sql
+      # 随 compose 一起放到宿主，migrate 在空库时还原它（非空库一律跳过）。
+      - ./deploy/seed:/app/deploy/seed:ro
+    # 先按空库门禁还原数据 seed，再 alembic upgrade head 追平结构。
+    command: ["/app/scripts/migrate-and-restore.sh"]
     restart: "no"
 
   # ─────────────────────────────────────────────────────────────────

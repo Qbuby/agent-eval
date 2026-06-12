@@ -18,6 +18,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
+        postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -37,8 +38,15 @@ RUN find /app/alembic -type d -name __pycache__ -prune -exec rm -rf {} + && \
 # host.docker.internal so the backend can reach the agent tunnel on the
 # Windows host (see scripts/docker-entrypoint.sh for the full rationale).
 COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
+COPY scripts/migrate-and-restore.sh /app/scripts/migrate-and-restore.sh
 RUN sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
-    chmod +x /app/scripts/docker-entrypoint.sh
+    sed -i 's/\r$//' /app/scripts/migrate-and-restore.sh && \
+    chmod +x /app/scripts/docker-entrypoint.sh /app/scripts/migrate-and-restore.sh
+
+# NOTE: the production data seed (deploy/seed/seed.sql) is deliberately NOT
+# baked into the image — it carries password hashes, Fernet-encrypted provider
+# keys and plaintext entry codes. It is bind-mounted read-only by the `migrate`
+# service in docker-compose instead (see compose `migrate.volumes`).
 
 EXPOSE 8000
 
