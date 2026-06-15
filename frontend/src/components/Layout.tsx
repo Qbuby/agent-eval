@@ -47,6 +47,7 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/admin/tenants', label: '租户管理', icon: 'users' },
       { to: '/admin/entry-codes', label: '入口码', icon: 'key' },
       { to: '/feedback', label: '客户反馈', icon: 'inbox' },
+      { to: '/tracing-metrics', label: 'Tracing 指标', icon: 'activity' },
       { to: '/evaluator-providers', label: 'Judge Providers', icon: 'key' },
       { to: '/config', label: '配置', icon: 'settings' },
       { to: '/audit', label: '审计日志', icon: 'file' },

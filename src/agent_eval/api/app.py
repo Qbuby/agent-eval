@@ -9,8 +9,8 @@ from fastapi.responses import JSONResponse
 from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
     admin, admin_entry_codes, admin_tenants, auth, benchmark, candidates, cases, config,
-    datasets, evaluation, evaluator_providers, feedback_review, generate, governance, portal,
-    projects, routing, scheduler, traces,
+    datasets, evaluation, evaluator_providers, feedback_review, generate, governance,
+    langfuse_metrics, portal, projects, routing, scheduler, traces,
 )
 from agent_eval.config import settings
 from agent_eval.logging_config import setup_logging
@@ -25,6 +25,7 @@ async def lifespan(app: FastAPI):
     from agent_eval.data.traces_warmer import get_warmer
     from agent_eval.db import close_db
     from agent_eval.evaluation.langfuse_runner import sweep_orphaned_runs
+    from agent_eval.langfuse_metrics.service import LangfuseMetricsService
     from agent_eval.scheduler.service import SchedulerService
 
     await config_service.init_defaults()
@@ -44,8 +45,13 @@ async def lifespan(app: FastAPI):
     warmer = get_warmer()
     await warmer.start()
 
+    lf_metrics = LangfuseMetricsService()
+    langfuse_metrics.set_service(lf_metrics)
+    await lf_metrics.start()
+
     yield
 
+    await lf_metrics.stop()
     await warmer.stop()
     await svc.stop()
     await close_db()
@@ -117,6 +123,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_entry_codes.router)
     app.include_router(portal.router)
     app.include_router(feedback_review.router)
+    app.include_router(langfuse_metrics.router)
 
     @app.get("/health")
     async def health():

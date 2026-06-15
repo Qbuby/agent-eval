@@ -28,6 +28,7 @@ import PortalBatchDetailPage from '@/pages/portal/PortalBatchDetailPage'
 import TenantsPage from '@/pages/admin/TenantsPage'
 import EntryCodesPage from '@/pages/admin/EntryCodesPage'
 import FeedbackReviewPage from '@/pages/FeedbackReviewPage'
+import LangfuseMetricsPage from '@/pages/LangfuseMetricsPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -155,6 +156,15 @@ export default function App() {
                 element={
                   <RoleRoute roles={['admin']}>
                     <FeedbackReviewPage />
+                  </RoleRoute>
+                }
+              />
+              {/* Langfuse Tracing 指标（内部 admin 专属） */}
+              <Route
+                path="tracing-metrics"
+                element={
+                  <RoleRoute roles={['admin']}>
+                    <LangfuseMetricsPage />
                   </RoleRoute>
                 }
               />

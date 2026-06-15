@@ -54,6 +54,7 @@ export interface CategorySchema {
 export interface CandidateCase {
   id: string
   project_id: string | null
+  category: string | null
   source: string
   question: string
   answer: string | null
@@ -187,7 +188,7 @@ export const benchmarkApi = {
 }
 
 export const candidatesApi = {
-  list(params?: { status?: string; project_id?: string; dataset_name?: string; source?: string; search?: string; page?: number; page_size?: number }) {
+  list(params?: { status?: string; project_id?: string; dataset_name?: string; source?: string; category?: string; search?: string; page?: number; page_size?: number }) {
     return api.get<PaginatedResponse<CandidateCase>>('/candidates', { params })
   },
   exportCases(
@@ -201,8 +202,11 @@ export const candidatesApi = {
       fallbackName: 'candidates',
     })
   },
-  create(data: { question: string; answer?: string; project_id?: string; dataset_name?: string; tags?: string[]; source?: string }) {
+  create(data: { question: string; answer?: string; project_id?: string; dataset_name?: string; category?: string; tags?: string[]; source?: string }) {
     return api.post<{ id: string; status: string }>('/candidates', data)
+  },
+  categories(params?: { dataset_name?: string; project_id?: string }) {
+    return api.get<{ categories: string[] }>('/candidates/categories', { params })
   },
   update(caseId: string, data: Partial<CandidateCase>) {
     return api.put<{ updated: string; status: string }>(`/candidates/${caseId}`, data)
@@ -221,5 +225,33 @@ export const candidatesApi = {
   },
   importFromTraces(data: { project_name: string; run_ids: string[]; target_project_id?: string }) {
     return api.post<{ imported: number }>('/candidates/import-traces', data)
+  },
+  importPreview(file: File, opts?: { questionColumn?: string; answerColumn?: string }) {
+    const formData = new FormData()
+    formData.append('file', file)
+    const params: Record<string, string | number> = { max_rows: 5 }
+    if (opts?.questionColumn) params.question_column = opts.questionColumn
+    if (opts?.answerColumn) params.answer_column = opts.answerColumn
+    return api.post<ImportPreview>(
+      '/candidates/import/preview', formData,
+      { headers: { 'Content-Type': 'multipart/form-data' }, params },
+    )
+  },
+  importFile(
+    file: File,
+    opts?: { datasetName?: string; projectId?: string; category?: string; questionColumn?: string; answerColumn?: string },
+  ) {
+    const formData = new FormData()
+    formData.append('file', file)
+    const params: Record<string, string> = {}
+    if (opts?.datasetName) params.dataset_name = opts.datasetName
+    if (opts?.projectId) params.project_id = opts.projectId
+    if (opts?.category) params.category = opts.category
+    if (opts?.questionColumn) params.question_column = opts.questionColumn
+    if (opts?.answerColumn) params.answer_column = opts.answerColumn
+    return api.post<ImportResult>(
+      '/candidates/import', formData,
+      { headers: { 'Content-Type': 'multipart/form-data' }, params: Object.keys(params).length ? params : undefined },
+    )
   },
 }

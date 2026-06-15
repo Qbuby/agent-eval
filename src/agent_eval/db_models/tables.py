@@ -7,6 +7,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     Numeric,
@@ -481,6 +482,9 @@ class CandidateCaseRow(Base, TenantMixin):
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     question: Mapped[str] = mapped_column(Text, nullable=False)
     answer: Mapped[str | None] = mapped_column(Text)
+    # 自由文本类别名（不绑 project 的 CategoryRow）。promote 时按名同步到目标
+    # project 的 categories（有则复用、无则新增），见 candidates.promote。
+    category: Mapped[str | None] = mapped_column(String(128), index=True)
     key_points: Mapped[list | None] = mapped_column(JSONB)
     negative_points: Mapped[list | None] = mapped_column(JSONB)
     tags: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
@@ -735,6 +739,158 @@ class EntryCodeRow(Base):
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id")
     )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class LangfuseTraceMetricRow(Base, TenantMixin):
+    """从 Langfuse 周期拉取并持久化的 trace 级聚合指标。
+
+    24h 轮询近 30 天窗口，按 ``langfuse_trace_id`` 幂等 upsert（同一 trace 的
+    cost/score 可能被异步补算，全窗口重拉保证最终一致）。挂 TenantMixin：后台
+    轮询无租户上下文 → 监听器旁路、写入自动落 INTERNAL_TENANT_ID，内部 admin
+    （superadmin）读取不被过滤、跨 env 全见。
+
+    指标来源见 langfuse_metrics/compute.py。cache_* 三列恒 NULL（当前 trace 未
+    上报缓存 token，留作占位，前端显示 N/A）。
+    """
+
+    __tablename__ = "langfuse_trace_metrics"
+    __table_args__ = (
+        # 支撑「按 environment + 时间窗筛选」主查询
+        Index("ix_lf_trace_env_ts", "environment", "trace_timestamp"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    langfuse_trace_id: Mapped[str] = mapped_column(
+        String(256), unique=True, nullable=False, index=True
+    )
+    environment: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str | None] = mapped_column(String(512))
+    trace_timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    session_id: Mapped[str | None] = mapped_column(String(256))
+    user_id: Mapped[str | None] = mapped_column(String(256))
+    release: Mapped[str | None] = mapped_column(String(128))
+    tags: Mapped[list | None] = mapped_column(JSONB)
+
+    # 总响应时间
+    latency_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    # token 汇总
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    # 成本
+    total_cost: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    # 首工具调用时间（秒，相对 trace 起点）
+    first_tool_call_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    # 工具调用统计
+    tool_call_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_success_rate: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    tool_call_counts: Mapped[dict | None] = mapped_column(JSONB)  # {tool_name: count}
+    # 首思考 / 首答 token 时间（秒，相对 trace 起点）
+    first_thinking_token_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    first_answer_token_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    # 缓存（占位，当前恒 NULL）
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_creation_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_hit_rate: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    # 结构计数
+    observation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    generation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    has_error: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 详情展示原文
+    input: Mapped[dict | None] = mapped_column(JSONB)
+    output: Mapped[dict | None] = mapped_column(JSONB)
+    # 列名用 trace_metadata 避开 DeclarativeBase 保留属性名 metadata
+    trace_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    scores: Mapped[list | None] = mapped_column(JSONB)
+
+    raw_synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class LangfuseObservationMetricRow(Base, TenantMixin):
+    """Langfuse observation（CHAIN/AGENT/GENERATION/TOOL）明细。
+
+    用业务键 ``langfuse_trace_id`` 关联回 trace（**不建 DB 外键**，避免拉取顺序
+    耦合；Langfuse id 全局唯一，index 足够）。冗余存 ``trace_timestamp`` 便于按
+    时间独立清理。``output`` 必存——compute 的首思考/首答判别依赖它。
+    """
+
+    __tablename__ = "langfuse_observation_metrics"
+    __table_args__ = (
+        UniqueConstraint("langfuse_observation_id", name="uq_lf_obs_observation_id"),
+        # 详情页按 trace 拉明细 + 可按类型筛
+        Index("ix_lf_obs_trace_type", "langfuse_trace_id", "type"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    langfuse_observation_id: Mapped[str] = mapped_column(
+        String(256), nullable=False, index=True
+    )
+    langfuse_trace_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    environment: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    trace_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    name: Mapped[str | None] = mapped_column(String(512))
+    level: Mapped[str | None] = mapped_column(String(16))
+    status_message: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(128))
+    start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latency_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    usage_input: Mapped[int | None] = mapped_column(Integer)
+    usage_output: Mapped[int | None] = mapped_column(Integer)
+    usage_total: Mapped[int | None] = mapped_column(Integer)
+    calculated_total_cost: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    total_price: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    time_to_first_token_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    completion_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    parent_observation_id: Mapped[str | None] = mapped_column(String(256))
+    obs_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    input: Mapped[dict | None] = mapped_column(JSONB)
+    output: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class LangfuseMetricsCursorRow(Base, TenantMixin):
+    """Langfuse 指标轮询的单例游标 / 运行状态。
+
+    ``scope`` 固定一行（"global"），记录上次成功轮询的 wall-clock 用于进程重启
+    补跑判断（距上次 ≥ 间隔才补跑），以及累计 / 最近一轮计数、连续失败、状态。
+    """
+
+    __tablename__ = "langfuse_metrics_cursors"
+    __table_args__ = (UniqueConstraint("scope", name="uq_lf_metrics_cursor_scope"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False, default="global")
+    last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    traces_synced_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    observations_synced_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_run_traces: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_run_observations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="idle")
+    last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

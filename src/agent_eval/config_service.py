@@ -145,6 +145,24 @@ DEFAULT_CONFIGS: list[dict[str, Any]] = [
         "category": "eval.retry",
         "description": "退避秒数上限，避免长尾等待。",
     },
+    {
+        "key": "langfuse_metrics.poll_interval_seconds",
+        "value": _pack([{"value": 86400, "label": None}], 0),
+        "category": "langfuse_metrics",
+        "description": "Langfuse 指标轮询间隔（秒）。默认 86400（24h），最小 60。",
+    },
+    {
+        "key": "langfuse_metrics.lookback_days",
+        "value": _pack([{"value": 30, "label": None}], 0),
+        "category": "langfuse_metrics",
+        "description": "首次回填窗口 + 数据保留天数。增量拉取后旧于该天数的数据会被清理。",
+    },
+    {
+        "key": "langfuse_metrics.environments",
+        "value": _pack([{"value": "saas-prod,xinchai-prod,smartlink-hc-dev", "label": None}], 0),
+        "category": "langfuse_metrics",
+        "description": "拉取的目标环境列表，逗号分隔。留空则用内置默认。",
+    },
 ]
 
 
@@ -398,7 +416,7 @@ class ConfigService:
         prefix = parts[0]
         if prefix == "eval" and len(parts) >= 2:
             return f"eval.{parts[1]}"
-        if prefix in ("langsmith", "llm", "target_agent"):
+        if prefix in ("langsmith", "llm", "target_agent", "langfuse_metrics"):
             return prefix
         return "general"
 

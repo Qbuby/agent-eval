@@ -41,3 +41,6 @@ _probe*.js
 # Data seed dump — holds password hashes, Fernet-encrypted provider keys,
 # plaintext entry codes. NEVER commit. Ship to prod out-of-band (scp).
 deploy/seed/*.sql
+
+# Local IDE / tool config (not shared)
+.claude/

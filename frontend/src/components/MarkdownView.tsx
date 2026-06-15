@@ -21,7 +21,10 @@ const VIDEO_RE = /\[视频[:：]\s*(https?:\/\/[^\]\s]+)\s*\]/g
 const CITE_RE = /(?:\[citation:[^\]]+\]\s*)+/g
 
 function preprocess(text: string): string {
+  // 防御：调用方偶尔会误传非字符串（如未序列化的 JSON 对象），String() 兜底，
+  // 避免 .replace 在对象上抛 TypeError 导致整页崩溃。
   if (!text) return ''
+  if (typeof text !== 'string') text = String(text)
   let out = text.replace(VIDEO_RE, (_m, url) => `🎬 视频链接 [点击此处](${url})`)
   out = out.replace(CITE_RE, '')
   return out
