@@ -99,7 +99,15 @@ export default function App() {
               <Route path="evaluation/runs/:runId" element={<InternalRoute><EvaluationRunDetailPage /></InternalRoute>} />
               <Route path="evaluators" element={<InternalRoute><EvaluatorsPage /></InternalRoute>} />
               <Route path="evaluators/compare" element={<InternalRoute><EvaluatorComparePage /></InternalRoute>} />
-              <Route path="auto-collect" element={<InternalRoute><AutoCollectPage /></InternalRoute>} />
+              {/* 自动采集（内部 admin 专属，内部普通 user 不需要） */}
+              <Route
+                path="auto-collect"
+                element={
+                  <RoleRoute roles={['admin']}>
+                    <AutoCollectPage />
+                  </RoleRoute>
+                }
+              />
               <Route
                 path="config"
                 element={
@@ -159,13 +167,13 @@ export default function App() {
                   </RoleRoute>
                 }
               />
-              {/* Langfuse Tracing 指标（内部 admin 专属） */}
+              {/* Langfuse Tracing 指标（内部角色可见：admin + 内部普通 user） */}
               <Route
                 path="tracing-metrics"
                 element={
-                  <RoleRoute roles={['admin']}>
+                  <InternalRoute>
                     <LangfuseMetricsPage />
-                  </RoleRoute>
+                  </InternalRoute>
                 }
               />
             </Route>

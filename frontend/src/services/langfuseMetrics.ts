@@ -32,6 +32,11 @@ export interface LangfuseTrendBucket {
   total_cost: number | null
   total_tokens: number | null
   tool_success_rate: number | null // 0-1
+  // 错误趋势 + 首 token 时间趋势
+  error_count: number
+  avg_first_tool_call_s: number | null
+  avg_first_thinking_token_s: number | null
+  avg_first_answer_token_s: number | null
 }
 
 export interface LangfuseTrends {

@@ -22,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import distinct, func, select
 
-from agent_eval.auth.dependencies import ROLE_ADMIN, require_role
+from agent_eval.auth.dependencies import require_internal
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
     LangfuseMetricsCursorRow,
@@ -30,10 +30,14 @@ from agent_eval.db_models.tables import (
     LangfuseTraceMetricRow,
 )
 
+# 内部角色（admin + 内部普通 user）可见：require_internal = admin|user。
+# 这三张表由后台无租户上下文写入（落 INTERNAL_TENANT_ID）；内部 user 登录态虽非
+# superadmin，但这些表的 tenant_id 恒为 INTERNAL，且 db.py 读监听器对「无显式租户
+# 上下文不匹配」不会误伤同租户行——内部 user 属内部租户，可读 INTERNAL 数据。
 router = APIRouter(
     prefix="/api/langfuse-metrics",
     tags=["langfuse-metrics"],
-    dependencies=[Depends(require_role(ROLE_ADMIN))],
+    dependencies=[Depends(require_internal())],
 )
 
 
@@ -99,6 +103,11 @@ class MetricsTrendBucket(BaseModel):
     total_cost: float | None = None
     total_tokens: int | None = None
     tool_success_rate: float | None = None
+    # 新增：错误趋势 + 首 token 时间趋势（支撑更丰富图表）
+    error_count: int = 0
+    avg_first_tool_call_s: float | None = None
+    avg_first_thinking_token_s: float | None = None
+    avg_first_answer_token_s: float | None = None
 
 
 class MetricsTrendResponse(BaseModel):
@@ -315,6 +324,11 @@ async def get_metrics_trends(
             func.sum(T.total_tokens).label("total_tokens"),
             func.sum(T.tool_call_count).label("calls"),
             func.sum(T.tool_success_count).label("success"),
+            # 错误数：count(*) filter (where has_error)，避免 sum(cast(bool)) 方言坑
+            func.count().filter(T.has_error.is_(True)).label("error_count"),
+            func.avg(T.first_tool_call_s).label("avg_first_tool_call_s"),
+            func.avg(T.first_thinking_token_s).label("avg_first_thinking_token_s"),
+            func.avg(T.first_answer_token_s).label("avg_first_answer_token_s"),
         )
         .group_by(bucket_col)
         .order_by(bucket_col.asc())
@@ -326,7 +340,19 @@ async def get_metrics_trends(
         rows = (await session.execute(stmt)).all()
 
     buckets: list[MetricsTrendBucket] = []
-    for b, trace_count, avg_latency_s, total_cost, total_tokens, calls, success in rows:
+    for (
+        b,
+        trace_count,
+        avg_latency_s,
+        total_cost,
+        total_tokens,
+        calls,
+        success,
+        error_count,
+        avg_first_tool_call_s,
+        avg_first_thinking_token_s,
+        avg_first_answer_token_s,
+    ) in rows:
         c = int(calls or 0)
         s = int(success or 0)
         buckets.append(
@@ -337,6 +363,10 @@ async def get_metrics_trends(
                 total_cost=_round(total_cost, 6),
                 total_tokens=int(total_tokens) if total_tokens is not None else None,
                 tool_success_rate=_round(s / c, 4) if c > 0 else None,
+                error_count=int(error_count or 0),
+                avg_first_tool_call_s=_round(avg_first_tool_call_s),
+                avg_first_thinking_token_s=_round(avg_first_thinking_token_s),
+                avg_first_answer_token_s=_round(avg_first_answer_token_s),
             )
         )
 

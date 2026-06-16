@@ -4,7 +4,11 @@ import { useNavigate } from 'react-router-dom'
 import { clsx } from 'clsx'
 import { ThemeToggle } from '@/components/ui'
 
-type NavItem = { to: string; label: string; icon: string }
+// item 级可见性（比 group 级更细）：
+//   adminOnly: 仅 admin 可见；
+//   internalUserHidden: 对内部普通 user 隐藏（external_customer 与 admin 仍可见）——
+//     用于「样例评审」这类客户门户项，内部 user 不需要但外部客户必须能看到。
+type NavItem = { to: string; label: string; icon: string; adminOnly?: boolean; internalUserHidden?: boolean }
 // internalOnly: 仅内部角色可见（external_customer 隐藏）；adminOnly: 仅 admin 可见。
 // 入口反转后用 role 判定分组可见性，而不只是 adminOnly：外部客户只看到 portal 分组。
 type NavGroup = { title?: string; items: NavItem[]; adminOnly?: boolean; internalOnly?: boolean }
@@ -13,9 +17,10 @@ type NavGroup = { title?: string; items: NavItem[]; adminOnly?: boolean; interna
 // SF "Footnote" style (uppercase tracking, tertiary color).
 const NAV_GROUPS: NavGroup[] = [
   {
-    // 外部客户 portal 入口：external_customer 唯一可见分组；内部角色也能看到便于排查。
+    // 外部客户 portal 入口：external_customer 唯一可见分组；admin 也能看到便于排查。
+    // 内部普通 user 不需要样例评审，故 internalUserHidden。
     title: '客户门户',
-    items: [{ to: '/portal', label: '样例评审', icon: 'inbox' }],
+    items: [{ to: '/portal', label: '样例评审', icon: 'inbox', internalUserHidden: true }],
   },
   {
     internalOnly: true,
@@ -37,7 +42,9 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/traces', label: '调用轨迹', icon: 'activity' },
       { to: '/evaluators', label: '评估器', icon: 'beaker' },
       { to: '/evaluation', label: '评估', icon: 'gauge' },
-      { to: '/auto-collect', label: '自动采集', icon: 'route' },
+      { to: '/tracing-metrics', label: 'Tracing 指标', icon: 'pulse' },
+      // 自动采集仅 admin 需要
+      { to: '/auto-collect', label: '自动采集', icon: 'route', adminOnly: true },
     ],
   },
   {
@@ -47,7 +54,6 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/admin/tenants', label: '租户管理', icon: 'users' },
       { to: '/admin/entry-codes', label: '入口码', icon: 'key' },
       { to: '/feedback', label: '客户反馈', icon: 'inbox' },
-      { to: '/tracing-metrics', label: 'Tracing 指标', icon: 'activity' },
       { to: '/evaluator-providers', label: 'Judge Providers', icon: 'key' },
       { to: '/config', label: '配置', icon: 'settings' },
       { to: '/audit', label: '审计日志', icon: 'file' },
@@ -181,13 +187,27 @@ export default function Layout() {
   const navigate = useNavigate()
 
   const isAdmin = user?.role === 'admin'
-  // external_customer 只看到 portal 分组：internalOnly 分组对其隐藏，adminOnly 仍只给 admin。
+  // external_customer 只看到 portal 分组；内部 user 看 internal 分组但非 admin 项隐藏。
   const isExternal = user?.role === 'external_customer'
-  const visibleGroups = NAV_GROUPS.filter((group) => {
-    if (group.adminOnly && !isAdmin) return false
-    if (group.internalOnly && isExternal) return false
-    return true
-  })
+  // 先按 group 级（adminOnly/internalOnly）过滤，再按 item 级过滤：
+  //   - item.adminOnly：仅 admin 可见（如自动采集）
+  //   - item.internalUserHidden：内部 user 隐藏，external/admin 可见（如样例评审 portal）
+  // 过滤后 items 为空的组整组剔除。
+  const visibleGroups = NAV_GROUPS
+    .filter((group) => {
+      if (group.adminOnly && !isAdmin) return false
+      if (group.internalOnly && isExternal) return false
+      return true
+    })
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => {
+        if (item.adminOnly && !isAdmin) return false
+        if (item.internalUserHidden && !isAdmin && !isExternal) return false
+        return true
+      }),
+    }))
+    .filter((group) => group.items.length > 0)
 
   const handleLogout = () => {
     logout()
