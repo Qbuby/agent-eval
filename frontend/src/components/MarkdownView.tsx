@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState, type ImgHTMLAttributes } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
@@ -17,8 +17,12 @@ import remarkGfm from 'remark-gfm'
 // ──────────────────────────────────────────────────────────────────────────
 
 const VIDEO_RE = /\[视频[:：]\s*(https?:\/\/[^\]\s]+)\s*\]/g
-// 连续的 [citation:xxx] 一并吃掉（含其间空白），避免留下孤立空格
-const CITE_RE = /(?:\[citation:[^\]]+\]\s*)+/g
+// 连续的 [citation:xxx] 一并吃掉（含其间水平空白），避免留下孤立空格。
+// ⚠️ 只吃空格/制表符 [ \t]，绝不吃换行：citation 常紧跟在某行行尾（如标题、
+// 列表项），若把后续 \n\n 一并吞掉，会让下一行的 ``` 代码块围栏被拼到上一行
+// 行尾，退化成行内 code 标记，导致整篇 fence 配对错位、标题/表格/图片全部当
+// 原始文本渲染（实测「中力CPD16pro」批次多条样例如此炸裂）。
+const CITE_RE = /(?:\[citation:[^\]]+\][ \t]*)+/g
 
 function preprocess(text: string): string {
   // 防御：调用方偶尔会误传非字符串（如未序列化的 JSON 对象），String() 兜底，
@@ -28,6 +32,23 @@ function preprocess(text: string): string {
   let out = text.replace(VIDEO_RE, (_m, url) => `🎬 视频链接 [点击此处](${url})`)
   out = out.replace(CITE_RE, '')
   return out
+}
+
+// 图片渲染：外链图（如阿里云 OSS / 内部图床）可能 404 或被防盗链拦截，
+// 浏览器默认显示「破图」图标 + alt 文本，既难看又看不出是哪张图。这里改为
+// 加载失败时降级成一个带 alt 描述的占位块，告诉评审者「这里本应有张图但没加载出来」。
+function MarkdownImage(props: ImgHTMLAttributes<HTMLImageElement>) {
+  const [failed, setFailed] = useState(false)
+  const { src, alt } = props
+  if (failed) {
+    return (
+      <span className="md-img-fallback" title={typeof src === 'string' ? src : undefined}>
+        🖼️ 图片未能加载{alt ? `：${alt}` : ''}
+      </span>
+    )
+  }
+  // eslint-disable-next-line jsx-a11y/alt-text
+  return <img loading="lazy" decoding="async" {...props} onError={() => setFailed(true)} />
 }
 
 export default function MarkdownView({
@@ -48,9 +69,8 @@ export default function MarkdownView({
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          // 图片懒加载（样式在 .markdown-body img）
-          // eslint-disable-next-line jsx-a11y/alt-text
-          img: (props) => <img loading="lazy" decoding="async" {...props} />,
+          // 图片懒加载 + 加载失败降级占位（样式在 .markdown-body img / .md-img-fallback）
+          img: (props) => <MarkdownImage {...props} />,
           // 外链新窗口打开
           a: (props) => <a target="_blank" rel="noopener noreferrer" {...props} />,
         }}

@@ -68,6 +68,10 @@ export const portalApi = {
   submitFeedback(sampleId: string, data: FeedbackPayload) {
     return api.post<SampleFeedback>(`/portal/samples/${sampleId}/feedback`, data)
   },
+  /** 删除整个样例集（批次）；后端 FK 级联删除其样例与反馈。 */
+  deleteBatch(batchId: string) {
+    return api.delete<void>(`/portal/batches/${batchId}`)
+  },
 }
 
 // 打分维度定义：UI 渲染维度分输入用。key 与后端 scores JSON 对齐。

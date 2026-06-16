@@ -31,6 +31,30 @@ export default function PortalBatchesPage() {
     },
   })
 
+  const deleteMutation = useMutation({
+    mutationFn: (batchId: string) => portalApi.deleteBatch(batchId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['portal-batches'] })
+      toast.success('样例集已删除')
+    },
+    onError: (err) => {
+      const norm = formatApiError(err, { fallbackTitle: '删除失败' })
+      toast.error(toToastMessage(norm), '删除失败')
+    },
+  })
+
+  // 删除前二次确认：连同其下全部样例与已提交反馈一并删除，不可恢复。
+  function handleDelete(e: React.MouseEvent, batch: { id: string; name: string; row_count: number }) {
+    e.stopPropagation() // 阻止冒泡，避免触发卡片的导航
+    if (
+      window.confirm(
+        `确定删除样例集「${batch.name}」吗？\n其下 ${batch.row_count} 条样例及所有评审反馈将一并删除，且不可恢复。`,
+      )
+    ) {
+      deleteMutation.mutate(batch.id)
+    }
+  }
+
   function handlePick() {
     fileInputRef.current?.click()
   }
@@ -112,9 +136,25 @@ export default function PortalBatchesPage() {
                 <span className="text-[15px] font-display font-semibold tracking-[-0.2px] text-text-primary truncate">
                   {b.name}
                 </span>
-                <span className="badge badge-positive shrink-0">
-                  {b.status === 'active' ? '可评审' : b.status}
-                </span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <span className="badge badge-positive">
+                    {b.status === 'active' ? '可评审' : b.status}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => handleDelete(e, b)}
+                    disabled={deleteMutation.isPending}
+                    aria-label={`删除样例集 ${b.name}`}
+                    title="删除样例集"
+                    className="p-1 rounded text-text-tertiary hover:text-negative hover:bg-negative/10 transition-colors disabled:opacity-50"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                      <line x1="10" y1="11" x2="10" y2="17" />
+                      <line x1="14" y1="11" x2="14" y2="17" />
+                    </svg>
+                  </button>
+                </div>
               </div>
               <div className="space-y-1.5">
                 <div className="flex justify-between items-center">

@@ -246,6 +246,27 @@ async def list_batches() -> list[BatchSummary]:
         return [_batch_summary(b) for b in batches]
 
 
+@router.delete("/batches/{batch_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_batch(
+    batch_id: uuid.UUID,
+    user: UserRow = Depends(require_external),
+) -> None:
+    """删除整个样例集（批次）。samples / feedbacks 经 FK ondelete=CASCADE 一并清除。
+
+    租户隔离由监听器负责：跨租户的 batch 在当前上下文不可见 → get 返回 None → 404，
+    因此无法删除他人租户的批次。
+    """
+    async with async_session_factory() as session:
+        batch = await session.get(PortalSampleBatchRow, batch_id)
+        if batch is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="批次不存在或无权访问",
+            )
+        await session.delete(batch)
+        await session.commit()
+
+
 @router.get("/batches/{batch_id}/samples", response_model=SamplePage)
 async def list_samples(
     batch_id: uuid.UUID,

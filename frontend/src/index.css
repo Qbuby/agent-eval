@@ -461,6 +461,11 @@ body {
   .markdown-body img {
     @apply max-w-full h-auto my-2 rounded-md border border-separator bg-fill/5;
   }
+  /* 外链图加载失败时的降级占位（替代浏览器破图标）。 */
+  .md-img-fallback {
+    @apply inline-flex items-center gap-1 my-2 px-2.5 py-1.5 text-[12px] text-text-tertiary
+           bg-fill/5 border border-dashed border-separator rounded-md;
+  }
   /* citation 上标 — 对齐 xlsx_to_html.py 的 .cite */
   .markdown-body sup.cite {
     @apply text-[10px] text-text-tertiary bg-fill/10 px-1 py-0.5 rounded mx-0.5 font-medium align-super;
