@@ -55,6 +55,7 @@ export interface LangfuseTraceRow {
   tool_call_count: number | null
   tool_success_rate: number | null // 0-1
   has_error: boolean
+  input_preview: string | null // 后端截断后的 input 文本预览
 }
 
 export interface LangfuseTracesPage {

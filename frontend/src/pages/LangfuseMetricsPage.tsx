@@ -490,7 +490,8 @@ export default function LangfuseMetricsPage() {
           <thead>
             <tr>
               <th className="w-40">时间</th>
-              <th>Name</th>
+              <th className="w-44">Name</th>
+              <th>Input</th>
               <th className="w-24">环境</th>
               <th className="w-20 text-right">延迟</th>
               <th className="w-20 text-right">总 Token</th>
@@ -502,7 +503,7 @@ export default function LangfuseMetricsPage() {
           </thead>
           <tbody>
             {tracesQuery.isLoading
-              ? Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} cols={9} />)
+              ? Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} cols={10} />)
               : traces.map((t) => (
                   <tr
                     key={t.langfuse_trace_id}
@@ -512,8 +513,14 @@ export default function LangfuseMetricsPage() {
                     <td className="font-mono text-text-tertiary text-[11px]">
                       {fmtTime(t.trace_timestamp)}
                     </td>
-                    <td className="text-text-primary truncate max-w-[240px]" title={t.name ?? ''}>
+                    <td className="text-text-primary truncate max-w-[180px]" title={t.name ?? ''}>
                       {t.name ?? '—'}
+                    </td>
+                    <td
+                      className="text-text-secondary truncate max-w-[320px] text-[12px]"
+                      title={t.input_preview ?? ''}
+                    >
+                      {t.input_preview ?? '—'}
                     </td>
                     <td className="text-text-secondary truncate">{t.environment ?? '—'}</td>
                     <td className="text-right font-mono tabular-nums text-text-secondary">
@@ -542,7 +549,7 @@ export default function LangfuseMetricsPage() {
                 ))}
             {!tracesQuery.isLoading && traces.length === 0 && (
               <tr>
-                <td colSpan={9} className="empty-state">
+                <td colSpan={10} className="empty-state">
                   {search || errorOnly ? '无匹配的 trace' : '该区间暂无 trace'}
                 </td>
               </tr>

@@ -76,6 +76,30 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
+def _input_preview(value, max_len: int = 300) -> str | None:
+    """列表用 input 预览：文本化后截断，避免大 JSON 撑爆列表 payload。
+
+    str 原样使用；dict/list 等用紧凑 JSON 序列化。超长截断并加省略号。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            import json
+
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            text = str(value)
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) > max_len:
+        return text[:max_len] + "…"
+    return text
+
+
 # --------------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------------- #
@@ -125,6 +149,7 @@ class TraceListItem(BaseModel):
     tool_call_count: int
     tool_success_rate: float | None = None
     has_error: bool
+    input_preview: str | None = None
 
 
 class TraceListResponse(BaseModel):
@@ -418,6 +443,7 @@ async def list_traces(
             tool_call_count=t.tool_call_count,
             tool_success_rate=_float(t.tool_success_rate),
             has_error=t.has_error,
+            input_preview=_input_preview(t.input),
         )
         for t in rows
     ]
