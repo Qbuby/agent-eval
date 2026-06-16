@@ -1,24 +1,34 @@
 """内部反馈展示（feedback-api 摊）。
 
 外部客户在 portal 对样例的手动打分 + 意见，回流到内部入口的这个模块给
-内部 admin 查看。全部端点 ``require_role(ROLE_ADMIN)``：内部 admin 登录态是
-superadmin，db.py 的读监听器对 superadmin **旁路过滤**，所以这里直连
-``async_session_factory()`` 查 TenantMixin 表（batches/samples/feedbacks）能
-**跨租户**看到全部数据，无需手写 ``.where(tenant_id==...)``。
+**内部角色（admin + 内部普通 user）** 查看。
+
+跨租户可见的实现 —— 关键点：反馈数据落在各**外部客户租户**里，不在内部租户。
+内部 admin 登录态是 superadmin，db.py 的读监听器对 superadmin **旁路过滤**，
+天然能跨租户看到全部。但内部普通 user **不是** superadmin，get_current_user
+会把租户上下文设为 ``(INTERNAL, superadmin=False)``，读监听器会注入
+``tenant_id == INTERNAL`` 把反馈查询过滤成空。
+
+因此本 router 用 ``_internal_crosstenant`` 依赖：先经 ``require_internal()``
+校验为内部角色（external_customer 被 403 挡掉），再把租户上下文**覆盖为
+superadmin 旁路**，使内部普通 user 也能跨租户读反馈 —— 与 admin 行为一致。
+所以下方各端点直连 ``async_session_factory()`` 查 TenantMixin 表
+（batches/samples/feedbacks）即可跨租户，无需手写 ``.where(tenant_id==...)``。
 
 可选 ``tenant_id`` 过滤是「想只看某租户」时由调用方显式追加的 where —— 因为
-superadmin 默认不被过滤，不显式加就是全租户。
+旁路后默认不被过滤，不显式加就是全租户。
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
-from agent_eval.auth.dependencies import ROLE_ADMIN, require_role
+from agent_eval.auth.dependencies import require_internal
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
     PortalSampleBatchRow,
@@ -27,11 +37,37 @@ from agent_eval.db_models.tables import (
     TenantRow,
     UserRow,
 )
+from agent_eval.db_models.tenant_context import (
+    INTERNAL_TENANT_ID,
+    TenantContext,
+    reset_tenant_context,
+    set_tenant_context,
+)
+
+
+async def _internal_crosstenant(
+    user: UserRow | None = Depends(require_internal()),
+) -> AsyncIterator[UserRow | None]:
+    """内部角色（admin|user）放行 + 跨租户旁路。
+
+    ``require_internal()`` 先校验角色：external_customer 拿 403，到不了这里；
+    auth 关闭（dev 模式）时 user 为 None（已是无上下文旁路），也无妨。
+
+    随后把租户上下文覆盖为 ``superadmin=True``：内部 admin 本就旁路、内部普通
+    user 借此也能跨租户读反馈。请求结束后 reset 回 get_current_user 设的原
+    上下文（再由其 reset 回 None），ContextVar token 链保证不跨请求泄漏。
+    """
+    token = set_tenant_context(TenantContext(INTERNAL_TENANT_ID, superadmin=True))
+    try:
+        yield user
+    finally:
+        reset_tenant_context(token)
+
 
 router = APIRouter(
     prefix="/api/feedback",
     tags=["feedback-review"],
-    dependencies=[Depends(require_role(ROLE_ADMIN))],
+    dependencies=[Depends(_internal_crosstenant)],
 )
 
 

@@ -158,13 +158,14 @@ export default function App() {
                   </RoleRoute>
                 }
               />
-              {/* 客户反馈回流展示（内部 admin 专属，superadmin 跨租户可见） */}
+              {/* 客户反馈回流展示（内部角色可见：admin + 内部普通 user；
+                  后端 feedback router 对内部 user 跨租户旁路，故能看到全部反馈） */}
               <Route
                 path="feedback"
                 element={
-                  <RoleRoute roles={['admin']}>
+                  <InternalRoute>
                     <FeedbackReviewPage />
-                  </RoleRoute>
+                  </InternalRoute>
                 }
               />
               {/* Langfuse Tracing 指标（内部角色可见：admin + 内部普通 user） */}

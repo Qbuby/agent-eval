@@ -43,6 +43,8 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/evaluators', label: '评估器', icon: 'beaker' },
       { to: '/evaluation', label: '评估', icon: 'gauge' },
       { to: '/tracing-metrics', label: 'Tracing 指标', icon: 'pulse' },
+      // 客户反馈：内部角色（admin + 内部普通 user）均可见，故放在 internalOnly 的运行组。
+      { to: '/feedback', label: '客户反馈', icon: 'inbox' },
       // 自动采集仅 admin 需要
       { to: '/auto-collect', label: '自动采集', icon: 'route', adminOnly: true },
     ],
@@ -53,7 +55,6 @@ const NAV_GROUPS: NavGroup[] = [
     items: [
       { to: '/admin/tenants', label: '租户管理', icon: 'users' },
       { to: '/admin/entry-codes', label: '入口码', icon: 'key' },
-      { to: '/feedback', label: '客户反馈', icon: 'inbox' },
       { to: '/evaluator-providers', label: 'Judge Providers', icon: 'key' },
       { to: '/config', label: '配置', icon: 'settings' },
       { to: '/audit', label: '审计日志', icon: 'file' },
