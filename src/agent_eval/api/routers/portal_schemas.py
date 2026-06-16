@@ -64,3 +64,27 @@ class SubmitFeedbackRequest(BaseModel):
     overall: int | None = Field(default=None, ge=1, le=5)
     scores: dict[str, Any] = Field(default_factory=dict)
     comment: str | None = None
+
+
+class PortalBatchProgress(BaseModel):
+    """外部客户仪表盘：单个批次的评审进度（本人视角）。"""
+
+    batch_id: str
+    name: str
+    sample_count: int  # 批次样例总数
+    rated_count: int  # 本人已评样例数
+
+
+class PortalStatsResponse(BaseModel):
+    """外部客户仪表盘总览（当前租户 + 本人评审视角）。
+
+    租户隔离由 db.py 监听器按 ContextVar 自动注入，本端点无需手写 where。
+    评审进度按「本人」(rated_by == 当前用户) 统计，便于客户看自己的待办。
+    """
+
+    batch_count: int
+    sample_count: int  # 全部批次样例总数
+    rated_count: int  # 本人已评样例数
+    coverage: float  # rated_count / sample_count，0-1
+    avg_overall: float | None = None  # 本人评分的平均总体分
+    by_batch: list[PortalBatchProgress] = Field(default_factory=list)

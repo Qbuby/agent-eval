@@ -59,11 +59,10 @@ function InternalRoute({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
-// 入口反转的落地分流：登录后访问 "/" 时按角色决定默认视图。
-// external_customer → portal（样例评审），内部角色 → dashboard。
+// 入口反转的落地分流：登录后访问 "/" 时统一落地 dashboard。
+// 各角色都有仪表盘（页面内按角色分流），外部客户仪表盘聚焦其评审进度。
 function LandingRedirect() {
-  const isExternal = useAuthStore((s) => s.isExternal)
-  return <Navigate to={isExternal() ? '/portal' : '/dashboard'} replace />
+  return <Navigate to="/dashboard" replace />
 }
 
 export default function App() {
@@ -87,7 +86,8 @@ export default function App() {
                   external_customer 默认落地于此，admin 也可访问便于排查 */}
               <Route path="portal" element={<PortalBatchesPage />} />
               <Route path="portal/batches/:batchId" element={<PortalBatchDetailPage />} />
-              <Route path="dashboard" element={<InternalRoute><DashboardPage /></InternalRoute>} />
+              {/* 仪表盘：全角色可达（含 external_customer），页面内按角色分流渲染。 */}
+              <Route path="dashboard" element={<DashboardPage />} />
               <Route path="datasets" element={<InternalRoute><DatasetsPage /></InternalRoute>} />
               <Route path="datasets/:name" element={<InternalRoute><DatasetDetailPage /></InternalRoute>} />
               <Route path="projects" element={<InternalRoute><ProjectsPage /></InternalRoute>} />

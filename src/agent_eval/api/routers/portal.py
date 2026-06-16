@@ -11,6 +11,8 @@ from sqlalchemy import func, select
 from agent_eval.api.routers.portal_schemas import (
     BatchSummary,
     FeedbackPayload,
+    PortalBatchProgress,
+    PortalStatsResponse,
     SampleItem,
     SamplePage,
     SubmitFeedbackRequest,
@@ -265,6 +267,104 @@ async def delete_batch(
             )
         await session.delete(batch)
         await session.commit()
+
+
+@router.get("/stats", response_model=PortalStatsResponse)
+async def portal_stats(
+    user: UserRow | None = Depends(get_current_user),
+) -> PortalStatsResponse:
+    """外部客户仪表盘聚合：本租户的批次/样例总量 + 本人评审进度。
+
+    全部走 TenantMixin 自动租户过滤（外部客户上下文 superadmin=False），
+    所以只统计当前租户的数据。「已评 / 平均分」按**本人** feedback 计 —— 一个
+    样例可被多人评，这里只反映当前登录用户自己的评审进度（与 portal 评审页一致）。
+    """
+    async with async_session_factory() as session:
+        # 本租户全部批次（按创建时间倒序）
+        batches = (
+            (
+                await session.execute(
+                    select(PortalSampleBatchRow).order_by(
+                        PortalSampleBatchRow.created_at.desc()
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # 每批次样例数：batch_id -> count
+        sample_rows = (
+            await session.execute(
+                select(
+                    PortalSampleRow.batch_id,
+                    func.count(PortalSampleRow.id),
+                ).group_by(PortalSampleRow.batch_id)
+            )
+        ).all()
+        sample_count_by_batch: dict[uuid.UUID, int] = {
+            bid: int(cnt or 0) for bid, cnt in sample_rows
+        }
+
+        # 本人对每批次的已评样例数 + 平均总体分（经 sample 关联 batch）
+        rated_count_by_batch: dict[uuid.UUID, int] = {}
+        overall_sum_by_batch: dict[uuid.UUID, float] = {}
+        overall_n_by_batch: dict[uuid.UUID, int] = {}
+        if user is not None:
+            fb_rows = (
+                await session.execute(
+                    select(
+                        PortalSampleRow.batch_id,
+                        func.count(func.distinct(SampleFeedbackRow.sample_id)),
+                        func.avg(SampleFeedbackRow.overall),
+                        func.count(SampleFeedbackRow.overall),
+                    )
+                    .join(
+                        SampleFeedbackRow,
+                        SampleFeedbackRow.sample_id == PortalSampleRow.id,
+                    )
+                    .where(SampleFeedbackRow.rated_by == user.id)
+                    .group_by(PortalSampleRow.batch_id)
+                )
+            ).all()
+            for bid, rated, avg_overall, overall_n in fb_rows:
+                rated_count_by_batch[bid] = int(rated or 0)
+                if avg_overall is not None:
+                    overall_sum_by_batch[bid] = float(avg_overall) * int(overall_n or 0)
+                    overall_n_by_batch[bid] = int(overall_n or 0)
+
+    by_batch: list[PortalBatchProgress] = []
+    total_samples = 0
+    total_rated = 0
+    weighted_sum = 0.0
+    weighted_n = 0
+    for b in batches:
+        s_count = sample_count_by_batch.get(b.id, 0)
+        r_count = rated_count_by_batch.get(b.id, 0)
+        total_samples += s_count
+        total_rated += r_count
+        weighted_sum += overall_sum_by_batch.get(b.id, 0.0)
+        weighted_n += overall_n_by_batch.get(b.id, 0)
+        by_batch.append(
+            PortalBatchProgress(
+                batch_id=str(b.id),
+                name=b.name,
+                sample_count=s_count,
+                rated_count=r_count,
+            )
+        )
+
+    avg_overall = round(weighted_sum / weighted_n, 2) if weighted_n > 0 else None
+    coverage = round(total_rated / total_samples, 4) if total_samples > 0 else 0.0
+
+    return PortalStatsResponse(
+        batch_count=len(batches),
+        sample_count=total_samples,
+        rated_count=total_rated,
+        coverage=coverage,
+        avg_overall=avg_overall,
+        by_batch=by_batch,
+    )
 
 
 @router.get("/batches/{batch_id}/samples", response_model=SamplePage)

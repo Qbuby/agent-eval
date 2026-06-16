@@ -47,6 +47,24 @@ export interface FeedbackPayload {
   comment: string | null
 }
 
+/** 外部客户仪表盘：单批次的评审进度（本人已评 vs 总样例）。 */
+export interface PortalBatchProgress {
+  batch_id: string
+  name: string
+  sample_count: number
+  rated_count: number
+}
+
+/** GET /portal/stats —— 外部客户本租户聚合 + 本人评审进度。 */
+export interface PortalStats {
+  batch_count: number
+  sample_count: number
+  rated_count: number
+  coverage: number // rated / sample，0-1
+  avg_overall: number | null // 本人平均总体分（1-5），无则 null
+  by_batch: PortalBatchProgress[]
+}
+
 export const portalApi = {
   /** 上传 xlsx，后端解析落库后返回批次概要。 */
   uploadBatch(file: File) {
@@ -71,6 +89,10 @@ export const portalApi = {
   /** 删除整个样例集（批次）；后端 FK 级联删除其样例与反馈。 */
   deleteBatch(batchId: string) {
     return api.delete<void>(`/portal/batches/${batchId}`)
+  },
+  /** 外部客户仪表盘：本租户聚合 + 本人评审进度。 */
+  stats() {
+    return api.get<PortalStats>('/portal/stats')
   },
 }
 

@@ -23,7 +23,7 @@ const NAV_GROUPS: NavGroup[] = [
     items: [{ to: '/portal', label: '样例评审', icon: 'inbox', internalUserHidden: true }],
   },
   {
-    internalOnly: true,
+    // 仪表盘：全角色可见（页面内按角色分流）。外部客户看到聚焦评审进度的视图。
     items: [{ to: '/dashboard', label: '仪表盘', icon: 'grid' }],
   },
   {
