@@ -273,11 +273,12 @@ async def delete_batch(
 async def portal_stats(
     user: UserRow | None = Depends(get_current_user),
 ) -> PortalStatsResponse:
-    """外部客户仪表盘聚合：本租户的批次/样例总量 + 本人评审进度。
+    """外部客户仪表盘聚合：本租户的批次/样例总量 + 全队协作评审进度。
 
     全部走 TenantMixin 自动租户过滤（外部客户上下文 superadmin=False），
-    所以只统计当前租户的数据。「已评 / 平均分」按**本人** feedback 计 —— 一个
-    样例可被多人评，这里只反映当前登录用户自己的评审进度（与 portal 评审页一致）。
+    所以只统计当前租户的数据。「已评 / 平均分」按**全队协作**口径计 —— 团队共享
+    样例集，任一成员评完某样例即算「已完成」，平均分汇总全队所有反馈（与 portal
+    评审页一致）。同一样例被多人评时，已评数按 distinct(sample_id) 只计一次。
     """
     async with async_session_factory() as session:
         # 本租户全部批次（按创建时间倒序）
@@ -306,32 +307,33 @@ async def portal_stats(
             bid: int(cnt or 0) for bid, cnt in sample_rows
         }
 
-        # 本人对每批次的已评样例数 + 平均总体分（经 sample 关联 batch）
+        # 协作式：每批次「已被任意成员评过的样例数」+ 全队平均总体分（经 sample
+        # 关联 batch）。不按 rated_by 过滤 —— 团队共享样例集，任一成员评完某样例即
+        # 对全队算「已完成」。租户隔离由监听器对 SampleFeedbackRow 自动注入，统计
+        # 不会跨租户。distinct(sample_id) 保证同一样例被多人评只计一次「已评」。
         rated_count_by_batch: dict[uuid.UUID, int] = {}
         overall_sum_by_batch: dict[uuid.UUID, float] = {}
         overall_n_by_batch: dict[uuid.UUID, int] = {}
-        if user is not None:
-            fb_rows = (
-                await session.execute(
-                    select(
-                        PortalSampleRow.batch_id,
-                        func.count(func.distinct(SampleFeedbackRow.sample_id)),
-                        func.avg(SampleFeedbackRow.overall),
-                        func.count(SampleFeedbackRow.overall),
-                    )
-                    .join(
-                        SampleFeedbackRow,
-                        SampleFeedbackRow.sample_id == PortalSampleRow.id,
-                    )
-                    .where(SampleFeedbackRow.rated_by == user.id)
-                    .group_by(PortalSampleRow.batch_id)
+        fb_rows = (
+            await session.execute(
+                select(
+                    PortalSampleRow.batch_id,
+                    func.count(func.distinct(SampleFeedbackRow.sample_id)),
+                    func.avg(SampleFeedbackRow.overall),
+                    func.count(SampleFeedbackRow.overall),
                 )
-            ).all()
-            for bid, rated, avg_overall, overall_n in fb_rows:
-                rated_count_by_batch[bid] = int(rated or 0)
-                if avg_overall is not None:
-                    overall_sum_by_batch[bid] = float(avg_overall) * int(overall_n or 0)
-                    overall_n_by_batch[bid] = int(overall_n or 0)
+                .join(
+                    SampleFeedbackRow,
+                    SampleFeedbackRow.sample_id == PortalSampleRow.id,
+                )
+                .group_by(PortalSampleRow.batch_id)
+            )
+        ).all()
+        for bid, rated, avg_overall, overall_n in fb_rows:
+            rated_count_by_batch[bid] = int(rated or 0)
+            if avg_overall is not None:
+                overall_sum_by_batch[bid] = float(avg_overall) * int(overall_n or 0)
+                overall_n_by_batch[bid] = int(overall_n or 0)
 
     by_batch: list[PortalBatchProgress] = []
     total_samples = 0
@@ -402,15 +404,19 @@ async def list_samples(
         )
         samples = result.scalars().all()
 
-        # 本人对这些样例的 feedback
+        # 协作式评审：取该样例**任意成员**的反馈（不限本人）。同一租户内多个外部
+        # 用户共享样例集，任一人评完即对全队显示「已评」并带出已有打分。一个样例
+        # 可被多人各评一条（submit 按 (sample_id, rated_by) upsert 保留每人记录），
+        # 这里按 updated_at 升序遍历、用字典覆盖，最终保留**最新**那条作为展示值。
+        # 租户隔离由 db.py 监听器自动注入（SampleFeedbackRow 挂 TenantMixin），
+        # 故不会串到他租户。
         feedback_map: dict[uuid.UUID, SampleFeedbackRow] = {}
-        if samples and user is not None:
+        if samples:
             sample_ids = [s.id for s in samples]
             fb_result = await session.execute(
-                select(SampleFeedbackRow).where(
-                    SampleFeedbackRow.sample_id.in_(sample_ids),
-                    SampleFeedbackRow.rated_by == user.id,
-                )
+                select(SampleFeedbackRow)
+                .where(SampleFeedbackRow.sample_id.in_(sample_ids))
+                .order_by(SampleFeedbackRow.updated_at.asc())
             )
             for fb in fb_result.scalars().all():
                 feedback_map[fb.sample_id] = fb
