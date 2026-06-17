@@ -47,21 +47,26 @@ export interface FeedbackPayload {
   comment: string | null
 }
 
-/** 外部客户仪表盘：单批次的评审进度（本人已评 vs 总样例）。 */
+/** 外部客户仪表盘：单批次的评审进度（协作式 = 全队口径 + 本人口径）。 */
 export interface PortalBatchProgress {
   batch_id: string
   name: string
   sample_count: number
-  rated_count: number
+  rated_count: number // 全队已评样例数（任意成员评过即计）
+  my_rated_count: number // 本人已评样例数
 }
 
-/** GET /portal/stats —— 外部客户本租户聚合 + 本人评审进度。 */
+/** GET /portal/stats —— 外部客户本租户聚合（全队 + 本人双口径）。 */
 export interface PortalStats {
   batch_count: number
   sample_count: number
+  // —— 全队口径（任意成员评过即计；用于「待评审」反映团队剩余）——
   rated_count: number
   coverage: number // rated / sample，0-1
-  avg_overall: number | null // 本人平均总体分（1-5），无则 null
+  avg_overall: number | null // 全队平均总体分（1-5），无则 null
+  // —— 本人口径（仅当前用户；用于「我已评」反映个人贡献）——
+  my_rated_count: number
+  my_avg_overall: number | null
   by_batch: PortalBatchProgress[]
 }
 

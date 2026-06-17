@@ -67,24 +67,32 @@ class SubmitFeedbackRequest(BaseModel):
 
 
 class PortalBatchProgress(BaseModel):
-    """外部客户仪表盘：单个批次的评审进度（本人视角）。"""
+    """外部客户仪表盘：单个批次的评审进度（协作式 = 全队口径 + 本人口径）。"""
 
     batch_id: str
     name: str
     sample_count: int  # 批次样例总数
-    rated_count: int  # 本人已评样例数
+    rated_count: int  # 全队已评样例数（任意成员评过即计）
+    my_rated_count: int = 0  # 本人已评样例数
 
 
 class PortalStatsResponse(BaseModel):
-    """外部客户仪表盘总览（当前租户 + 本人评审视角）。
+    """外部客户仪表盘总览（当前租户）。协作式评审：同时给「全队」与「本人」口径。
 
     租户隔离由 db.py 监听器按 ContextVar 自动注入，本端点无需手写 where。
-    评审进度按「本人」(rated_by == 当前用户) 统计，便于客户看自己的待办。
+    - 全队口径（rated_count / coverage / avg_overall）：任意成员评过即计，
+      用于「待评审」反映团队剩余工作量。
+    - 本人口径（my_rated_count / my_avg_overall）：仅当前登录用户的评审，
+      用于「我已评」反映个人贡献。
     """
 
     batch_count: int
     sample_count: int  # 全部批次样例总数
-    rated_count: int  # 本人已评样例数
+    # —— 全队口径 ——
+    rated_count: int  # 全队已评样例数（任意成员评过即计）
     coverage: float  # rated_count / sample_count，0-1
-    avg_overall: float | None = None  # 本人评分的平均总体分
+    avg_overall: float | None = None  # 全队评分的平均总体分
+    # —— 本人口径 ——
+    my_rated_count: int = 0  # 本人已评样例数
+    my_avg_overall: float | None = None  # 本人评分的平均总体分
     by_batch: list[PortalBatchProgress] = Field(default_factory=list)

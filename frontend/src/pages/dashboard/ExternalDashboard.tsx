@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Cell } from 'recharts'
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts'
 import { portalApi } from '@/services/portal'
 import { ChartCard, MetricCard, COLORS, AXIS_TICK, GRID_PROPS, TOOLTIP_STYLE } from './charts'
 
@@ -18,15 +18,22 @@ export default function ExternalDashboard() {
 
   const batchCount = stats?.batch_count ?? 0
   const sampleCount = stats?.sample_count ?? 0
-  const ratedCount = stats?.rated_count ?? 0
-  const pendingCount = Math.max(0, sampleCount - ratedCount)
+  // 全队口径：团队任一成员评过即计，「待评审」据此反映团队剩余工作量。
+  const teamRated = stats?.rated_count ?? 0
+  const pendingCount = Math.max(0, sampleCount - teamRated)
   const coveragePct = Math.round((stats?.coverage ?? 0) * 100)
   const avgOverall = stats?.avg_overall
+  // 本人口径：仅当前登录用户的评审，「我已评」据此反映个人贡献。
+  const myRated = stats?.my_rated_count ?? 0
+  const myAvgOverall = stats?.my_avg_overall
 
-  // 评审进度：每批次「已评 vs 待评」堆叠柱。
+  // 评审进度：每批次「我评的 / 队友评的 / 待评」堆叠柱。
+  // 队友评的 = 全队已评 − 本人已评（协作式下同一样例只算一次「已评」，
+  // 本人是全队的子集，故差值即「他人评过而我没评」的部分，非负）。
   const progressData = (stats?.by_batch ?? []).map((b) => ({
     name: b.name.length > 16 ? b.name.slice(0, 15) + '…' : b.name,
-    rated: b.rated_count,
+    mine: b.my_rated_count,
+    teammates: Math.max(0, b.rated_count - b.my_rated_count),
     pending: Math.max(0, b.sample_count - b.rated_count),
   }))
 
@@ -37,17 +44,27 @@ export default function ExternalDashboard() {
         <h1 className="page-title">仪表盘</h1>
       </header>
 
-      {/* KPI 指标卡 */}
-      <div className="grid grid-cols-4 gap-3 mb-8">
+      {/* KPI 指标卡：个人口径（我已评）+ 团队口径（团队已评 / 待评审）并列 */}
+      <div className="grid grid-cols-5 gap-3 mb-8">
         <Link to="/portal" className="no-underline block">
           <MetricCard label="样例集" value={batchCount} hint="个批次" />
         </Link>
-        <MetricCard label="总样例" value={sampleCount} hint="条待评审" />
-        <MetricCard label="我已评" value={ratedCount} hint={`覆盖率 ${coveragePct}%`} tone="positive" />
+        <MetricCard label="总样例" value={sampleCount} hint="条样例" />
+        <MetricCard
+          label="我已评"
+          value={myRated}
+          hint={myAvgOverall != null ? `我的均分 ${myAvgOverall}` : '我的贡献'}
+          tone="positive"
+        />
+        <MetricCard
+          label="团队已评"
+          value={teamRated}
+          hint={`覆盖率 ${coveragePct}%${avgOverall != null ? ` · 均分 ${avgOverall}` : ''}`}
+        />
         <MetricCard
           label="待评审"
           value={pendingCount}
-          hint={avgOverall != null ? `我的均分 ${avgOverall}` : '尚未评分'}
+          hint="团队剩余"
           tone={pendingCount > 0 ? 'warning' : 'default'}
         />
       </div>
@@ -67,12 +84,9 @@ export default function ExternalDashboard() {
             <YAxis tick={AXIS_TICK} allowDecimals={false} />
             <Tooltip {...TOOLTIP_STYLE} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            <Bar dataKey="rated" name="已评" stackId="a" fill={COLORS.emerald} radius={[0, 0, 0, 0]} />
-            <Bar dataKey="pending" name="待评" stackId="a" fill={COLORS.amber} radius={[3, 3, 0, 0]}>
-              {progressData.map((_, i) => (
-                <Cell key={i} fill={COLORS.amber} />
-              ))}
-            </Bar>
+            <Bar dataKey="mine" name="我评的" stackId="a" fill={COLORS.emerald} />
+            <Bar dataKey="teammates" name="队友评的" stackId="a" fill={COLORS.sky} />
+            <Bar dataKey="pending" name="待评" stackId="a" fill={COLORS.amber} radius={[3, 3, 0, 0]} />
           </BarChart>
         </ChartCard>
       </div>

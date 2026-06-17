@@ -307,15 +307,13 @@ async def portal_stats(
             bid: int(cnt or 0) for bid, cnt in sample_rows
         }
 
-        # 协作式：每批次「已被任意成员评过的样例数」+ 全队平均总体分（经 sample
-        # 关联 batch）。不按 rated_by 过滤 —— 团队共享样例集，任一成员评完某样例即
-        # 对全队算「已完成」。租户隔离由监听器对 SampleFeedbackRow 自动注入，统计
-        # 不会跨租户。distinct(sample_id) 保证同一样例被多人评只计一次「已评」。
-        rated_count_by_batch: dict[uuid.UUID, int] = {}
-        overall_sum_by_batch: dict[uuid.UUID, float] = {}
-        overall_n_by_batch: dict[uuid.UUID, int] = {}
-        fb_rows = (
-            await session.execute(
+        # 协作式评审同时给两套口径，便于仪表盘分别展示「我已评」与团队「待评审」：
+        #   - 全队口径：不按 rated_by 过滤，任一成员评过某样例即对全队算「已完成」。
+        #   - 本人口径：仅 rated_by == 当前用户，反映个人贡献。
+        # distinct(sample_id) 保证同一样例被多人评只计一次。租户隔离由监听器对
+        # SampleFeedbackRow 自动注入，两套统计都不会跨租户。
+        def _agg_by_batch(extra_where=None):
+            stmt = (
                 select(
                     PortalSampleRow.batch_id,
                     func.count(func.distinct(SampleFeedbackRow.sample_id)),
@@ -328,35 +326,65 @@ async def portal_stats(
                 )
                 .group_by(PortalSampleRow.batch_id)
             )
-        ).all()
-        for bid, rated, avg_overall, overall_n in fb_rows:
-            rated_count_by_batch[bid] = int(rated or 0)
-            if avg_overall is not None:
-                overall_sum_by_batch[bid] = float(avg_overall) * int(overall_n or 0)
-                overall_n_by_batch[bid] = int(overall_n or 0)
+            if extra_where is not None:
+                stmt = stmt.where(extra_where)
+            return stmt
+
+        async def _collect(stmt):
+            rated: dict[uuid.UUID, int] = {}
+            osum: dict[uuid.UUID, float] = {}
+            on: dict[uuid.UUID, int] = {}
+            rows = (await session.execute(stmt)).all()
+            for bid, r, avg_overall, n in rows:
+                rated[bid] = int(r or 0)
+                if avg_overall is not None:
+                    osum[bid] = float(avg_overall) * int(n or 0)
+                    on[bid] = int(n or 0)
+            return rated, osum, on
+
+        # 全队口径
+        rated_count_by_batch, overall_sum_by_batch, overall_n_by_batch = await _collect(
+            _agg_by_batch()
+        )
+        # 本人口径（user 为 None 时——dev 模式关 auth——视为无个人评审）
+        if user is not None:
+            my_rated_by_batch, my_sum_by_batch, my_n_by_batch = await _collect(
+                _agg_by_batch(SampleFeedbackRow.rated_by == user.id)
+            )
+        else:
+            my_rated_by_batch, my_sum_by_batch, my_n_by_batch = {}, {}, {}
 
     by_batch: list[PortalBatchProgress] = []
     total_samples = 0
     total_rated = 0
+    total_my_rated = 0
     weighted_sum = 0.0
     weighted_n = 0
+    my_weighted_sum = 0.0
+    my_weighted_n = 0
     for b in batches:
         s_count = sample_count_by_batch.get(b.id, 0)
         r_count = rated_count_by_batch.get(b.id, 0)
+        my_r_count = my_rated_by_batch.get(b.id, 0)
         total_samples += s_count
         total_rated += r_count
+        total_my_rated += my_r_count
         weighted_sum += overall_sum_by_batch.get(b.id, 0.0)
         weighted_n += overall_n_by_batch.get(b.id, 0)
+        my_weighted_sum += my_sum_by_batch.get(b.id, 0.0)
+        my_weighted_n += my_n_by_batch.get(b.id, 0)
         by_batch.append(
             PortalBatchProgress(
                 batch_id=str(b.id),
                 name=b.name,
                 sample_count=s_count,
                 rated_count=r_count,
+                my_rated_count=my_r_count,
             )
         )
 
     avg_overall = round(weighted_sum / weighted_n, 2) if weighted_n > 0 else None
+    my_avg_overall = round(my_weighted_sum / my_weighted_n, 2) if my_weighted_n > 0 else None
     coverage = round(total_rated / total_samples, 4) if total_samples > 0 else 0.0
 
     return PortalStatsResponse(
@@ -365,6 +393,8 @@ async def portal_stats(
         rated_count=total_rated,
         coverage=coverage,
         avg_overall=avg_overall,
+        my_rated_count=total_my_rated,
+        my_avg_overall=my_avg_overall,
         by_batch=by_batch,
     )
 
