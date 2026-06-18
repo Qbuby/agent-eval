@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class CreateDatasetRequest(BaseModel):
@@ -38,6 +38,20 @@ class DatasetStatsResponse(BaseModel):
     avg_messages_per_case: float
 
 
+# 多轮对话：合法 message role 白名单。多轮样例必须明确角色语义，
+# 故在入口层收紧（此前完全无校验）。tool 角色保留给 function/tool 结果消息。
+_ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
+
+
+class TurnExpectationInput(BaseModel):
+    """单轮（user→assistant）的期望。turn_index 指向 input_messages 中
+    被评测的 assistant 轮下标（从 0 计）。本期只录入，第二期评估消费。"""
+
+    turn_index: int
+    criteria: list[str] = []
+    expected_output: str | None = None
+
+
 class TestCaseInput(BaseModel):
     name: str
     description: str = ""
@@ -52,6 +66,24 @@ class TestCaseInput(BaseModel):
     max_latency_ms: int | None = None
     max_tokens: int | None = None
     scoring_mode: str = "hybrid"
+    # —— 多轮对话扩展（向后兼容：单轮样例不填即可）——
+    conversation_goal: str | None = None
+    turn_expectations: list[TurnExpectationInput] = []
+
+    @field_validator("input_messages")
+    @classmethod
+    def _check_messages(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not v:
+            raise ValueError("input_messages 不能为空")
+        for i, m in enumerate(v):
+            role = m.get("role")
+            if role not in _ALLOWED_ROLES:
+                raise ValueError(
+                    f"消息 #{i + 1} role 非法：{role!r}，须为 {sorted(_ALLOWED_ROLES)} 之一"
+                )
+            if not isinstance(m.get("content"), str):
+                raise ValueError(f"消息 #{i + 1} content 必须是字符串")
+        return v
 
 
 class AddCasesRequest(BaseModel):

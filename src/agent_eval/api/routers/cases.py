@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.schemas import AddCasesRequest, BatchDeleteRequest, TestCaseInput
@@ -11,9 +11,16 @@ from agent_eval.auth.dependencies import (
     require_internal,
     require_role,
 )
+from agent_eval.data.benchmark_import import (
+    iter_upload_rows,
+    resolve_conversation_goal,
+    resolve_messages,
+)
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.data.schemas import validate_and_parse
+from agent_eval.models.test_case import TestCase
 from agent_eval.governance.helpers import log_audit
+from agent_eval.models.test_case import TestCase
 
 # All case endpoints require an internal role (admin|user); external_customer -> 403.
 router = APIRouter(tags=["cases"], dependencies=[Depends(require_internal())])
@@ -113,3 +120,54 @@ async def batch_delete_cases(
     await mgr.delete_cases_batch(req.example_ids)
     await log_audit("example", "batch", "delete", details={"count": len(req.example_ids), "ids": req.example_ids[:10]})
     return {"deleted": len(req.example_ids)}
+
+
+@router.post("/api/datasets/{name}/cases/import-conversations")
+async def import_conversations(
+    name: str,
+    file: UploadFile = File(...),
+    split: str | None = Query(None),
+    messages_column: str | None = Query(None, description="手动指定消息列（覆盖自动识别）"),
+    goal_column: str | None = Query(None, description="手动指定对话目标列（覆盖自动识别）"),
+    mgr: DatasetManager = Depends(get_manager),
+):
+    """从 CSV / JSON / JSONL / XLSX 文件批量导入多轮对话样例到 LangSmith 数据集。
+
+    一行 = 一个完整对话样例：消息列里放消息数组（JSON/JSONL 天然是 list，
+    CSV/XLSX 单元格放 JSON 字符串），可选的对话目标列写入 conversation_goal。
+    消息列识别不到的行按跳过处理，不影响其余行导入。
+    """
+    content = await file.read()
+    filename = file.filename or "unknown"
+    try:
+        _, row_iter = iter_upload_rows(content, filename)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    cases: list[TestCase] = []
+    skipped = 0
+    for i, row in enumerate(row_iter):
+        messages = resolve_messages(row, messages_column=messages_column)
+        if not messages:
+            skipped += 1
+            continue
+        goal = resolve_conversation_goal(row, goal_column=goal_column)
+        first = next((m["content"] for m in messages if m.get("content")), "")
+        cases.append(TestCase(
+            dataset_version=name,
+            name=str(row.get("name") or row.get("名称") or "").strip() or f"conv-{i + 1}-{first[:30]}",
+            description=str(row.get("description") or row.get("描述") or "").strip(),
+            source="file_imported",
+            input_messages=messages,
+            conversation_goal=goal,
+        ))
+
+    if not cases:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未识别到任何多轮对话样例（文件为空或消息列未匹配；跳过 {skipped} 行）",
+        )
+
+    ids = await mgr.add_cases_batch(name, cases, split=split)
+    await log_audit("example", name, "import", details={"count": len(ids), "kind": "conversation"})
+    return {"added": len(ids), "skipped": skipped, "ids": ids[:10]}

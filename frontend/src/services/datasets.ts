@@ -42,6 +42,23 @@ export const datasetsApi = {
   addCases(name: string, data: AddCasesRequest) {
     return api.post<{ added: number; ids: string[] }>(`/datasets/${name}/cases`, data)
   },
+  importConversations(
+    name: string,
+    file: File,
+    opts?: { split?: string; messagesColumn?: string; goalColumn?: string },
+  ) {
+    const form = new FormData()
+    form.append('file', file)
+    const params: Record<string, string> = {}
+    if (opts?.split) params.split = opts.split
+    if (opts?.messagesColumn) params.messages_column = opts.messagesColumn
+    if (opts?.goalColumn) params.goal_column = opts.goalColumn
+    return api.post<{ added: number; skipped: number; ids: string[] }>(
+      `/datasets/${name}/cases/import-conversations`,
+      form,
+      { params, headers: { 'Content-Type': 'multipart/form-data' } },
+    )
+  },
   updateCase(exampleId: string, data: TestCase) {
     return api.put(`/cases/${exampleId}`, data)
   },

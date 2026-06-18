@@ -3,7 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 from agent_eval.data._utils import normalize_messages
-from agent_eval.models.test_case import EvalWeights, TestCase, ToolCallExpectation
+from agent_eval.models.test_case import (
+    EvalWeights,
+    TestCase,
+    ToolCallExpectation,
+    TurnExpectation,
+)
 
 SCHEMA_VERSION = "1"
 
@@ -27,6 +32,10 @@ def case_to_example(case: TestCase, split: str | None = None) -> dict[str, Any]:
         outputs["expected_criteria"] = case.expected_output_criteria
     if case.expected_tool_calls:
         outputs["expected_tool_calls"] = [tc.model_dump() for tc in case.expected_tool_calls]
+    if case.conversation_goal:
+        outputs["conversation_goal"] = case.conversation_goal
+    if case.turn_expectations:
+        outputs["turn_expectations"] = [te.model_dump() for te in case.turn_expectations]
 
     metadata: dict[str, Any] = {
         "agent_eval_version": SCHEMA_VERSION,
@@ -35,6 +44,10 @@ def case_to_example(case: TestCase, split: str | None = None) -> dict[str, Any]:
         "eval_weights": case.eval_weights.model_dump(),
         "scoring_mode": case.scoring_mode,
     }
+    # 多轮对话样例标记：便于前端/导入按类型区分，单轮老数据不带这些字段
+    if case.conversation_goal or case.turn_expectations:
+        metadata["case_type"] = "conversation"
+        metadata["turn_count"] = len(case.input_messages)
     if case.name:
         metadata["name"] = case.name
     if case.description:
@@ -58,6 +71,10 @@ def example_to_test_case(example: Any) -> TestCase:
     tool_calls_raw = outputs.get("expected_tool_calls", [])
     tool_calls = [ToolCallExpectation(**tc) for tc in tool_calls_raw]
 
+    # 多轮字段：无标记的单轮老数据这两个字段缺省为空，向后兼容
+    turn_exp_raw = outputs.get("turn_expectations", [])
+    turn_expectations = [TurnExpectation(**te) for te in turn_exp_raw]
+
     return TestCase(
         id=str(example.id),
         dataset_version=str(example.dataset_id) if hasattr(example, "dataset_id") else "",
@@ -70,6 +87,8 @@ def example_to_test_case(example: Any) -> TestCase:
         expected_output=outputs.get("expected_output"),
         expected_output_criteria=outputs.get("expected_criteria", []),
         expected_tool_calls=tool_calls,
+        conversation_goal=outputs.get("conversation_goal"),
+        turn_expectations=turn_expectations,
         max_tool_calls=meta.get("max_tool_calls"),
         max_latency_ms=meta.get("max_latency_ms"),
         max_tokens=meta.get("max_tokens"),

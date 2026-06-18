@@ -7,6 +7,7 @@ import RegisterPage from '@/pages/RegisterPage'
 import DashboardPage from '@/pages/DashboardPage'
 import DatasetsPage from '@/pages/DatasetsPage'
 import DatasetDetailPage from '@/pages/DatasetDetailPage'
+import ConversationDatasetPage from '@/pages/ConversationDatasetPage'
 import GeneratePage from '@/pages/GeneratePage'
 import TracesPage from '@/pages/TracesPage'
 import AutoCollectPage from '@/pages/AutoCollectPage'
@@ -89,6 +90,7 @@ export default function App() {
               {/* 仪表盘：全角色可达（含 external_customer），页面内按角色分流渲染。 */}
               <Route path="dashboard" element={<DashboardPage />} />
               <Route path="datasets" element={<InternalRoute><DatasetsPage /></InternalRoute>} />
+              <Route path="conversations" element={<InternalRoute><ConversationDatasetPage /></InternalRoute>} />
               <Route path="datasets/:name" element={<InternalRoute><DatasetDetailPage /></InternalRoute>} />
               <Route path="projects" element={<InternalRoute><ProjectsPage /></InternalRoute>} />
               <Route path="benchmark/:projectId" element={<InternalRoute><BenchmarkPage /></InternalRoute>} />

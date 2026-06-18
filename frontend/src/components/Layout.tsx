@@ -31,6 +31,7 @@ const NAV_GROUPS: NavGroup[] = [
     internalOnly: true,
     items: [
       { to: '/datasets', label: '备选数据集', icon: 'list' },
+      { to: '/conversations', label: '多轮对话集', icon: 'message' },
       { to: '/projects', label: '基准测试集', icon: 'target' },
       { to: '/generate', label: '样例生成', icon: 'sparkle' },
     ],
@@ -176,6 +177,13 @@ function NavIcon({ name }: { name: string }) {
           <path d="M2.5 13a3.5 3.5 0 0 1 7 0" />
           <path d="M10.5 4.2a2.3 2.3 0 0 1 0 4.1" />
           <path d="M11 9.6a3.5 3.5 0 0 1 2.5 3.4" />
+        </svg>
+      )
+    case 'message':
+      return (
+        <svg {...props}>
+          <path d="M2.5 3.5h11a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H6l-3 2.5v-2.5H2.5a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1z" />
+          <path d="M4.5 6.5h7M4.5 8.5h4" />
         </svg>
       )
     default:

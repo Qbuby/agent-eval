@@ -34,6 +34,8 @@ from typing import Any
 
 import openpyxl
 
+from agent_eval.data._utils import normalize_messages
+
 VEHICLE_MODEL_PATTERN = re.compile(
     r"(RPL[A-Z0-9]+|CPD[A-Z0-9]+|CQD[A-Z0-9]+|EPT[A-Z0-9\-]+|EXP[A-Z0-9]+|"
     r"EPL[A-Z0-9]+|WPL[A-Z0-9]+|DS\d[A-Z0-9]*|KPL[A-Z0-9]+|F\d{4}[A-Z0-9]*)",
@@ -303,6 +305,75 @@ def resolve_question_answer(
         answer = get_answer_from_row(row, schema_columns, field_mapping)
 
     return (question or None), (answer or None)
+
+
+# 多轮对话导入：一行 = 一个对话样例，对话消息列里放消息数组。
+_MESSAGES_COLUMN_ALIASES = (
+    "messages", "input_messages", "conversation", "dialog", "dialogue",
+    "对话", "消息", "会话", "chat", "chat_history", "turns",
+)
+_GOAL_COLUMN_ALIASES = (
+    "conversation_goal", "goal", "对话目标", "目标", "session_goal",
+)
+
+
+def resolve_messages(
+    row: dict[str, Any],
+    *,
+    messages_column: str | None = None,
+) -> list[dict[str, str]] | None:
+    """从一行里抽取多轮对话消息列表。
+
+    一行代表一个完整对话样例，消息列里可以是：
+    - 已解析的 list（JSON/JSONL 文件天然如此）
+    - JSON 字符串（CSV/XLSX 单元格里塞的 JSON 数组）
+    显式列名优先，否则按别名表自动识别。识别不到返回 None（按单轮处理）。
+    """
+    candidates: list[str] = []
+    if messages_column:
+        candidates.append(messages_column)
+    candidates.extend(a for a in _MESSAGES_COLUMN_ALIASES if a not in candidates)
+
+    lower_map = {str(k).lower().strip(): k for k in row}
+    for cand in candidates:
+        key = cand if cand in row else lower_map.get(cand.lower())
+        if key is None:
+            continue
+        raw = row[key]
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                # 不是 JSON 数组，当作单条用户输入，交回单轮处理
+                return None
+        if isinstance(raw, list) and raw:
+            msgs = normalize_messages(raw)
+            return msgs or None
+    return None
+
+
+def resolve_conversation_goal(
+    row: dict[str, Any],
+    *,
+    goal_column: str | None = None,
+) -> str | None:
+    """从一行里抽取对话级目标（可选）。"""
+    candidates: list[str] = []
+    if goal_column:
+        candidates.append(goal_column)
+    candidates.extend(a for a in _GOAL_COLUMN_ALIASES if a not in candidates)
+
+    lower_map = {str(k).lower().strip(): k for k in row}
+    for cand in candidates:
+        key = cand if cand in row else lower_map.get(cand.lower())
+        if key is None:
+            continue
+        val = row[key]
+        if val not in (None, ""):
+            return str(val).strip()
+    return None
 
 
 def collect_sample_values(

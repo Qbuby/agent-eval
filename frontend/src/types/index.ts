@@ -77,6 +77,15 @@ export interface TestCase {
   max_latency_ms?: number
   max_tokens?: number
   scoring_mode?: string
+  // 多轮对话：会话级目标 + 逐轮期望（turn_index 指向 input_messages 里 user 消息下标）
+  conversation_goal?: string
+  turn_expectations?: TurnExpectation[]
+}
+
+export interface TurnExpectation {
+  turn_index: number
+  criteria?: string[]
+  expected_output?: string
 }
 
 export interface AddCasesRequest {
