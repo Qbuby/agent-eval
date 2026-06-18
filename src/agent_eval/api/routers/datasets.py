@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.schemas import (
+    DEFAULT_DATASET_TYPE,
     CreateDatasetRequest,
     DatasetResponse,
     DatasetStatsResponse,
@@ -47,6 +48,42 @@ async def _get_source_projects(dataset_names: list[str]) -> dict[str, str | None
             .where(DatasetMetadataRow.dataset_name.in_(dataset_names))
         )
         return {name: sp for name, sp in result.all()}
+
+
+async def _get_dataset_types(dataset_names: list[str]) -> dict[str, str]:
+    """Batch fetch dataset_type. 本地表是权威过滤源：没有行的老数据集按
+    DEFAULT_DATASET_TYPE（candidate）处理，保证历史数据继续留在备选页、不丢。"""
+    if not dataset_names:
+        return {}
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(DatasetMetadataRow.dataset_name, DatasetMetadataRow.dataset_type)
+            .where(DatasetMetadataRow.dataset_name.in_(dataset_names))
+        )
+        return {name: dt for name, dt in result.all()}
+
+
+async def _get_dataset_type(dataset_name: str) -> str:
+    types = await _get_dataset_types([dataset_name])
+    return types.get(dataset_name, DEFAULT_DATASET_TYPE)
+
+
+async def _set_dataset_type(dataset_name: str, dataset_type: str) -> None:
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(DatasetMetadataRow).where(
+                DatasetMetadataRow.dataset_name == dataset_name
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is not None:
+            row.dataset_type = dataset_type
+        else:
+            session.add(DatasetMetadataRow(
+                dataset_name=dataset_name,
+                dataset_type=dataset_type,
+            ))
+        await session.commit()
 
 
 async def _candidate_counts(dataset_names: list[str]) -> dict[str, int]:
@@ -95,27 +132,39 @@ async def create_dataset(
     ds_id = await mgr.create_dataset(req.name, req.description, req.metadata)
     if req.source_project:
         await _set_source_project(req.name, req.source_project)
-    await log_audit("dataset", req.name, "create", details={"id": ds_id})
+    # 始终落一行 dataset_type，使该数据集在对应页面可见、与另一类隔离。
+    await _set_dataset_type(req.name, req.dataset_type)
+    await log_audit("dataset", req.name, "create", details={"id": ds_id, "type": req.dataset_type})
     return {"id": ds_id, "name": req.name}
 
 
 @router.get("", response_model=list[DatasetResponse])
 async def list_datasets(
     filter: str | None = Query(None, description="Filter by name"),
+    type: str | None = Query(
+        None,
+        description="按数据集类型过滤：candidate / conversation。不传=全部（兼容旧调用方）",
+    ),
     mgr: DatasetManager = Depends(get_manager),
 ):
     datasets = await mgr.list_datasets(filter)
     names = [ds.name for ds in datasets]
     counts = await _candidate_counts(names)
     sources = await _get_source_projects(names)
-    return [
+    types = await _get_dataset_types(names)
+    items = [
         DatasetResponse(
             id=ds.id, name=ds.name, description=ds.description,
             example_count=counts.get(ds.name, 0), created_at=ds.created_at,
             metadata=ds.metadata, source_project=sources.get(ds.name),
+            dataset_type=types.get(ds.name, DEFAULT_DATASET_TYPE),
         )
         for ds in datasets
     ]
+    # type 过滤在本地表权威映射之上做（老数据集无行 → DEFAULT_DATASET_TYPE）。
+    if type:
+        items = [d for d in items if d.dataset_type == type]
+    return items
 
 
 @router.get("/{name}", response_model=DatasetResponse)
@@ -129,10 +178,12 @@ async def get_dataset(
         raise HTTPException(status_code=404, detail=f"Dataset '{name}' not found") from e
     sp = await _get_source_project(name)
     count = await _candidate_count(name)
+    dt = await _get_dataset_type(name)
     return DatasetResponse(
         id=ds.id, name=ds.name, description=ds.description,
         example_count=count, created_at=ds.created_at,
         metadata=ds.metadata, source_project=sp,
+        dataset_type=dt,
     )
 
 

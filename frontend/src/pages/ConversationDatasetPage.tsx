@@ -4,7 +4,7 @@ import { Button, Dialog, useConfirm, useToast } from '@/components/ui'
 import { datasetsApi } from '@/services'
 import ConversationView from '@/components/ConversationView'
 import ConversationEditor from '@/components/ConversationEditor'
-import type { TestCase } from '@/types'
+import type { TestCase, CreateDatasetRequest } from '@/types'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 
 // 多轮对话样例：input_messages 含多条消息，或带 conversation_goal / turn_expectations。
@@ -41,12 +41,16 @@ export default function ConversationDatasetPage() {
   const [viewing, setViewing] = useState<TestCase | null>(null)
   const [showImport, setShowImport] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+  // 多轮对话集可建自己的独立数据集（dataset_type=conversation），与备选数据集隔离。
+  const [showCreateDs, setShowCreateDs] = useState(false)
+  const [dsForm, setDsForm] = useState<CreateDatasetRequest>({ name: '', description: '', dataset_type: 'conversation' })
 
   const pageSize = 20
 
+  // 多轮对话集页只看 conversation 类型，与备选数据集隔离。
   const { data: datasets } = useQuery({
-    queryKey: ['datasets'],
-    queryFn: () => datasetsApi.list().then(r => r.data),
+    queryKey: ['datasets', 'conversation'],
+    queryFn: () => datasetsApi.list({ type: 'conversation' }).then(r => r.data),
   })
 
   // 首个数据集兜底选中（在 effect 里 setState，避免渲染期触发更新）
@@ -90,6 +94,19 @@ export default function ConversationDatasetPage() {
     onError: (e) => toast.error(toToastMessage(formatApiError(e)), '导入失败'),
   })
 
+  const createDsMutation = useMutation({
+    mutationFn: (data: CreateDatasetRequest) => datasetsApi.create(data),
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ['datasets', 'conversation'] })
+      setShowCreateDs(false)
+      const created = dsForm.name
+      setDsForm({ name: '', description: '', dataset_type: 'conversation' })
+      setSelectedDataset(created)
+      toast.success(`已创建对话数据集「${res.data.name}」`)
+    },
+    onError: (e) => toast.error(toToastMessage(formatApiError(e)), '创建失败'),
+  })
+
   // LangSmith case 列表无法按类型服务端过滤，这里前端筛多轮样例。
   const allCases = casesData?.items ?? []
   const cases = allCases.filter(isConversation)
@@ -130,6 +147,9 @@ export default function ConversationDatasetPage() {
           className="input-sm w-[240px]"
         />
         <div className="flex-1" />
+        <Button variant="secondary" size="sm" onClick={() => setShowCreateDs(true)}>
+          新建数据集
+        </Button>
         <Button variant="secondary" size="sm" disabled={!selectedDataset} onClick={() => setShowImport(true)}>
           导入对话
         </Button>
@@ -139,7 +159,11 @@ export default function ConversationDatasetPage() {
       </div>
 
       {!selectedDataset ? (
-        <div className="empty-state">请先选择一个数据集</div>
+        <div className="empty-state">
+          {(datasets ?? []).length === 0
+            ? '还没有多轮对话数据集，点击「新建数据集」创建第一个'
+            : '请先选择一个数据集'}
+        </div>
       ) : (
         <>
           <div className="table-card">
@@ -307,6 +331,49 @@ export default function ConversationDatasetPage() {
           <div>
             <label htmlFor={importFileId} className="field-label">选择文件</label>
             <input id={importFileId} ref={fileRef} type="file" accept=".csv,.json,.jsonl,.xlsx,.xls" className="text-[12px]" />
+          </div>
+        </div>
+      </Dialog>
+
+      {/* 新建多轮对话数据集（dataset_type=conversation，与备选数据集隔离） */}
+      <Dialog
+        open={showCreateDs}
+        onClose={() => setShowCreateDs(false)}
+        title="新建多轮对话数据集"
+        width={480}
+        footer={
+          <>
+            <Button variant="secondary" size="md" onClick={() => setShowCreateDs(false)}>取消</Button>
+            <Button
+              variant="primary"
+              size="md"
+              loading={createDsMutation.isPending}
+              disabled={!dsForm.name.trim()}
+              onClick={() => createDsMutation.mutate(dsForm)}
+            >
+              创建
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div>
+            <label className="field-label">名称</label>
+            <input
+              value={dsForm.name}
+              onChange={e => setDsForm({ ...dsForm, name: e.target.value })}
+              placeholder="对话数据集名称"
+              className="input"
+            />
+          </div>
+          <div>
+            <label className="field-label">描述（可选）</label>
+            <input
+              value={dsForm.description ?? ''}
+              onChange={e => setDsForm({ ...dsForm, description: e.target.value })}
+              placeholder="简述用途"
+              className="input"
+            />
           </div>
         </div>
       </Dialog>

@@ -322,6 +322,9 @@ class DatasetMetadataRow(Base, TenantMixin):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
     dataset_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
     source_project: Mapped[str | None] = mapped_column(String(256))
+    # 数据集类型：区分备选数据集（candidate，默认）与多轮对话集（conversation），
+    # 用于两类数据集在各自页面互相隔离。无本地行的老数据集按 candidate 处理。
+    dataset_type: Mapped[str] = mapped_column(String(16), nullable=False, default="candidate", index=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     max_examples: Mapped[int | None] = mapped_column(Integer)
     retention_policy: Mapped[str | None] = mapped_column(String(16))

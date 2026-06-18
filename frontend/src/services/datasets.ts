@@ -12,8 +12,8 @@ import type {
 } from '@/types'
 
 export const datasetsApi = {
-  list(filter?: string) {
-    return api.get<Dataset[]>('/datasets', { params: filter ? { filter } : undefined })
+  list(params?: { filter?: string; type?: string }) {
+    return api.get<Dataset[]>('/datasets', { params })
   },
   get(name: string) {
     return api.get<Dataset>(`/datasets/${name}`)

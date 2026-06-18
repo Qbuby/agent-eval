@@ -6,11 +6,26 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 
+# 数据集类型：区分用途不同的两类数据集，避免在各自页面里互相串。
+# - candidate    备选数据集（单轮问答样例，老数据无标记一律按此处理，向后兼容）
+# - conversation 多轮对话集（多轮对话样例，固定 thread_id 逐轮调用）
+_DATASET_TYPES = {"candidate", "conversation"}
+DEFAULT_DATASET_TYPE = "candidate"
+
+
 class CreateDatasetRequest(BaseModel):
     name: str
     description: str = ""
     metadata: dict[str, Any] | None = None
     source_project: str | None = None
+    dataset_type: str = DEFAULT_DATASET_TYPE
+
+    @field_validator("dataset_type")
+    @classmethod
+    def _check_type(cls, v: str) -> str:
+        if v not in _DATASET_TYPES:
+            raise ValueError(f"dataset_type 非法：{v!r}，须为 {sorted(_DATASET_TYPES)} 之一")
+        return v
 
 
 class DatasetResponse(BaseModel):
@@ -21,6 +36,7 @@ class DatasetResponse(BaseModel):
     created_at: datetime | None = None
     metadata: dict[str, Any] = {}
     source_project: str | None = None
+    dataset_type: str = DEFAULT_DATASET_TYPE
 
 
 class VersionResponse(BaseModel):

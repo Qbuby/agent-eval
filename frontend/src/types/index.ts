@@ -36,6 +36,10 @@ export interface UserUpdateRequest {
   password?: string
 }
 
+// 数据集类型：candidate=备选数据集（单轮，老数据默认）/ conversation=多轮对话集。
+// 两类在各自页面隔离展示，互不可见。
+export type DatasetType = 'candidate' | 'conversation'
+
 export interface Dataset {
   id: string
   name: string
@@ -43,6 +47,7 @@ export interface Dataset {
   example_count: number
   created_at: string | null
   metadata: Record<string, unknown>
+  dataset_type: DatasetType
 }
 
 export interface CreateDatasetRequest {
@@ -50,6 +55,7 @@ export interface CreateDatasetRequest {
   description?: string
   source_project?: string
   metadata?: Record<string, unknown>
+  dataset_type?: DatasetType
 }
 
 export interface DatasetStats {

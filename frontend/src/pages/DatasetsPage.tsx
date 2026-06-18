@@ -13,12 +13,13 @@ export default function DatasetsPage() {
   const toast = useToast()
   const [deletingName, setDeletingName] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
-  const [form, setForm] = useState<CreateDatasetRequest>({ name: '', description: '', source_project: '' })
+  const [form, setForm] = useState<CreateDatasetRequest>({ name: '', description: '', source_project: '', dataset_type: 'candidate' })
   const [search, setSearch] = useState('')
 
+  // 备选数据集页只看 candidate 类型，与多轮对话集隔离。
   const { data: datasets, isLoading, isFetching } = useQuery({
-    queryKey: ['datasets'],
-    queryFn: () => datasetsApi.list().then((r) => r.data),
+    queryKey: ['datasets', 'candidate'],
+    queryFn: () => datasetsApi.list({ type: 'candidate' }).then((r) => r.data),
     staleTime: 30_000,
     placeholderData: (prev) => prev,
   })
@@ -28,7 +29,7 @@ export default function DatasetsPage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['datasets'] })
       setShowCreate(false)
-      setForm({ name: '', description: '', source_project: '' })
+      setForm({ name: '', description: '', source_project: '', dataset_type: 'candidate' })
     },
   })
 
