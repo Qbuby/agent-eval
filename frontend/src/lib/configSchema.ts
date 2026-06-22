@@ -43,6 +43,28 @@ export const CONFIG_SCHEMA: ConfigSchemaEntry[] = [
     type: 'password',
     description: '有 read 权限即可',
   },
+  {
+    key: 'langsmith.connection',
+    label: 'LangSmith 连接预设',
+    category: 'langsmith',
+    type: 'json',
+    description: '一组 {api_url, api_key} 凭据。可配多组，标记一个为默认即当前生效连接。',
+    placeholder: '{"api_url": "https://api.smith.langchain.com", "api_key": ""}',
+    suggestions: [
+      { value: '{"api_url": "https://api.smith.langchain.com", "api_key": ""}', label: '官方默认' },
+    ],
+  },
+  {
+    key: 'langfuse.connection',
+    label: 'Langfuse 连接预设',
+    category: 'langfuse',
+    type: 'json',
+    description: '一组 {host, public_key, secret_key, remote_write} 凭据。可配多组，标记一个为默认即当前生效连接。',
+    placeholder: '{"host": "https://cloud.langfuse.com", "public_key": "", "secret_key": "", "remote_write": false}',
+    suggestions: [
+      { value: '{"host": "https://cloud.langfuse.com", "public_key": "", "secret_key": "", "remote_write": false}', label: 'Langfuse Cloud' },
+    ],
+  },
 
   {
     key: 'llm.base_url',
@@ -177,6 +199,7 @@ const SCHEMA_INDEX: Record<string, ConfigSchemaEntry> = Object.fromEntries(
 // every entry in CONFIG_SCHEMA; unknown keys infer category by prefix.
 export const CONFIG_CATEGORIES: Array<{ value: string; label: string }> = [
   { value: 'langsmith', label: 'LangSmith' },
+  { value: 'langfuse', label: 'Langfuse' },
   { value: 'llm', label: 'LLM 服务' },
   { value: 'target_agent', label: '测试目标模型' },
   { value: 'eval.retry', label: '评估重试' },
@@ -192,7 +215,7 @@ export function getConfigSchema(key: string): ConfigSchemaEntry | undefined {
 export function inferConfigCategory(key: string): string {
   const parts = key.split('.')
   if (parts[0] === 'eval' && parts.length >= 2) return `eval.${parts[1]}`
-  if (['langsmith', 'llm', 'target_agent'].includes(parts[0])) return parts[0]
+  if (['langsmith', 'langfuse', 'llm', 'target_agent', 'langfuse_metrics'].includes(parts[0])) return parts[0]
   return 'general'
 }
 
