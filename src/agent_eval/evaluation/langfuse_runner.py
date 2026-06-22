@@ -1146,14 +1146,18 @@ async def _execute_run(
                     f"({agent_url})。请确认 agent 服务在线、网络可达；如在容器内访问宿主机请用 host.docker.internal "
                     "或宿主机 LAN IP 而非 localhost。"
                 )
+        # Resolve active data-source connection presets (fall back to env).
+        from agent_eval.config_service import config_service as _cfg_svc
+        ls_conn = await _cfg_svc.get_langsmith_connection()
+        lf_conn = await _cfg_svc.get_langfuse_connection()
         if langsmith_project:
             summary["langsmith_project"] = langsmith_project
             # LangSmith web root; the UI uses it to deep-link.
-            summary["langsmith_host"] = settings.langsmith.api_url.replace(
+            summary["langsmith_host"] = ls_conn["api_url"].replace(
                 "api.smith", "smith"
-            ) if settings.langsmith.api_url else None
-        if settings.langfuse.remote_write and settings.langfuse.configured:
-            summary["langfuse_host"] = settings.langfuse.host
+            ) if ls_conn["api_url"] else None
+        if lf_conn["remote_write"] and lf_conn["configured"]:
+            summary["langfuse_host"] = lf_conn["host"]
         if cancel_event.is_set():
             summary["stopped_early"] = True
 
@@ -1183,7 +1187,7 @@ async def _execute_run(
         # LANGFUSE_REMOTE_WRITE=true (or set langfuse.remote_write in /config)
         # to push every evaluator score into the Langfuse UI as a fresh trace
         # per case. Doesn't depend on LangSmith.
-        if settings.langfuse.remote_write and settings.langfuse.configured and per_case_results:
+        if lf_conn["remote_write"] and lf_conn["configured"] and per_case_results:
             from agent_eval.evaluation.langfuse_sync import (
                 pull_evaluator_scores_for_run, sync_run_scores_to_langfuse,
             )

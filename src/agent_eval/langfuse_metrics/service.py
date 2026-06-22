@@ -23,7 +23,6 @@ from typing import Any
 from sqlalchemy import delete, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from agent_eval.config import settings
 from agent_eval.config_service import config_service
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
@@ -105,13 +104,14 @@ class LangfuseMetricsService:
 
     async def start(self) -> None:
         """启动后台轮询任务。未配置 Langfuse 或已在运行则不重复启动。"""
-        if not settings.langfuse.configured:
+        conn = await config_service.get_langfuse_connection()
+        if not conn["configured"]:
             logger.warning("langfuse-metrics: 未配置 Langfuse（host/key 缺失），轮询不启动")
             return
         if self._running:
             return
         if self._client is None:
-            self._client = LangfuseMetricsClient.from_settings()
+            self._client = LangfuseMetricsClient.from_connection(conn)
         # 从 config 读取间隔 / 回看天数（覆盖默认），并注册热更新监听（仅一次）。
         self._interval = await self._get_interval()
         self._lookback = await self._get_lookback()

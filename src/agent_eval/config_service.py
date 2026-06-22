@@ -74,6 +74,43 @@ DEFAULT_CONFIGS: list[dict[str, Any]] = [
         "description": "LangSmith API Key",
     },
     {
+        # Connection preset: each option's value is a full credential group
+        # {api_url, api_key}. The *default* option is the active connection;
+        # switch the default on the config page to repoint LangSmith globally.
+        "key": "langsmith.connection",
+        "value": _pack(
+            [{
+                "value": {
+                    "api_url": settings.langsmith.api_url,
+                    "api_key": settings.langsmith.api_key,
+                },
+                "label": "默认",
+            }],
+            0,
+        ),
+        "category": "langsmith",
+        "description": "LangSmith 连接预设（api_url + api_key）。可配多组，默认项为当前生效连接。",
+    },
+    {
+        # Connection preset for Langfuse: each option's value is a full
+        # credential group {host, public_key, secret_key, remote_write}.
+        "key": "langfuse.connection",
+        "value": _pack(
+            [{
+                "value": {
+                    "host": settings.langfuse.host,
+                    "public_key": settings.langfuse.public_key,
+                    "secret_key": settings.langfuse.secret_key,
+                    "remote_write": settings.langfuse.remote_write,
+                },
+                "label": "默认",
+            }],
+            0,
+        ),
+        "category": "langfuse",
+        "description": "Langfuse 连接预设（host + public_key + secret_key + remote_write）。可配多组，默认项为当前生效连接。",
+    },
+    {
         "key": "llm.base_url",
         "value": _pack([{"value": "", "label": None}], 0),
         "category": "llm",
@@ -239,6 +276,43 @@ class ConfigService:
         if row is None:
             return [], 0
         return _normalize_options(row.value)
+
+    async def get_langsmith_connection(self) -> dict[str, Any]:
+        """Resolve the active LangSmith connection ``{api_url, api_key}``.
+
+        Reads the default option of ``langsmith.connection``; falls back
+        field-by-field to the legacy single keys (``langsmith.api_url`` /
+        ``langsmith.api_key``) and finally to env settings, so setups that
+        predate the connection preset keep working.
+        """
+        opts, di = await self.get_options("langsmith.connection")
+        conn = opts[di]["value"] if opts and isinstance(opts[di].get("value"), dict) else {}
+        api_url = conn.get("api_url") or await self.get("langsmith.api_url") or settings.langsmith.api_url
+        api_key = conn.get("api_key") or await self.get("langsmith.api_key") or settings.langsmith.api_key
+        return {"api_url": api_url or "", "api_key": api_key or ""}
+
+    async def get_langfuse_connection(self) -> dict[str, Any]:
+        """Resolve the active Langfuse connection group.
+
+        Returns ``{host, public_key, secret_key, remote_write, configured}``.
+        Reads the default option of ``langfuse.connection``; falls back
+        field-by-field to env settings.
+        """
+        opts, di = await self.get_options("langfuse.connection")
+        conn = opts[di]["value"] if opts and isinstance(opts[di].get("value"), dict) else {}
+        host = conn.get("host") or settings.langfuse.host
+        public_key = conn.get("public_key") or settings.langfuse.public_key
+        secret_key = conn.get("secret_key") or settings.langfuse.secret_key
+        remote_write = conn.get("remote_write")
+        if remote_write is None:
+            remote_write = settings.langfuse.remote_write
+        return {
+            "host": host or "",
+            "public_key": public_key or "",
+            "secret_key": secret_key or "",
+            "remote_write": bool(remote_write),
+            "configured": bool(host and public_key and secret_key),
+        }
 
     async def set(
         self,
@@ -416,7 +490,7 @@ class ConfigService:
         prefix = parts[0]
         if prefix == "eval" and len(parts) >= 2:
             return f"eval.{parts[1]}"
-        if prefix in ("langsmith", "llm", "target_agent", "langfuse_metrics"):
+        if prefix in ("langsmith", "llm", "target_agent", "langfuse", "langfuse_metrics"):
             return prefix
         return "general"
 

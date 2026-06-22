@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent_eval.config import settings
 from agent_eval.config_service import config_service
 from agent_eval.data.case_generator import CaseGenerator
 from agent_eval.data.dataset_manager import DatasetManager
@@ -11,18 +10,14 @@ from agent_eval.data.trace_extractor import TraceExtractor
 
 
 async def _get_langsmith_kwargs() -> dict[str, Any]:
+    # Resolve the active LangSmith connection preset (langsmith.connection),
+    # which itself falls back to the legacy single keys + env settings.
+    conn = await config_service.get_langsmith_connection()
     kwargs: dict[str, Any] = {}
-    api_key = await config_service.get("langsmith.api_key")
-    if not api_key and settings.langsmith.api_key:
-        api_key = settings.langsmith.api_key
-    if api_key:
-        kwargs["api_key"] = api_key
-
-    api_url = await config_service.get("langsmith.api_url")
-    if not api_url and settings.langsmith.api_url:
-        api_url = settings.langsmith.api_url
-    if api_url:
-        kwargs["api_url"] = api_url
+    if conn.get("api_key"):
+        kwargs["api_key"] = conn["api_key"]
+    if conn.get("api_url"):
+        kwargs["api_url"] = conn["api_url"]
     return kwargs
 
 

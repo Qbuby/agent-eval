@@ -19,8 +19,6 @@ from datetime import datetime
 
 import httpx
 
-from agent_eval.config import settings
-
 logger = logging.getLogger(__name__)
 
 # 每页请求的最大重试次数（含首次），针对 5xx / 超时
@@ -46,18 +44,31 @@ class LangfuseMetricsClient:
         self._headers = headers
 
     @classmethod
-    def from_settings(cls) -> "LangfuseMetricsClient":
-        """从 ``settings.langfuse`` 读 host/public_key/secret_key 构造客户端。
+    def from_connection(cls, conn: dict) -> "LangfuseMetricsClient":
+        """从连接组 dict（host/public_key/secret_key）构造客户端。
 
         与 evaluation/langfuse_sync.py 同款：base64 拼 ``pk:sk`` 做 Basic Auth，
-        host 去尾斜杠。
+        host 去尾斜杠。连接组由 ``config_service.get_langfuse_connection()``
+        解析（连接预设 → env 回退）。
         """
         auth = base64.b64encode(
-            f"{settings.langfuse.public_key}:{settings.langfuse.secret_key}".encode()
+            f"{conn.get('public_key', '')}:{conn.get('secret_key', '')}".encode()
         ).decode()
         headers = {"Authorization": f"Basic {auth}"}
-        base = settings.langfuse.host.rstrip("/")
+        base = (conn.get("host") or "").rstrip("/")
         return cls(base=base, headers=headers)
+
+    @classmethod
+    async def from_settings(cls) -> "LangfuseMetricsClient":
+        """从生效的 Langfuse 连接预设构造客户端（异步）。
+
+        历史名保留兼容；内部改读 ``config_service.get_langfuse_connection()``，
+        即连接预设默认项，缺失时回退 env。
+        """
+        from agent_eval.config_service import config_service
+
+        conn = await config_service.get_langfuse_connection()
+        return cls.from_connection(conn)
 
     async def _get(self, c: httpx.AsyncClient, path: str, params: dict | None = None) -> dict:
         """带重试的 GET，返回解析后的 JSON dict。
