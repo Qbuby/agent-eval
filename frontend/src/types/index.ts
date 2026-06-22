@@ -450,6 +450,9 @@ export interface StartEvalRequest {
   benchmark_version_id?: string | null
   project_id?: string | null
   case_source_id?: string | null
+  // 多轮对话数据集（dataset_type=conversation）名称：直读 LangSmith dataset，
+  // 整段 input_messages + conversation_goal + turn_expectations 透传给 runner 回放。
+  conversation_dataset?: string | null
   case_ids?: string[] | null
   filter_tags?: string[] | null
   filter_category_id?: string | null
@@ -517,6 +520,28 @@ export interface CotStep {
   started_at?: number | null
   duration_ms?: number | null
   first_token_ms?: number | null
+  // 多轮回放时该 step 所属的 user 轮序号（0-based），单轮无此字段。
+  turn?: number
+}
+
+// 多轮评估回放出的单轮记录（落在 full_trace.conversation.turns）。
+export interface ConversationTurn {
+  turn_index: number
+  turn_no?: number
+  user: string
+  assistant: string
+  tool_calls?: Array<Record<string, unknown>>
+  steps?: CotStep[]
+  latency_ms?: number | null
+  attempts?: number
+}
+
+// 多轮评估结果的会话级上下文（落在 full_trace.conversation）。
+// turn.user/assistant 为该轮输入与 agent 回复；turn_expectations 按 turn_index 对齐。
+export interface ConversationTrace {
+  turns: ConversationTurn[]
+  goal?: string | null
+  turn_expectations?: TurnExpectation[]
 }
 
 export interface EvalResultRow {
@@ -536,7 +561,7 @@ export interface EvalResultRow {
   first_thinking_token_ms?: number | null
   first_answer_token_ms?: number | null
   actual_tool_calls?: Array<Record<string, unknown>> | null
-  full_trace?: { steps?: CotStep[] } | null
+  full_trace?: { steps?: CotStep[]; conversation?: ConversationTrace } | null
   error_message: string | null
   langfuse_trace_id: string | null
   langsmith_run_id?: string | null

@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button, useConfirm, useToast, ExportMenu } from '@/components/ui'
 import {
   benchmarkApi,
+  datasetsApi,
   evaluationApi,
   projectsApi,
 } from '@/services'
@@ -396,7 +397,7 @@ function StatusBadge({ status }: { status: string }) {
 
 // ─── New run tab ────────────────────────────────────────────────────────────
 
-type CaseSourceTab = 'benchmark' | 'upload'
+type CaseSourceTab = 'benchmark' | 'upload' | 'conversation'
 
 function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const qc = useQueryClient()
@@ -456,6 +457,14 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     onSuccess: (data) => setUploadedSource(data),
   })
 
+  // ── conversation dataset branch（多轮对话集，dataset_type=conversation）──
+  const [convDataset, setConvDataset] = useState('')
+  const convDatasetsQuery = useQuery({
+    queryKey: ['datasets', 'conversation'],
+    queryFn: () => datasetsApi.list({ type: 'conversation' }).then(r => r.data),
+    enabled: sourceTab === 'conversation',
+  })
+
   // ── agent ──
   const [agentType, setAgentType] = useState<'sse' | 'openai' | 'sse_generic'>('sse')
   const [agentUrl, setAgentUrl] = useState('')
@@ -508,10 +517,17 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     },
   })
 
-  const hasCaseSource = sourceTab === 'benchmark' ? !!projectId : !!uploadedSource
+  const hasCaseSource =
+    sourceTab === 'benchmark' ? !!projectId
+    : sourceTab === 'conversation' ? !!convDataset
+    : !!uploadedSource
   const startBlockers: string[] = []
   if (!hasCaseSource) {
-    startBlockers.push(sourceTab === 'benchmark' ? '选择基准项目' : '上传一个样例文件')
+    startBlockers.push(
+      sourceTab === 'benchmark' ? '选择基准项目'
+      : sourceTab === 'conversation' ? '选择一个多轮对话集'
+      : '上传一个样例文件',
+    )
   }
   if (selectedEvaluatorIds.size === 0) startBlockers.push('勾选至少 1 个评估器')
   if (agentUrl.trim().length === 0) startBlockers.push('填写智能体 URL')
@@ -549,6 +565,10 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     if (sourceTab === 'upload' && uploadedSource) {
       body.case_source_id = uploadedSource.source_id
       body.limit = typeof limit === 'number' ? limit : null
+    } else if (sourceTab === 'conversation') {
+      // 多轮对话集：直读 LangSmith dataset，runner 走 multiturn 回放+逐轮/会话级打分。
+      body.conversation_dataset = convDataset
+      body.limit = typeof limit === 'number' ? limit : null
     } else {
       body.project_id = projectId
       if (selectionMode === 'pick') {
@@ -574,6 +594,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
           {([
             { id: 'benchmark', label: '从基准数据集' },
             { id: 'upload', label: '上传文件' },
+            { id: 'conversation', label: '多轮对话集' },
           ] as { id: CaseSourceTab; label: string }[]).map(t => (
             <button
               key={t.id}
@@ -758,6 +779,43 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               </div>
             )}
             {uploadedSource && (
+              <Field label="最多跑多少条（空=全部）">
+                <input
+                  type="number" min={1} value={limit}
+                  onChange={e => setLimit(e.target.value ? Number(e.target.value) : '')}
+                  className="input max-w-[180px] mt-3"
+                />
+              </Field>
+            )}
+          </div>
+        )}
+
+        {sourceTab === 'conversation' && (
+          <div>
+            <Field label="多轮对话数据集">
+              <select
+                value={convDataset}
+                onChange={e => setConvDataset(e.target.value)}
+                className="input max-w-[360px]"
+              >
+                <option value="">选择对话数据集…</option>
+                {(convDatasetsQuery.data ?? []).map(d => (
+                  <option key={d.name} value={d.name}>
+                    {d.name}（{d.example_count} 条）
+                  </option>
+                ))}
+              </select>
+            </Field>
+            {convDatasetsQuery.data && convDatasetsQuery.data.length === 0 && (
+              <p className="text-[11px] text-text-tertiary mt-2">
+                还没有多轮对话数据集。请先到「多轮对话集」页创建并录入样例。
+              </p>
+            )}
+            <p className="text-[10px] text-text-tertiary mt-2">
+              固定 thread_id 逐轮回放每条样例的 user 消息给智能体，按 turn_expectations 逐轮打分、
+              按 conversation_goal 做会话级打分。
+            </p>
+            {convDataset && (
               <Field label="最多跑多少条（空=全部）">
                 <input
                   type="number" min={1} value={limit}

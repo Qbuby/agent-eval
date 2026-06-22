@@ -6,8 +6,9 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
 } from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep } from '@/types'
+import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep, ConversationTrace } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
+import MarkdownView from '@/components/MarkdownView'
 import { Button, Drawer, ErrorCard, ExportMenu } from '@/components/ui'
 import {
   getScoreMeta, isPassing, directionMark, tone,
@@ -664,12 +665,22 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
         </div>
       )}
 
-      <div className="mb-3">
-        <div className="field-label">输出</div>
-        <pre className="font-mono text-[11px] bg-fill/5 border border-border rounded-md p-2.5 max-h-[240px] overflow-y-auto whitespace-pre-wrap">
-          {row.actual_output || '（无输出）'}
-        </pre>
-      </div>
+      {row.full_trace?.conversation ? (
+        <div className="mb-3">
+          <div className="field-label">多轮对话回放</div>
+          <ConversationResultView
+            conversation={row.full_trace.conversation}
+            scores={row.scores}
+          />
+        </div>
+      ) : (
+        <div className="mb-3">
+          <div className="field-label">输出</div>
+          <pre className="font-mono text-[11px] bg-fill/5 border border-border rounded-md p-2.5 max-h-[240px] overflow-y-auto whitespace-pre-wrap">
+            {row.actual_output || '（无输出）'}
+          </pre>
+        </div>
+      )}
 
       {row.error_message && (
         <div className="mb-3">
@@ -1018,6 +1029,83 @@ function ReportSection({
         )}
       </div>
     </section>
+  )
+}
+
+
+// 多轮评估结果：把回放出的逐轮 user/assistant 渲染成气泡，每条 user 下方挂
+// 该轮的逐轮分数（score key 形如 `<label>.turn<turn_index>`）。会话级分数
+// （`<label>.conversation`）与逐轮分数已在上方「评分」区统一展示，这里只做
+// 逐轮对齐，方便按轮核对。
+function ConversationResultView({
+  conversation, scores,
+}: {
+  conversation: ConversationTrace
+  scores: Record<string, number>
+}) {
+  const turns = conversation.turns ?? []
+  // turn_index → 该轮所有分数项（跨多个 evaluator label）。
+  const perTurnScores = (turnIndex: number): Array<[string, number]> =>
+    Object.entries(scores).filter(([k]) => k.endsWith(`.turn${turnIndex}`))
+
+  return (
+    <div className="space-y-3">
+      {conversation.goal && (
+        <div className="rounded-md border border-accent/30 bg-accent/5 px-3 py-2 text-[12px]">
+          <span className="font-medium text-accent">会话目标</span>
+          <div className="mt-1 text-text-secondary">
+            <MarkdownView text={conversation.goal} />
+          </div>
+        </div>
+      )}
+
+      {turns.map((t, i) => {
+        const turnScores = perTurnScores(t.turn_index)
+        return (
+          <div key={i} className="space-y-1.5">
+            {/* user 气泡（右） */}
+            <div className="flex flex-col items-end">
+              <div className="max-w-[85%] rounded-lg px-3 py-2 bg-accent/10 border border-accent/20">
+                <div className="text-[10px] uppercase tracking-wide text-text-tertiary mb-1">
+                  用户 · 第 {i + 1} 轮
+                </div>
+                <div className="text-[12px] text-text-primary">
+                  <MarkdownView text={t.user} />
+                </div>
+              </div>
+            </div>
+            {/* assistant 气泡（左） */}
+            <div className="flex flex-col items-start">
+              <div className="max-w-[85%] rounded-lg px-3 py-2 bg-fill/5 border border-border">
+                <div className="text-[10px] uppercase tracking-wide text-text-tertiary mb-1">
+                  助手
+                </div>
+                <div className="text-[12px] text-text-primary">
+                  <MarkdownView text={t.assistant || '（无回复）'} />
+                </div>
+              </div>
+              {turnScores.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {turnScores.map(([n, v]) => {
+                    const t2 = tone(n, v)
+                    const cls = t2 === 'good' ? 'badge badge-positive' : 'badge badge-negative'
+                    return (
+                      <span key={n} className={cls} title={n}>
+                        本轮: {v.toFixed(2)}
+                      </span>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      })}
+
+      {turns.length === 0 && (
+        <div className="empty-state text-[12px]">无逐轮回放记录</div>
+      )}
+    </div>
   )
 }
 
