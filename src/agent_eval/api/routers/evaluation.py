@@ -69,16 +69,23 @@ async def list_builtin_evaluators():
 @router.post("/runs/start")
 async def start_eval(req: StartEvalRequest):
     # ── 1. resolve cases ──────────────────────────────────────────
-    sources = [x for x in (req.benchmark_version_id, req.project_id, req.case_source_id) if x]
+    sources = [
+        x for x in (
+            req.benchmark_version_id, req.project_id,
+            req.case_source_id, req.conversation_dataset,
+        ) if x
+    ]
     if not sources:
         raise HTTPException(
             status_code=400,
-            detail="one of benchmark_version_id / project_id / case_source_id is required",
+            detail="one of benchmark_version_id / project_id / case_source_id / "
+            "conversation_dataset is required",
         )
     if len(sources) > 1:
         raise HTTPException(
             status_code=400,
-            detail="provide only one source: benchmark_version_id OR project_id OR case_source_id",
+            detail="provide only one source: benchmark_version_id OR project_id OR "
+            "case_source_id OR conversation_dataset",
         )
 
     cases: list[dict[str, Any]] = []
@@ -86,7 +93,50 @@ async def start_eval(req: StartEvalRequest):
     async with async_session_factory() as session:
         repo = Repository(session)
 
-        if req.case_source_id:
+        if req.conversation_dataset:
+            # ── 多轮对话数据集（直读 LangSmith dataset，保留多轮字段）──
+            # 与 benchmark/file 不同：这条路径不降维成单 question，而是整段
+            # input_messages + conversation_goal + turn_expectations 透传给
+            # runner，由 multiturn 回放逐轮调用 agent 并逐轮+会话级打分。
+            from agent_eval.api.dependencies import get_manager
+
+            mgr = await get_manager()
+            try:
+                ds_cases = await mgr.load_cases(req.conversation_dataset, limit=req.limit)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"读取对话数据集 '{req.conversation_dataset}' 失败：{e}",
+                ) from e
+            for c in ds_cases:
+                msgs = c.input_messages or []
+                if not any(m.get("role") == "user" and m.get("content") for m in msgs):
+                    # 没有任何 user 消息的样例无法回放，跳过。
+                    continue
+                # question 仅作落库/展示的单值快照（首条 user 消息）。
+                first_user = next(
+                    (m.get("content", "") for m in msgs if m.get("role") == "user"), ""
+                )
+                cases.append({
+                    "id": c.id,
+                    "name": c.name or c.id,
+                    "question": first_user,
+                    "expected_output": c.expected_output or "",
+                    "expected_tool_calls": [],
+                    "metadata": {"tags": list(c.tags or [])},
+                    "source": "conversation",
+                    # 多轮标记 + 完整回放/打分输入：runner 据此走 multiturn 分支。
+                    "multi_turn": True,
+                    "input_messages": msgs,
+                    "conversation_goal": c.conversation_goal,
+                    "turn_expectations": [te.model_dump() for te in c.turn_expectations],
+                })
+            if not cases:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"对话数据集 '{req.conversation_dataset}' 没有可回放的多轮样例",
+                )
+        elif req.case_source_id:
             # ── uploaded file ──
             src = await repo.get_eval_case_source(uuid.UUID(req.case_source_id))
             if src is None:

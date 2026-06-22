@@ -556,6 +556,135 @@ async def _invoke_with_retry(
     raise RuntimeError("retry loop exited without returning or raising")
 
 
+async def _run_multiturn_case(
+    *,
+    case: dict[str, Any],
+    agent_cfg: dict,
+    evaluator_specs: list[dict[str, Any]],
+    cancel_event: asyncio.Event | None = None,
+    retry_policy: _RetryPolicy | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """多轮对话 case 执行：固定 thread_id 逐轮回放 + 逐轮/会话级打分。
+
+    复用单轮的 adapter 工厂、重试器与 judge provider 预解析；回放与打分细节
+    在 ``evaluation.multiturn``。返回 dict 与 ``_run_one_case`` 同契约，落库/
+    聚合路径无需区分单轮多轮。"""
+    from agent_eval.evaluation import multiturn
+
+    input_messages = case.get("input_messages") or []
+    conversation_goal = case.get("conversation_goal")
+    turn_expectations = case.get("turn_expectations") or []
+    question = case.get("question") or ""
+    expected = case.get("expected_output") or ""
+    agent_type = agent_cfg.get("type", "sse")
+
+    # 整段对话共用一个 thread_id（agent 端按它维持上下文）。
+    thread_id = f"eval-{case.get('name','conv')}-{uuid.uuid4().hex[:8]}"
+    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    if retry_policy is None:
+        retry_policy = _retry_policy_from_cfg(agent_cfg)
+
+    async def _invoke(adp: Any, msgs: list[dict[str, Any]]):
+        return await _invoke_with_retry(
+            adp, msgs, policy=retry_policy, cancel_event=cancel_event,
+        )
+
+    invoked_at = datetime.now(timezone.utc)
+    error_msg: str | None = None
+    error_type: str | None = None
+    replay: dict[str, Any] = {}
+    scores: dict[str, float] = {}
+
+    try:
+        try:
+            replay = await multiturn.replay_conversation(
+                adapter=adapter,
+                agent_type=agent_type,
+                input_messages=input_messages,
+                invoke=_invoke,
+            )
+        except Exception as e:
+            attempts = getattr(e, "_eval_attempts_made", 1)
+            error_msg = str(e)
+            if attempts > 1:
+                error_msg = f"{error_msg} (after {attempts} attempts)"
+            error_type = _classify_agent_error(e)
+            logger.warning(
+                "multiturn replay failed for case %s [%s]: %s",
+                case.get("id"), error_type, e,
+            )
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
+
+    turns = replay.get("turns") or []
+    # 整段输出快照：拼接 transcript，供列表/详情页展示与会话级回看。
+    transcript = multiturn.build_transcript(turns)
+    usage = replay.get("usage") or {
+        "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+        "cache_creation_tokens": None, "cache_read_tokens": None,
+    }
+    actual_tool_calls = replay.get("tool_calls") or []
+    cot_steps = replay.get("steps") or []
+
+    # 打分（仅在回放成功时）。
+    if not error_msg:
+        try:
+            scores = await multiturn.score_conversation(
+                turns=turns,
+                conversation_goal=conversation_goal,
+                turn_expectations=turn_expectations,
+                evaluator_specs=evaluator_specs,
+                case_metadata=case.get("metadata"),
+                case_id=case.get("id"),
+            )
+        except Exception as e:
+            logger.warning("multiturn scoring crashed on case %s: %s", case.get("id"), e)
+
+    status = "pass"
+    if error_msg:
+        if error_type in ("agent_unreachable", "agent_timeout"):
+            status = error_type
+        else:
+            status = "error"
+    elif scores and any(v < 0.5 for v in scores.values()):
+        status = "fail"
+
+    return {
+        "case_id": case.get("id"),
+        "case_name": case.get("name"),
+        "case_source": case.get("source"),
+        "thread_id": thread_id,
+        "question": question,
+        "expected_output": expected,
+        "expected_tool_calls": [],
+        "invoked_at": invoked_at,
+        "status": status,
+        "actual_output": transcript,
+        "actual_tool_calls": actual_tool_calls,
+        "cot_steps": cot_steps,
+        # 多轮专属：完整逐轮记录 + 会话级上下文，落库进 full_trace.conversation。
+        "conversation": {
+            "turns": turns,
+            "goal": conversation_goal,
+            "turn_expectations": turn_expectations,
+        },
+        "latency_ms": replay.get("latency_ms"),
+        "first_thinking_token_ms": None,
+        "first_answer_token_ms": None,
+        "error_message": error_msg,
+        "error_type": error_type,
+        "attempts_made": replay.get("attempts", 1),
+        "tool_call_count": len(actual_tool_calls),
+        "message_count": len(turns),
+        "scores": scores,
+        **usage,
+    }
+
+
 async def _run_one_case(
     *,
     case: dict[str, Any],
@@ -574,6 +703,18 @@ async def _run_one_case(
     back to per-call resolution from ``agent_cfg`` only (no DB lookup) for
     callers/tests that don't go through ``_execute_run``.
     Returns one row's worth of data ready to persist."""
+    # 多轮对话样例（source='conversation'）：走 multiturn 回放+逐轮/会话级打分。
+    # 返回 dict 与单轮契约一致，落库/聚合无需区分。
+    if case.get("multi_turn"):
+        return await _run_multiturn_case(
+            case=case,
+            agent_cfg=agent_cfg,
+            evaluator_specs=evaluator_specs,
+            cancel_event=cancel_event,
+            retry_policy=retry_policy,
+            http_client=http_client,
+        )
+
     question = case["question"]
     expected = case.get("expected_output") or ""
     expected_tool_calls = case.get("expected_tool_calls") or []
@@ -852,6 +993,15 @@ async def _execute_run(
                             bench_id = uuid.UUID(case["id"])
                         except (ValueError, TypeError):
                             bench_id = None
+                    # full_trace 承载单轮 steps；多轮额外带 conversation
+                    # （逐轮记录 + goal + turn_expectations），供详情页按轮回看。
+                    full_trace: dict[str, Any] | None = None
+                    if res.get("cot_steps") or res.get("conversation"):
+                        full_trace = {}
+                        if res.get("cot_steps"):
+                            full_trace["steps"] = res["cot_steps"]
+                        if res.get("conversation"):
+                            full_trace["conversation"] = res["conversation"]
                     created = await repo.create_test_result(
                         uuid.UUID(run_id),
                         benchmark_case_id=bench_id,
@@ -860,7 +1010,7 @@ async def _execute_run(
                         thread_id=res["thread_id"],
                         actual_output=res["actual_output"],
                         actual_tool_calls=res["actual_tool_calls"] or None,
-                        full_trace=({"steps": res["cot_steps"]} if res.get("cot_steps") else None),
+                        full_trace=full_trace,
                         latency_ms=res["latency_ms"],
                         total_tokens=res["total_tokens"],
                         prompt_tokens=res["prompt_tokens"],

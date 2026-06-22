@@ -241,10 +241,14 @@ class EvaluatorConfig(BaseModel):
 
 
 class StartEvalRequest(BaseModel):
-    # Source: exactly one of these three should be set.
+    # Source: exactly one of these four should be set.
     benchmark_version_id: str | None = None
     project_id: str | None = None                # use all benchmark_cases of a project
     case_source_id: str | None = None            # uploaded file (eval_case_sources.id)
+    # 多轮对话集（dataset_type=conversation）的 LangSmith 数据集名。设置后走
+    # 多轮回放评估通路：固定 thread_id 逐轮喂 user 消息，逐轮期望 + 对话级目标
+    # 双重打分。与上面三种单轮源互斥。
+    conversation_dataset: str | None = None
     # Sample selection for benchmark-backed sources:
     case_ids: list[str] | None = None
     filter_tags: list[str] | None = None
