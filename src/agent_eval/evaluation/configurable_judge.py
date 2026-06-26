@@ -90,6 +90,9 @@ DEFAULT_EVALUATION_PROMPT = """请评估下面 AI 助手的回答质量。
 ## 期望答案（如有）
 {{GroundTruth}}
 
+## 评判要点（如有，逐条核对回答是否满足）
+{{Criteria}}
+
 请给出一个 0 到 1 之间的总分（0=完全错误，1=完美）。"""
 
 DEFAULT_REASONING_PROMPT = """你是一个严谨、客观的评估专家。
@@ -106,6 +109,9 @@ DEFAULT_VARIABLE_MAPPING: dict[str, str] = {
     "Query": "input",
     "Generation": "output",
     "GroundTruth": "expected_output",
+    # 多轮逐轮打分时，score_conversation 把该轮 criteria 注入 metadata.turn_criteria；
+    # 单轮场景无此 key → 渲染空字符串，无副作用。
+    "Criteria": "metadata.turn_criteria",
 }
 
 

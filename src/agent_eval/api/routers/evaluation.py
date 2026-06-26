@@ -224,6 +224,7 @@ async def start_eval(req: StartEvalRequest):
             concurrency=req.concurrency,
             run_name=req.run_name,
             langsmith_project=req.langsmith_project,
+            langfuse_trace_name=req.langfuse_trace_name,
             benchmark_version_id=req.benchmark_version_id,
             eval_case_source_id=req.case_source_id,
         )
@@ -241,6 +242,7 @@ def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRun
         finished_at=row.finished_at,
         langfuse_run_name=row.langfuse_run_name,
         langsmith_project=row.langsmith_project,
+        langfuse_trace_name=row.langfuse_trace_name,
         agent_config=row.agent_config or {},
         summary_scores=row.summary_scores,
         progress=progress or {},

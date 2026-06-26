@@ -133,6 +133,38 @@ class LangfuseMetricsClient:
                     yield trace
                 page += 1
 
+    async def iter_traces_by_name(self, name: str, from_ts: datetime, to_ts: datetime):
+        """翻页拉取指定 trace name 与时间窗内的 trace，逐个 yield trace dict。
+
+        与 :meth:`iter_traces` 同款翻页逻辑，但过滤维度是 trace ``name`` 而非
+        ``environment`` —— 这正是评估回拉所需：发起 run 时约定一个 trace name，
+        被测 agent 用该 name 上报 trace，run 结束后按 (name, 时间窗) 拉回来，再按
+        question 文本匹配回贴 ``langfuse_trace_id``。project 由凭据对固定，不是
+        查询参数。
+
+        GET ``/api/public/traces``，按 ``meta.totalPages`` 从 page=1 翻到末页。
+        """
+        async with httpx.AsyncClient(timeout=_TIMEOUT, headers=self._headers) as c:
+            page = 1
+            total_pages = 1  # 拿到首页 meta 后更新
+            while page <= total_pages:
+                body = await self._get(
+                    c,
+                    "/api/public/traces",
+                    params={
+                        "name": name,
+                        "fromTimestamp": from_ts.isoformat(),
+                        "toTimestamp": to_ts.isoformat(),
+                        "page": page,
+                        "limit": _PAGE_LIMIT,
+                    },
+                )
+                meta = body.get("meta", {})
+                total_pages = meta.get("totalPages", 0) or 0
+                for trace in body.get("data", []):
+                    yield trace
+                page += 1
+
     async def get_trace_observations(self, trace_id: str) -> list[dict]:
         """拉单 trace 详情，返回其 ``observations`` 数组（全字段）。
 

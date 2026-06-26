@@ -41,7 +41,7 @@ class TestCase(BaseModel):
     name: str
     description: str = ""
     tags: list[str] = []
-    source: Literal["manual", "auto_generated", "failure_derived", "trace_derived", "external"] = "manual"
+    source: Literal["manual", "auto_generated", "failure_derived", "trace_derived", "external", "file_imported"] = "manual"
 
     input_messages: list[dict[str, Any]]
     agent_config_override: dict[str, Any] | None = None

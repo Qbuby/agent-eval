@@ -6,7 +6,7 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
 } from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep, ConversationTrace } from '@/types'
+import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep, ConversationTrace, TurnExpectation } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
 import MarkdownView from '@/components/MarkdownView'
 import { Button, Drawer, ErrorCard, ExportMenu } from '@/components/ui'
@@ -1047,6 +1047,11 @@ function ConversationResultView({
   // turn_index → 该轮所有分数项（跨多个 evaluator label）。
   const perTurnScores = (turnIndex: number): Array<[string, number]> =>
     Object.entries(scores).filter(([k]) => k.endsWith(`.turn${turnIndex}`))
+  // turn_index → 该轮期望（评判要点 / 期望输出），按 turn_index 对齐。
+  const expByIndex = new Map<number, TurnExpectation>()
+  for (const te of conversation.turn_expectations ?? []) {
+    if (typeof te.turn_index === 'number') expByIndex.set(te.turn_index, te)
+  }
 
   return (
     <div className="space-y-3">
@@ -1061,6 +1066,10 @@ function ConversationResultView({
 
       {turns.map((t, i) => {
         const turnScores = perTurnScores(t.turn_index)
+        const exp = expByIndex.get(t.turn_index)
+        const criteria = exp?.criteria ?? []
+        const turnSteps = t.steps ?? []
+        const turnToolCalls = t.tool_calls ?? []
         return (
           <div key={i} className="space-y-1.5">
             {/* user 气泡（右） */}
@@ -1073,6 +1082,25 @@ function ConversationResultView({
                   <MarkdownView text={t.user} />
                 </div>
               </div>
+              {/* 该轮期望（评判要点 / 期望输出）——按什么标准打分 */}
+              {(criteria.length > 0 || exp?.expected_output) && (
+                <div className="max-w-[85%] mt-1 rounded-md border border-border bg-fill/5 px-3 py-2 text-[11px] text-text-secondary">
+                  {criteria.length > 0 && (
+                    <div>
+                      <span className="font-medium text-text-primary">评判要点：</span>
+                      <ul className="list-disc list-inside mt-0.5 space-y-0.5">
+                        {criteria.map((c, ci) => <li key={ci}>{c}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                  {exp?.expected_output && (
+                    <div className={criteria.length > 0 ? 'mt-1' : ''}>
+                      <span className="font-medium text-text-primary">期望输出：</span>
+                      <span className="ml-1">{exp.expected_output}</span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             {/* assistant 气泡（左） */}
             <div className="flex flex-col items-start">
@@ -1095,6 +1123,17 @@ function ConversationResultView({
                       </span>
                     )
                   })}
+                </div>
+              )}
+              {/* 该轮工具调用 / 推理步骤（与单轮 CotTimeline 同形态） */}
+              {turnSteps.length > 0 ? (
+                <div className="max-w-[85%] mt-1 w-full">
+                  <div className="text-[10px] text-text-tertiary mb-1">本轮步骤（{turnSteps.length}）</div>
+                  <CotTimeline steps={turnSteps} />
+                </div>
+              ) : turnToolCalls.length > 0 && (
+                <div className="max-w-[85%] mt-1 text-[11px] text-text-tertiary">
+                  本轮工具调用：{turnToolCalls.length} 次
                 </div>
               )}
             </div>

@@ -1,4 +1,5 @@
 import api from './client'
+import { triggerExport, type ExportFormat } from '@/lib/download'
 import type {
   Dataset,
   CreateDatasetRequest,
@@ -10,6 +11,23 @@ import type {
   QualityReport,
   CapacityInfo,
 } from '@/types'
+
+// 多轮对话两步式导入预览：解析结果 + 与现有同名样例的新增/更新比对。
+export interface ConversationImportPreview {
+  total: number
+  new: number
+  updated: number
+  skipped: number
+  samples: {
+    name: string
+    turns: number
+    first_user: string
+    has_assistant: boolean
+    checkpoints: number
+    goal: string
+    action: 'new' | 'update'
+  }[]
+}
 
 export const datasetsApi = {
   list(params?: { filter?: string; type?: string }) {
@@ -53,11 +71,36 @@ export const datasetsApi = {
     if (opts?.split) params.split = opts.split
     if (opts?.messagesColumn) params.messages_column = opts.messagesColumn
     if (opts?.goalColumn) params.goal_column = opts.goalColumn
-    return api.post<{ added: number; skipped: number; ids: string[] }>(
+    return api.post<{ added: number; updated: number; skipped: number; ids: string[] }>(
       `/datasets/${name}/cases/import-conversations`,
       form,
       { params, headers: { 'Content-Type': 'multipart/form-data' } },
     )
+  },
+  // 两步式导入第一步：解析文件但不写库，返回解析结果预览 + 新增/更新比对。
+  previewConversations(
+    name: string,
+    file: File,
+    opts?: { messagesColumn?: string; goalColumn?: string },
+  ) {
+    const form = new FormData()
+    form.append('file', file)
+    const params: Record<string, string> = {}
+    if (opts?.messagesColumn) params.messages_column = opts.messagesColumn
+    if (opts?.goalColumn) params.goal_column = opts.goalColumn
+    return api.post<ConversationImportPreview>(
+      `/datasets/${name}/cases/import-conversations/preview`,
+      form,
+      { params, headers: { 'Content-Type': 'multipart/form-data' } },
+    )
+  },
+  exportConversations(name: string, format: ExportFormat) {
+    return triggerExport({
+      url: `/datasets/${name}/cases/export-conversations`,
+      params: { format },
+      format,
+      fallbackName: `conversations_${name.slice(0, 20)}`,
+    })
   },
   updateCase(exampleId: string, data: TestCase) {
     return api.put(`/cases/${exampleId}`, data)

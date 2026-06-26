@@ -104,6 +104,13 @@ async def replay_conversation(
     # 客户端自带历史模式下累积的完整消息序列（含 agent 回复）。
     running: list[dict[str, Any]] = []
 
+    # 逐轮容错：某轮调用失败不整段抛弃，保留已完成轮供展示/排查，并停止后续轮
+    # （thread 上下文已断，继续发只会得到脱节的回复）。错误经返回 dict 上交 runner
+    # 分类落库，不在此 raise（避免丢掉已完成轮）。
+    error_str: str | None = None
+    error_exc: BaseException | None = None
+    failed_turn: int | None = None
+
     for turn_no, idx in enumerate(user_idxs):
         user_content = input_messages[idx].get("content", "")
         if server_memory:
@@ -114,7 +121,21 @@ async def replay_conversation(
             running.append({"role": "user", "content": user_content})
             send_messages = list(running)
 
-        resp, attempts = await invoke(adapter, send_messages)
+        try:
+            resp, attempts = await invoke(adapter, send_messages)
+        except Exception as e:
+            attempts_made = getattr(e, "_eval_attempts_made", 1)
+            error_str = str(e)
+            if attempts_made > 1:
+                error_str = f"{error_str} (after {attempts_made} attempts)"
+            error_exc = e
+            failed_turn = turn_no
+            max_attempts = max(max_attempts, attempts_made)
+            logger.warning(
+                "multiturn replay: turn %s (idx %s) failed, keeping %s completed turns: %s",
+                turn_no, idx, len(turns), e,
+            )
+            break
         max_attempts = max(max_attempts, attempts)
         assistant_text = resp.content or ""
 
@@ -193,6 +214,12 @@ async def replay_conversation(
         "latency_ms": int(total_latency),
         "usage": usage,
         "attempts": max_attempts,
+        # 逐轮容错：某轮失败时这三项非空，已完成轮仍在 turns 里。
+        # runner 据此分类错误并落库（区分 agent_unreachable/timeout/error），
+        # 同时保留已回放的轮供展示。全程成功时三项均为 None。
+        "error": error_str,
+        "error_exc": error_exc,
+        "failed_turn": failed_turn,
     }
 
 
@@ -204,8 +231,12 @@ async def score_conversation(
     evaluator_specs: list[dict[str, Any]],
     case_metadata: dict[str, Any] | None,
     case_id: str | None = None,
-) -> dict[str, float]:
-    """对回放结果做逐轮 + 会话级打分，返回扁平 ``{score_key: value}``。
+) -> tuple[dict[str, float], dict[str, str]]:
+    """对回放结果做逐轮 + 会话级打分。
+
+    返回 ``(scores, reasons)``：``scores`` 是扁平 ``{score_key: value}``（聚合 /
+    status 判定用，结构不变）；``reasons`` 是并行 ``{score_key: judge 理由}``，供
+    落库写进 details，详情页展示「按什么打的分」。
 
     只处理 ``configurable_judge`` 评估器（多轮场景下规则类 evaluator 无单一
     expected 概念，本期不接）。score key 约定：
@@ -213,6 +244,7 @@ async def score_conversation(
         - 会话级：``f"{label}.conversation"``
     """
     scores: dict[str, float] = {}
+    reasons: dict[str, str] = {}
 
     # turn_index → 该轮回放记录，便于按期望对齐。
     turn_by_index = {t["turn_index"]: t for t in turns}
@@ -275,6 +307,8 @@ async def score_conversation(
                 continue
             for s in res.scores:
                 scores[f"{label}.turn{ti}"] = float(s.value)
+                if s.reason:
+                    reasons[f"{label}.turn{ti}"] = s.reason
 
         # ── 会话级打分：以 conversation_goal 为依据，整段对话作 output ──
         if conversation_goal:
@@ -303,5 +337,7 @@ async def score_conversation(
                 continue
             for s in res.scores:
                 scores[f"{label}.conversation"] = float(s.value)
+                if s.reason:
+                    reasons[f"{label}.conversation"] = s.reason
 
-    return scores
+    return scores, reasons

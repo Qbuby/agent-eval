@@ -264,6 +264,11 @@ class StartEvalRequest(BaseModel):
     # evaluation service uses this to backfill test_results.langsmith_run_id
     # after the agent call completes. Leave blank to skip backfill.
     langsmith_project: str | None = None
+    # Langfuse trace name where the agent writes its own trace. Symmetric to
+    # langsmith_project: after the run settles, the service pulls Langfuse
+    # traces by (name, time-window), matches each by question text, and
+    # backfills test_results.langfuse_trace_id. Leave blank to skip.
+    langfuse_trace_name: str | None = None
 
 
 class EvalRunSummary(BaseModel):
@@ -274,6 +279,7 @@ class EvalRunSummary(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     langfuse_run_name: str | None = None
+    langfuse_trace_name: str | None = None
     langsmith_project: str | None = None
     agent_config: dict[str, Any] = {}
     summary_scores: dict[str, Any] | None = None

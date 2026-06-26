@@ -34,7 +34,7 @@ export default function EvaluationPage() {
       <header className="mb-6">
         <div className="page-eyebrow">评估</div>
         <h1 className="page-title">评估</h1>
-        <p className="page-subtitle">运行管理 · LangSmith 追踪 · 本地评分</p>
+        <p className="page-subtitle">运行管理 · Trace 关联 · 本地评分</p>
       </header>
 
       <div className="page-tabs mb-5">
@@ -398,6 +398,7 @@ function StatusBadge({ status }: { status: string }) {
 // ─── New run tab ────────────────────────────────────────────────────────────
 
 type CaseSourceTab = 'benchmark' | 'upload' | 'conversation'
+type TraceSource = 'none' | 'langsmith' | 'langfuse'
 
 function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const qc = useQueryClient()
@@ -476,7 +477,13 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const [agentTimeout, setAgentTimeout] = useState(300)
   const [concurrency, setConcurrency] = useState(3)
   const [runName, setRunName] = useState('')
+  // Trace 来源：'none' = 不关联外部 trace（纯本地评分）；'langsmith' = agent
+  // 自报 trace 到 LangSmith，运行后按 project+时间窗回查贴回 langsmith_run_id；
+  // 'langfuse' = agent 自报 trace 到 Langfuse，运行后按 trace name+时间窗回查、
+  // 按 question 匹配贴回 langfuse_trace_id（对称于 langsmith，project 由凭据对固定）。
+  const [traceSource, setTraceSource] = useState<TraceSource>('none')
   const [langsmithProject, setLangsmithProject] = useState('')
+  const [langfuseTraceName, setLangfuseTraceName] = useState('')
 
   // Multi-value config options — pickers in the form let users reuse
   // pre-saved presets from /config; the URL field also auto-prefills with
@@ -559,7 +566,8 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       evaluator_ids: Array.from(selectedEvaluatorIds),
       concurrency,
       run_name: runName.trim() || null,
-      langsmith_project: langsmithProject.trim() || null,
+      langsmith_project: traceSource === 'langsmith' ? (langsmithProject.trim() || null) : null,
+      langfuse_trace_name: traceSource === 'langfuse' ? (langfuseTraceName.trim() || null) : null,
     }
 
     if (sourceTab === 'upload' && uploadedSource) {
@@ -884,10 +892,25 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               <input type="text" value={agentLanguage} onChange={e => setAgentLanguage(e.target.value)} className="input" />
             </Field>
           )}
-          <Field label="LangSmith 项目（用于拉回 trace）">
-            <input type="text" value={langsmithProject} onChange={e => setLangsmithProject(e.target.value)}
-                   placeholder="例如：ep-agent / ruyi-agent" className="input" />
+          <Field label="Trace 来源">
+            <select value={traceSource} onChange={e => setTraceSource(e.target.value as TraceSource)} className="input">
+              <option value="none">不关联（仅本地评分）</option>
+              <option value="langsmith">LangSmith（回拉 agent trace）</option>
+              <option value="langfuse">Langfuse（回拉 trace）</option>
+            </select>
           </Field>
+          {traceSource === 'langsmith' && (
+            <Field label="LangSmith 项目（agent 自报的项目名）">
+              <input type="text" value={langsmithProject} onChange={e => setLangsmithProject(e.target.value)}
+                     placeholder="例如：ep-agent / ruyi-agent" className="input" />
+            </Field>
+          )}
+          {traceSource === 'langfuse' && (
+            <Field label="Langfuse trace 名称（agent 自报的 trace name）">
+              <input type="text" value={langfuseTraceName} onChange={e => setLangfuseTraceName(e.target.value)}
+                     placeholder="例如：ep-agent-chat" className="input" />
+            </Field>
+          )}
         </div>
 
         <details className="mt-3">

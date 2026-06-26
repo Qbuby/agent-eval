@@ -196,3 +196,52 @@ def _extract_criteria(outputs: dict[str, Any], meta: dict[str, Any]) -> list[str
             if key in source and isinstance(source[key], list):
                 return [str(c) for c in source[key]]
     return []
+
+
+# ---------------------------------------------------------------------------
+# Langfuse dataset item <-> TestCase
+#
+# Langfuse 的 DatasetItem 形状与 LangSmith Example 不同：
+#   - inputs/outputs 双栏 → input/expected_output 双栏（字段名变、outputs 复数→单数）
+#   - 没有 split 一等公民概念 → split 降级进 metadata["split"]
+#   - DatasetItem 同时有 dataset_id + dataset_name
+# 为避免字段映射在两套后端间分叉，这里直接复用上面的 case_to_example /
+# example_to_test_case 作为单一事实源，只做 input/output 的形状适配。
+# ---------------------------------------------------------------------------
+
+
+def case_to_dataset_item(case: TestCase, split: str | None = None) -> dict[str, Any]:
+    """TestCase → Langfuse create_dataset_item 入参三元组 + id。
+
+    复用 case_to_example 的字段映射；inputs→input、outputs→expected_output。
+    Langfuse 无 split，故把 split 收进 metadata（load 时按需过滤）。id 透传
+    case.id（uuid），既作 Langfuse item 的全局唯一 id，也支撑 upsert 去重。
+    """
+    params = case_to_example(case, split=split)
+    metadata = dict(params["metadata"])
+    if params.get("split"):
+        metadata["split"] = params["split"]
+    return {
+        "id": case.id,
+        "input": params["inputs"],
+        "expected_output": params["outputs"],
+        "metadata": metadata,
+    }
+
+
+class _ItemAsExample:
+    """把 Langfuse DatasetItem 适配成 example_to_test_case 期望的 Example 形状，
+    从而复用同一套反序列化逻辑（input→inputs / expected_output→outputs）。"""
+
+    def __init__(self, item: Any):
+        self.inputs = getattr(item, "input", None) or {}
+        self.outputs = getattr(item, "expected_output", None) or {}
+        self.metadata = getattr(item, "metadata", None) or {}
+        self.id = getattr(item, "id", "")
+        # Langfuse 用 dataset_name 标识归属，比 dataset_id 更可读，作为 dataset_version。
+        self.dataset_id = getattr(item, "dataset_name", "") or ""
+
+
+def dataset_item_to_test_case(item: Any) -> TestCase:
+    """Langfuse DatasetItem → TestCase（复用 example_to_test_case）。"""
+    return example_to_test_case(_ItemAsExample(item))

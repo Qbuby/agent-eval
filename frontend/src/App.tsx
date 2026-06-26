@@ -8,6 +8,7 @@ import DashboardPage from '@/pages/DashboardPage'
 import DatasetsPage from '@/pages/DatasetsPage'
 import DatasetDetailPage from '@/pages/DatasetDetailPage'
 import ConversationDatasetPage from '@/pages/ConversationDatasetPage'
+import ConversationDatasetDetailPage from '@/pages/ConversationDatasetDetailPage'
 import GeneratePage from '@/pages/GeneratePage'
 import TracesPage from '@/pages/TracesPage'
 import AutoCollectPage from '@/pages/AutoCollectPage'
@@ -91,6 +92,7 @@ export default function App() {
               <Route path="dashboard" element={<DashboardPage />} />
               <Route path="datasets" element={<InternalRoute><DatasetsPage /></InternalRoute>} />
               <Route path="conversations" element={<InternalRoute><ConversationDatasetPage /></InternalRoute>} />
+              <Route path="conversations/:name" element={<InternalRoute><ConversationDatasetDetailPage /></InternalRoute>} />
               <Route path="datasets/:name" element={<InternalRoute><DatasetDetailPage /></InternalRoute>} />
               <Route path="projects" element={<InternalRoute><ProjectsPage /></InternalRoute>} />
               <Route path="benchmark/:projectId" element={<InternalRoute><BenchmarkPage /></InternalRoute>} />

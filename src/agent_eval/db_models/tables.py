@@ -121,6 +121,11 @@ class TestRunRow(Base, TenantMixin):
     summary_scores: Mapped[dict | None] = mapped_column(JSONB)
     langfuse_run_name: Mapped[str | None] = mapped_column(Text)
     langsmith_project: Mapped[str | None] = mapped_column(Text)
+    # Per-run Langfuse trace name: the回拉键 used to fetch traces by name+time
+    # window from the Langfuse public API after a run, then match by question
+    # text to backfill test_results.langfuse_trace_id. Mirrors langsmith_project's
+    # role for LangSmith. Distinct from langfuse_run_name (display/search only).
+    langfuse_trace_name: Mapped[str | None] = mapped_column(Text)
     evaluator_configs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     # Soft-delete: list endpoints filter out non-null deleted_at by default;
@@ -198,7 +203,9 @@ class EvaluationScoreRow(Base, TenantMixin):
     result_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("test_results.id"), nullable=False, index=True
     )
-    dimension: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # 多轮评估的 score key 形如 `{label}.turn{n}` / `{label}.conversation`，
+    # label 可能较长 → 扩到 255 防止超长 flush 报错回滚整行（见迁移 0025）。
+    dimension: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     weight: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     weighted_score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)

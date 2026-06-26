@@ -275,7 +275,7 @@ async def get_quality_report(
 ):
     from agent_eval.api.dependencies import get_manager
 
-    manager = get_manager()
+    manager = await get_manager()
     cases = await manager.provider.load_cases(name)
 
     validator_config = {

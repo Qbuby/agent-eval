@@ -376,6 +376,321 @@ def resolve_conversation_goal(
     return None
 
 
+# ── 灵活多轮对话解析 ────────────────────────────────────────────────────────
+# 不同来源的多轮对话文件布局差异很大，统一支持三种：
+#   A) chat 数组：消息列里是 [{"role","content"}, ...]（标准聊天记录）
+#   B) QA-turn 数组：消息列里是 [{"question","answer","expected_checkpoints"},...]
+#      （评测输出常见形态，如 turns 列）—— 展开成 user 轮 + 逐轮期望
+#   C) 拍平多行：每行是一个 turn，靠 conversation_id 跨行聚合成一段对话
+#      （Excel 导出常见形态）
+# 三种布局都归一到「user 轮列表 + turn_expectations(criteria/expected_output)
+# + conversation_goal」，与 multiturn 回放/打分的消费方式对齐。
+
+# QA-turn 里「问 / 答 / 检查点」的列名别名（大小写不敏感）。
+_QUESTION_KEYS = (
+    "question", "q", "user", "human", "prompt", "input", "query",
+    "用户", "用户输入", "提问", "问题",
+)
+_ANSWER_KEYS = (
+    "answer", "a", "assistant", "ai", "response", "reply", "output", "bot",
+    "助手", "回答", "回复", "答案",
+)
+_CHECKPOINT_KEYS = (
+    "expected_checkpoints", "checkpoints", "criteria", "expected_criteria",
+    "assertions", "checks", "key_points", "检查点", "要点", "评分点", "关键点",
+)
+# 拍平布局里用于把多行聚合成同一段对话的分组键。
+_CONV_ID_KEYS = (
+    "conversation_id", "conv_id", "dialog_id", "dialogue_id", "session_id",
+    "thread_id", "case_id", "对话id", "会话id", "对话编号",
+)
+# 拍平布局里的轮次序号列（用于排序）。
+_TURN_NO_KEYS = ("turn", "turn_no", "turn_index", "round", "step", "轮次", "序号")
+# 行级目标列（拍平/per-row 都可作 conversation_goal 兜底）。
+_GOAL_ROW_KEYS = (
+    "scenario", "场景", "conversation_goal", "goal", "对话目标", "目标",
+    "session_goal", "test_focus", "task", "意图",
+)
+# 对话名/描述列。
+_NAME_KEYS = ("name", "名称", "标题", "title")
+_DESC_KEYS = ("description", "描述", "说明", "note", "备注")
+
+
+@dataclass
+class ParsedConversation:
+    """归一化后的一段多轮对话样例。"""
+
+    input_messages: list[dict[str, str]]
+    conversation_goal: str | None = None
+    turn_expectations: list[dict[str, Any]] = field(default_factory=list)
+    name: str = ""
+    description: str = ""
+
+
+def _lower_map(row: dict[str, Any]) -> dict[str, str]:
+    return {str(k).lower().strip(): k for k in row}
+
+
+def _first_value(row: dict[str, Any], low: dict[str, str], keys) -> Any:
+    """按别名取第一个非空值（大小写不敏感）。"""
+    for k in keys:
+        real = low.get(k.lower())
+        if real is None:
+            continue
+        val = row.get(real)
+        if val not in (None, ""):
+            return val
+    return None
+
+
+def _as_list(raw: Any) -> list | None:
+    """把单元格值解析成 list：已是 list 直接用；JSON 字符串则尝试解析。"""
+    if isinstance(raw, list):
+        return raw or None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, list) and parsed else None
+    return None
+
+
+def _checkpoints_to_list(val: Any) -> list[str]:
+    """检查点列归一成 list[str]（支持 list / JSON 数组串 / 换行分隔串）。"""
+    if val in (None, ""):
+        return []
+    if isinstance(val, list):
+        items = val
+    else:
+        parsed = _as_list(val)
+        if parsed is not None:
+            items = parsed
+        else:
+            items = [seg for seg in re.split(r"[\n;；]", str(val)) if seg.strip()]
+    return [str(c).strip() for c in items if str(c).strip()]
+
+
+def _is_chat_message(d: Any) -> bool:
+    if not isinstance(d, dict):
+        return False
+    low = {str(k).lower() for k in d}
+    return ("role" in low or "type" in low) and ("content" in low or "text" in low)
+
+
+def _looks_like_qa_turns(raw: list) -> bool:
+    """list 里出现「带问句键但不是标准 chat 消息」的元素 → 判定为 QA-turn 数组。"""
+    for x in raw:
+        if isinstance(x, dict) and not _is_chat_message(x):
+            low = {str(k).lower() for k in x}
+            if any(k in low for k in _QUESTION_KEYS):
+                return True
+    return False
+
+
+def _expand_qa_turns(turns: list) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """QA-turn 列表 → (对话消息, turn_expectations)。
+
+    每个 turn 的 question 作 user 轮、answer 作紧随的 assistant 轮，二者一并进
+    input_messages（对话视图按气泡展示「用户输入 + 生成答案」）。检查点作该轮
+    criteria。turn_index 对齐 user 消息在 input_messages 里的下标（user/assistant
+    交替后即 0,2,4...）。
+
+    注意：answer 是评测时 agent 实际「生成的答案」（如 multichat_results 输出），
+    而非预设的标准答案，故只作 assistant 消息存档、**不写入 expected_output**
+    ——期望答案留空，供人工后补。评测回放只重放 user 轮（见 multiturn
+    ._user_turn_indices），夹带的 assistant 历史不会被当成输入重放。
+    """
+    messages: list[dict[str, str]] = []
+    turn_expectations: list[dict[str, Any]] = []
+    for t in turns:
+        if not isinstance(t, dict):
+            continue
+        low = _lower_map(t)
+        q = _first_value(t, low, _QUESTION_KEYS)
+        if q in (None, ""):
+            continue
+        idx = len(messages)
+        messages.append({"role": "user", "content": str(q).strip()})
+        a = _first_value(t, low, _ANSWER_KEYS)
+        if a not in (None, ""):
+            messages.append({"role": "assistant", "content": str(a).strip()})
+
+        criteria = _checkpoints_to_list(_first_value(t, low, _CHECKPOINT_KEYS))
+        if criteria:
+            turn_expectations.append({"turn_index": idx, "criteria": criteria})
+    return messages, turn_expectations
+
+
+def _conversation_from_list(
+    row: dict[str, Any], raw: list, *, goal_column: str | None
+) -> ParsedConversation | None:
+    """单行里已有完整对话数组（布局 A / B）→ ParsedConversation。"""
+    low = _lower_map(row)
+    if _looks_like_qa_turns(raw):
+        messages, turn_exp = _expand_qa_turns(raw)
+    else:
+        messages = normalize_messages(raw)
+        turn_exp = []
+    if not messages:
+        return None
+    goal = resolve_conversation_goal(row, goal_column=goal_column)
+    if not goal:
+        gv = _first_value(row, low, _GOAL_ROW_KEYS)
+        goal = str(gv).strip() if gv not in (None, "") else None
+    name = _first_value(row, low, _NAME_KEYS) or _first_value(row, low, _CONV_ID_KEYS)
+    desc = _first_value(row, low, _DESC_KEYS)
+    return ParsedConversation(
+        input_messages=messages,
+        conversation_goal=goal,
+        turn_expectations=turn_exp,
+        name=str(name).strip() if name not in (None, "") else "",
+        description=str(desc).strip() if desc not in (None, "") else "",
+    )
+
+
+def _parse_flattened(
+    rows: list[tuple[dict[str, Any], dict[str, str]]], *, goal_column: str | None
+) -> tuple[list[ParsedConversation], int]:
+    """拍平布局（布局 C）：每行一个 turn，按 conversation_id 聚合成对话。
+
+    无分组键的行各自成一段单轮对话。返回 (conversations, skipped_rows)。
+    """
+    groups: dict[str, list[tuple[dict[str, Any], dict[str, str]]]] = {}
+    order: list[str] = []
+    skipped = 0
+    standalone_seq = 0
+    # forward-fill：Excel 合并单元格导出时，conversation_id 只在每组首行有值，
+    # 后续 turn 行为空。空 id 行沿用上一个非空分组键，归属同一段对话。
+    last_gid: str | None = None
+    for row, low in rows:
+        q = _first_value(row, low, _QUESTION_KEYS)
+        if q in (None, ""):
+            skipped += 1
+            continue
+        gid = _first_value(row, low, _CONV_ID_KEYS)
+        if gid not in (None, ""):
+            last_gid = str(gid).strip()
+            key = last_gid
+        elif last_gid is not None:
+            # 空 id 且已见过分组键 → 归属上一段对话（合并单元格续行）。
+            key = last_gid
+        else:
+            standalone_seq += 1
+            key = f"__standalone_{standalone_seq}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append((row, low))
+
+    conversations: list[ParsedConversation] = []
+    for key in order:
+        items = groups[key]
+
+        def _turn_sort(it: tuple[dict[str, Any], dict[str, str]]):
+            r, lw = it
+            tv = _first_value(r, lw, _TURN_NO_KEYS)
+            try:
+                return (0, int(float(tv)))
+            except (TypeError, ValueError):
+                return (1, 0)
+
+        items.sort(key=_turn_sort)
+
+        messages: list[dict[str, str]] = []
+        turn_exp: list[dict[str, Any]] = []
+        goal: str | None = None
+        name = ""
+        for r, lw in items:
+            q = _first_value(r, lw, _QUESTION_KEYS)
+            idx = len(messages)
+            messages.append({"role": "user", "content": str(q).strip()})
+            # answer 是 agent 实际「生成的答案」，作 assistant 消息存档进对话流，
+            # 不写入 expected_output（期望答案留空，供人工后补）。与 _expand_qa_turns
+            # 语义一致。
+            a = _first_value(r, lw, _ANSWER_KEYS)
+            if a not in (None, ""):
+                messages.append({"role": "assistant", "content": str(a).strip()})
+            criteria = _checkpoints_to_list(_first_value(r, lw, _CHECKPOINT_KEYS))
+            if criteria:
+                turn_exp.append({"turn_index": idx, "criteria": criteria})
+            if goal is None:
+                g = resolve_conversation_goal(r, goal_column=goal_column)
+                if not g:
+                    gv = _first_value(r, lw, _GOAL_ROW_KEYS)
+                    g = str(gv).strip() if gv not in (None, "") else None
+                goal = g
+            if not name and not key.startswith("__standalone_"):
+                name = key
+        if messages:
+            conversations.append(ParsedConversation(
+                input_messages=messages,
+                conversation_goal=goal,
+                turn_expectations=turn_exp,
+                name=name,
+                description="",
+            ))
+    return conversations, skipped
+
+
+def parse_conversations(
+    rows,
+    *,
+    messages_column: str | None = None,
+    goal_column: str | None = None,
+) -> tuple[list[ParsedConversation], int]:
+    """把上传文件的所有行解析成多轮对话样例，自动适配三种布局。
+
+    - 行内带消息/turns 数组列 → 单行即一段对话（布局 A chat / B QA-turn）。
+    - 其余行 → 按 conversation_id 跨行聚合的拍平布局（布局 C）。
+
+    返回 (conversations, skipped_rows)。skipped_rows 为既不含对话数组、也不含
+    问句列、无法构成任何轮次的行数。
+    """
+    materialized = list(rows)
+    conversations: list[ParsedConversation] = []
+    flattened: list[tuple[dict[str, Any], dict[str, str]]] = []
+    skipped = 0
+
+    explicit: list[str] = []
+    if messages_column:
+        explicit.append(messages_column)
+    list_col_candidates = explicit + [
+        a for a in _MESSAGES_COLUMN_ALIASES if a not in explicit
+    ]
+
+    for row in materialized:
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        low = _lower_map(row)
+        raw_list = None
+        for cand in list_col_candidates:
+            real = cand if cand in row else low.get(cand.lower())
+            if real is None:
+                continue
+            raw_list = _as_list(row.get(real))
+            if raw_list is not None:
+                break
+        if raw_list is not None:
+            conv = _conversation_from_list(row, raw_list, goal_column=goal_column)
+            if conv is not None:
+                conversations.append(conv)
+            else:
+                skipped += 1
+        else:
+            flattened.append((row, low))
+
+    if flattened:
+        flat_convs, flat_skipped = _parse_flattened(flattened, goal_column=goal_column)
+        conversations.extend(flat_convs)
+        skipped += flat_skipped
+
+    return conversations, skipped
+
+
 def collect_sample_values(
     rows: list[dict[str, Any]], headers: list[str], limit: int = 3
 ) -> dict[str, list[str]]:

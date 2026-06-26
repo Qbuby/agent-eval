@@ -373,9 +373,11 @@ class ImportFromTracesRequest(BaseModel):
 @router.post("/import-langsmith")
 async def import_from_langsmith(req: ImportFromLangSmithRequest):
     """Import examples from a LangSmith dataset into candidate_cases."""
-    from agent_eval.api.dependencies import get_manager
+    from agent_eval.api.dependencies import get_langsmith_manager
 
-    mgr = await get_manager()
+    # 外部 LangSmith 数据集导入是保留功能：显式走 LangSmith manager（数据集存储
+    # 已切到 Langfuse，但这里的「源」就是外部 LangSmith，不能用默认 manager）。
+    mgr = await get_langsmith_manager()
     try:
         cases = await mgr.load_cases(req.dataset_name, limit=req.limit)
     except Exception as e:

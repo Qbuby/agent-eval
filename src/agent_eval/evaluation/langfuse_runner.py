@@ -595,6 +595,7 @@ async def _run_multiturn_case(
     error_type: str | None = None
     replay: dict[str, Any] = {}
     scores: dict[str, float] = {}
+    score_reasons: dict[str, str] = {}
 
     try:
         try:
@@ -620,6 +621,17 @@ async def _run_multiturn_case(
         except Exception:
             pass
 
+    # 逐轮容错：replay 某轮失败时不再抛异常，而是正常返回带 error 字段 +
+    # 已完成轮（#136）。这里消费该 error 设置 error_msg/error_type，但保留
+    # replay["turns"]（已完成轮仍落库展示），不丢弃部分进度。
+    if not error_msg and replay.get("error"):
+        error_msg = replay["error"]
+        error_type = _classify_agent_error(replay.get("error_exc"))
+        logger.warning(
+            "multiturn replay partial failure for case %s [%s] at turn %s: %s",
+            case.get("id"), error_type, replay.get("failed_turn"), error_msg,
+        )
+
     turns = replay.get("turns") or []
     # 整段输出快照：拼接 transcript，供列表/详情页展示与会话级回看。
     transcript = multiturn.build_transcript(turns)
@@ -630,10 +642,11 @@ async def _run_multiturn_case(
     actual_tool_calls = replay.get("tool_calls") or []
     cot_steps = replay.get("steps") or []
 
-    # 打分（仅在回放成功时）。
-    if not error_msg:
+    # 打分：只要有已完成轮就打分（含部分失败的样例——已完成轮仍应评分留痕）。
+    # status 判定优先看 error_msg，故部分失败样例即便有分数仍标 error，不会假性 pass。
+    if turns:
         try:
-            scores = await multiturn.score_conversation(
+            scores, score_reasons = await multiturn.score_conversation(
                 turns=turns,
                 conversation_goal=conversation_goal,
                 turn_expectations=turn_expectations,
@@ -644,13 +657,18 @@ async def _run_multiturn_case(
         except Exception as e:
             logger.warning("multiturn scoring crashed on case %s: %s", case.get("id"), e)
 
+    # status 判定：回放成功但「零有效评分」必须区分于「通过」——多轮场景下
+    # 内建评估器（exact_match 等）不接、或样例无 turn_expectations/goal 时，
+    # scores 会是空 dict；此时判 skipped（未评分），不能默认 pass 假性通过。
     status = "pass"
     if error_msg:
         if error_type in ("agent_unreachable", "agent_timeout"):
             status = error_type
         else:
             status = "error"
-    elif scores and any(v < 0.5 for v in scores.values()):
+    elif not scores:
+        status = "skipped"
+    elif any(v < 0.5 for v in scores.values()):
         status = "fail"
 
     return {
@@ -681,6 +699,9 @@ async def _run_multiturn_case(
         "tool_call_count": len(actual_tool_calls),
         "message_count": len(turns),
         "scores": scores,
+        # 逐分数项的 judge 理由（score_key → reasoning），落库写进 details，
+        # 详情页展示「按什么打的分」。单轮路径无此键，下方落库循环用 .get 兜底。
+        "score_reasons": score_reasons,
         **usage,
     }
 
@@ -918,10 +939,11 @@ async def _execute_run(
     langsmith_project: str | None,
     cancel_event: asyncio.Event,
     handle: _RunHandle,
+    langfuse_trace_name: str | None = None,
 ) -> None:
     """Background task body. Invokes agent for each case, runs evaluators,
     persists results. After all cases settle, optionally kicks off the
-    LangSmith backfill (non-blocking)."""
+    LangSmith and/or Langfuse trace backfill (non-blocking)."""
     handle.progress["total"] = len(cases)
     retry_policy = await _resolve_retry_policy(agent_cfg)
     logger.info(
@@ -1025,11 +1047,15 @@ async def _execute_run(
                         status=res["status"],
                         attempts_made=res.get("attempts_made", 1),
                     )
+                    # 多轮 judge 理由（#137）：score_reasons 仅多轮 case 带，单轮无此键
+                    # → .get 兜底空 dict，details 退回 {}，单轮零回归。
+                    reasons_map = res.get("score_reasons") or {}
                     for sname, sval in res["scores"].items():
+                        reason = reasons_map.get(sname)
                         await repo.create_eval_score(
                             created.id, dimension=sname, score=sval,
                             weight=1.0, weighted_score=sval, scoring_method="eval",
-                            details={},
+                            details={"reasoning": reason} if reason else {},
                         )
                     await session.commit()
             except Exception as e:
@@ -1045,8 +1071,11 @@ async def _execute_run(
         except Exception:
             pass
         # Aggregate
+        # skipped（回放成功但零有效评分）单独成桶，不混进 fail——否则
+        # 「没评」会被当成「没通过」，污染通过率与失败分析。
         succ = [r for r in per_case_results if r["status"] == "pass"]
-        fail = [r for r in per_case_results if r["status"] != "pass"]
+        skipped = [r for r in per_case_results if r["status"] == "skipped"]
+        fail = [r for r in per_case_results if r["status"] not in ("pass", "skipped")]
         all_scores: dict[str, list[float]] = {}
         for r in per_case_results:
             for k, v in r["scores"].items():
@@ -1118,6 +1147,9 @@ async def _execute_run(
                 "total": len(per_case_results),
                 "passed": len(succ),
                 "failed": len(fail),
+                # skipped：回放成功但无有效评估器产出分数（多轮零评估），
+                # 与 failed 区分，避免「没评」被读成「没通过」。
+                "skipped": len(skipped),
                 "unreachable": sum(
                     1 for r in per_case_results
                     if r["status"] in ("agent_unreachable", "agent_timeout")
@@ -1156,7 +1188,12 @@ async def _execute_run(
             summary["langsmith_host"] = ls_conn["api_url"].replace(
                 "api.smith", "smith"
             ) if ls_conn["api_url"] else None
-        if lf_conn["remote_write"] and lf_conn["configured"]:
+        # Surface the Langfuse web root whenever we'll have trace ids to link:
+        # either remote_write pushed them, or the symmetric trace backfill will
+        # fill them in. Without this the detail page can't build /trace/{id}.
+        if lf_conn["configured"] and (
+            lf_conn["remote_write"] or langfuse_trace_name
+        ):
             summary["langfuse_host"] = lf_conn["host"]
         if cancel_event.is_set():
             summary["stopped_early"] = True
@@ -1179,6 +1216,19 @@ async def _execute_run(
                 _backfill_langsmith_traces(
                     run_id=run_id,
                     project=langsmith_project,
+                    per_case_results=per_case_results,
+                )
+            )
+
+        # Fire-and-forget Langfuse trace backfill — symmetric to the LangSmith
+        # one above. Pulls traces by (trace_name, time-window) from the active
+        # Langfuse connection, matches each by question text, and writes
+        # test_results.langfuse_trace_id. Independent of remote_write/score sync.
+        if langfuse_trace_name and per_case_results:
+            asyncio.create_task(
+                _backfill_langfuse_traces(
+                    run_id=run_id,
+                    trace_name=langfuse_trace_name,
                     per_case_results=per_case_results,
                 )
             )
@@ -1381,6 +1431,159 @@ def _classify_langsmith_error(err: Exception) -> str:
     return "unknown"
 
 
+def _langfuse_trace_question(trace: dict[str, Any]) -> str:
+    """Best-effort pull of the user question from a Langfuse trace dict.
+
+    The agent writes its trace ``input`` in one of two shapes, mirroring the
+    LangSmith convention:
+      - ``{"messages": [{"role","content"}, ...]}`` → last message content
+      - ``{"question": "..."}`` → the question field directly
+    Some agents wrap the whole thing under ``input``; others put it at the top
+    level. Tolerant to missing fields — returns "" rather than raising.
+    """
+    inp = trace.get("input")
+    if isinstance(inp, str):
+        return inp
+    if not isinstance(inp, dict):
+        inp = trace if isinstance(trace, dict) else {}
+    msgs = inp.get("messages")
+    if isinstance(msgs, list) and msgs:
+        last = msgs[-1] if isinstance(msgs[-1], dict) else None
+        txt = (last or {}).get("content", "")
+        if isinstance(txt, str) and txt:
+            return txt
+    txt = inp.get("question") or inp.get("input") or ""
+    return txt if isinstance(txt, str) else ""
+
+
+async def _backfill_langfuse_traces(
+    *,
+    run_id: str,
+    trace_name: str,
+    per_case_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Symmetric counterpart to :func:`_backfill_langsmith_traces`, for Langfuse.
+
+    Pulls Langfuse traces by (``name`` == trace_name) within the run's time
+    window, builds a ``question text → trace id`` map, then matches each local
+    result by question text and writes ``test_results.langfuse_trace_id``.
+
+    The Langfuse project is fixed by the connection's key pair (it is NOT a
+    query parameter), so ``trace_name`` is the per-run join key — the agent
+    must report its trace under this name for the pull-back to find it.
+
+    Returns the same diagnostics shape as the LangSmith version::
+
+        {"errors": int, "error_kind": str | None, "error_message": str | None}
+    """
+    diagnostics: dict[str, Any] = {
+        "errors": 0,
+        "error_kind": None,
+        "error_message": None,
+    }
+
+    # ── Build the client from the active Langfuse connection preset ──
+    try:
+        from agent_eval.config_service import config_service
+        from agent_eval.langfuse_metrics.client import LangfuseMetricsClient
+
+        conn = await config_service.get_langfuse_connection()
+        if not conn.get("configured"):
+            logger.info("lf-backfill: Langfuse not configured (DB or .env), skipping")
+            diagnostics["error_kind"] = "client_init"
+            diagnostics["error_message"] = (
+                "Langfuse not configured (set via /config or LANGFUSE_* env)"
+            )
+            return diagnostics
+        client = LangfuseMetricsClient.from_connection(conn)
+    except Exception as e:
+        logger.warning("lf-backfill: langfuse client init failed: %s", e)
+        diagnostics["error_kind"] = "client_init"
+        diagnostics["error_message"] = str(e)[:300]
+        return diagnostics
+
+    from datetime import timedelta
+    invoked_times = [r["invoked_at"] for r in per_case_results if r.get("invoked_at")]
+    if not invoked_times:
+        return diagnostics
+    window_lower = min(invoked_times) - timedelta(minutes=1)
+    window_upper = max(invoked_times) + timedelta(minutes=10)
+
+    by_question: dict[str, str] = {}  # question text → trace id
+    try:
+        async for trace in client.iter_traces_by_name(
+            trace_name, window_lower, window_upper,
+        ):
+            tid = trace.get("id")
+            if not tid:
+                continue
+            txt = _langfuse_trace_question(trace)
+            if txt:
+                # Latest wins on duplicate questions — the time window already
+                # prunes most dupes, so collisions are rare.
+                by_question.setdefault(txt, str(tid))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("lf-backfill window fetch err: %s", e)
+        diagnostics["errors"] = len(per_case_results)
+        diagnostics["error_kind"] = _classify_langfuse_backfill_error(e)
+        diagnostics["error_message"] = str(e)[:300]
+        return diagnostics
+
+    logger.info(
+        "lf-backfill: name=%s window=%s..%s fetched=%d unique-questions",
+        trace_name, window_lower.isoformat(), window_upper.isoformat(),
+        len(by_question),
+    )
+
+    # ── Match local cases against the in-memory map, write trace ids ──
+    triples: list[tuple[str, str | None]] = []
+    for res in per_case_results:
+        thread_id = res.get("thread_id") or ""
+        question = res.get("question") or ""
+        triples.append((thread_id, by_question.get(question)))
+
+    hits = 0
+    async with async_session_factory() as session:
+        from agent_eval.db_models.tables import TestResultRow
+        for thread_id, lftrace in triples:
+            if not lftrace or not thread_id:
+                continue
+            rows = (await session.execute(
+                select(TestResultRow)
+                .where(TestResultRow.run_id == uuid.UUID(run_id))
+                .where(TestResultRow.thread_id == thread_id)
+            )).scalars().all()
+            for row in rows:
+                row.langfuse_trace_id = lftrace
+                hits += 1
+        await session.commit()
+    logger.info(
+        "lf-backfill: name=%s run=%s matched %d/%d cases (errors=%d kind=%s)",
+        trace_name, run_id, hits, len(per_case_results),
+        diagnostics["errors"], diagnostics["error_kind"],
+    )
+    return diagnostics
+
+
+def _classify_langfuse_backfill_error(err: Exception) -> str:
+    """Map a Langfuse public-API error to a stable banner category.
+
+    The metrics client surfaces ``httpx.HTTPStatusError`` for 4xx/5xx and
+    ``httpx.TimeoutException`` for timeouts; we sniff the stringified form so
+    we don't depend on which exception type bubbled up.
+    """
+    s = str(err).lower()
+    if "403" in s or "forbidden" in s:
+        return "forbidden"
+    if "401" in s or "unauthorized" in s:
+        return "unauthorized"
+    if "404" in s or "not found" in s:
+        return "not_found"
+    if any(t in s for t in ("connection", "timeout", "timed out", "dns")):
+        return "network"
+    return "unknown"
+
+
 def _run_matches_question(run_obj: Any, question: str) -> bool:
     """Return True if ``run_obj.inputs`` carries the same user question.
 
@@ -1490,6 +1693,7 @@ async def start_run(
     concurrency: int = 3,
     run_name: str | None = None,
     langsmith_project: str | None = None,
+    langfuse_trace_name: str | None = None,
     benchmark_version_id: str | None = None,
     eval_case_source_id: str | None = None,
 ) -> str:
@@ -1517,6 +1721,7 @@ async def start_run(
             agent_config=agent_cfg,
             langfuse_run_name=run_name,
             langsmith_project=langsmith_project,
+            langfuse_trace_name=langfuse_trace_name,
             evaluator_configs=evaluator_specs,
             status="running",
         )
@@ -1533,6 +1738,7 @@ async def start_run(
         concurrency=concurrency,
         run_name=run_name,
         langsmith_project=langsmith_project,
+        langfuse_trace_name=langfuse_trace_name,
         cancel_event=cancel_event,
         handle=handle,
     ))

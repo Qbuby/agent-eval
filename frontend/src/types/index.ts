@@ -462,6 +462,9 @@ export interface StartEvalRequest {
   concurrency?: number
   run_name?: string | null
   langsmith_project?: string | null
+  // Langfuse trace 名：对称于 langsmith_project。设置后 run 结束按 (name, 时间窗)
+  // 回拉 Langfuse trace，按 question 文本匹配贴回 langfuse_trace_id。
+  langfuse_trace_name?: string | null
 }
 
 export interface StartEvalResponse {
@@ -478,6 +481,7 @@ export interface EvalRunSummary {
   finished_at: string | null
   langfuse_run_name: string | null
   langsmith_project?: string | null
+  langfuse_trace_name?: string | null
   agent_config: Record<string, unknown>
   summary_scores: {
     counts?: { total?: number; passed?: number; failed?: number; unreachable?: number }

@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from agent_eval.api.dependencies import get_extractor, get_manager
+from agent_eval.api.dependencies import get_extractor, get_langsmith_manager, get_manager
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
 from agent_eval.auth.dependencies import require_internal
 from agent_eval.api.schemas import (
@@ -161,14 +161,34 @@ async def import_traces(
 @router.post("/pull")
 async def pull_dataset(
     req: PullDatasetRequest,
-    mgr: DatasetManager = Depends(get_manager),
 ):
-    cases = await mgr.pull_external_dataset(
-        req.source_dataset,
-        target_dataset_name=req.target_dataset,
-        split=req.split,
-        limit=req.limit,
-    )
+    # 跨 provider：源是外部 LangSmith 数据集（读用 LangSmith manager，属保留的
+    # 外部导入功能），写回目标是我们自己的数据集（已切到 Langfuse）。所以这里
+    # 不能用单一 manager 的 pull_external_dataset（它在同一 provider 内既读又写，
+    # 而 Langfuse provider 不支持 pull）。拆成：LangSmith 拉取 → Langfuse 写回。
+    from agent_eval.api.dependencies import get_langsmith_manager, get_manager
+    from agent_eval.api.routers.datasets import _set_dataset_type
+
+    ls_mgr = await get_langsmith_manager()
+    try:
+        cases = await ls_mgr.pull_external_dataset(req.source_dataset, limit=req.limit)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LangSmith API error: {e}") from e
+
+    if req.target_dataset and cases:
+        lf_mgr = await get_manager()
+        try:
+            # 写回前确保目标库在 Langfuse 存在（幂等 upsert），并复位本地
+            # dataset_metadata：status=active（万一目标曾被软删除则复活它）+
+            # 落 dataset_type 行（否则新名会落到 DEFAULT_DATASET_TYPE 被分错页）。
+            await lf_mgr.create_dataset(
+                req.target_dataset, description=f"Pulled from {req.source_dataset}"
+            )
+            await _set_dataset_type(req.target_dataset, "candidate")
+            await lf_mgr.add_cases_batch(req.target_dataset, cases, split=req.split)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Langfuse write error: {e}") from e
+
     return {
         "pulled": len(cases),
         "saved_to": req.target_dataset,

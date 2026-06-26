@@ -5,6 +5,10 @@ from typing import Any
 from agent_eval.config_service import config_service
 from agent_eval.data.case_generator import CaseGenerator
 from agent_eval.data.dataset_manager import DatasetManager
+from agent_eval.data.langfuse_provider import (
+    LangfuseDatasetProvider,
+    build_langfuse_client,
+)
 from agent_eval.data.langsmith_provider import LangSmithDatasetProvider
 from agent_eval.data.trace_extractor import TraceExtractor
 
@@ -21,13 +25,27 @@ async def _get_langsmith_kwargs() -> dict[str, Any]:
     return kwargs
 
 
-async def get_provider() -> LangSmithDatasetProvider:
-    kwargs = await _get_langsmith_kwargs()
-    return LangSmithDatasetProvider(**kwargs)
+async def get_provider() -> LangfuseDatasetProvider:
+    # Dataset storage now lives in the self-hosted Langfuse instance (the
+    # LangSmith cloud creds are dead — see migration). The LangSmith provider
+    # is kept only for the external-import paths (get_langsmith_manager).
+    client = await build_langfuse_client()
+    return LangfuseDatasetProvider(client)
 
 
 async def get_manager() -> DatasetManager:
     return DatasetManager(provider=await get_provider())
+
+
+async def get_langsmith_provider() -> LangSmithDatasetProvider:
+    # LangSmith-backed provider — ONLY for external-dataset import features
+    # (pull_external_dataset / import-langsmith). Default storage is Langfuse.
+    kwargs = await _get_langsmith_kwargs()
+    return LangSmithDatasetProvider(**kwargs)
+
+
+async def get_langsmith_manager() -> DatasetManager:
+    return DatasetManager(provider=await get_langsmith_provider())
 
 
 async def get_extractor() -> TraceExtractor:
