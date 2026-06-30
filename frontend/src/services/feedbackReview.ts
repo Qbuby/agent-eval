@@ -31,6 +31,7 @@ export interface SampleFeedbackDetail {
   overall: number | null
   scores: Record<string, number> // 维度→分
   comment: string | null
+  expected_answer: string | null // 评审人补写的期望答案（参考标准答案）
   created_at: string
   updated_at: string
 }
@@ -131,6 +132,7 @@ interface RawFeedback {
   overall: number | null
   scores: Record<string, number>
   comment: string | null
+  expected_answer: string | null
   created_at: string
   updated_at: string
 }
@@ -192,6 +194,7 @@ function mapFeedback(f: RawFeedback): SampleFeedbackDetail {
     overall: f.overall,
     scores: f.scores ?? {},
     comment: f.comment,
+    expected_answer: f.expected_answer,
     created_at: f.created_at,
     updated_at: f.updated_at,
   }

@@ -41,6 +41,10 @@ class TestCase(BaseModel):
     name: str
     description: str = ""
     tags: list[str] = []
+    # 受管单值类别名（多轮对话集用）。对齐基准测试集的受管类别：值是某个
+    # ConversationCategoryRow.name。存进 Langfuse item 的 metadata["category"]
+    # 做 round-trip（见 converter）。空=未分类。
+    category: str | None = None
     source: Literal["manual", "auto_generated", "failure_derived", "trace_derived", "external", "file_imported"] = "manual"
 
     input_messages: list[dict[str, Any]]

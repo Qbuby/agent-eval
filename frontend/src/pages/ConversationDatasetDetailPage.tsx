@@ -26,6 +26,7 @@ function emptyCase(): TestCase {
     input_messages: [{ role: 'user', content: '' }],
     conversation_goal: '',
     turn_expectations: [],
+    category: '',
   }
 }
 
@@ -41,6 +42,10 @@ export default function ConversationDatasetDetailPage() {
 
   const [page, setPage] = useState(1)
   const [search, setSearch] = useState('')
+  // 类别筛选（空串=全部）。经后端 category query 过滤，覆盖全量而非仅当前页。
+  const [categoryFilter, setCategoryFilter] = useState('')
+  const [showAddCategory, setShowAddCategory] = useState(false)
+  const [newCategoryName, setNewCategoryName] = useState('')
   const [editing, setEditing] = useState<TestCase | null>(null)
   const [isNew, setIsNew] = useState(false)
   const [viewing, setViewing] = useState<TestCase | null>(null)
@@ -51,6 +56,8 @@ export default function ConversationDatasetDetailPage() {
   // 两步式导入：选文件 → 预览（解析结果 + 新增/更新比对）→ 确认导入。
   const [importFile, setImportFile] = useState<File | null>(null)
   const [importPreview, setImportPreview] = useState<ConversationImportPreview | null>(null)
+  // 导入时为整批样例统一指定的类别（空串=不指定）。
+  const [importCategory, setImportCategory] = useState('')
 
   const pageSize = 20
 
@@ -61,10 +68,18 @@ export default function ConversationDatasetDetailPage() {
   })
 
   const { data: casesData, isLoading } = useQuery({
-    queryKey: ['conv-cases', name, page, search],
+    queryKey: ['conv-cases', name, page, search, categoryFilter],
     queryFn: () => datasetsApi.listCasesPaginated(name, {
       page, page_size: pageSize, search: search || undefined,
+      category: categoryFilter || undefined,
     }).then(r => r.data),
+    enabled: !!name,
+  })
+
+  // 受管类别列表（实体存 Postgres，对齐基准测试集）。下拉筛选 + 编辑 select 共用。
+  const { data: categories } = useQuery({
+    queryKey: ['conv-categories', name],
+    queryFn: () => datasetsApi.listConvCategories(name).then(r => r.data),
     enabled: !!name,
   })
 
@@ -75,6 +90,7 @@ export default function ConversationDatasetDetailPage() {
         : datasetsApi.updateCase(c.id!, c),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['conv-cases'] })
+      queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
       setEditing(null)
       toast.success(isNew ? '已添加对话样例' : '已保存')
     },
@@ -83,16 +99,19 @@ export default function ConversationDatasetDetailPage() {
 
   // 两步式导入第一步：预览解析结果（不写库）。
   const previewMutation = useMutation({
-    mutationFn: (file: File) => datasetsApi.previewConversations(name, file).then(r => r.data),
+    mutationFn: (file: File) =>
+      datasetsApi.previewConversations(name, file, { category: importCategory || undefined }).then(r => r.data),
     onSuccess: (data) => setImportPreview(data),
     onError: (e) => toast.error(toToastMessage(formatApiError(e)), '预览失败'),
   })
 
-  // 第二步：确认导入（按名 upsert，重复样例按最新导入更新字段）。
+  // 第二步：确认导入（按名 upsert，重复样例按最新导入更新字段）。整批可统一指定类别。
   const importMutation = useMutation({
-    mutationFn: (file: File) => datasetsApi.importConversations(name, file),
+    mutationFn: (file: File) =>
+      datasetsApi.importConversations(name, file, { category: importCategory || undefined }),
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['conv-cases'] })
+      queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
       closeImport()
       const d = res.data
       const parts: string[] = []
@@ -121,16 +140,53 @@ export default function ConversationDatasetDetailPage() {
     mutationFn: (ids: string[]) => datasetsApi.batchDeleteCases(ids),
     onSuccess: (_res, ids) => {
       queryClient.invalidateQueries({ queryKey: ['conv-cases'] })
+      queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
       setSelectedIds(new Set())
       toast.success(`已删除 ${ids.length} 条样例`)
     },
     onError: (e) => toast.error(toToastMessage(formatApiError(e)), '删除失败'),
   })
 
+  // ── 受管类别 CRUD（对齐基准测试集）──
+  const addCategoryMutation = useMutation({
+    mutationFn: (cat: string) => datasetsApi.createCategory(name, { name: cat }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
+      setShowAddCategory(false)
+      setNewCategoryName('')
+      toast.success('类别已新建')
+    },
+    onError: (e) => toast.error(toToastMessage(formatApiError(e)), '新建类别失败'),
+  })
+
+  const renameCategoryMutation = useMutation({
+    mutationFn: (args: { id: string; name: string }) =>
+      datasetsApi.updateCategory(args.id, { name: args.name }),
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
+      // 重命名会把样例的 metadata.category 批量同步成新名，需刷新样例列表。
+      queryClient.invalidateQueries({ queryKey: ['conv-cases'] })
+      const synced = res.data?.synced_cases
+      toast.success(synced ? `类别已重命名，同步 ${synced} 条样例` : '类别已重命名')
+    },
+    onError: (e) => toast.error(toToastMessage(formatApiError(e)), '重命名失败'),
+  })
+
+  const deleteCategoryMutation = useMutation({
+    mutationFn: (id: string) => datasetsApi.deleteCategory(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
+      if (categoryFilter) { setCategoryFilter(''); setPage(1) }
+      toast.success('类别已删除')
+    },
+    onError: (e) => toast.error(toToastMessage(formatApiError(e)), '删除类别失败'),
+  })
+
   function closeImport() {
     setShowImport(false)
     setImportFile(null)
     setImportPreview(null)
+    setImportCategory('')
     if (fileRef.current) fileRef.current.value = ''
   }
 
@@ -186,6 +242,43 @@ export default function ConversationDatasetDetailPage() {
           onChange={e => { setSearch(e.target.value); setPage(1) }}
           className="input-sm w-[240px]"
         />
+        <select
+          value={categoryFilter}
+          onChange={e => { setCategoryFilter(e.target.value); setPage(1) }}
+          className="input-sm w-[160px]"
+        >
+          <option value="">全部类别</option>
+          {(categories ?? []).map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+        </select>
+        {isAdmin && categoryFilter && (() => {
+          const cat = (categories ?? []).find(c => c.name === categoryFilter)
+          if (!cat) return null
+          return (
+            <>
+              <button
+                className="text-action text-[12px]"
+                onClick={() => {
+                  const next = window.prompt('重命名类别', cat.name)?.trim()
+                  if (next && next !== cat.name) renameCategoryMutation.mutate({ id: cat.id, name: next })
+                }}
+              >重命名</button>
+              <button
+                className="text-action-danger text-[12px]"
+                onClick={async () => {
+                  const ok = await confirm({
+                    title: '删除类别',
+                    description: '确定删除该类别？仅当类别下无样例时可删除。',
+                    confirmText: '删除', danger: true,
+                  })
+                  if (ok) deleteCategoryMutation.mutate(cat.id)
+                }}
+              >删除类别</button>
+            </>
+          )
+        })()}
+        {isAdmin && (
+          <button className="text-action text-[12px]" onClick={() => setShowAddCategory(true)}>+ 类别</button>
+        )}
         <div className="flex-1" />
         {isAdmin && selectedIds.size > 0 && (
           <Button
@@ -261,6 +354,7 @@ export default function ConversationDatasetDetailPage() {
               <th>名称</th>
               <th className="w-20 text-center">轮数</th>
               <th>会话目标</th>
+              {!categoryFilter && <th className="w-32">类别</th>}
               <th className="w-24 text-center">逐轮期望</th>
               <th className="w-28 text-right">操作</th>
             </tr>
@@ -290,6 +384,15 @@ export default function ConversationDatasetDetailPage() {
                   <td className="max-w-[320px]">
                     <div className="truncate text-text-secondary">{c.conversation_goal || '—'}</div>
                   </td>
+                  {!categoryFilter && (
+                    <td className="max-w-[160px]">
+                      {c.category ? (
+                        <span className="badge badge-neutral">{c.category}</span>
+                      ) : (
+                        <span className="text-text-tertiary">—</span>
+                      )}
+                    </td>
+                  )}
                   <td className="text-center text-text-secondary">
                     {c.turn_expectations?.length || 0}
                   </td>
@@ -308,6 +411,7 @@ export default function ConversationDatasetDetailPage() {
                           try {
                             await datasetsApi.deleteCase(c.id)
                             queryClient.invalidateQueries({ queryKey: ['conv-cases'] })
+      queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
                             toast.success('样例已删除')
                           } catch (err) {
                             toast.error(toToastMessage(formatApiError(err)), '删除失败')
@@ -395,6 +499,22 @@ export default function ConversationDatasetDetailPage() {
                 />
               </div>
             </div>
+            <div>
+              <label className="field-label">类别（可选）</label>
+              <select
+                value={editing.category || ''}
+                onChange={e => setEditing({ ...editing, category: e.target.value || null })}
+                className="input"
+              >
+                <option value="">不指定类别</option>
+                {(categories ?? []).map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+              </select>
+              {(categories ?? []).length === 0 && (
+                <p className="text-[11px] text-text-tertiary mt-1">
+                  还没有类别。先用工具栏「+ 类别」新建，再回来归类。
+                </p>
+              )}
+            </div>
             <ConversationEditor value={editing} onChange={setEditing} />
           </div>
         )}
@@ -446,6 +566,20 @@ export default function ConversationDatasetDetailPage() {
             <div>
               <label htmlFor={importFileId} className="field-label">选择文件</label>
               <input id={importFileId} ref={fileRef} type="file" accept=".csv,.json,.jsonl,.xlsx,.xls" className="text-[12px]" />
+            </div>
+            <div>
+              <label className="field-label">统一指定类别（可选）</label>
+              <select
+                value={importCategory}
+                onChange={e => setImportCategory(e.target.value)}
+                className="input"
+              >
+                <option value="">不指定类别</option>
+                {(categories ?? []).map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+              </select>
+              <p className="text-[11px] text-text-tertiary mt-1">
+                选中后，本次导入的全部样例统一归到该类别。需先在工具栏「+ 类别」建好类别。
+              </p>
             </div>
           </div>
         ) : (
@@ -504,6 +638,39 @@ export default function ConversationDatasetDetailPage() {
             </button>
           </div>
         )}
+      </Dialog>
+
+      {/* 新增类别 */}
+      <Dialog
+        open={showAddCategory}
+        onClose={() => { setShowAddCategory(false); setNewCategoryName('') }}
+        title="新增类别"
+        width={420}
+        footer={
+          <>
+            <Button variant="secondary" size="md" onClick={() => { setShowAddCategory(false); setNewCategoryName('') }}>取消</Button>
+            <Button
+              variant="primary"
+              size="md"
+              loading={addCategoryMutation.isPending}
+              disabled={!newCategoryName.trim()}
+              onClick={() => addCategoryMutation.mutate(newCategoryName.trim())}
+            >
+              创建
+            </Button>
+          </>
+        }
+      >
+        <div>
+          <label className="field-label">类别名称</label>
+          <input
+            value={newCategoryName}
+            onChange={e => setNewCategoryName(e.target.value)}
+            placeholder="如：故障诊断"
+            className="input"
+            autoFocus
+          />
+        </div>
       </Dialog>
     </div>
   )

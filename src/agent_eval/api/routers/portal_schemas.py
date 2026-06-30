@@ -33,6 +33,8 @@ class FeedbackPayload(BaseModel):
     overall: int | None = None
     scores: dict[str, Any] = Field(default_factory=dict)
     comment: str | None = None
+    # 评审人为该样例补写的「期望答案」（参考标准答案），用于回灌评估的 GroundTruth。
+    expected_answer: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -64,6 +66,8 @@ class SubmitFeedbackRequest(BaseModel):
     overall: int | None = Field(default=None, ge=1, le=5)
     scores: dict[str, Any] = Field(default_factory=dict)
     comment: str | None = None
+    # 评审人补写的期望答案（可选，自由文本/Markdown）。
+    expected_answer: str | None = None
 
 
 class PortalBatchProgress(BaseModel):

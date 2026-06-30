@@ -54,8 +54,27 @@ export const datasetsApi = {
   listCases(name: string, params?: { split?: string; tag?: string[]; as_of?: string; limit?: number }) {
     return api.get<TestCase[]>(`/datasets/${name}/cases`, { params })
   },
-  listCasesPaginated(name: string, params?: { page?: number; page_size?: number; search?: string; tag?: string }) {
+  listCasesPaginated(name: string, params?: { page?: number; page_size?: number; search?: string; tag?: string; category?: string }) {
     return api.get<{ items: TestCase[]; total: number; page: number; page_size: number }>(`/datasets/${name}/cases`, { params })
+  },
+  // ── 多轮对话集的受管类别（对齐基准测试集的类别 CRUD）──
+  // 后端：list/create 带 dataset name（作用域）；update/delete 用全局 category_id。
+  listConvCategories(name: string) {
+    return api.get<{ id: string; name: string; description: string | null; created_at: string }[]>(
+      `/datasets/${name}/categories`,
+    )
+  },
+  createCategory(name: string, data: { name: string; description?: string }) {
+    return api.post<{ id: string; name: string }>(`/datasets/${name}/categories`, data)
+  },
+  updateCategory(categoryId: string, data: { name?: string; description?: string }) {
+    return api.put<{ id: string; name: string; synced_cases: number }>(
+      `/datasets/categories/${categoryId}`,
+      data,
+    )
+  },
+  deleteCategory(categoryId: string) {
+    return api.delete(`/datasets/categories/${categoryId}`)
   },
   addCases(name: string, data: AddCasesRequest) {
     return api.post<{ added: number; ids: string[] }>(`/datasets/${name}/cases`, data)
@@ -63,7 +82,7 @@ export const datasetsApi = {
   importConversations(
     name: string,
     file: File,
-    opts?: { split?: string; messagesColumn?: string; goalColumn?: string },
+    opts?: { split?: string; messagesColumn?: string; goalColumn?: string; category?: string },
   ) {
     const form = new FormData()
     form.append('file', file)
@@ -71,6 +90,7 @@ export const datasetsApi = {
     if (opts?.split) params.split = opts.split
     if (opts?.messagesColumn) params.messages_column = opts.messagesColumn
     if (opts?.goalColumn) params.goal_column = opts.goalColumn
+    if (opts?.category) params.category = opts.category
     return api.post<{ added: number; updated: number; skipped: number; ids: string[] }>(
       `/datasets/${name}/cases/import-conversations`,
       form,
@@ -81,13 +101,14 @@ export const datasetsApi = {
   previewConversations(
     name: string,
     file: File,
-    opts?: { messagesColumn?: string; goalColumn?: string },
+    opts?: { messagesColumn?: string; goalColumn?: string; category?: string },
   ) {
     const form = new FormData()
     form.append('file', file)
     const params: Record<string, string> = {}
     if (opts?.messagesColumn) params.messages_column = opts.messagesColumn
     if (opts?.goalColumn) params.goal_column = opts.goalColumn
+    if (opts?.category) params.category = opts.category
     return api.post<ConversationImportPreview>(
       `/datasets/${name}/cases/import-conversations/preview`,
       form,

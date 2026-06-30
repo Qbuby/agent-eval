@@ -143,6 +143,7 @@ class SampleFeedbackDetail(BaseModel):
     overall: int | None = None
     scores: dict
     comment: str | None = None
+    expected_answer: str | None = None  # 评审人补写的期望答案（GroundTruth）
     created_at: str
     updated_at: str
 
@@ -405,6 +406,7 @@ async def get_sample_feedback(sample_id: uuid.UUID) -> SampleFeedbackResponse:
                 overall=fb.overall,
                 scores=fb.scores or {},
                 comment=fb.comment,
+                expected_answer=fb.expected_answer,
                 created_at=fb.created_at.isoformat(),
                 updated_at=fb.updated_at.isoformat(),
             )

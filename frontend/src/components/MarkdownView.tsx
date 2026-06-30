@@ -34,21 +34,32 @@ function preprocess(text: string): string {
   return out
 }
 
-// 图片渲染：外链图（如阿里云 OSS / 内部图床）可能 404 或被防盗链拦截，
-// 浏览器默认显示「破图」图标 + alt 文本，既难看又看不出是哪张图。这里改为
-// 加载失败时降级成一个带 alt 描述的占位块，告诉评审者「这里本应有张图但没加载出来」。
+// 图片渲染：外链图（阿里云 OSS / 内网图床）浏览器 <img> 直连取不到——
+//   * OSS 配了 Referer 防盗链：浏览器自带 Referer → 403；
+//   * 内网图床：浏览器所在网络解析/可达不稳定。
+// 故把 src 改写成走后端代理 /api/img-proxy（服务端不带 Referer 拉图、部署环境
+// 可达内网）。非 http(s) 的 src（如 data: URI）原样透传，不绕代理。
+// 仍保留 onError 降级占位：代理也取不到（真 404 / 不在白名单）时告诉评审者
+// 「这里本应有张图但没加载出来」，附原始 URL 便于排查。
+function toProxyUrl(src: string): string {
+  if (!/^https?:\/\//i.test(src)) return src
+  return `/api/img-proxy?url=${encodeURIComponent(src)}`
+}
+
 function MarkdownImage(props: ImgHTMLAttributes<HTMLImageElement>) {
   const [failed, setFailed] = useState(false)
-  const { src, alt } = props
+  const { src, alt, ...rest } = props
+  const rawSrc = typeof src === 'string' ? src : undefined
   if (failed) {
     return (
-      <span className="md-img-fallback" title={typeof src === 'string' ? src : undefined}>
+      <span className="md-img-fallback" title={rawSrc}>
         🖼️ 图片未能加载{alt ? `：${alt}` : ''}
       </span>
     )
   }
+  const proxied = rawSrc ? toProxyUrl(rawSrc) : rawSrc
   // eslint-disable-next-line jsx-a11y/alt-text
-  return <img loading="lazy" decoding="async" {...props} onError={() => setFailed(true)} />
+  return <img loading="lazy" decoding="async" {...rest} alt={alt} src={proxied} onError={() => setFailed(true)} />
 }
 
 export default function MarkdownView({

@@ -339,6 +339,29 @@ class DatasetMetadataRow(Base, TenantMixin):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ConversationCategoryRow(Base, TenantMixin):
+    """多轮对话集的受管类别（对齐基准测试集 CategoryRow，但作用域是 dataset_name）。
+
+    对话样例的真身存在 Langfuse（Postgres 没有对话 case 表），无法像 benchmark 那样
+    用外键 category_id 关联。故此表只承载受管实体（列出/新建/重命名/删除/唯一性），
+    样例→类别的归属以**类别名字符串**存进 Langfuse item 的 ``metadata["category"]``
+    （见 converter.case_to_example）。重命名类别时旧样例的 metadata 字符串需一次性
+    批量同步（rename 端点负责），与 candidate→benchmark promote 的按名同步同类。
+    """
+    __tablename__ = "conversation_categories"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    # 作用域锚点：对话集没有 project 概念，dataset_name 才是边界（对齐 DatasetMetadataRow）。
+    dataset_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("dataset_name", "name", name="uq_conv_category_dataset_name"),
+    )
+
+
 class AuditLogRow(Base, TenantMixin):
     __tablename__ = "audit_logs"
 
@@ -720,6 +743,9 @@ class SampleFeedbackRow(Base, TenantMixin):
     # 维度→分，如 {relevance, difficulty, answer_accuracy}
     scores: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     comment: Mapped[str | None] = mapped_column(Text)
+    # 评审人为该样例填写的「期望答案」（参考答案/标准答案）。与打分同属评审产出，
+    # 故并入本表复用 (sample_id, rated_by) upsert：每位评审各存一份，随样例带出。
+    expected_answer: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

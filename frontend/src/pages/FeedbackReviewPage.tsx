@@ -12,6 +12,18 @@ import type {
 
 const SAMPLE_PAGE_SIZE = 20
 
+// 维度 key → 中文标签。与 portal 评审页 SCORE_DIMENSIONS 对齐；
+// 未知 key 回退原文，保证新增维度也能显示。
+const DIMENSION_LABELS: Record<string, string> = {
+  relevance: '相关性',
+  difficulty: '难度',
+  answer_accuracy: '答案准确性',
+}
+
+function dimLabel(key: string): string {
+  return DIMENSION_LABELS[key] ?? key
+}
+
 function fmtScore(v: number | null | undefined): string {
   return v == null ? '—' : v.toFixed(2)
 }
@@ -421,29 +433,56 @@ function SampleFeedbackDrawer({
 function FeedbackCard({ feedback }: { feedback: SampleFeedbackDetail }) {
   const scoreEntries = Object.entries(feedback.scores ?? {})
   return (
-    <div className="border border-border rounded-md p-3 animate-fade-in">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-[12px] font-medium text-text-primary">
-          {feedback.rated_by_name ?? '匿名'}
-        </span>
-        <span className="flex items-center gap-2">
-          <span className="text-[11px] text-text-tertiary">总体</span>
-          <span className={`font-mono font-medium tabular-nums ${scoreClass(feedback.overall)}`}>
-            {feedback.overall == null ? '—' : `${feedback.overall} / 5`}
+    <div className="border border-border rounded-lg p-3.5 bg-surface animate-fade-in">
+      {/* 头部：评价人 + 总体分 */}
+      <div className="flex items-center justify-between gap-2 mb-2.5">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-accent/10 text-accent text-[11px] font-medium shrink-0">
+            {(feedback.rated_by_name ?? '匿')[0]}
           </span>
+          <span className="text-[13px] font-medium text-text-primary truncate">
+            {feedback.rated_by_name ?? '匿名'}
+          </span>
+        </div>
+        <span className="flex items-baseline gap-1 shrink-0">
+          <span className="text-[11px] text-text-tertiary">总体</span>
+          <span className={`font-mono font-semibold tabular-nums text-[15px] ${scoreClass(feedback.overall)}`}>
+            {feedback.overall == null ? '—' : feedback.overall}
+          </span>
+          <span className="text-[11px] text-text-tertiary">/ 5</span>
         </span>
       </div>
+
+      {/* 维度分：中文标签 + 星档，整齐排列 */}
       {scoreEntries.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-2">
+        <div className="flex flex-wrap gap-x-4 gap-y-1.5 mb-2.5">
           {scoreEntries.map(([dim, val]) => (
-            <span key={dim} className="badge badge-neutral font-mono">
-              {dim}: {val}
+            <span key={dim} className="inline-flex items-center gap-1.5 text-[12px]">
+              <span className="text-text-tertiary">{dimLabel(dim)}</span>
+              <span className="text-warning tracking-tight" aria-hidden>
+                {'★'.repeat(Math.max(0, Math.min(5, Number(val) || 0)))}
+                <span className="text-text-tertiary/40">
+                  {'★'.repeat(Math.max(0, 5 - (Number(val) || 0)))}
+                </span>
+              </span>
+              <span className="font-mono tabular-nums text-text-secondary">{val}</span>
             </span>
           ))}
         </div>
       )}
+
+      {/* 期望答案：评审人补写的参考标准答案 */}
+      {feedback.expected_answer && (
+        <div className="mb-2.5">
+          <div className="text-[11px] font-medium text-text-tertiary mb-1">期望答案</div>
+          <div className="rounded-md bg-accent/[0.04] border border-accent/15 p-2.5 text-[12px]">
+            <MarkdownView text={feedback.expected_answer} />
+          </div>
+        </div>
+      )}
+
       {feedback.comment && (
-        <div className="text-[12px] text-text-secondary whitespace-pre-wrap break-words">
+        <div className="text-[12px] text-text-secondary whitespace-pre-wrap break-words border-t border-separator pt-2">
           {feedback.comment}
         </div>
       )}

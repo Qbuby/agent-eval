@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from pydantic import BaseModel
+from sqlalchemy import func, select
 
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
@@ -18,6 +20,8 @@ from agent_eval.data.benchmark_import import (
 )
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.data.schemas import validate_and_parse
+from agent_eval.db import async_session_factory
+from agent_eval.db_models.tables import ConversationCategoryRow
 from agent_eval.governance.helpers import log_audit
 from agent_eval.models.test_case import TestCase, TurnExpectation
 
@@ -34,6 +38,7 @@ async def list_cases(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     search: str | None = Query(None, description="按 name/description 模糊搜索"),
+    category: str | None = Query(None, description="按受管类别名精确过滤（多轮对话集）"),
     mgr: DatasetManager = Depends(get_manager),
 ):
     as_of_dt = datetime.fromisoformat(as_of) if as_of else None
@@ -51,6 +56,11 @@ async def list_cases(
             c for c in cases
             if search_lower in c.name.lower() or search_lower in (c.description or "").lower()
         ]
+
+    # 受管类别过滤：与 search/tag 同构（全量 load + 内存 filter）。category 存在
+    # case.category（→ Langfuse item metadata["category"]，见 converter）。
+    if category:
+        cases = [c for c in cases if (c.category or "") == category]
 
     total = len(cases)
     start = (page - 1) * page_size
@@ -127,6 +137,7 @@ async def _parse_conversation_cases(
     *,
     messages_column: str | None,
     goal_column: str | None,
+    category: str | None = None,
 ) -> tuple[list[TestCase], int]:
     """文件字节 → (对话 TestCase 列表, 跳过行数)。preview 与 import 共用。
 
@@ -163,6 +174,7 @@ async def _parse_conversation_cases(
             input_messages=conv.input_messages,
             conversation_goal=conv.conversation_goal,
             turn_expectations=[TurnExpectation(**te) for te in conv.turn_expectations],
+            category=category or None,
         ))
     return cases, skipped
 
@@ -173,6 +185,7 @@ async def preview_conversations(
     file: UploadFile = File(...),
     messages_column: str | None = Query(None, description="手动指定消息列（覆盖自动识别）"),
     goal_column: str | None = Query(None, description="手动指定对话目标列（覆盖自动识别）"),
+    category: str | None = Query(None, description="为整批导入样例统一指定类别"),
     mgr: DatasetManager = Depends(get_manager),
 ):
     """解析上传文件但不写库，返回解析结果预览 + 与现有同名样例的新增/更新比对。
@@ -183,7 +196,8 @@ async def preview_conversations(
     content = await file.read()
     filename = file.filename or "unknown"
     cases, skipped = await _parse_conversation_cases(
-        content, filename, messages_column=messages_column, goal_column=goal_column
+        content, filename, messages_column=messages_column, goal_column=goal_column,
+        category=category,
     )
 
     # 与现有同名样例比对：命中→update，否则→new（按名 upsert 的预演）。
@@ -229,6 +243,7 @@ async def import_conversations(
     split: str | None = Query(None),
     messages_column: str | None = Query(None, description="手动指定消息列（覆盖自动识别）"),
     goal_column: str | None = Query(None, description="手动指定对话目标列（覆盖自动识别）"),
+    category: str | None = Query(None, description="为整批导入样例统一指定类别"),
     mgr: DatasetManager = Depends(get_manager),
 ):
     """从 CSV / JSON / JSONL / XLSX 文件批量导入多轮对话样例到数据集。
@@ -239,7 +254,8 @@ async def import_conversations(
     content = await file.read()
     filename = file.filename or "unknown"
     cases, skipped = await _parse_conversation_cases(
-        content, filename, messages_column=messages_column, goal_column=goal_column
+        content, filename, messages_column=messages_column, goal_column=goal_column,
+        category=category,
     )
 
     if not cases:
@@ -354,3 +370,167 @@ async def export_conversations(
     return build_export_response(
         rows, columns, format, f"conversations_{_ascii_slug(name)}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 多轮对话集的受管类别（对齐基准测试集 CategoryRow CRUD，作用域 = dataset_name）。
+#
+# 实体存 Postgres（conversation_categories），样例→类别归属以类别名字符串存进
+# Langfuse item 的 metadata["category"]（见 converter）。故：
+#   * 删除前先 load_cases 统计该类别下样例数，>0 拒删（409），与基准一致。
+#   * 重命名时把旧名样例的 metadata.category 批量改写成新名（无外键级联，手动同步）。
+# 这两步都要遍历 Langfuse items，成本与现有 list/导出同量级（本就全量 load）。
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class CreateConvCategoryRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+class UpdateConvCategoryRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+
+
+def _conv_cat_dict(row: ConversationCategoryRow) -> dict:
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "description": row.description,
+        "created_at": row.created_at,
+    }
+
+
+@router.get("/api/datasets/{name}/categories")
+async def list_conv_categories(name: str):
+    """列出某对话集下的全部受管类别（按 name 排序）。"""
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(ConversationCategoryRow)
+            .where(ConversationCategoryRow.dataset_name == name)
+            .order_by(ConversationCategoryRow.name)
+        )
+        return [_conv_cat_dict(r) for r in result.scalars().all()]
+
+
+@router.post("/api/datasets/{name}/categories", dependencies=[Depends(require_role(ROLE_ADMIN))])
+async def create_conv_category(name: str, req: CreateConvCategoryRequest):
+    """新建类别。幂等：同 (dataset_name, name) 已存在则直接返回现有行。"""
+    cat_name = (req.name or "").strip()
+    if not cat_name:
+        raise HTTPException(status_code=400, detail="类别名不能为空")
+    async with async_session_factory() as session:
+        existing = await session.execute(
+            select(ConversationCategoryRow).where(
+                ConversationCategoryRow.dataset_name == name,
+                ConversationCategoryRow.name == cat_name,
+            )
+        )
+        row = existing.scalar_one_or_none()
+        if row is not None:
+            return _conv_cat_dict(row)
+        row = ConversationCategoryRow(
+            dataset_name=name, name=cat_name, description=req.description or None
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    await log_audit("conversation_category", str(row.id), "create", details={"dataset": name, "name": cat_name})
+    return _conv_cat_dict(row)
+
+
+@router.put("/api/datasets/categories/{category_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
+async def update_conv_category(
+    category_id: str,
+    req: UpdateConvCategoryRequest,
+    mgr: DatasetManager = Depends(get_manager),
+):
+    """重命名 / 改描述。重命名时把该类别下样例的 metadata.category 批量同步成新名。"""
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(ConversationCategoryRow).where(ConversationCategoryRow.id == category_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Category not found")
+
+        old_name = row.name
+        dataset_name = row.dataset_name
+        new_name = (req.name or "").strip() if req.name is not None else None
+
+        if new_name and new_name != old_name:
+            # 唯一性预检（DB 也有唯一约束兜底，这里给出友好报错）。
+            dup = await session.execute(
+                select(ConversationCategoryRow).where(
+                    ConversationCategoryRow.dataset_name == dataset_name,
+                    ConversationCategoryRow.name == new_name,
+                )
+            )
+            if dup.scalar_one_or_none() is not None:
+                raise HTTPException(status_code=409, detail=f"类别名「{new_name}」已存在")
+            row.name = new_name
+        if req.description is not None:
+            row.description = req.description or None
+        await session.commit()
+        await session.refresh(row)
+        renamed = bool(new_name and new_name != old_name)
+
+    # 把旧名样例的 metadata.category 批量改写为新名（无外键，手动同步）。
+    synced = 0
+    if renamed:
+        try:
+            cases = await mgr.load_cases(dataset_name)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"读取样例失败，类别已改名但样例未同步：{e}") from e
+        for c in cases:
+            if c.category == old_name:
+                c.category = new_name
+                try:
+                    await mgr.update_case(c.id, c)
+                    synced += 1
+                except Exception:
+                    # 单条同步失败不阻断整体；返回 synced 计数供前端提示。
+                    pass
+    await log_audit(
+        "conversation_category", category_id, "update",
+        details={"dataset": dataset_name, "renamed": renamed, "synced_cases": synced},
+    )
+    return {**_conv_cat_dict(row), "synced_cases": synced}
+
+
+@router.delete("/api/datasets/categories/{category_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
+async def delete_conv_category(category_id: str, mgr: DatasetManager = Depends(get_manager)):
+    """删除类别。保护性拒删：该类别下仍有样例则 409，要求先移除/改类。"""
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(ConversationCategoryRow).where(ConversationCategoryRow.id == category_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Category not found")
+        dataset_name = row.dataset_name
+        cat_name = row.name
+
+    # 引用保护：统计该类别下的样例（按 metadata.category 名匹配）。
+    try:
+        cases = await mgr.load_cases(dataset_name)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"读取样例失败：{e}") from e
+    in_use = sum(1 for c in cases if c.category == cat_name)
+    if in_use > 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"无法删除：类别「{cat_name}」下还有 {in_use} 条样例，请先移除或改类。",
+        )
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(ConversationCategoryRow).where(ConversationCategoryRow.id == category_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is not None:
+            await session.delete(row)
+            await session.commit()
+    await log_audit("conversation_category", category_id, "delete", details={"dataset": dataset_name, "name": cat_name})
+    return {"deleted": category_id}

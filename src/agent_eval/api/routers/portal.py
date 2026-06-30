@@ -467,6 +467,7 @@ async def list_samples(
                             overall=fb.overall,
                             scores=fb.scores or {},
                             comment=fb.comment,
+                            expected_answer=fb.expected_answer,
                             created_at=fb.created_at,
                             updated_at=fb.updated_at,
                         )
@@ -516,12 +517,14 @@ async def submit_feedback(
                 overall=req.overall,
                 scores=req.scores or {},
                 comment=req.comment,
+                expected_answer=req.expected_answer,
             )
             session.add(feedback)
         else:
             feedback.overall = req.overall
             feedback.scores = req.scores or {}
             feedback.comment = req.comment
+            feedback.expected_answer = req.expected_answer
 
         await session.commit()
         await session.refresh(feedback)
@@ -531,6 +534,7 @@ async def submit_feedback(
             overall=feedback.overall,
             scores=feedback.scores or {},
             comment=feedback.comment,
+            expected_answer=feedback.expected_answer,
             created_at=feedback.created_at,
             updated_at=feedback.updated_at,
         )

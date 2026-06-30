@@ -10,7 +10,7 @@ from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
     admin, admin_entry_codes, admin_tenants, auth, benchmark, candidates, cases, config,
     datasets, evaluation, evaluator_providers, feedback_review, generate, governance,
-    langfuse_metrics, portal, projects, routing, scheduler, traces,
+    img_proxy, langfuse_metrics, portal, projects, routing, scheduler, traces,
 )
 from agent_eval.config import settings
 from agent_eval.logging_config import setup_logging
@@ -124,6 +124,7 @@ def create_app() -> FastAPI:
     app.include_router(portal.router)
     app.include_router(feedback_review.router)
     app.include_router(langfuse_metrics.router)
+    app.include_router(img_proxy.router)
 
     @app.get("/health")
     async def health():

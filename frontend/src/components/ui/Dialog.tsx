@@ -84,11 +84,11 @@ export function Dialog({
         aria-labelledby={title ? titleId : undefined}
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
-        className="relative bg-bg-elevated rounded-2xl shadow-xl border border-border/60 animate-dialog-in outline-none"
-        style={{ width: `min(${width}px, calc(100vw - 32px))` }}
+        className="relative flex flex-col bg-bg-elevated rounded-2xl shadow-xl border border-border/60 animate-dialog-in outline-none"
+        style={{ width: `min(${width}px, calc(100vw - 32px))`, maxHeight: 'calc(100vh - 32px)' }}
       >
         {(title || description) && (
-          <div className="px-6 pt-5 pb-3">
+          <div className="px-6 pt-5 pb-3 shrink-0">
             {title && (
               <div id={titleId} className="text-[17px] font-display font-semibold tracking-[-0.4px] text-text-primary">{title}</div>
             )}
@@ -99,9 +99,10 @@ export function Dialog({
             )}
           </div>
         )}
-        {children && <div className="px-6 pb-3 text-[13px] text-text-secondary">{children}</div>}
+        {/* 主体可滚动：长内容（如多轮对话查看）超高时此区域内部滚动，标题/footer 固定 */}
+        {children && <div className="px-6 pb-3 text-[13px] text-text-secondary overflow-y-auto min-h-0 flex-1">{children}</div>}
         {footer && (
-          <div className="flex items-center justify-end gap-2 px-6 pb-5 pt-2">{footer}</div>
+          <div className="flex items-center justify-end gap-2 px-6 pb-5 pt-2 shrink-0">{footer}</div>
         )}
       </div>
     </div>,

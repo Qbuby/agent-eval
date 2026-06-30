@@ -22,38 +22,69 @@ import { formatApiError, toToastMessage } from '@/lib/errors'
 
 const PAGE_SIZE = 50 // 导航一页装更多条（只渲染摘要，开销低），减少翻页
 
+// 各档评分的语义标签（hover / 选中时提示，降低打分心智负担）。
+const SCORE_LABELS = ['', '很差', '较差', '一般', '良好', '优秀'] as const
+
 // 1-5 星形打分控件（也用于维度分）。0/null = 未评。
+// 支持 hover 预览（悬停高亮到该星并显示档位文案）+ 较大点击区，提升易用性。
 function StarRating({
   value,
   onChange,
   ariaLabel,
+  size = 'md',
+  showLabel = false,
 }: {
   value: number | null
   onChange: (v: number) => void
   ariaLabel: string
+  size?: 'md' | 'lg'
+  showLabel?: boolean
 }) {
+  const [hover, setHover] = useState<number | null>(null)
+  // 显示值：hover 时预览 hover 档，否则用已选值。
+  const shown = hover ?? value
+  const starCls = size === 'lg' ? 'text-[26px] w-7' : 'text-[20px] w-[22px]'
+
   return (
-    <div className="inline-flex items-center gap-0.5" role="radiogroup" aria-label={ariaLabel}>
-      {[1, 2, 3, 4, 5].map((n) => {
-        const active = value != null && n <= value
-        return (
-          <button
-            key={n}
-            type="button"
-            role="radio"
-            aria-checked={value === n}
-            aria-label={`${n} 分`}
-            onClick={() => onChange(n)}
-            className={`text-[18px] leading-none transition-colors ${
-              active ? 'text-warning' : 'text-text-tertiary hover:text-text-secondary'
-            }`}
-          >
-            {active ? '★' : '☆'}
-          </button>
+    <div className="inline-flex items-center gap-1.5">
+      <div
+        className="inline-flex items-center"
+        role="radiogroup"
+        aria-label={ariaLabel}
+        onMouseLeave={() => setHover(null)}
+      >
+        {[1, 2, 3, 4, 5].map((n) => {
+          const active = shown != null && n <= shown
+          return (
+            <button
+              key={n}
+              type="button"
+              role="radio"
+              aria-checked={value === n}
+              aria-label={`${n} 分（${SCORE_LABELS[n]}）`}
+              onMouseEnter={() => setHover(n)}
+              onClick={() => onChange(n)}
+              className={`${starCls} text-center leading-none transition-transform duration-100 hover:scale-110 ${
+                active ? 'text-warning' : 'text-text-tertiary/50 hover:text-warning/60'
+              }`}
+            >
+              {active ? '★' : '☆'}
+            </button>
+          )
+        })}
+      </div>
+      {showLabel ? (
+        <span
+          className={`min-w-[28px] text-[12px] tabular-nums transition-colors ${
+            shown != null ? 'text-text-secondary' : 'text-text-tertiary/60'
+          }`}
+        >
+          {shown != null ? SCORE_LABELS[shown] : '未评'}
+        </span>
+      ) : (
+        shown != null && (
+          <span className="min-w-[24px] text-[11px] tabular-nums text-text-tertiary">{shown}/5</span>
         )
-      })}
-      {value != null && (
-        <span className="ml-1.5 text-[11px] tabular-nums text-text-tertiary">{value}/5</span>
       )}
     </div>
   )
@@ -74,6 +105,7 @@ function SampleDetail({ sample }: { sample: PortalSample }) {
   const [overall, setOverall] = useState<number | null>(initial?.overall ?? null)
   const [scores, setScores] = useState<Record<string, number>>(initial?.scores ?? {})
   const [comment, setComment] = useState(initial?.comment ?? '')
+  const [expectedAnswer, setExpectedAnswer] = useState(initial?.expected_answer ?? '')
 
   const submitMutation = useMutation({
     mutationFn: (data: FeedbackPayload) => portalApi.submitFeedback(sample.id, data),
@@ -112,6 +144,25 @@ function SampleDetail({ sample }: { sample: PortalSample }) {
           <MarkdownView text={sample.answer} />
         </div>
 
+        {/* 期望答案：评审人补写的参考标准答案，作为回灌评估的 GroundTruth。
+            放在滚动区内（可长文本编辑），与打分一同提交。 */}
+        <div className="mb-5">
+          <label className="field-label" htmlFor={`expected-${sample.id}`}>
+            期望答案
+            <span className="ml-1.5 font-normal text-text-tertiary">
+              （评审人补写的参考标准答案，可选）
+            </span>
+          </label>
+          <textarea
+            id={`expected-${sample.id}`}
+            value={expectedAnswer}
+            onChange={(e) => setExpectedAnswer(e.target.value)}
+            placeholder="填写你认为该问题应有的标准答案，支持 Markdown。将作为评估的参考答案。"
+            rows={4}
+            className="input w-full resize-y font-mono text-[13px]"
+          />
+        </div>
+
         {extraEntries.length > 0 && (
           <details className="text-[12px] mb-2">
             <summary className="cursor-pointer text-text-tertiary hover:text-text-secondary">
@@ -131,23 +182,33 @@ function SampleDetail({ sample }: { sample: PortalSample }) {
 
       {/* 常驻打分区：固定在详情区底部，答案再长也不用滚到底 */}
       <div className="shrink-0 border-t border-border bg-surface pt-4 mt-2">
-        <div className="flex flex-wrap items-start gap-x-6 gap-y-3">
-          <div className="flex items-center gap-3">
-            <span className="field-label !mb-0 min-w-[64px]">总体评分</span>
-            <StarRating value={overall} onChange={setOverall} ariaLabel="总体评分" />
+        {/* 评分面板：浅色底分组，所有行「标签 + 星」左对齐、标签等宽，纵向对齐整齐。 */}
+        <div className="rounded-lg border border-border bg-fill/[0.03] px-4 py-3 mb-3">
+          {/* 总体评分：大星 + 档位文案，作为主评分突出 */}
+          <div className="flex items-center gap-3 pb-2.5 mb-2.5 border-b border-separator">
+            <span className="w-[72px] shrink-0 text-[13px] font-medium text-text-primary">
+              总体评分
+            </span>
+            <StarRating value={overall} onChange={setOverall} ariaLabel="总体评分" size="lg" showLabel />
           </div>
-          {SCORE_DIMENSIONS.map((dim) => (
-            <div key={dim.key} className="flex items-center gap-3">
-              <span className="field-label !mb-0 min-w-[64px]">{dim.label}</span>
-              <StarRating
-                value={scores[dim.key] ?? null}
-                onChange={(v) => setScores((prev) => ({ ...prev, [dim.key]: v }))}
-                ariaLabel={dim.label}
-              />
-            </div>
-          ))}
+
+          {/* 维度分：每行标签等宽 + 星左对齐，三行纵向对齐 */}
+          <div className="flex flex-col gap-1.5">
+            {SCORE_DIMENSIONS.map((dim) => (
+              <div key={dim.key} className="flex items-center gap-3">
+                <span className="w-[72px] shrink-0 text-[12px] text-text-secondary">{dim.label}</span>
+                <StarRating
+                  value={scores[dim.key] ?? null}
+                  onChange={(v) => setScores((prev) => ({ ...prev, [dim.key]: v }))}
+                  ariaLabel={dim.label}
+                  showLabel
+                />
+              </div>
+            ))}
+          </div>
         </div>
-        <div className="mt-3 flex items-end gap-3">
+
+        <div className="flex items-end gap-3">
           <div className="flex-1">
             <label className="field-label">意见反馈</label>
             <textarea
@@ -167,6 +228,7 @@ function SampleDetail({ sample }: { sample: PortalSample }) {
                 overall,
                 scores,
                 comment: comment.trim() || null,
+                expected_answer: expectedAnswer.trim() || null,
               })
             }
           >
@@ -225,10 +287,29 @@ export default function PortalBatchDetailPage() {
           ← 返回批次列表
         </Link>
         <h1 className="page-title mt-2">样例评审</h1>
-        <p className="page-subtitle">
-          共 {total} 条 · 本页已评 {reviewedCount}/{items.length} · 逐条打分（1-5）并填写意见
-          {isFetching && !isLoading && <span className="ml-2 text-text-tertiary">刷新中…</span>}
-        </p>
+        <div className="flex items-center gap-3 mt-1">
+          <p className="page-subtitle !mb-0">
+            共 {total} 条 · 逐条打分（1-5）并填写意见
+            {isFetching && !isLoading && <span className="ml-2 text-text-tertiary">刷新中…</span>}
+          </p>
+          {/* 本页评审进度：用带色徽标突出，全未评时给醒目引导 */}
+          {items.length > 0 && (
+            reviewedCount === 0 ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-warning/10 px-2.5 py-0.5 text-[12px] font-medium text-warning">
+                <span className="w-1.5 h-1.5 rounded-full bg-warning" />
+                本页 {items.length} 条均未评 · 从左侧第一条开始
+              </span>
+            ) : reviewedCount < items.length ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-accent/10 px-2.5 py-0.5 text-[12px] font-medium text-accent">
+                本页已评 {reviewedCount}/{items.length}
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-positive/10 px-2.5 py-0.5 text-[12px] font-medium text-positive">
+                ✓ 本页已全部评完（{items.length}）
+              </span>
+            )
+          )}
+        </div>
       </header>
 
       {isLoading ? (

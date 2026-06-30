@@ -48,6 +48,9 @@ def case_to_example(case: TestCase, split: str | None = None) -> dict[str, Any]:
     if case.conversation_goal or case.turn_expectations:
         metadata["case_type"] = "conversation"
         metadata["turn_count"] = len(case.input_messages)
+    # 受管单值类别（多轮对话集用）：存类别名字符串，空则不写。
+    if case.category:
+        metadata["category"] = case.category
     if case.name:
         metadata["name"] = case.name
     if case.description:
@@ -81,6 +84,7 @@ def example_to_test_case(example: Any) -> TestCase:
         name=meta.get("name", ""),
         description=meta.get("description", ""),
         tags=meta.get("tags", []),
+        category=meta.get("category"),
         source=meta.get("source", "manual"),
         input_messages=inputs.get("messages", []),
         agent_config_override=inputs.get("agent_config_override"),

@@ -72,6 +72,8 @@ class TestCaseInput(BaseModel):
     name: str
     description: str = ""
     tags: list[str] = []
+    # 受管单值类别名（多轮对话集用，对齐基准测试集的类别）。空=不指定。
+    category: str | None = None
     source: str = "manual"
     input_messages: list[dict[str, Any]]
     agent_config_override: dict[str, Any] | None = None

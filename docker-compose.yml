@@ -155,10 +155,14 @@ services:
     # judge / agent 调用走外网域名（如 kiro.aidong-ai.com），
     # 宿主 /etc/resolv.conf 在某些 Docker Desktop / WSL 环境下
     # 不会被容器继承，导致 "Temporary failure in name resolution"。
-    # 显式指定公共 DNS 兜底。
+    # 显式指定 DNS 兜底。
+    # ⚠️ 阿里云/腾讯 DNS 放最前：图片代理回源阿里云 OSS（*.aliyuncs.com），
+    # 8.8.8.8/1.1.1.1 在国内对 OSS 域名解析间歇性失败或解析到错误节点，
+    # 导致 img-proxy 偶发 502；国内 DNS 对 OSS 解析稳定。8.8.8.8 留作兜底。
     dns:
+      - 223.5.5.5
+      - 119.29.29.29
       - 8.8.8.8
-      - 1.1.1.1
     depends_on:
       postgres:
         condition: service_healthy

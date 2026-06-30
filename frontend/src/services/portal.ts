@@ -20,6 +20,8 @@ export interface SampleFeedback {
   // 维度分：relevance / difficulty / answer_accuracy，1-5
   scores: Record<string, number>
   comment: string | null
+  // 评审人补写的期望答案（参考标准答案），可回灌评估作 GroundTruth
+  expected_answer?: string | null
   updated_at?: string
 }
 
@@ -45,6 +47,7 @@ export interface FeedbackPayload {
   overall: number | null
   scores: Record<string, number>
   comment: string | null
+  expected_answer?: string | null
 }
 
 /** 外部客户仪表盘：单批次的评审进度（协作式 = 全队口径 + 本人口径）。 */

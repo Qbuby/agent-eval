@@ -73,6 +73,8 @@ export interface TestCase {
   name: string
   description?: string
   tags?: string[]
+  // 受管单值类别（对齐基准测试集）：类别名字符串，存进 Langfuse item metadata.category。
+  category?: string | null
   source?: string
   input_messages: Array<{ role: string; content: string }>
   agent_config_override?: Record<string, unknown>
