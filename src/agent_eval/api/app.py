@@ -8,8 +8,9 @@ from fastapi.responses import JSONResponse
 
 from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
-    auth, benchmark, candidates, cases, config, datasets, evaluation, generate,
-    governance, projects, routing, scheduler, traces,
+    admin, admin_entry_codes, admin_tenants, auth, benchmark, candidates, cases, config,
+    datasets, evaluation, evaluator_providers, feedback_review, generate, governance,
+    img_proxy, langfuse_metrics, portal, projects, routing, scheduler, traces,
 )
 from agent_eval.config import settings
 from agent_eval.logging_config import setup_logging
@@ -24,6 +25,7 @@ async def lifespan(app: FastAPI):
     from agent_eval.data.traces_warmer import get_warmer
     from agent_eval.db import close_db
     from agent_eval.evaluation.langfuse_runner import sweep_orphaned_runs
+    from agent_eval.langfuse_metrics.service import LangfuseMetricsService
     from agent_eval.scheduler.service import SchedulerService
 
     await config_service.init_defaults()
@@ -43,8 +45,13 @@ async def lifespan(app: FastAPI):
     warmer = get_warmer()
     await warmer.start()
 
+    lf_metrics = LangfuseMetricsService()
+    langfuse_metrics.set_service(lf_metrics)
+    await lf_metrics.start()
+
     yield
 
+    await lf_metrics.stop()
     await warmer.stop()
     await svc.stop()
     await close_db()
@@ -107,6 +114,17 @@ def create_app() -> FastAPI:
     app.include_router(routing.router)
     app.include_router(scheduler.router)
     app.include_router(evaluation.router)
+    app.include_router(evaluator_providers.router)
+    app.include_router(admin.router)
+    # 多租户 + 外部客户 Portal 三个新模块：admin 后台开户、客户 portal、内部反馈展示。
+    # 各 router 已自带 prefix 与角色门禁（admin_tenants/feedback_review 挂 require_role(ROLE_ADMIN)，
+    # portal 挂 get_current_user），此处仅接线注册。
+    app.include_router(admin_tenants.router)
+    app.include_router(admin_entry_codes.router)
+    app.include_router(portal.router)
+    app.include_router(feedback_review.router)
+    app.include_router(langfuse_metrics.router)
+    app.include_router(img_proxy.router)
 
     @app.get("/health")
     async def health():

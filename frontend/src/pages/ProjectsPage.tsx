@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
+import { Button, Dialog } from '@/components/ui'
 import { projectsApi, type Project } from '@/services/benchmark'
 
 export default function ProjectsPage() {
@@ -8,6 +9,9 @@ export default function ProjectsPage() {
   const [showCreate, setShowCreate] = useState(false)
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
+  const reactId = useId()
+  const nameId = `${reactId}-name`
+  const descId = `${reactId}-desc`
 
   const { data: projects, isLoading } = useQuery({
     queryKey: ['projects'],
@@ -26,23 +30,21 @@ export default function ProjectsPage() {
 
   return (
     <div>
-      <header className="mb-8">
-        <div className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary">management</div>
-        <h1 className="text-xl font-medium tracking-tight">基准测试集</h1>
+      <header className="mb-6">
+        <div className="page-eyebrow">管理</div>
+        <h1 className="page-title">基准测试集</h1>
+        <p className="page-subtitle">为不同业务场景管理可复用的评测项目</p>
       </header>
 
-      <div className="flex items-center gap-3 mb-6">
-        <button
-          onClick={() => setShowCreate(true)}
-          className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 active:scale-[0.97] transition-all"
-        >
-          + 新建项目
-        </button>
+      <div className="toolbar">
+        <Button onClick={() => setShowCreate(true)} variant="primary" size="md">
+          新建项目
+        </Button>
       </div>
 
       {isLoading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {[1, 2, 3].map(i => <div key={i} className="skeleton h-28 rounded-lg" />)}
+          {[1, 2, 3].map(i => <div key={i} className="skeleton h-32 rounded-xl" />)}
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -50,65 +52,73 @@ export default function ProjectsPage() {
             <Link
               key={p.id}
               to={`/benchmark/${p.id}`}
-              className="block p-5 bg-surface border border-border rounded-lg hover:-translate-y-0.5 hover:shadow-sm hover:border-accent/20 transition-all no-underline"
+              className="card p-5 transition-[transform,box-shadow,border-color] duration-200 ease-standard hover:-translate-y-0.5 hover:shadow-md hover:border-border-strong focus:outline-none focus-visible:shadow-focus no-underline"
             >
-              <div className="text-[14px] font-medium text-text-primary mb-1">{p.name}</div>
-              <div className="text-[11px] text-text-tertiary mb-3">{p.description || '无描述'}</div>
-              <div className="text-[10px] text-text-tertiary">
+              <div className="text-[15px] font-display font-semibold tracking-[-0.2px] text-text-primary mb-1 truncate">
+                {p.name}
+              </div>
+              <div className="text-[12px] text-text-secondary mb-4 line-clamp-2 min-h-[36px]">
+                {p.description || '无描述'}
+              </div>
+              <div className="text-[11px] text-text-tertiary">
                 创建于 {new Date(p.created_at).toLocaleDateString()}
               </div>
             </Link>
           ))}
           {projects?.length === 0 && (
-            <div className="col-span-full text-center py-12 border border-dashed border-border rounded-lg">
-              <div className="text-[14px] font-medium mb-1">暂无项目</div>
+            <div className="col-span-full card border-dashed empty-state">
+              <div className="text-[14px] font-medium text-text-primary mb-1">暂无项目</div>
               <div className="text-[12px] text-text-tertiary">创建一个项目来开始管理基准测试集</div>
             </div>
           )}
         </div>
       )}
 
-      {showCreate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setShowCreate(false)}>
-          <div className="bg-surface border border-border rounded-lg p-6 w-[400px] shadow-lg" onClick={e => e.stopPropagation()}>
-            <div className="flex justify-between items-center mb-5">
-              <h2 className="text-[14px] font-medium">新建项目</h2>
-              <button onClick={() => setShowCreate(false)} className="text-text-tertiary hover:text-text-primary text-lg">×</button>
-            </div>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">项目名称</label>
-                <input
-                  value={name}
-                  onChange={e => setName(e.target.value)}
-                  placeholder="e.g. ep-agent"
-                  className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] tracking-widest uppercase text-text-tertiary mb-1.5">描述</label>
-                <textarea
-                  value={description}
-                  onChange={e => setDescription(e.target.value)}
-                  placeholder="项目用途描述..."
-                  rows={3}
-                  className="w-full py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent resize-y transition-all"
-                />
-              </div>
-              <div className="flex gap-2 justify-end pt-2">
-                <button onClick={() => setShowCreate(false)} className="py-2 px-3.5 text-[11px] rounded-[6px] border border-border hover:bg-accent-subtle transition-all">取消</button>
-                <button
-                  onClick={() => createMutation.mutate()}
-                  disabled={!name.trim() || createMutation.isPending}
-                  className="py-2 px-3.5 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 disabled:opacity-40 transition-all"
-                >
-                  创建
-                </button>
-              </div>
-            </div>
+      <Dialog
+        open={showCreate}
+        onClose={() => setShowCreate(false)}
+        title="新建项目"
+        footer={
+          <>
+            <Button variant="secondary" size="md" onClick={() => setShowCreate(false)}>
+              取消
+            </Button>
+            <Button
+              variant="primary"
+              size="md"
+              onClick={() => createMutation.mutate()}
+              disabled={!name.trim() || createMutation.isPending}
+              loading={createMutation.isPending}
+            >
+              创建
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div>
+            <label htmlFor={nameId} className="field-label">项目名称</label>
+            <input
+              id={nameId}
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder="例如：ep-agent"
+              className="input"
+            />
+          </div>
+          <div>
+            <label htmlFor={descId} className="field-label">描述</label>
+            <textarea
+              id={descId}
+              value={description}
+              onChange={e => setDescription(e.target.value)}
+              placeholder="项目用途描述…"
+              rows={3}
+              className="input resize-y"
+            />
           </div>
         </div>
-      )}
+      </Dialog>
     </div>
   )
 }

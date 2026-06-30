@@ -15,66 +15,190 @@ from agent_eval.db_models.tables import SystemConfigRow
 
 SENSITIVE_PREFIXES = ("auth.", "db.")
 
+
+# ─── Storage shape ──────────────────────────────────────────────────────────
+# A config row's `value` JSONB is now an "options bag":
+#   {"options": [{"value": <any>, "label": <str|null>}, ...], "default_index": 0}
+#
+# - Backwards compatible read: rows still in {"v": x} legacy shape are
+#   translated to single-option on the fly. They get rewritten to the new
+#   shape on the next set/add.
+# - Single-value consumers (settings, retry config, agents) keep using
+#   `config_service.get(key)` which returns the *default* option's scalar.
+
+def _normalize_options(raw: Any) -> tuple[list[dict[str, Any]], int]:
+    """Return (options, default_index) from any historical JSONB shape."""
+    if isinstance(raw, dict):
+        if "options" in raw and isinstance(raw["options"], list):
+            opts = []
+            for o in raw["options"]:
+                if isinstance(o, dict) and "value" in o:
+                    opts.append({"value": o["value"], "label": o.get("label")})
+                else:
+                    opts.append({"value": o, "label": None})
+            di = raw.get("default_index", 0)
+            if not isinstance(di, int) or di < 0 or di >= len(opts):
+                di = 0
+            if not opts:
+                return [], 0
+            return opts, di
+        if "v" in raw:
+            return [{"value": raw["v"], "label": None}], 0
+    # Treat any other shape (scalar, list) as a single value.
+    return [{"value": raw, "label": None}], 0
+
+
+def _pack(options: list[dict[str, Any]], default_index: int) -> dict[str, Any]:
+    di = default_index if 0 <= default_index < len(options) else 0
+    return {"options": options, "default_index": di}
+
+
+def _default_value(raw: Any) -> Any:
+    opts, di = _normalize_options(raw)
+    if not opts:
+        return None
+    return opts[di]["value"]
+
+
 DEFAULT_CONFIGS: list[dict[str, Any]] = [
     {
         "key": "langsmith.api_url",
-        "value": {"v": settings.langsmith.api_url},
+        "value": _pack([{"value": settings.langsmith.api_url, "label": "默认"}], 0),
         "category": "langsmith",
         "description": "LangSmith API 地址",
     },
     {
         "key": "langsmith.api_key",
-        "value": {"v": ""},
+        "value": _pack([{"value": "", "label": None}], 0),
         "category": "langsmith",
         "description": "LangSmith API Key",
     },
     {
+        # Connection preset: each option's value is a full credential group
+        # {api_url, api_key}. The *default* option is the active connection;
+        # switch the default on the config page to repoint LangSmith globally.
+        "key": "langsmith.connection",
+        "value": _pack(
+            [{
+                "value": {
+                    "api_url": settings.langsmith.api_url,
+                    "api_key": settings.langsmith.api_key,
+                },
+                "label": "默认",
+            }],
+            0,
+        ),
+        "category": "langsmith",
+        "description": "LangSmith 连接预设（api_url + api_key）。可配多组，默认项为当前生效连接。",
+    },
+    {
+        # Connection preset for Langfuse: each option's value is a full
+        # credential group {host, public_key, secret_key, remote_write}.
+        "key": "langfuse.connection",
+        "value": _pack(
+            [{
+                "value": {
+                    "host": settings.langfuse.host,
+                    "public_key": settings.langfuse.public_key,
+                    "secret_key": settings.langfuse.secret_key,
+                    "remote_write": settings.langfuse.remote_write,
+                },
+                "label": "默认",
+            }],
+            0,
+        ),
+        "category": "langfuse",
+        "description": "Langfuse 连接预设（host + public_key + secret_key + remote_write）。可配多组，默认项为当前生效连接。",
+    },
+    {
         "key": "llm.base_url",
-        "value": {"v": ""},
+        "value": _pack([{"value": "", "label": None}], 0),
         "category": "llm",
         "description": "LLM 服务地址",
     },
     {
         "key": "llm.api_key",
-        "value": {"v": ""},
+        "value": _pack([{"value": "", "label": None}], 0),
         "category": "llm",
         "description": "LLM API Key",
     },
     {
         "key": "target_agent.endpoint_url",
-        "value": {"v": ""},
+        "value": _pack([{"value": "", "label": None}], 0),
         "category": "target_agent",
         "description": "测试目标模型 POST 接口地址",
     },
     {
         "key": "target_agent.api_key",
-        "value": {"v": ""},
+        "value": _pack([{"value": "", "label": None}], 0),
         "category": "target_agent",
         "description": "测试目标模型 API Key（如需鉴权）",
     },
     {
         "key": "target_agent.timeout",
-        "value": {"v": "30"},
+        "value": _pack([{"value": "30", "label": None}], 0),
         "category": "target_agent",
         "description": "请求超时时间（秒）",
     },
     {
         "key": "target_agent.request_template",
-        "value": {"v": "{\"query\": \"{{question}}\"}"},
+        "value": _pack([{"value": "{\"query\": \"{{question}}\"}", "label": None}], 0),
         "category": "target_agent",
         "description": "请求体模板（JSON），用 {{question}} 作为问题占位符",
     },
     {
         "key": "target_agent.response_path",
-        "value": {"v": "data.answer"},
+        "value": _pack([{"value": "data.answer", "label": None}], 0),
         "category": "target_agent",
         "description": "从响应 JSON 中提取答案的路径（点分隔）",
     },
     {
         "key": "target_agent.headers",
-        "value": {"v": "{\"Content-Type\": \"application/json\"}"},
+        "value": _pack([{"value": "{\"Content-Type\": \"application/json\"}", "label": None}], 0),
         "category": "target_agent",
         "description": "自定义请求头（JSON 格式）",
+    },
+    {
+        "key": "eval.retry.max_retries",
+        "value": _pack([{"value": 2, "label": None}], 0),
+        "category": "eval.retry",
+        "description": "评估时单条 case 调 agent 失败后最多重试次数（不含首次）。0 表示不重试。",
+    },
+    {
+        "key": "eval.retry.initial_backoff_s",
+        "value": _pack([{"value": 2.0, "label": None}], 0),
+        "category": "eval.retry",
+        "description": "首次重试前的等待秒数（指数退避起点）。",
+    },
+    {
+        "key": "eval.retry.backoff_factor",
+        "value": _pack([{"value": 2.0, "label": None}], 0),
+        "category": "eval.retry",
+        "description": "每次重试退避乘数；下次等待 = 上次 × 该值。",
+    },
+    {
+        "key": "eval.retry.max_backoff_s",
+        "value": _pack([{"value": 30.0, "label": None}], 0),
+        "category": "eval.retry",
+        "description": "退避秒数上限，避免长尾等待。",
+    },
+    {
+        "key": "langfuse_metrics.poll_interval_seconds",
+        "value": _pack([{"value": 86400, "label": None}], 0),
+        "category": "langfuse_metrics",
+        "description": "Langfuse 指标轮询间隔（秒）。默认 86400（24h），最小 60。",
+    },
+    {
+        "key": "langfuse_metrics.lookback_days",
+        "value": _pack([{"value": 30, "label": None}], 0),
+        "category": "langfuse_metrics",
+        "description": "首次回填窗口 + 数据保留天数。增量拉取后旧于该天数的数据会被清理。",
+    },
+    {
+        "key": "langfuse_metrics.environments",
+        "value": _pack([{"value": "saas-prod,xinchai-prod,smartlink-hc-dev", "label": None}], 0),
+        "category": "langfuse_metrics",
+        "description": "拉取的目标环境列表，逗号分隔。留空则用内置默认。",
     },
 ]
 
@@ -116,6 +240,7 @@ class ConfigService:
         return getattr(obj, field, None)
 
     async def get(self, key: str) -> Any | None:
+        """Return the *default* option's scalar value, for back-compat."""
         if self.is_sensitive(key):
             return None
 
@@ -130,7 +255,7 @@ class ConfigService:
             row = result.scalar_one_or_none()
 
         if row is not None:
-            value = row.value.get("v") if isinstance(row.value, dict) else row.value
+            value = _default_value(row.value)
             async with self._lock:
                 self._cache[key] = (value, time.time())
             return value
@@ -141,10 +266,141 @@ class ConfigService:
                 self._cache[key] = (fallback, time.time())
         return fallback
 
+    async def get_options(self, key: str) -> tuple[list[dict[str, Any]], int]:
+        """Return all options and the default index for `key`."""
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(SystemConfigRow).where(SystemConfigRow.key == key)
+            )
+            row = result.scalar_one_or_none()
+        if row is None:
+            return [], 0
+        return _normalize_options(row.value)
+
+    async def get_langsmith_connection(self) -> dict[str, Any]:
+        """Resolve the active LangSmith connection ``{api_url, api_key}``.
+
+        Reads the default option of ``langsmith.connection``; falls back
+        field-by-field to the legacy single keys (``langsmith.api_url`` /
+        ``langsmith.api_key``) and finally to env settings, so setups that
+        predate the connection preset keep working.
+        """
+        opts, di = await self.get_options("langsmith.connection")
+        conn = opts[di]["value"] if opts and isinstance(opts[di].get("value"), dict) else {}
+        api_url = conn.get("api_url") or await self.get("langsmith.api_url") or settings.langsmith.api_url
+        api_key = conn.get("api_key") or await self.get("langsmith.api_key") or settings.langsmith.api_key
+        return {"api_url": api_url or "", "api_key": api_key or ""}
+
+    async def get_langfuse_connection(self) -> dict[str, Any]:
+        """Resolve the active Langfuse connection group.
+
+        Returns ``{host, public_key, secret_key, remote_write, configured}``.
+        Reads the default option of ``langfuse.connection``; falls back
+        field-by-field to env settings.
+        """
+        opts, di = await self.get_options("langfuse.connection")
+        conn = opts[di]["value"] if opts and isinstance(opts[di].get("value"), dict) else {}
+        host = conn.get("host") or settings.langfuse.host
+        public_key = conn.get("public_key") or settings.langfuse.public_key
+        secret_key = conn.get("secret_key") or settings.langfuse.secret_key
+        remote_write = conn.get("remote_write")
+        if remote_write is None:
+            remote_write = settings.langfuse.remote_write
+        return {
+            "host": host or "",
+            "public_key": public_key or "",
+            "secret_key": secret_key or "",
+            "remote_write": bool(remote_write),
+            "configured": bool(host and public_key and secret_key),
+        }
+
     async def set(
         self,
         key: str,
         value: Any,
+        user_id: uuid.UUID | None = None,
+        description: str | None = None,
+    ) -> SystemConfigRow:
+        """Single-value set: replace options with a single entry. Keeps
+        backwards compatibility with callers that still treat config as 1:1."""
+        return await self._mutate(
+            key,
+            lambda _opts, _di: ([{"value": value, "label": None}], 0),
+            user_id=user_id,
+            description=description,
+        )
+
+    async def add_option(
+        self,
+        key: str,
+        value: Any,
+        label: str | None = None,
+        make_default: bool = False,
+        user_id: uuid.UUID | None = None,
+        description: str | None = None,
+    ) -> SystemConfigRow:
+        def mutate(opts: list[dict[str, Any]], di: int) -> tuple[list[dict[str, Any]], int]:
+            new_opts = list(opts) + [{"value": value, "label": label}]
+            new_di = len(new_opts) - 1 if make_default else di
+            return new_opts, new_di
+
+        return await self._mutate(key, mutate, user_id=user_id, description=description)
+
+    async def update_option(
+        self,
+        key: str,
+        index: int,
+        value: Any,
+        label: str | None = None,
+        user_id: uuid.UUID | None = None,
+    ) -> SystemConfigRow:
+        def mutate(opts: list[dict[str, Any]], di: int) -> tuple[list[dict[str, Any]], int]:
+            if not opts or index < 0 or index >= len(opts):
+                raise IndexError(f"option index {index} out of range")
+            new_opts = list(opts)
+            new_opts[index] = {"value": value, "label": label}
+            return new_opts, di
+
+        return await self._mutate(key, mutate, user_id=user_id)
+
+    async def remove_option(
+        self,
+        key: str,
+        index: int,
+        user_id: uuid.UUID | None = None,
+    ) -> SystemConfigRow:
+        def mutate(opts: list[dict[str, Any]], di: int) -> tuple[list[dict[str, Any]], int]:
+            if not opts or index < 0 or index >= len(opts):
+                raise IndexError(f"option index {index} out of range")
+            if len(opts) == 1:
+                raise ValueError("cannot remove the last remaining option; delete the key instead")
+            new_opts = [o for i, o in enumerate(opts) if i != index]
+            new_di = di
+            if index == di:
+                new_di = 0
+            elif index < di:
+                new_di = di - 1
+            return new_opts, new_di
+
+        return await self._mutate(key, mutate, user_id=user_id)
+
+    async def set_default(
+        self,
+        key: str,
+        index: int,
+        user_id: uuid.UUID | None = None,
+    ) -> SystemConfigRow:
+        def mutate(opts: list[dict[str, Any]], _di: int) -> tuple[list[dict[str, Any]], int]:
+            if not opts or index < 0 or index >= len(opts):
+                raise IndexError(f"option index {index} out of range")
+            return opts, index
+
+        return await self._mutate(key, mutate, user_id=user_id)
+
+    async def _mutate(
+        self,
+        key: str,
+        mutate: Callable[[list[dict[str, Any]], int], tuple[list[dict[str, Any]], int]],
         user_id: uuid.UUID | None = None,
         description: str | None = None,
     ) -> SystemConfigRow:
@@ -155,7 +411,15 @@ class ConfigService:
             row = result.scalar_one_or_none()
 
             if row is not None:
-                row.value = {"v": value}
+                opts, di = _normalize_options(row.value)
+            else:
+                opts, di = [], 0
+
+            new_opts, new_di = mutate(opts, di)
+            packed = _pack(new_opts, new_di)
+
+            if row is not None:
+                row.value = packed
                 row.updated_by = user_id
                 row.updated_at = datetime.now(timezone.utc)
                 if description is not None:
@@ -163,7 +427,7 @@ class ConfigService:
             else:
                 row = SystemConfigRow(
                     key=key,
-                    value={"v": value},
+                    value=packed,
                     category=self._infer_category(key),
                     description=description,
                     updated_by=user_id,
@@ -173,9 +437,10 @@ class ConfigService:
             await session.commit()
             await session.refresh(row)
 
+        new_default = _default_value(row.value)
         async with self._lock:
-            self._cache[key] = (value, time.time())
-        self._notify(key, value)
+            self._cache[key] = (new_default, time.time())
+        self._notify(key, new_default)
         return row
 
     async def list(self, category: str | None = None) -> list[SystemConfigRow]:
@@ -204,40 +469,9 @@ class ConfigService:
     async def batch_set(
         self, items: dict[str, Any], user_id: uuid.UUID | None = None
     ) -> list[SystemConfigRow]:
-        results = []
-        async with async_session_factory() as session:
-            for key, value in items.items():
-                result = await session.execute(
-                    select(SystemConfigRow).where(SystemConfigRow.key == key)
-                )
-                row = result.scalar_one_or_none()
-
-                if row is not None:
-                    row.value = {"v": value}
-                    row.updated_by = user_id
-                    row.updated_at = datetime.now(timezone.utc)
-                else:
-                    row = SystemConfigRow(
-                        key=key,
-                        value={"v": value},
-                        category=self._infer_category(key),
-                        updated_by=user_id,
-                    )
-                    session.add(row)
-                results.append(row)
-
-            await session.commit()
-            for row in results:
-                await session.refresh(row)
-
-        async with self._lock:
-            now = time.time()
-            for key, value in items.items():
-                self._cache[key] = (value, now)
-
+        results: list[SystemConfigRow] = []
         for key, value in items.items():
-            self._notify(key, value)
-
+            results.append(await self.set(key, value, user_id=user_id))
         return results
 
     async def init_defaults(self) -> None:
@@ -252,14 +486,25 @@ class ConfigService:
 
     @staticmethod
     def _infer_category(key: str) -> str:
-        prefix = key.split(".")[0]
-        if prefix in ("langsmith", "llm", "target_agent"):
+        parts = key.split(".")
+        prefix = parts[0]
+        if prefix == "eval" and len(parts) >= 2:
+            return f"eval.{parts[1]}"
+        if prefix in ("langsmith", "llm", "target_agent", "langfuse", "langfuse_metrics"):
             return prefix
         return "general"
 
     @staticmethod
     def is_sensitive(key: str) -> bool:
         return any(key.startswith(p) for p in SENSITIVE_PREFIXES)
+
+    @staticmethod
+    def normalize_options(raw: Any) -> tuple[list[dict[str, Any]], int]:
+        return _normalize_options(raw)
+
+    @staticmethod
+    def default_value(raw: Any) -> Any:
+        return _default_value(raw)
 
 
 config_service = ConfigService()

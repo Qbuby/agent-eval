@@ -21,17 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import random
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from langfuse import Langfuse  # kept for optional remote write; unused otherwise
 from sqlalchemy import select
 
 from agent_eval.config import settings
-from agent_eval.data._utils import truncate
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import BenchmarkCaseRow
@@ -40,10 +40,7 @@ from agent_eval.evaluation.agent_adapter import (
     OpenAICompatibleAdapter,
     SSEStreamAdapter,
 )
-from agent_eval.evaluation.scorers.llm_judge import (
-    JudgeDimension,
-    LLMJudgeScorer,
-)
+from agent_eval.evaluation.configurable_judge import run_configurable_judge
 
 logger = logging.getLogger(__name__)
 
@@ -99,48 +96,6 @@ def _evaluator_tool_sequence(
     )])
 
 
-async def _evaluator_llm_judge(
-    *, input: str, output: str, expected_output: str | None,
-    params: dict, llm_client: Any, **_,
-) -> EvaluatorResult:
-    """Run LLMJudgeScorer; emit one score per dimension on a 0..1 scale."""
-    if llm_client is None:
-        return EvaluatorResult([("llm_judge_error", 0.0, "no llm client configured")])
-    dim_cfgs = params.get("dimensions") or [
-        {"name": "accuracy", "weight": 0.4, "description": "答案是否准确、事实正确"},
-        {"name": "completeness", "weight": 0.3, "description": "答案是否完整"},
-        {"name": "relevance", "weight": 0.3, "description": "答案是否切题"},
-    ]
-    judge = LLMJudgeScorer(
-        llm=llm_client,
-        dimensions=[
-            JudgeDimension(name=d["name"], weight=d.get("weight", 1.0),
-                          description=d.get("description", ""))
-            for d in dim_cfgs
-        ],
-        system_prompt=params.get("system_prompt"),
-        user_template=params.get("user_template"),
-    )
-    question = input
-    if expected_output:
-        question = f"{input}\n\n[期望答案] {expected_output}"
-    result = await judge.score(question, output)
-    # Emit each dimension score normalised to 0..1 (LLMJudge is 1-10 scale)
-    out: list[tuple[str, float, str]] = []
-    for dim in result.dimensions:
-        out.append((
-            f"llm_judge.{dim.dimension}",
-            round(dim.score / 10.0, 3),
-            dim.reason or "",
-        ))
-    out.append((
-        "llm_judge.aggregate",
-        round(result.aggregate_score / 10.0, 3),
-        truncate(result.raw_response, 200),
-    ))
-    return EvaluatorResult(out)
-
-
 BUILTIN_EVALUATORS = {
     "exact_match": {
         "fn": _evaluator_exact_match, "is_async": False,
@@ -151,15 +106,6 @@ BUILTIN_EVALUATORS = {
         "fn": _evaluator_tool_sequence, "is_async": False,
         "description": "对比 actual_tool_calls 与 expected_tool_calls 的工具名前缀匹配率。",
         "params_schema": {},
-    },
-    "llm_judge": {
-        "fn": _evaluator_llm_judge, "is_async": True,
-        "description": "用 LLM 当裁判按维度打分。可自定义 prompt 与 dimensions。",
-        "params_schema": {
-            "dimensions": {"type": "array", "default": []},
-            "system_prompt": {"type": "string"},
-            "user_template": {"type": "string"},
-        },
     },
 }
 
@@ -183,7 +129,6 @@ def _aggregate_cost(rows: list[dict[str, Any]]) -> dict[str, Any]:
         return round(sum(vals) / len(vals), 2) if vals else None
 
     prompt = _avg("prompt_tokens")
-    cache_create = _avg("cache_creation_tokens")
     cache_read = _avg("cache_read_tokens")
     # cache_hit_rate = avg(cache_read) / avg(prompt_tokens).
     #
@@ -206,6 +151,8 @@ def _aggregate_cost(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_tool_calls": _avg("tool_call_count"),
         "avg_messages": _avg("message_count"),
         "avg_latency_ms": _avg("latency_ms"),
+        "avg_first_thinking_token_ms": _avg("first_thinking_token_ms"),
+        "avg_first_answer_token_ms": _avg("first_answer_token_ms"),
         "cache_hit_rate": cache_hit_rate,
     }
 
@@ -244,7 +191,12 @@ def request_stop(run_id: str) -> bool:
 # ───────────────────────────────────────────────────────────────────────────
 
 
-def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
+def _make_adapter(
+    agent_cfg: dict,
+    *,
+    thread_id: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> Any:
     """Build the HTTP adapter for one case.
 
     - ``type='sse'`` defaults to LangGraph v2 payload/event shape (the production
@@ -253,6 +205,11 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
       (even though agent-side id rewriting may change what LangSmith records).
     - ``type='openai'`` for OpenAI-compatible /v1/chat/completions.
     - ``type='sse_generic'`` for the legacy templated SSE behaviour.
+
+    ``client`` lets the caller inject one shared, connection-pooled
+    ``httpx.AsyncClient`` for the whole run so 20 concurrent cases reuse
+    keepalive connections (and one DNS lookup) instead of each opening a
+    fresh client — the dominant cause of burst DNS failures / agent_unreachable.
     """
     t = agent_cfg.get("type", "sse")
     if t == "openai":
@@ -262,6 +219,7 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
             model=agent_cfg.get("model", "default"),
             timeout=float(agent_cfg.get("timeout", 120.0)),
             extra_headers=agent_cfg.get("headers") or None,
+            client=client,
         )
     if t in ("sse", "sse_langgraph"):
         return SSEStreamAdapter(
@@ -271,6 +229,7 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
             mode="langgraph_v2",
             thread_id=thread_id,
             language=agent_cfg.get("language", "请用中文回复"),
+            client=client,
         )
     if t == "sse_generic":
         return SSEStreamAdapter(
@@ -279,27 +238,48 @@ def _make_adapter(agent_cfg: dict, *, thread_id: str | None = None) -> Any:
             payload_template=agent_cfg.get("payload_template"),
             timeout=float(agent_cfg.get("timeout", 120.0)),
             mode="generic",
+            client=client,
         )
     raise ValueError(f"unknown agent type: {t!r}")
 
 
-def _make_judge_llm() -> Any | None:
-    """Build a ChatOpenAI client for llm_judge using settings.llm."""
-    if not settings.llm.api_key:
-        return None
-    try:
-        from langchain_openai import ChatOpenAI
-        kwargs = {
-            "model": settings.llm.judge_model or settings.llm.model,
-            "api_key": settings.llm.api_key,
-            "temperature": 0.0,
-        }
-        if settings.llm.base_url:
-            kwargs["base_url"] = settings.llm.base_url
-        return ChatOpenAI(**kwargs)
-    except Exception as e:
-        logger.warning("could not build judge LLM: %s", e)
-        return None
+async def _resolve_judge_providers(specs: list[dict[str, Any]]) -> None:
+    """Mutate ``specs`` in place: for any ``configurable_judge`` evaluator
+    whose params reference a provider_id, fetch the EvaluatorProviderRow
+    once and stash it under ``_provider``. Subsequent per-case scoring then
+    reuses the row instead of round-tripping the DB on every sample.
+
+    Resolution failures are logged but non-fatal — the case-level loop
+    will detect ``_provider is None`` and skip the dimension instead of
+    crashing the whole run.
+    """
+    needed: dict[str, list[dict[str, Any]]] = {}
+    for spec in specs:
+        if spec.get("evaluator_type") != "configurable_judge":
+            continue
+        pid = (spec.get("params") or {}).get("provider_id")
+        if not pid:
+            continue
+        needed.setdefault(pid, []).append(spec)
+
+    if not needed:
+        return
+
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        for pid, specs_for_pid in needed.items():
+            try:
+                row = await repo.get_evaluator_provider(uuid.UUID(pid))
+            except (TypeError, ValueError):
+                row = None
+            if row is None:
+                logger.warning(
+                    "configurable_judge: provider %s not found — affected evaluators "
+                    "(%s) will be skipped at score time",
+                    pid, ", ".join(s.get("label", "?") for s in specs_for_pid),
+                )
+            for s in specs_for_pid:
+                s["_provider"] = row
 
 
 def _langfuse_client() -> Langfuse:
@@ -388,9 +368,19 @@ def _extract_usage(resp: AgentResponse) -> dict[str, int | None]:
 #   1. _classify_agent_error: turn a raw exception into a stable category
 #      (agent_unreachable / agent_timeout / agent_5xx / parse_error /
 #      unknown) so the UI can render it differently than a plain "error".
-#   2. _invoke_with_retry: 1 immediate retry after 5s when the first
-#      attempt fails with a connection / 5xx / timeout class — that's the
-#      window the agent typically needs to spin back up.
+#   2. _invoke_with_retry: configurable retry-with-exponential-backoff over
+#      transient errors (connection / 5xx / timeout). Defaults to 2 retries
+#      (3 total attempts) with 2s → 4s → 8s backoff capped at 30s. Three
+#      sources of params, in priority order:
+#         a) per-run override via agent_cfg["retry"]={max_retries,
+#            initial_backoff_s, backoff_factor, max_backoff_s}
+#         b) system_configs rows under category "eval.retry" (Config UI)
+#         c) the hardcoded defaults in _RetryPolicy
+#      Resolution happens once per run inside _execute_run via
+#      _resolve_retry_policy, then the resolved policy is threaded through
+#      to every _run_one_case so we don't hit the DB per sample. The
+#      backoff sleep wakes early on a cancel_event so /stop doesn't have to
+#      wait out a slow retry.
 
 _TRANSIENT_HINTS = (
     "all connection attempts failed",
@@ -398,6 +388,15 @@ _TRANSIENT_HINTS = (
     "bad gateway", "service unavailable", "gateway timeout",
     "502", "503", "504",
     "timed out", "timeout",
+    # DNS resolution failures under burst concurrency inside containers.
+    # httpx surfaces these as ConnectError with these substrings; they are
+    # transient (the resolver recovers once the burst subsides), so they
+    # MUST be retried — previously they matched no hint and failed terminally.
+    "temporary failure in name resolution",
+    "name or service not known",
+    "failed to resolve",
+    "nodename nor servname",
+    "eai_again",
 )
 
 
@@ -407,6 +406,16 @@ def _classify_agent_error(err: Exception) -> str:
     if "502" in s or "bad gateway" in s or "503" in s or "service unavailable" in s:
         return "agent_unreachable"
     if "all connection attempts failed" in s or "connection refused" in s or "connection reset" in s:
+        return "agent_unreachable"
+    # DNS failures mean we never reached the agent — same bucket as a refused
+    # connection so the UI renders it as infra (neutral), not a wrong answer.
+    if (
+        "temporary failure in name resolution" in s
+        or "name or service not known" in s
+        or "failed to resolve" in s
+        or "nodename nor servname" in s
+        or "eai_again" in s
+    ):
         return "agent_unreachable"
     if "504" in s or "timed out" in s or "timeout" in s or "gateway timeout" in s:
         return "agent_timeout"
@@ -422,23 +431,279 @@ def _is_transient(err: Exception) -> bool:
     return any(hint in s for hint in _TRANSIENT_HINTS)
 
 
-async def _invoke_with_retry(adapter: Any, messages: list[dict]) -> Any:
-    """Call adapter.invoke once; retry once after 5s on transient errors.
+@dataclass
+class _RetryPolicy:
+    max_retries: int = 2
+    initial_backoff_s: float = 2.0
+    backoff_factor: float = 2.0
+    max_backoff_s: float = 30.0
 
-    The agent often returns 502 on the first cold-start request. By the
-    time we get to the retry, the upstream is typically warm. If the second
-    attempt also fails the original exception class propagates, the caller
-    classifies it and the sample lands as agent_unreachable.
-    """
+
+def _retry_policy_from_cfg(agent_cfg: dict) -> _RetryPolicy:
+    raw = (agent_cfg or {}).get("retry") or {}
     try:
-        return await adapter.invoke(messages)
-    except Exception as first:
-        if not _is_transient(first):
-            raise
-        logger.info("agent transient err on attempt 1 (%s); retrying after 5s",
-                    type(first).__name__)
-        await asyncio.sleep(5)
-        return await adapter.invoke(messages)
+        return _RetryPolicy(
+            max_retries=max(0, int(raw.get("max_retries", 2))),
+            initial_backoff_s=max(0.0, float(raw.get("initial_backoff_s", 2.0))),
+            backoff_factor=max(1.0, float(raw.get("backoff_factor", 2.0))),
+            max_backoff_s=max(0.0, float(raw.get("max_backoff_s", 30.0))),
+        )
+    except (TypeError, ValueError):
+        return _RetryPolicy()
+
+
+async def _resolve_retry_policy(agent_cfg: dict) -> _RetryPolicy:
+    """Three-tier fallback for retry params, resolved once per run:
+
+      1. ``agent_cfg["retry"]`` — caller passed explicit overrides.
+      2. ``system_configs`` rows under ``eval.retry.*`` (set via Config UI).
+      3. Hardcoded defaults baked into ``_RetryPolicy``.
+
+    The DB lookup is best-effort; any failure (table missing during tests,
+    config_service not initialized) silently falls back to step 3 so the
+    eval pipeline never blocks on configuration plumbing.
+    """
+    raw = dict((agent_cfg or {}).get("retry") or {})
+    if not all(
+        k in raw for k in
+        ("max_retries", "initial_backoff_s", "backoff_factor", "max_backoff_s")
+    ):
+        try:
+            from agent_eval.config_service import config_service
+            for short_key, full_key in (
+                ("max_retries", "eval.retry.max_retries"),
+                ("initial_backoff_s", "eval.retry.initial_backoff_s"),
+                ("backoff_factor", "eval.retry.backoff_factor"),
+                ("max_backoff_s", "eval.retry.max_backoff_s"),
+            ):
+                if short_key in raw:
+                    continue
+                v = await config_service.get(full_key)
+                if v is not None:
+                    raw[short_key] = v
+        except Exception as e:
+            logger.debug("retry policy fallback to defaults: %s", e)
+    return _retry_policy_from_cfg({"retry": raw})
+
+
+async def _sleep_with_cancel(seconds: float, cancel_event: asyncio.Event | None) -> bool:
+    """Sleep up to ``seconds`` but wake immediately if ``cancel_event`` fires.
+    Returns True if cancelled, False if the full duration elapsed."""
+    if seconds <= 0:
+        return bool(cancel_event and cancel_event.is_set())
+    if cancel_event is None:
+        await asyncio.sleep(seconds)
+        return False
+    try:
+        await asyncio.wait_for(cancel_event.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _invoke_with_retry(
+    adapter: Any,
+    messages: list[dict],
+    *,
+    policy: _RetryPolicy,
+    cancel_event: asyncio.Event | None = None,
+) -> tuple[Any, int]:
+    """Call ``adapter.invoke`` with up to ``policy.max_retries`` retries on
+    transient errors. Returns ``(response, attempts_made)``; ``attempts_made``
+    is 1-based (1 = succeeded on first try).
+
+    Non-transient errors propagate immediately without retry. On terminal
+    failure, the final exception is annotated with ``_eval_attempts_made``
+    so the caller can record how many attempts were spent before giving up.
+    If ``cancel_event`` fires during a backoff sleep, the loop aborts and
+    the last seen exception propagates with the same annotation.
+    """
+    backoff = policy.initial_backoff_s
+    total_attempts = policy.max_retries + 1
+    for attempt in range(1, total_attempts + 1):
+        try:
+            resp = await adapter.invoke(messages)
+            if attempt > 1:
+                logger.info(
+                    "agent invoke succeeded on attempt %d/%d",
+                    attempt, total_attempts,
+                )
+            return resp, attempt
+        except Exception as e:
+            terminal = attempt >= total_attempts or not _is_transient(e)
+            if terminal:
+                setattr(e, "_eval_attempts_made", attempt)
+                if attempt > 1:
+                    logger.warning(
+                        "agent invoke exhausted retries (%d/%d): %s",
+                        attempt, total_attempts, type(e).__name__,
+                    )
+                raise
+            logger.info(
+                "agent transient err on attempt %d/%d (%s); backing off %.1fs",
+                attempt, total_attempts, type(e).__name__, backoff,
+            )
+            # Jitter the sleep so 20 concurrent cases that all failed in the
+            # same burst don't wake and retry in lockstep into the same
+            # congestion window. Full jitter over [0, backoff].
+            jittered = backoff * (0.5 + random.random() * 0.5)
+            cancelled = await _sleep_with_cancel(jittered, cancel_event)
+            if cancelled:
+                setattr(e, "_eval_attempts_made", attempt)
+                raise
+            backoff = min(backoff * policy.backoff_factor, policy.max_backoff_s)
+    # Unreachable: loop body always returns or raises.
+    raise RuntimeError("retry loop exited without returning or raising")
+
+
+async def _run_multiturn_case(
+    *,
+    case: dict[str, Any],
+    agent_cfg: dict,
+    evaluator_specs: list[dict[str, Any]],
+    cancel_event: asyncio.Event | None = None,
+    retry_policy: _RetryPolicy | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """多轮对话 case 执行：固定 thread_id 逐轮回放 + 逐轮/会话级打分。
+
+    复用单轮的 adapter 工厂、重试器与 judge provider 预解析；回放与打分细节
+    在 ``evaluation.multiturn``。返回 dict 与 ``_run_one_case`` 同契约，落库/
+    聚合路径无需区分单轮多轮。"""
+    from agent_eval.evaluation import multiturn
+
+    input_messages = case.get("input_messages") or []
+    conversation_goal = case.get("conversation_goal")
+    turn_expectations = case.get("turn_expectations") or []
+    question = case.get("question") or ""
+    expected = case.get("expected_output") or ""
+    agent_type = agent_cfg.get("type", "sse")
+
+    # 整段对话共用一个 thread_id（agent 端按它维持上下文）。
+    thread_id = f"eval-{case.get('name','conv')}-{uuid.uuid4().hex[:8]}"
+    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    if retry_policy is None:
+        retry_policy = _retry_policy_from_cfg(agent_cfg)
+
+    async def _invoke(adp: Any, msgs: list[dict[str, Any]]):
+        return await _invoke_with_retry(
+            adp, msgs, policy=retry_policy, cancel_event=cancel_event,
+        )
+
+    invoked_at = datetime.now(timezone.utc)
+    error_msg: str | None = None
+    error_type: str | None = None
+    replay: dict[str, Any] = {}
+    scores: dict[str, float] = {}
+    score_reasons: dict[str, str] = {}
+
+    try:
+        try:
+            replay = await multiturn.replay_conversation(
+                adapter=adapter,
+                agent_type=agent_type,
+                input_messages=input_messages,
+                invoke=_invoke,
+            )
+        except Exception as e:
+            attempts = getattr(e, "_eval_attempts_made", 1)
+            error_msg = str(e)
+            if attempts > 1:
+                error_msg = f"{error_msg} (after {attempts} attempts)"
+            error_type = _classify_agent_error(e)
+            logger.warning(
+                "multiturn replay failed for case %s [%s]: %s",
+                case.get("id"), error_type, e,
+            )
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
+
+    # 逐轮容错：replay 某轮失败时不再抛异常，而是正常返回带 error 字段 +
+    # 已完成轮（#136）。这里消费该 error 设置 error_msg/error_type，但保留
+    # replay["turns"]（已完成轮仍落库展示），不丢弃部分进度。
+    if not error_msg and replay.get("error"):
+        error_msg = replay["error"]
+        error_type = _classify_agent_error(replay.get("error_exc"))
+        logger.warning(
+            "multiturn replay partial failure for case %s [%s] at turn %s: %s",
+            case.get("id"), error_type, replay.get("failed_turn"), error_msg,
+        )
+
+    turns = replay.get("turns") or []
+    # 整段输出快照：拼接 transcript，供列表/详情页展示与会话级回看。
+    transcript = multiturn.build_transcript(turns)
+    usage = replay.get("usage") or {
+        "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+        "cache_creation_tokens": None, "cache_read_tokens": None,
+    }
+    actual_tool_calls = replay.get("tool_calls") or []
+    cot_steps = replay.get("steps") or []
+
+    # 打分：只要有已完成轮就打分（含部分失败的样例——已完成轮仍应评分留痕）。
+    # status 判定优先看 error_msg，故部分失败样例即便有分数仍标 error，不会假性 pass。
+    if turns:
+        try:
+            scores, score_reasons = await multiturn.score_conversation(
+                turns=turns,
+                conversation_goal=conversation_goal,
+                turn_expectations=turn_expectations,
+                evaluator_specs=evaluator_specs,
+                case_metadata=case.get("metadata"),
+                case_id=case.get("id"),
+            )
+        except Exception as e:
+            logger.warning("multiturn scoring crashed on case %s: %s", case.get("id"), e)
+
+    # status 判定：回放成功但「零有效评分」必须区分于「通过」——多轮场景下
+    # 内建评估器（exact_match 等）不接、或样例无 turn_expectations/goal 时，
+    # scores 会是空 dict；此时判 skipped（未评分），不能默认 pass 假性通过。
+    status = "pass"
+    if error_msg:
+        if error_type in ("agent_unreachable", "agent_timeout"):
+            status = error_type
+        else:
+            status = "error"
+    elif not scores:
+        status = "skipped"
+    elif any(v < 0.5 for v in scores.values()):
+        status = "fail"
+
+    return {
+        "case_id": case.get("id"),
+        "case_name": case.get("name"),
+        "case_source": case.get("source"),
+        "thread_id": thread_id,
+        "question": question,
+        "expected_output": expected,
+        "expected_tool_calls": [],
+        "invoked_at": invoked_at,
+        "status": status,
+        "actual_output": transcript,
+        "actual_tool_calls": actual_tool_calls,
+        "cot_steps": cot_steps,
+        # 多轮专属：完整逐轮记录 + 会话级上下文，落库进 full_trace.conversation。
+        "conversation": {
+            "turns": turns,
+            "goal": conversation_goal,
+            "turn_expectations": turn_expectations,
+        },
+        "latency_ms": replay.get("latency_ms"),
+        "first_thinking_token_ms": None,
+        "first_answer_token_ms": None,
+        "error_message": error_msg,
+        "error_type": error_type,
+        "attempts_made": replay.get("attempts", 1),
+        "tool_call_count": len(actual_tool_calls),
+        "message_count": len(turns),
+        "scores": scores,
+        # 逐分数项的 judge 理由（score_key → reasoning），落库写进 details，
+        # 详情页展示「按什么打的分」。单轮路径无此键，下方落库循环用 .get 兜底。
+        "score_reasons": score_reasons,
+        **usage,
+    }
 
 
 async def _run_one_case(
@@ -446,13 +711,31 @@ async def _run_one_case(
     case: dict[str, Any],
     agent_cfg: dict,
     evaluator_specs: list[dict[str, Any]],
-    judge_llm: Any,
+    cancel_event: asyncio.Event | None = None,
+    retry_policy: _RetryPolicy | None = None,
+    http_client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Execute one case end-to-end. ``case`` is the normalized dict from
     ``_normalize_cases_for_runner``: {id, name, question, expected_output,
     expected_tool_calls, source}. ``evaluator_specs`` are pre-resolved
     {evaluator_type, params, label} dicts (DB lookup already done by caller).
+    ``retry_policy`` is normally resolved once at run start (via
+    ``_resolve_retry_policy``) and threaded through; passing ``None`` falls
+    back to per-call resolution from ``agent_cfg`` only (no DB lookup) for
+    callers/tests that don't go through ``_execute_run``.
     Returns one row's worth of data ready to persist."""
+    # 多轮对话样例（source='conversation'）：走 multiturn 回放+逐轮/会话级打分。
+    # 返回 dict 与单轮契约一致，落库/聚合无需区分。
+    if case.get("multi_turn"):
+        return await _run_multiturn_case(
+            case=case,
+            agent_cfg=agent_cfg,
+            evaluator_specs=evaluator_specs,
+            cancel_event=cancel_event,
+            retry_policy=retry_policy,
+            http_client=http_client,
+        )
+
     question = case["question"]
     expected = case.get("expected_output") or ""
     expected_tool_calls = case.get("expected_tool_calls") or []
@@ -462,14 +745,20 @@ async def _run_one_case(
     # (start_time, question text) instead.
     thread_id = f"eval-{case.get('name','case')}-{uuid.uuid4().hex[:8]}"
 
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id)
+    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
     messages = [{"role": "user", "content": question}]
+    if retry_policy is None:
+        retry_policy = _retry_policy_from_cfg(agent_cfg)
 
     output_text = ""
     error_msg: str | None = None
     error_type: str | None = None
     actual_tool_calls: list[dict] = []
+    cot_steps: list[dict] = []
     latency_ms: int | None = None
+    first_thinking_token_ms: int | None = None
+    first_answer_token_ms: int | None = None
+    attempts_made = 0
     usage = {
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
         "cache_creation_tokens": None, "cache_read_tokens": None,
@@ -478,7 +767,10 @@ async def _run_one_case(
 
     try:
         try:
-            resp = await _invoke_with_retry(adapter, messages)
+            resp, attempts_made = await _invoke_with_retry(
+                adapter, messages,
+                policy=retry_policy, cancel_event=cancel_event,
+            )
             output_text = resp.content
             latency_ms = int(resp.latency_ms)
             usage = _extract_usage(resp)
@@ -488,13 +780,35 @@ async def _run_one_case(
                 tcs = raw.get("tool_calls")
                 if isinstance(tcs, list):
                     actual_tool_calls = tcs
+                steps_raw = raw.get("steps")
+                if isinstance(steps_raw, list):
+                    cot_steps = steps_raw
             if not actual_tool_calls:
                 actual_tool_calls = _extract_tool_calls_from_response(resp)
+            # Time-to-first-token, derived from per-step first_token_ms that
+            # SSEStreamAdapter stamps on each thought/answer step.
+            #   thinking = first thought-or-answer step that has a value
+            #   answer   = the step whose type='answer' (final LLM step)
+            for s in cot_steps:
+                if not isinstance(s, dict):
+                    continue
+                t = s.get("first_token_ms")
+                if t is None:
+                    continue
+                if s.get("type") in ("thought", "answer") and first_thinking_token_ms is None:
+                    first_thinking_token_ms = int(t)
+                if s.get("type") == "answer":
+                    first_answer_token_ms = int(t)
         except Exception as e:
+            attempts_made = getattr(e, "_eval_attempts_made", attempts_made or 1)
             error_msg = str(e)
+            if attempts_made > 1:
+                error_msg = f"{error_msg} (after {attempts_made} attempts)"
             error_type = _classify_agent_error(e)
-            logger.warning("agent invoke failed for case %s [%s]: %s",
-                           case.get("id"), error_type, e)
+            logger.warning(
+                "agent invoke failed for case %s [%s] after %d attempt(s): %s",
+                case.get("id"), error_type, attempts_made, e,
+            )
     finally:
         try:
             await adapter.close()
@@ -506,26 +820,65 @@ async def _run_one_case(
     if not error_msg:
         for spec in evaluator_specs:
             etype = spec.get("evaluator_type")
+            label = spec.get("label") or etype or "evaluator"
             # In tag-only mode (post-2026-05-19) evaluators don't define a
             # local scoring function — they're just template tags forwarded
             # to Langfuse. Skip the local-scoring loop for them; their
             # contribution shows up later via the Langfuse pull-back.
             if not etype:
                 continue
+            # Configurable LLM judge — params (provider/model/prompt/dims)
+            # are saved on the evaluator row; provider was pre-resolved into
+            # spec['_provider'] by _execute_run.
+            if etype == "configurable_judge":
+                provider_row = spec.get("_provider")
+                if provider_row is None:
+                    logger.warning(
+                        "configurable_judge[%s]: skipped (no provider resolved) on case %s",
+                        label, case.get("id"),
+                    )
+                    continue
+                try:
+                    judge_result = await run_configurable_judge(
+                        params=spec.get("params") or {},
+                        provider=provider_row,
+                        input_text=question,
+                        output_text=output_text,
+                        expected_output=expected,
+                        metadata=case.get("metadata"),
+                        evaluator_name=label,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "configurable_judge[%s] crashed on case %s: %s",
+                        label, case.get("id"), e,
+                    )
+                    continue
+                if judge_result.error and not judge_result.scores:
+                    logger.warning(
+                        "configurable_judge[%s] error on case %s: %s",
+                        label, case.get("id"), judge_result.error,
+                    )
+                    continue
+                # Single-score paradigm: configurable_judge produces at most
+                # one JudgeScore per evaluator; we use evaluator label as the
+                # score key so multiple instances don't collide.
+                for s in judge_result.scores:
+                    scores[label] = float(s.value)
+                continue
+
             ev_def = BUILTIN_EVALUATORS.get(etype)
             if ev_def is None:
                 # Unknown legacy type — silently skip so old runs don't
                 # crash the pipeline.
                 continue
             fn = ev_def["fn"]
-            label = spec.get("label") or etype
             kwargs = {
                 "input": question, "output": output_text,
                 "expected_output": expected,
                 "expected_tool_calls": expected_tool_calls,
                 "actual_tool_calls": actual_tool_calls,
                 "params": spec.get("params") or {},
-                "llm_client": judge_llm,
             }
             try:
                 result = await fn(**kwargs) if ev_def["is_async"] else fn(**kwargs)
@@ -562,9 +915,13 @@ async def _run_one_case(
         "status": status,
         "actual_output": output_text,
         "actual_tool_calls": actual_tool_calls,
+        "cot_steps": cot_steps,
         "latency_ms": latency_ms,
+        "first_thinking_token_ms": first_thinking_token_ms,
+        "first_answer_token_ms": first_answer_token_ms,
         "error_message": error_msg,
         "error_type": error_type,
+        "attempts_made": attempts_made,
         "tool_call_count": len(actual_tool_calls),
         "message_count": len(messages),
         "scores": scores,
@@ -582,15 +939,43 @@ async def _execute_run(
     langsmith_project: str | None,
     cancel_event: asyncio.Event,
     handle: _RunHandle,
+    langfuse_trace_name: str | None = None,
 ) -> None:
     """Background task body. Invokes agent for each case, runs evaluators,
     persists results. After all cases settle, optionally kicks off the
-    LangSmith backfill (non-blocking)."""
+    LangSmith and/or Langfuse trace backfill (non-blocking)."""
     handle.progress["total"] = len(cases)
-    judge_llm = _make_judge_llm()
+    retry_policy = await _resolve_retry_policy(agent_cfg)
+    logger.info(
+        "eval run %s retry policy: max_retries=%d initial=%.1fs factor=%.1f cap=%.1fs",
+        run_id, retry_policy.max_retries, retry_policy.initial_backoff_s,
+        retry_policy.backoff_factor, retry_policy.max_backoff_s,
+    )
+
+    # Pre-resolve EvaluatorProviderRow for any configurable_judge specs so
+    # _run_one_case doesn't hit the DB per case. Each spec gets a `_provider`
+    # field — runtime cache only, never persisted.
+    await _resolve_judge_providers(evaluator_specs)
 
     sem = asyncio.Semaphore(max(1, concurrency))
     per_case_results: list[dict[str, Any]] = []
+
+    # One shared, connection-pooled client for the whole run. Without this each
+    # case opened its own httpx.AsyncClient with an unbounded pool, so 20
+    # concurrent cases meant 20 independent connection pools and a burst of
+    # simultaneous DNS lookups — the container's resolver drops these under
+    # load ("Temporary failure in name resolution"), surfacing as spurious
+    # agent_unreachable. Capping connections at the concurrency level and
+    # reusing keepalive connections removes both the DNS burst and the
+    # connection churn. keepalive_expiry is generous because agent calls can
+    # take tens of seconds (multi-step LangGraph) between requests on a slot.
+    limits = httpx.Limits(
+        max_connections=max(1, concurrency),
+        max_keepalive_connections=max(1, concurrency),
+        keepalive_expiry=120.0,
+    )
+    agent_timeout = float(agent_cfg.get("timeout", 120.0))
+    http_client = httpx.AsyncClient(limits=limits, timeout=agent_timeout)
 
     async def _do_one(case: dict[str, Any]):
         if cancel_event.is_set():
@@ -603,7 +988,9 @@ async def _execute_run(
                     case=case,
                     agent_cfg=agent_cfg,
                     evaluator_specs=evaluator_specs,
-                    judge_llm=judge_llm,
+                    cancel_event=cancel_event,
+                    retry_policy=retry_policy,
+                    http_client=http_client,
                 )
             except Exception as e:
                 logger.exception("case %s crashed during run: %s", case.get("id"), e)
@@ -628,13 +1015,24 @@ async def _execute_run(
                             bench_id = uuid.UUID(case["id"])
                         except (ValueError, TypeError):
                             bench_id = None
+                    # full_trace 承载单轮 steps；多轮额外带 conversation
+                    # （逐轮记录 + goal + turn_expectations），供详情页按轮回看。
+                    full_trace: dict[str, Any] | None = None
+                    if res.get("cot_steps") or res.get("conversation"):
+                        full_trace = {}
+                        if res.get("cot_steps"):
+                            full_trace["steps"] = res["cot_steps"]
+                        if res.get("conversation"):
+                            full_trace["conversation"] = res["conversation"]
                     created = await repo.create_test_result(
                         uuid.UUID(run_id),
                         benchmark_case_id=bench_id,
                         question=res["question"],
+                        expected_output=res.get("expected_output") or None,
                         thread_id=res["thread_id"],
                         actual_output=res["actual_output"],
                         actual_tool_calls=res["actual_tool_calls"] or None,
+                        full_trace=full_trace,
                         latency_ms=res["latency_ms"],
                         total_tokens=res["total_tokens"],
                         prompt_tokens=res["prompt_tokens"],
@@ -642,15 +1040,22 @@ async def _execute_run(
                         cache_creation_tokens=res.get("cache_creation_tokens"),
                         cache_read_tokens=res.get("cache_read_tokens"),
                         tool_call_count=res["tool_call_count"],
+                        first_thinking_token_ms=res.get("first_thinking_token_ms"),
+                        first_answer_token_ms=res.get("first_answer_token_ms"),
                         error_message=res["error_message"],
                         error_type=res["error_type"],
                         status=res["status"],
+                        attempts_made=res.get("attempts_made", 1),
                     )
+                    # 多轮 judge 理由（#137）：score_reasons 仅多轮 case 带，单轮无此键
+                    # → .get 兜底空 dict，details 退回 {}，单轮零回归。
+                    reasons_map = res.get("score_reasons") or {}
                     for sname, sval in res["scores"].items():
+                        reason = reasons_map.get(sname)
                         await repo.create_eval_score(
                             created.id, dimension=sname, score=sval,
                             weight=1.0, weighted_score=sval, scoring_method="eval",
-                            details={},
+                            details={"reasoning": reason} if reason else {},
                         )
                     await session.commit()
             except Exception as e:
@@ -659,9 +1064,18 @@ async def _execute_run(
     try:
         await asyncio.gather(*[_do_one(c) for c in cases])
     finally:
+        # Close the shared client before aggregation so its connections are
+        # released even if aggregation/backfill below raises.
+        try:
+            await http_client.aclose()
+        except Exception:
+            pass
         # Aggregate
+        # skipped（回放成功但零有效评分）单独成桶，不混进 fail——否则
+        # 「没评」会被当成「没通过」，污染通过率与失败分析。
         succ = [r for r in per_case_results if r["status"] == "pass"]
-        fail = [r for r in per_case_results if r["status"] != "pass"]
+        skipped = [r for r in per_case_results if r["status"] == "skipped"]
+        fail = [r for r in per_case_results if r["status"] not in ("pass", "skipped")]
         all_scores: dict[str, list[float]] = {}
         for r in per_case_results:
             for k, v in r["scores"].items():
@@ -716,11 +1130,26 @@ async def _execute_run(
             key=lambda x: (-x["calls"], x["name"]),
         )
 
+        attempts_list = [int(r.get("attempts_made") or 1) for r in per_case_results]
+        retried = [n for n in attempts_list if n > 1]
+        retry_stats: dict[str, Any] = {
+            "total_cases": len(attempts_list),
+            "cases_with_retries": len(retried),
+            "max_attempts": max(attempts_list) if attempts_list else 0,
+            "avg_attempts": round(
+                sum(attempts_list) / len(attempts_list), 3
+            ) if attempts_list else 0.0,
+            "total_retries": sum(n - 1 for n in attempts_list),
+        }
+
         summary: dict[str, Any] = {
             "counts": {
                 "total": len(per_case_results),
                 "passed": len(succ),
                 "failed": len(fail),
+                # skipped：回放成功但无有效评估器产出分数（多轮零评估），
+                # 与 failed 区分，避免「没评」被读成「没通过」。
+                "skipped": len(skipped),
                 "unreachable": sum(
                     1 for r in per_case_results
                     if r["status"] in ("agent_unreachable", "agent_timeout")
@@ -734,6 +1163,7 @@ async def _execute_run(
             "tool_usage": tool_usage,
             "cost_success": _aggregate_cost(succ),
             "cost_failure": _aggregate_cost(fail),
+            "retry_stats": retry_stats,
             "run_name": run_name,
         }
         # If most samples couldn't reach the agent, surface that on the run
@@ -748,14 +1178,23 @@ async def _execute_run(
                     f"({agent_url})。请确认 agent 服务在线、网络可达；如在容器内访问宿主机请用 host.docker.internal "
                     "或宿主机 LAN IP 而非 localhost。"
                 )
+        # Resolve active data-source connection presets (fall back to env).
+        from agent_eval.config_service import config_service as _cfg_svc
+        ls_conn = await _cfg_svc.get_langsmith_connection()
+        lf_conn = await _cfg_svc.get_langfuse_connection()
         if langsmith_project:
             summary["langsmith_project"] = langsmith_project
             # LangSmith web root; the UI uses it to deep-link.
-            summary["langsmith_host"] = settings.langsmith.api_url.replace(
+            summary["langsmith_host"] = ls_conn["api_url"].replace(
                 "api.smith", "smith"
-            ) if settings.langsmith.api_url else None
-        if settings.langfuse.remote_write and settings.langfuse.configured:
-            summary["langfuse_host"] = settings.langfuse.host
+            ) if ls_conn["api_url"] else None
+        # Surface the Langfuse web root whenever we'll have trace ids to link:
+        # either remote_write pushed them, or the symmetric trace backfill will
+        # fill them in. Without this the detail page can't build /trace/{id}.
+        if lf_conn["configured"] and (
+            lf_conn["remote_write"] or langfuse_trace_name
+        ):
+            summary["langfuse_host"] = lf_conn["host"]
         if cancel_event.is_set():
             summary["stopped_early"] = True
 
@@ -781,11 +1220,24 @@ async def _execute_run(
                 )
             )
 
+        # Fire-and-forget Langfuse trace backfill — symmetric to the LangSmith
+        # one above. Pulls traces by (trace_name, time-window) from the active
+        # Langfuse connection, matches each by question text, and writes
+        # test_results.langfuse_trace_id. Independent of remote_write/score sync.
+        if langfuse_trace_name and per_case_results:
+            asyncio.create_task(
+                _backfill_langfuse_traces(
+                    run_id=run_id,
+                    trace_name=langfuse_trace_name,
+                    per_case_results=per_case_results,
+                )
+            )
+
         # Fire-and-forget Langfuse score sync. Off by default — flip
         # LANGFUSE_REMOTE_WRITE=true (or set langfuse.remote_write in /config)
         # to push every evaluator score into the Langfuse UI as a fresh trace
         # per case. Doesn't depend on LangSmith.
-        if settings.langfuse.remote_write and settings.langfuse.configured and per_case_results:
+        if lf_conn["remote_write"] and lf_conn["configured"] and per_case_results:
             from agent_eval.evaluation.langfuse_sync import (
                 pull_evaluator_scores_for_run, sync_run_scores_to_langfuse,
             )
@@ -979,6 +1431,159 @@ def _classify_langsmith_error(err: Exception) -> str:
     return "unknown"
 
 
+def _langfuse_trace_question(trace: dict[str, Any]) -> str:
+    """Best-effort pull of the user question from a Langfuse trace dict.
+
+    The agent writes its trace ``input`` in one of two shapes, mirroring the
+    LangSmith convention:
+      - ``{"messages": [{"role","content"}, ...]}`` → last message content
+      - ``{"question": "..."}`` → the question field directly
+    Some agents wrap the whole thing under ``input``; others put it at the top
+    level. Tolerant to missing fields — returns "" rather than raising.
+    """
+    inp = trace.get("input")
+    if isinstance(inp, str):
+        return inp
+    if not isinstance(inp, dict):
+        inp = trace if isinstance(trace, dict) else {}
+    msgs = inp.get("messages")
+    if isinstance(msgs, list) and msgs:
+        last = msgs[-1] if isinstance(msgs[-1], dict) else None
+        txt = (last or {}).get("content", "")
+        if isinstance(txt, str) and txt:
+            return txt
+    txt = inp.get("question") or inp.get("input") or ""
+    return txt if isinstance(txt, str) else ""
+
+
+async def _backfill_langfuse_traces(
+    *,
+    run_id: str,
+    trace_name: str,
+    per_case_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Symmetric counterpart to :func:`_backfill_langsmith_traces`, for Langfuse.
+
+    Pulls Langfuse traces by (``name`` == trace_name) within the run's time
+    window, builds a ``question text → trace id`` map, then matches each local
+    result by question text and writes ``test_results.langfuse_trace_id``.
+
+    The Langfuse project is fixed by the connection's key pair (it is NOT a
+    query parameter), so ``trace_name`` is the per-run join key — the agent
+    must report its trace under this name for the pull-back to find it.
+
+    Returns the same diagnostics shape as the LangSmith version::
+
+        {"errors": int, "error_kind": str | None, "error_message": str | None}
+    """
+    diagnostics: dict[str, Any] = {
+        "errors": 0,
+        "error_kind": None,
+        "error_message": None,
+    }
+
+    # ── Build the client from the active Langfuse connection preset ──
+    try:
+        from agent_eval.config_service import config_service
+        from agent_eval.langfuse_metrics.client import LangfuseMetricsClient
+
+        conn = await config_service.get_langfuse_connection()
+        if not conn.get("configured"):
+            logger.info("lf-backfill: Langfuse not configured (DB or .env), skipping")
+            diagnostics["error_kind"] = "client_init"
+            diagnostics["error_message"] = (
+                "Langfuse not configured (set via /config or LANGFUSE_* env)"
+            )
+            return diagnostics
+        client = LangfuseMetricsClient.from_connection(conn)
+    except Exception as e:
+        logger.warning("lf-backfill: langfuse client init failed: %s", e)
+        diagnostics["error_kind"] = "client_init"
+        diagnostics["error_message"] = str(e)[:300]
+        return diagnostics
+
+    from datetime import timedelta
+    invoked_times = [r["invoked_at"] for r in per_case_results if r.get("invoked_at")]
+    if not invoked_times:
+        return diagnostics
+    window_lower = min(invoked_times) - timedelta(minutes=1)
+    window_upper = max(invoked_times) + timedelta(minutes=10)
+
+    by_question: dict[str, str] = {}  # question text → trace id
+    try:
+        async for trace in client.iter_traces_by_name(
+            trace_name, window_lower, window_upper,
+        ):
+            tid = trace.get("id")
+            if not tid:
+                continue
+            txt = _langfuse_trace_question(trace)
+            if txt:
+                # Latest wins on duplicate questions — the time window already
+                # prunes most dupes, so collisions are rare.
+                by_question.setdefault(txt, str(tid))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("lf-backfill window fetch err: %s", e)
+        diagnostics["errors"] = len(per_case_results)
+        diagnostics["error_kind"] = _classify_langfuse_backfill_error(e)
+        diagnostics["error_message"] = str(e)[:300]
+        return diagnostics
+
+    logger.info(
+        "lf-backfill: name=%s window=%s..%s fetched=%d unique-questions",
+        trace_name, window_lower.isoformat(), window_upper.isoformat(),
+        len(by_question),
+    )
+
+    # ── Match local cases against the in-memory map, write trace ids ──
+    triples: list[tuple[str, str | None]] = []
+    for res in per_case_results:
+        thread_id = res.get("thread_id") or ""
+        question = res.get("question") or ""
+        triples.append((thread_id, by_question.get(question)))
+
+    hits = 0
+    async with async_session_factory() as session:
+        from agent_eval.db_models.tables import TestResultRow
+        for thread_id, lftrace in triples:
+            if not lftrace or not thread_id:
+                continue
+            rows = (await session.execute(
+                select(TestResultRow)
+                .where(TestResultRow.run_id == uuid.UUID(run_id))
+                .where(TestResultRow.thread_id == thread_id)
+            )).scalars().all()
+            for row in rows:
+                row.langfuse_trace_id = lftrace
+                hits += 1
+        await session.commit()
+    logger.info(
+        "lf-backfill: name=%s run=%s matched %d/%d cases (errors=%d kind=%s)",
+        trace_name, run_id, hits, len(per_case_results),
+        diagnostics["errors"], diagnostics["error_kind"],
+    )
+    return diagnostics
+
+
+def _classify_langfuse_backfill_error(err: Exception) -> str:
+    """Map a Langfuse public-API error to a stable banner category.
+
+    The metrics client surfaces ``httpx.HTTPStatusError`` for 4xx/5xx and
+    ``httpx.TimeoutException`` for timeouts; we sniff the stringified form so
+    we don't depend on which exception type bubbled up.
+    """
+    s = str(err).lower()
+    if "403" in s or "forbidden" in s:
+        return "forbidden"
+    if "401" in s or "unauthorized" in s:
+        return "unauthorized"
+    if "404" in s or "not found" in s:
+        return "not_found"
+    if any(t in s for t in ("connection", "timeout", "timed out", "dns")):
+        return "network"
+    return "unknown"
+
+
 def _run_matches_question(run_obj: Any, question: str) -> bool:
     """Return True if ``run_obj.inputs`` carries the same user question.
 
@@ -1088,6 +1693,7 @@ async def start_run(
     concurrency: int = 3,
     run_name: str | None = None,
     langsmith_project: str | None = None,
+    langfuse_trace_name: str | None = None,
     benchmark_version_id: str | None = None,
     eval_case_source_id: str | None = None,
 ) -> str:
@@ -1098,7 +1704,7 @@ async def start_run(
           "expected_tool_calls": list, "metadata": dict, "source": "benchmark"|"file"}, ...]
 
     ``evaluator_specs`` is a list of DB-resolved evaluator configs:
-        [{"evaluator_type": "llm_judge", "params": {...}, "label": "my-judge"}, ...]
+        [{"evaluator_type": "configurable_judge", "params": {...}, "label": "my-judge"}, ...]
     """
     if not cases:
         raise ValueError("no cases selected")
@@ -1115,6 +1721,7 @@ async def start_run(
             agent_config=agent_cfg,
             langfuse_run_name=run_name,
             langsmith_project=langsmith_project,
+            langfuse_trace_name=langfuse_trace_name,
             evaluator_configs=evaluator_specs,
             status="running",
         )
@@ -1131,6 +1738,7 @@ async def start_run(
         concurrency=concurrency,
         run_name=run_name,
         langsmith_project=langsmith_project,
+        langfuse_trace_name=langfuse_trace_name,
         cancel_event=cancel_event,
         handle=handle,
     ))

@@ -25,6 +25,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.types import ASGIApp
 
+from agent_eval.api import request_log
 from agent_eval.logging_config import request_id_var
 
 logger = logging.getLogger(__name__)
@@ -69,13 +70,24 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
         try:
             response: Response = await call_next(request)
-        except Exception:
+        except Exception as exc:
             # The global exception handler logs the traceback. We only need to
             # finalize the access log line here.
             latency_ms = (time.perf_counter() - start) * 1000
             logger.error(
                 "request failed method=%s path=%s latency_ms=%.1f",
                 method, path, latency_ms,
+            )
+            request_log.capture(
+                method=method,
+                path=path,
+                status=500,
+                latency_ms=latency_ms,
+                request_id=rid,
+                query=query,
+                client=client,
+                error=str(exc) or exc.__class__.__name__,
+                body=cached_body,
             )
             request_id_var.reset(token)
             raise
@@ -99,6 +111,17 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
                 "request body on %d: method=%s path=%s body=%s%s",
                 status, method, path, preview_str, truncated,
             )
+
+        request_log.capture(
+            method=method,
+            path=path,
+            status=status,
+            latency_ms=latency_ms,
+            request_id=rid,
+            query=query,
+            client=client,
+            body=cached_body,
+        )
 
         response.headers["X-Request-ID"] = rid
         request_id_var.reset(token)

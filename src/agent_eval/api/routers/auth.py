@@ -22,7 +22,8 @@ from agent_eval.auth.security import (
     hash_password,
     verify_password,
 )
-from agent_eval.db_models.tables import RefreshTokenRow, UserRow
+from agent_eval.db_models.tables import EntryCodeRow, RefreshTokenRow, UserRow
+from agent_eval.db_models.tenant_context import INTERNAL_TENANT_ID
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -43,12 +44,41 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     user_count = await db.execute(select(UserRow.id).limit(1))
     is_first_user = user_count.scalar_one_or_none() is None
 
-    user = UserRow(
-        username=body.username,
-        email=body.email,
-        hashed_password=hash_password(body.password),
-        role="admin" if is_first_user else "user",
-    )
+    if is_first_user:
+        # 系统初始化：第一个用户成为内部超管，免入口码（否则无人能创建第一个码）。
+        user = UserRow(
+            username=body.username,
+            email=body.email,
+            hashed_password=hash_password(body.password),
+            role="admin",
+            tenant_id=INTERNAL_TENANT_ID,
+            is_superadmin=True,
+        )
+    else:
+        # 其余用户必须凭有效入口码注册：码决定租户 + 角色。
+        if not body.entry_code:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Entry code required",
+            )
+        code_result = await db.execute(
+            select(EntryCodeRow).where(EntryCodeRow.code == body.entry_code)
+        )
+        entry_code = code_result.scalar_one_or_none()
+        if entry_code is None or not entry_code.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid or inactive entry code",
+            )
+        user = UserRow(
+            username=body.username,
+            email=body.email,
+            hashed_password=hash_password(body.password),
+            role=entry_code.role,
+            tenant_id=entry_code.tenant_id,
+            is_superadmin=False,
+        )
+
     db.add(user)
     await db.commit()
     await db.refresh(user)

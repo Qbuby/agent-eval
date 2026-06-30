@@ -76,18 +76,39 @@ export default async function globalSetup(config: FullConfig) {
   const ctx = await browser.newContext({ baseURL })
   const page = await ctx.newPage()
 
+  // admin 凭证经环境变量传入（不落代码库）。设置后跳过新注册，直接用既有
+  // admin 登录 —— 用于覆盖 admin-only 操作（批量删除样例 / 删除数据集）。
+  const ADMIN_USER = process.env.E2E_ADMIN_USER
+  const ADMIN_PASS = process.env.E2E_ADMIN_PASS
+  if (ADMIN_USER && ADMIN_PASS) {
+    await page.goto('/login')
+    await page.getByPlaceholder('输入用户名').fill(ADMIN_USER)
+    await page.getByPlaceholder('输入密码').fill(ADMIN_PASS)
+    await page.getByRole('button', { name: /继续|登录/ }).click()
+    await page.waitForURL(/\/dashboard/, { timeout: 15_000 })
+    await ctx.storageState({ path: STORAGE_FILE })
+    await browser.close()
+    // eslint-disable-next-line no-console
+    console.log(`[globalSetup] 使用既有 admin 账号登录：${ADMIN_USER}`)
+    return
+  }
+
   await page.goto('/register')
   await page.getByPlaceholder('选择用户名').fill(TEST_USER.username)
   await page.getByPlaceholder('you@example.com').fill(TEST_USER.email)
   await page.getByPlaceholder('至少 8 位，含字母和数字').fill(TEST_USER.password)
   await page.getByPlaceholder('再次输入密码').fill(TEST_USER.password)
+  // 多租户加固后注册强制入口码（除第一个用户）。默认用 internal 租户的 user 码，
+  // 可用 ENTRY_CODE 覆盖。
+  await page.getByPlaceholder('由管理员提供的注册入口码')
+    .fill(process.env.ENTRY_CODE || 'AiDong2026!')
   await page.getByRole('button', { name: /注册|创建/ }).click()
 
   await page.waitForURL(/\/login/, { timeout: 15_000 })
 
   await page.getByPlaceholder('输入用户名').fill(TEST_USER.username)
   await page.getByPlaceholder('输入密码').fill(TEST_USER.password)
-  await page.getByRole('button', { name: '继续' }).click()
+  await page.getByRole('button', { name: /继续|登录/ }).click()
   await page.waitForURL(/\/dashboard/, { timeout: 15_000 })
 
   await ctx.storageState({ path: STORAGE_FILE })

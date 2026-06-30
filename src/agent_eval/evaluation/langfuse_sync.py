@@ -24,7 +24,7 @@ import logging
 import uuid
 from typing import Any
 
-from agent_eval.config import settings
+from agent_eval.config_service import config_service
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,10 @@ async def sync_run_scores_to_langfuse(
     """
     stats = {"traces": 0, "scores": 0, "errors": 0}
 
-    if not settings.langfuse.remote_write or not settings.langfuse.configured:
+    # Resolve the active Langfuse connection preset (langfuse.connection),
+    # falling back to env settings. remote_write also comes from the preset.
+    conn = await config_service.get_langfuse_connection()
+    if not conn["remote_write"] or not conn["configured"]:
         logger.info("langfuse-sync: remote_write off or not configured, skipping")
         return stats
 
@@ -112,9 +115,9 @@ async def sync_run_scores_to_langfuse(
         return stats
 
     client = Langfuse(
-        public_key=settings.langfuse.public_key,
-        secret_key=settings.langfuse.secret_key,
-        host=settings.langfuse.host,
+        public_key=conn["public_key"],
+        secret_key=conn["secret_key"],
+        host=conn["host"],
     )
 
     loop = asyncio.get_event_loop()
@@ -268,7 +271,8 @@ async def pull_evaluator_scores_for_run(
     were imported in total.
     """
     out = {"polls": 0, "pulled": 0}
-    if not settings.langfuse.configured:
+    conn = await config_service.get_langfuse_connection()
+    if not conn["configured"]:
         return out
 
     import httpx
@@ -281,10 +285,10 @@ async def pull_evaluator_scores_for_run(
     )
 
     auth = base64.b64encode(
-        f"{settings.langfuse.public_key}:{settings.langfuse.secret_key}".encode()
+        f"{conn['public_key']}:{conn['secret_key']}".encode()
     ).decode()
     headers = {"Authorization": f"Basic {auth}"}
-    base = settings.langfuse.host.rstrip("/")
+    base = conn["host"].rstrip("/")
 
     last_pulled = 0
     stale_polls = 0

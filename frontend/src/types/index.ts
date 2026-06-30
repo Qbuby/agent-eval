@@ -7,6 +7,8 @@ export interface RegisterRequest {
   username: string
   email: string
   password: string
+  // 入口码：非首个用户注册时必填，决定所属租户与角色（首个用户为内部超管，免码）
+  entry_code?: string
 }
 
 export interface TokenResponse {
@@ -21,6 +23,10 @@ export interface User {
   email: string
   role: string
   is_active: boolean
+  // 多租户：用户所属租户 id；内部用户挂默认内部租户（与后端 UserRow.tenant_id 对齐）
+  tenant_id: string
+  // 是否超级管理员（内部 admin）；为 true 时后端跨租户可见
+  is_superadmin: boolean
   created_at: string
   updated_at: string
 }
@@ -30,6 +36,10 @@ export interface UserUpdateRequest {
   password?: string
 }
 
+// 数据集类型：candidate=备选数据集（单轮，老数据默认）/ conversation=多轮对话集。
+// 两类在各自页面隔离展示，互不可见。
+export type DatasetType = 'candidate' | 'conversation'
+
 export interface Dataset {
   id: string
   name: string
@@ -37,6 +47,7 @@ export interface Dataset {
   example_count: number
   created_at: string | null
   metadata: Record<string, unknown>
+  dataset_type: DatasetType
 }
 
 export interface CreateDatasetRequest {
@@ -44,6 +55,7 @@ export interface CreateDatasetRequest {
   description?: string
   source_project?: string
   metadata?: Record<string, unknown>
+  dataset_type?: DatasetType
 }
 
 export interface DatasetStats {
@@ -61,6 +73,8 @@ export interface TestCase {
   name: string
   description?: string
   tags?: string[]
+  // 受管单值类别（对齐基准测试集）：类别名字符串，存进 Langfuse item metadata.category。
+  category?: string | null
   source?: string
   input_messages: Array<{ role: string; content: string }>
   agent_config_override?: Record<string, unknown>
@@ -71,6 +85,15 @@ export interface TestCase {
   max_latency_ms?: number
   max_tokens?: number
   scoring_mode?: string
+  // 多轮对话：会话级目标 + 逐轮期望（turn_index 指向 input_messages 里 user 消息下标）
+  conversation_goal?: string
+  turn_expectations?: TurnExpectation[]
+}
+
+export interface TurnExpectation {
+  turn_index: number
+  criteria?: string[]
+  expected_output?: string
 }
 
 export interface AddCasesRequest {
@@ -80,7 +103,7 @@ export interface AddCasesRequest {
 
 export interface GenerateScenarioRequest {
   dataset: string
-  test_scenario: string
+  test_scenario?: string
   case_category?: string
   count?: number
   context?: string
@@ -209,9 +232,16 @@ export interface FillModelsResponse {
   missing: string[]
 }
 
+export interface ConfigOption {
+  value: unknown
+  label: string | null
+}
+
 export interface ConfigItem {
   key: string
-  value: unknown
+  value: unknown                  // default option's value (back-compat)
+  options: ConfigOption[]
+  default_index: number
   category: string
   description: string | null
   updated_by: string | null
@@ -221,6 +251,18 @@ export interface ConfigItem {
 export interface ConfigUpdateRequest {
   value: unknown
   description?: string
+}
+
+export interface AddConfigOptionRequest {
+  value: unknown
+  label?: string | null
+  make_default?: boolean
+  description?: string
+}
+
+export interface UpdateConfigOptionRequest {
+  value: unknown
+  label?: string | null
 }
 
 export interface AuditLog {
@@ -358,8 +400,19 @@ export interface EvaluatorInstance {
   description: string | null
   params: Record<string, unknown>
   is_active: boolean
+  current_version_id?: string | null
   created_at: string | null
   updated_at: string | null
+}
+
+export interface EvaluatorVersion {
+  id: string
+  evaluator_id: string
+  version_number: number
+  params: Record<string, unknown>
+  description: string | null
+  created_by: string | null
+  created_at: string | null
 }
 
 export interface CreateEvaluatorRequest {
@@ -399,6 +452,9 @@ export interface StartEvalRequest {
   benchmark_version_id?: string | null
   project_id?: string | null
   case_source_id?: string | null
+  // 多轮对话数据集（dataset_type=conversation）名称：直读 LangSmith dataset，
+  // 整段 input_messages + conversation_goal + turn_expectations 透传给 runner 回放。
+  conversation_dataset?: string | null
   case_ids?: string[] | null
   filter_tags?: string[] | null
   filter_category_id?: string | null
@@ -408,6 +464,9 @@ export interface StartEvalRequest {
   concurrency?: number
   run_name?: string | null
   langsmith_project?: string | null
+  // Langfuse trace 名：对称于 langsmith_project。设置后 run 结束按 (name, 时间窗)
+  // 回拉 Langfuse trace，按 question 文本匹配贴回 langfuse_trace_id。
+  langfuse_trace_name?: string | null
 }
 
 export interface StartEvalResponse {
@@ -424,6 +483,7 @@ export interface EvalRunSummary {
   finished_at: string | null
   langfuse_run_name: string | null
   langsmith_project?: string | null
+  langfuse_trace_name?: string | null
   agent_config: Record<string, unknown>
   summary_scores: {
     counts?: { total?: number; passed?: number; failed?: number; unreachable?: number }
@@ -435,6 +495,13 @@ export interface EvalRunSummary {
     tool_usage?: Array<{ name: string; calls: number; errors: number; cases: number }>
     cost_success?: Record<string, number | null>
     cost_failure?: Record<string, number | null>
+    retry_stats?: {
+      total_cases?: number
+      cases_with_retries?: number
+      max_attempts?: number
+      avg_attempts?: number
+      total_retries?: number
+    }
     langfuse_dataset?: string
     langfuse_run_name?: string
     langfuse_host?: string
@@ -448,6 +515,39 @@ export interface EvalRunSummary {
 
 export interface EvalRunDetail extends EvalRunSummary {
   evaluator_configs: Array<Record<string, unknown>>
+}
+
+export interface CotStep {
+  type: 'thought' | 'tool_call' | 'answer'
+  content?: string
+  tool_name?: string
+  args?: unknown
+  output?: unknown
+  started_at?: number | null
+  duration_ms?: number | null
+  first_token_ms?: number | null
+  // 多轮回放时该 step 所属的 user 轮序号（0-based），单轮无此字段。
+  turn?: number
+}
+
+// 多轮评估回放出的单轮记录（落在 full_trace.conversation.turns）。
+export interface ConversationTurn {
+  turn_index: number
+  turn_no?: number
+  user: string
+  assistant: string
+  tool_calls?: Array<Record<string, unknown>>
+  steps?: CotStep[]
+  latency_ms?: number | null
+  attempts?: number
+}
+
+// 多轮评估结果的会话级上下文（落在 full_trace.conversation）。
+// turn.user/assistant 为该轮输入与 agent 回复；turn_expectations 按 turn_index 对齐。
+export interface ConversationTrace {
+  turns: ConversationTurn[]
+  goal?: string | null
+  turn_expectations?: TurnExpectation[]
 }
 
 export interface EvalResultRow {
@@ -464,10 +564,14 @@ export interface EvalResultRow {
   cache_creation_tokens?: number | null
   cache_read_tokens?: number | null
   tool_call_count: number | null
+  first_thinking_token_ms?: number | null
+  first_answer_token_ms?: number | null
   actual_tool_calls?: Array<Record<string, unknown>> | null
+  full_trace?: { steps?: CotStep[]; conversation?: ConversationTrace } | null
   error_message: string | null
   langfuse_trace_id: string | null
   langsmith_run_id?: string | null
+  attempts_made?: number
   scores: Record<string, number>
 }
 
@@ -489,4 +593,111 @@ export interface BuiltinEvaluator {
   name: string
   description: string
   params_schema: Record<string, unknown>
+}
+
+// ─── Evaluator Providers (LLM-judge endpoints) ───
+
+export type ProviderType =
+  | 'openai'
+  | 'openai_compatible'
+  | 'anthropic'
+  | 'deepseek'
+  | 'azure'
+  | 'custom'
+
+export interface EvaluatorProvider {
+  id: string
+  name: string
+  provider_type: string
+  base_url: string | null
+  default_model: string | null
+  extra_config: Record<string, unknown>
+  is_active: boolean
+  has_api_key: boolean
+  api_key_masked: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface CreateEvaluatorProviderRequest {
+  name: string
+  provider_type: string
+  base_url?: string | null
+  api_key?: string | null
+  default_model?: string | null
+  extra_config?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface UpdateEvaluatorProviderRequest {
+  name?: string
+  provider_type?: string
+  base_url?: string | null
+  // omit: keep existing; "": clear; non-empty: replace
+  api_key?: string | null
+  default_model?: string | null
+  extra_config?: Record<string, unknown>
+  is_active?: boolean
+}
+
+export interface TestProviderResponse {
+  ok: boolean
+  latency_ms: number | null
+  detail: string
+  models: string[]
+}
+
+export interface ProviderModelsResponse {
+  ok: boolean
+  models: string[]
+  detail: string
+}
+
+// ─── Configurable judge dry-run ───
+
+export interface DryRunRequest {
+  provider_id?: string | null
+  params: Record<string, unknown>
+  input: string
+  output: string
+  expected_output?: string | null
+  metadata?: Record<string, unknown> | null
+}
+
+export interface DryRunScoreItem {
+  name: string
+  value: number
+  reason: string
+  // 模型原始输出（数值/布尔/类别名），UI 在归一分旁展示便于核对
+  raw_value?: number | boolean | string | null
+}
+
+export interface DryRunResponse {
+  // 单分数范式：scores 至多一个元素
+  scores: DryRunScoreItem[]
+  model: string
+  usage: Record<string, number>
+  raw_content: string
+  rendered_messages: Array<{ role: string; content: string }>
+  error: string | null
+}
+
+export interface RequestLogEntry {
+  timestamp: string
+  method: string
+  path: string
+  status: number
+  latency_ms: number
+  request_id: string
+  query: string
+  client: string
+  error: string | null
+  body_preview: string | null
+  body_truncated: boolean
+}
+
+export interface RequestLogResponse {
+  capacity: number
+  returned: number
+  entries: RequestLogEntry[]
 }

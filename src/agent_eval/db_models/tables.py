@@ -7,7 +7,9 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -15,6 +17,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from agent_eval.db_models.tenant_context import INTERNAL_TENANT_ID
 
 
 def _utcnow() -> datetime:
@@ -29,7 +33,28 @@ class Base(DeclarativeBase):
     pass
 
 
-class DatasetVersionRow(Base):
+class TenantMixin:
+    """给「客户可分离数据」表挂租户列。
+
+    继承它的表会被 db.py 注册的事件监听器自动过滤（读）/盖章（写）：
+    - 读：非 superadmin 且有租户上下文时，查询自动加 ``tenant_id == ctx``。
+    - 写：新行 tenant_id 为空时，由 before_flush 补当前租户或内部 sentinel。
+
+    所以业务代码通常无需手写 tenant_id，靠监听器兜底。default 给
+    INTERNAL_TENANT_ID 是双保险：即便监听器未触发（极端情况），也不会写出
+    NULL 违反 NOT NULL 约束。
+    """
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id"),
+        nullable=False,
+        index=True,
+        default=INTERNAL_TENANT_ID,
+    )
+
+
+class DatasetVersionRow(Base, TenantMixin):
     __tablename__ = "dataset_versions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -39,7 +64,7 @@ class DatasetVersionRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class TestCaseRow(Base):
+class TestCaseRow(Base, TenantMixin):
     __tablename__ = "test_cases"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -71,7 +96,7 @@ class TestCaseRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class TestRunRow(Base):
+class TestRunRow(Base, TenantMixin):
     __tablename__ = "test_runs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -96,6 +121,11 @@ class TestRunRow(Base):
     summary_scores: Mapped[dict | None] = mapped_column(JSONB)
     langfuse_run_name: Mapped[str | None] = mapped_column(Text)
     langsmith_project: Mapped[str | None] = mapped_column(Text)
+    # Per-run Langfuse trace name: the回拉键 used to fetch traces by name+time
+    # window from the Langfuse public API after a run, then match by question
+    # text to backfill test_results.langfuse_trace_id. Mirrors langsmith_project's
+    # role for LangSmith. Distinct from langfuse_run_name (display/search only).
+    langfuse_trace_name: Mapped[str | None] = mapped_column(Text)
     evaluator_configs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     # Soft-delete: list endpoints filter out non-null deleted_at by default;
@@ -103,7 +133,7 @@ class TestRunRow(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class TestResultRow(Base):
+class TestResultRow(Base, TenantMixin):
     __tablename__ = "test_results"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -119,6 +149,11 @@ class TestResultRow(Base):
     )
 
     question: Mapped[str | None] = mapped_column(Text)
+    # Expected/reference answer, snapshotted at run time from the case source
+    # (benchmark reference_answer or uploaded expected_output). Persisted here
+    # so the export/detail view always has it, independent of whether the
+    # originating case still exists. NULL on rows created before 0016.
+    expected_output: Mapped[str | None] = mapped_column(Text)
     thread_id: Mapped[str | None] = mapped_column(Text)
     langsmith_run_id: Mapped[str | None] = mapped_column(Text)
 
@@ -140,21 +175,37 @@ class TestResultRow(Base):
     cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
     tool_call_count: Mapped[int | None] = mapped_column(Integer)
 
+    # Time-to-first-token (ms, relative to invoke start). Two flavours:
+    #   first_thinking_token_ms — first text byte from the agent's *first*
+    #     LLM step. For non-tool-using agents, this equals the answer's TTFT;
+    #     for tool-using agents, it's how long until reasoning began streaming.
+    #   first_answer_token_ms   — first text byte of the *final* LLM step
+    #     (the one promoted to type='answer' by SSEStreamAdapter). For agents
+    #     that loop through tools then answer, this is the user-perceived TTFT.
+    first_thinking_token_ms: Mapped[int | None] = mapped_column(Integer)
+    first_answer_token_ms: Mapped[int | None] = mapped_column(Integer)
+
     error_message: Mapped[str | None] = mapped_column(Text)
     error_type: Mapped[str | None] = mapped_column(String(64))
+
+    attempts_made: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
 
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class EvaluationScoreRow(Base):
+class EvaluationScoreRow(Base, TenantMixin):
     __tablename__ = "evaluation_scores"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
     result_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("test_results.id"), nullable=False, index=True
     )
-    dimension: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # 多轮评估的 score key 形如 `{label}.turn{n}` / `{label}.conversation`，
+    # label 可能较长 → 扩到 255 防止超长 flush 报错回滚整行（见迁移 0025）。
+    dimension: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     weight: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
     weighted_score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
@@ -163,7 +214,7 @@ class EvaluationScoreRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class OptimizationRow(Base):
+class OptimizationRow(Base, TenantMixin):
     __tablename__ = "optimizations"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -190,8 +241,19 @@ class UserRow(Base):
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     email: Mapped[str] = mapped_column(String(256), unique=True, nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
-    role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # users 表本身不挂 TenantMixin（admin 要跨租户管用户，不能被过滤），
+    # 但每个用户归属一个租户：外部客户落自己的租户，内部用户落 sentinel。
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id"),
+        nullable=False,
+        index=True,
+        default=INTERNAL_TENANT_ID,
+    )
+    # superadmin = 内部 admin，监听器对其读查询不注入租户过滤（全租户可见）。
+    is_superadmin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -225,7 +287,7 @@ class SystemConfigRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class RoutingRuleRow(Base):
+class RoutingRuleRow(Base, TenantMixin):
     __tablename__ = "routing_rules"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -243,7 +305,7 @@ class RoutingRuleRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class RoutingLogRow(Base):
+class RoutingLogRow(Base, TenantMixin):
     __tablename__ = "routing_logs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -258,7 +320,7 @@ class RoutingLogRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class DatasetMetadataRow(Base):
+class DatasetMetadataRow(Base, TenantMixin):
     __tablename__ = "dataset_metadata"
     __table_args__ = (
         UniqueConstraint("dataset_name", name="uq_dataset_metadata_name"),
@@ -267,6 +329,9 @@ class DatasetMetadataRow(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
     dataset_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
     source_project: Mapped[str | None] = mapped_column(String(256))
+    # 数据集类型：区分备选数据集（candidate，默认）与多轮对话集（conversation），
+    # 用于两类数据集在各自页面互相隔离。无本地行的老数据集按 candidate 处理。
+    dataset_type: Mapped[str] = mapped_column(String(16), nullable=False, default="candidate", index=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
     max_examples: Mapped[int | None] = mapped_column(Integer)
     retention_policy: Mapped[str | None] = mapped_column(String(16))
@@ -274,7 +339,30 @@ class DatasetMetadataRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class AuditLogRow(Base):
+class ConversationCategoryRow(Base, TenantMixin):
+    """多轮对话集的受管类别（对齐基准测试集 CategoryRow，但作用域是 dataset_name）。
+
+    对话样例的真身存在 Langfuse（Postgres 没有对话 case 表），无法像 benchmark 那样
+    用外键 category_id 关联。故此表只承载受管实体（列出/新建/重命名/删除/唯一性），
+    样例→类别的归属以**类别名字符串**存进 Langfuse item 的 ``metadata["category"]``
+    （见 converter.case_to_example）。重命名类别时旧样例的 metadata 字符串需一次性
+    批量同步（rename 端点负责），与 candidate→benchmark promote 的按名同步同类。
+    """
+    __tablename__ = "conversation_categories"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    # 作用域锚点：对话集没有 project 概念，dataset_name 才是边界（对齐 DatasetMetadataRow）。
+    dataset_name: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("dataset_name", "name", name="uq_conv_category_dataset_name"),
+    )
+
+
+class AuditLogRow(Base, TenantMixin):
     __tablename__ = "audit_logs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -288,7 +376,7 @@ class AuditLogRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
 
 
-class ExampleFingerprintRow(Base):
+class ExampleFingerprintRow(Base, TenantMixin):
     __tablename__ = "example_fingerprints"
     __table_args__ = (
         UniqueConstraint("dataset_name", "fingerprint", name="uq_dataset_fingerprint"),
@@ -301,7 +389,7 @@ class ExampleFingerprintRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class TraceWatchCursorRow(Base):
+class TraceWatchCursorRow(Base, TenantMixin):
     __tablename__ = "trace_watch_cursors"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -317,7 +405,7 @@ class TraceWatchCursorRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class LoopControlLogRow(Base):
+class LoopControlLogRow(Base, TenantMixin):
     __tablename__ = "loop_control_log"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -344,7 +432,7 @@ class LoopControlLogRow(Base):
 # ---------------------------------------------------------------------------
 
 
-class ProjectRow(Base):
+class ProjectRow(Base, TenantMixin):
     __tablename__ = "projects"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -354,7 +442,7 @@ class ProjectRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class CategoryRow(Base):
+class CategoryRow(Base, TenantMixin):
     __tablename__ = "categories"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -371,7 +459,7 @@ class CategoryRow(Base):
     )
 
 
-class BenchmarkVersionRow(Base):
+class BenchmarkVersionRow(Base, TenantMixin):
     __tablename__ = "benchmark_versions"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -388,7 +476,7 @@ class BenchmarkVersionRow(Base):
     )
 
 
-class BenchmarkCaseRow(Base):
+class BenchmarkCaseRow(Base, TenantMixin):
     __tablename__ = "benchmark_cases"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -416,7 +504,7 @@ class BenchmarkCaseRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class CandidateCaseRow(Base):
+class CandidateCaseRow(Base, TenantMixin):
     __tablename__ = "candidate_cases"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -427,6 +515,9 @@ class CandidateCaseRow(Base):
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     question: Mapped[str] = mapped_column(Text, nullable=False)
     answer: Mapped[str | None] = mapped_column(Text)
+    # 自由文本类别名（不绑 project 的 CategoryRow）。promote 时按名同步到目标
+    # project 的 categories（有则复用、无则新增），见 candidates.promote。
+    category: Mapped[str | None] = mapped_column(String(128), index=True)
     key_points: Mapped[list | None] = mapped_column(JSONB)
     negative_points: Mapped[list | None] = mapped_column(JSONB)
     tags: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
@@ -439,7 +530,7 @@ class CandidateCaseRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class ImportBatchRow(Base):
+class ImportBatchRow(Base, TenantMixin):
     __tablename__ = "import_batches"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
@@ -455,7 +546,7 @@ class ImportBatchRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class EvalCaseSourceRow(Base):
+class EvalCaseSourceRow(Base, TenantMixin):
     """Ephemeral per-upload case list (user-provided JSON/JSONL file).
 
     One row per upload. The ``cases`` JSONB is a list of
@@ -473,7 +564,7 @@ class EvalCaseSourceRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
-class EvaluatorConfigRow(Base):
+class EvaluatorConfigRow(Base, TenantMixin):
     """Named reusable evaluator instances.
 
     Originally each row carried evaluator_type + params and ran a local
@@ -496,5 +587,347 @@ class EvaluatorConfigRow(Base):
     description: Mapped[str | None] = mapped_column(Text)
     params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Pointer to the most recently published EvaluatorVersionRow. Nullable for
+    # legacy rows (pre-versioning) and for evaluators that haven't been saved
+    # through the versioned editor yet.
+    current_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("evaluator_versions.id", ondelete="SET NULL"),
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class EvaluatorVersionRow(Base, TenantMixin):
+    """Append-only snapshot of an evaluator's config at a point in time.
+
+    Each save through the configurable-judge editor writes a new row;
+    ``version_number`` is a per-evaluator monotonic counter starting at 1.
+    Runs pin to a specific version via
+    ``test_runs.evaluator_configs[].evaluator_version_id`` so historical
+    results reproduce against the exact prompt/model used at the time.
+    """
+    __tablename__ = "evaluator_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "evaluator_id", "version_number",
+            name="uq_evaluator_versions_evaluator_id_version_number",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    evaluator_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("evaluator_configs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    params: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    description: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class EvaluatorProviderRow(Base, TenantMixin):
+    """LLM-judge provider credential record.
+
+    A row represents one usable LLM endpoint (OpenAI / Anthropic / DeepSeek /
+    Azure / OpenAI-compatible) the user wants their configurable evaluators to
+    call. ``api_key_encrypted`` holds a fernet-encrypted key blob; plaintext
+    never touches DB or API responses (see ``evaluation.crypto``).
+
+    Evaluators reference a provider via ``evaluator_configs.params['provider_id']``
+    as a UUID string — kept loosely coupled (no FK) so deleting a provider
+    leaves historical evaluators in an "unconfigured" state instead of cascading.
+    """
+    __tablename__ = "evaluator_providers"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    provider_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(Text)
+    api_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
+    default_model: Mapped[str | None] = mapped_column(String(128))
+    extra_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+# ---------------------------------------------------------------------------
+# 多租户 + 外部客户 Portal 表
+# ---------------------------------------------------------------------------
+
+
+class TenantRow(Base):
+    """租户。内部租户是固定 sentinel（id=INTERNAL_TENANT_ID），存量数据全挂它。
+
+    tenants 本身不挂 TenantMixin —— 它是隔离的「维度表」，不能被自身过滤
+    （否则普通租户连自己所属的 tenant 行都查不到，admin 也管不了别家）。
+    """
+
+    __tablename__ = "tenants"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class PortalSampleBatchRow(Base, TenantMixin):
+    """外部客户一次 xlsx 上传 = 一个批次。tenant_id 由监听器自动盖章。"""
+
+    __tablename__ = "portal_sample_batches"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(Text, nullable=False)  # 来自文件名
+    uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class PortalSampleRow(Base, TenantMixin):
+    """解析后的单条 QA 样例。其余 xlsx 列进 extra（JSONB）。"""
+
+    __tablename__ = "portal_samples"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("portal_sample_batches.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    row_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str | None] = mapped_column(Text)
+    extra: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class SampleFeedbackRow(Base, TenantMixin):
+    """客户对单条样例的手动打分 + 意见。一个用户对一个 sample 一条。"""
+
+    __tablename__ = "sample_feedbacks"
+    __table_args__ = (
+        UniqueConstraint("sample_id", "rated_by", name="uq_sample_feedback_sample_rater"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    sample_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("portal_samples.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    rated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    overall: Mapped[int | None] = mapped_column(Integer)  # 总体 1-5
+    # 维度→分，如 {relevance, difficulty, answer_accuracy}
+    scores: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    comment: Mapped[str | None] = mapped_column(Text)
+    # 评审人为该样例填写的「期望答案」（参考答案/标准答案）。与打分同属评审产出，
+    # 故并入本表复用 (sample_id, rated_by) upsert：每位评审各存一份，随样例带出。
+    expected_answer: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class EntryCodeRow(Base):
+    """注册入口码：用户注册时凭码绑定到某租户并获得指定角色。
+
+    像 TenantRow 一样**不挂 TenantMixin** —— 注册发生在 pre-auth（还没有租户
+    上下文），监听器若对其注入过滤会查不到任何码；且内部 admin 要跨租户管理所有
+    码。code 为明文（admin 需查看并分发给客户，不同于密码的 bcrypt 哈希）。
+    """
+
+    __tablename__ = "entry_codes"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # 凭此码注册的用户落到哪个租户（内部码指向 INTERNAL_TENANT_ID）
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False, default=INTERNAL_TENANT_ID
+    )
+    # 凭此码注册的用户角色：user / external_customer / admin
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
+    label: Mapped[str | None] = mapped_column(String(128))  # 人类描述，如「中力客户入口」
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class LangfuseTraceMetricRow(Base, TenantMixin):
+    """从 Langfuse 周期拉取并持久化的 trace 级聚合指标。
+
+    24h 轮询近 30 天窗口，按 ``langfuse_trace_id`` 幂等 upsert（同一 trace 的
+    cost/score 可能被异步补算，全窗口重拉保证最终一致）。挂 TenantMixin：后台
+    轮询无租户上下文 → 监听器旁路、写入自动落 INTERNAL_TENANT_ID，内部 admin
+    （superadmin）读取不被过滤、跨 env 全见。
+
+    指标来源见 langfuse_metrics/compute.py。cache_* 三列恒 NULL（当前 trace 未
+    上报缓存 token，留作占位，前端显示 N/A）。
+    """
+
+    __tablename__ = "langfuse_trace_metrics"
+    __table_args__ = (
+        # 支撑「按 environment + 时间窗筛选」主查询
+        Index("ix_lf_trace_env_ts", "environment", "trace_timestamp"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    langfuse_trace_id: Mapped[str] = mapped_column(
+        String(256), unique=True, nullable=False, index=True
+    )
+    environment: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    name: Mapped[str | None] = mapped_column(String(512))
+    trace_timestamp: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    session_id: Mapped[str | None] = mapped_column(String(256))
+    user_id: Mapped[str | None] = mapped_column(String(256))
+    release: Mapped[str | None] = mapped_column(String(128))
+    tags: Mapped[list | None] = mapped_column(JSONB)
+
+    # 总响应时间
+    latency_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    # token 汇总
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    # 成本
+    total_cost: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    # 首工具调用时间（秒，相对 trace 起点）
+    first_tool_call_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    # 工具调用统计
+    tool_call_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_success_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_success_rate: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    tool_call_counts: Mapped[dict | None] = mapped_column(JSONB)  # {tool_name: count}
+    # 首思考 / 首答 token 时间（秒，相对 trace 起点）
+    first_thinking_token_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    first_answer_token_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    # 缓存（占位，当前恒 NULL）
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_creation_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_hit_rate: Mapped[float | None] = mapped_column(Numeric(5, 4))
+    # 结构计数
+    observation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    generation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    has_error: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 详情展示原文
+    input: Mapped[dict | None] = mapped_column(JSONB)
+    output: Mapped[dict | None] = mapped_column(JSONB)
+    # 列名用 trace_metadata 避开 DeclarativeBase 保留属性名 metadata
+    trace_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    scores: Mapped[list | None] = mapped_column(JSONB)
+
+    raw_synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class LangfuseObservationMetricRow(Base, TenantMixin):
+    """Langfuse observation（CHAIN/AGENT/GENERATION/TOOL）明细。
+
+    用业务键 ``langfuse_trace_id`` 关联回 trace（**不建 DB 外键**，避免拉取顺序
+    耦合；Langfuse id 全局唯一，index 足够）。冗余存 ``trace_timestamp`` 便于按
+    时间独立清理。``output`` 必存——compute 的首思考/首答判别依赖它。
+    """
+
+    __tablename__ = "langfuse_observation_metrics"
+    __table_args__ = (
+        UniqueConstraint("langfuse_observation_id", name="uq_lf_obs_observation_id"),
+        # 详情页按 trace 拉明细 + 可按类型筛
+        Index("ix_lf_obs_trace_type", "langfuse_trace_id", "type"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    langfuse_observation_id: Mapped[str] = mapped_column(
+        String(256), nullable=False, index=True
+    )
+    langfuse_trace_id: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    environment: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    trace_timestamp: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    name: Mapped[str | None] = mapped_column(String(512))
+    level: Mapped[str | None] = mapped_column(String(16))
+    status_message: Mapped[str | None] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(128))
+    start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    end_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    latency_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    usage_input: Mapped[int | None] = mapped_column(Integer)
+    usage_output: Mapped[int | None] = mapped_column(Integer)
+    usage_total: Mapped[int | None] = mapped_column(Integer)
+    calculated_total_cost: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    total_price: Mapped[float | None] = mapped_column(Numeric(12, 6))
+    time_to_first_token_s: Mapped[float | None] = mapped_column(Numeric(12, 4))
+    completion_start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    parent_observation_id: Mapped[str | None] = mapped_column(String(256))
+    obs_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    input: Mapped[dict | None] = mapped_column(JSONB)
+    output: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class LangfuseMetricsCursorRow(Base, TenantMixin):
+    """Langfuse 指标轮询的单例游标 / 运行状态。
+
+    ``scope`` 固定一行（"global"），记录上次成功轮询的 wall-clock 用于进程重启
+    补跑判断（距上次 ≥ 间隔才补跑），以及累计 / 最近一轮计数、连续失败、状态。
+    """
+
+    __tablename__ = "langfuse_metrics_cursors"
+    __table_args__ = (UniqueConstraint("scope", name="uq_lf_metrics_cursor_scope"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False, default="global")
+    last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    traces_synced_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    observations_synced_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_run_traces: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_run_observations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="idle")
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )

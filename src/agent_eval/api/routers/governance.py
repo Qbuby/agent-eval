@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_eval.auth.dependencies import get_current_user
+from agent_eval.auth.dependencies import get_current_user, require_internal
 from agent_eval.config import settings
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import DatasetMetadataRow, UserRow
@@ -17,7 +16,7 @@ from agent_eval.governance.dedup import DedupService, DedupStrategy
 from agent_eval.governance.lifecycle import DatasetStatus, LifecycleConfig, LifecycleService, RetentionPolicy
 from agent_eval.governance.validator import ExampleValidator
 
-router = APIRouter(prefix="/api", tags=["governance"])
+router = APIRouter(prefix="/api", tags=["governance"], dependencies=[Depends(require_internal())])
 
 
 # --- Schemas ---
@@ -276,7 +275,7 @@ async def get_quality_report(
 ):
     from agent_eval.api.dependencies import get_manager
 
-    manager = get_manager()
+    manager = await get_manager()
     cases = await manager.provider.load_cases(name)
 
     validator_config = {

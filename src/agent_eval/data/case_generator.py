@@ -4,71 +4,75 @@ import json
 import logging
 from typing import Any
 
-from langchain_core.language_models import BaseChatModel
-
+from agent_eval.evaluation.agent_adapter import AgentResponse
 from agent_eval.models.optimization import FailureCluster
 from agent_eval.models.test_case import TestCase
 
 logger = logging.getLogger(__name__)
 
+# The generator now drives the *same* agent endpoint used for evaluation
+# (an SSE/OpenAI-compatible agent, typically backed by a knowledge graph)
+# instead of a raw LLM. We send the generation instruction as a normal user
+# question; the agent answers from its own domain knowledge / KG and we parse
+# the JSON array out of its reply. This is what makes the generated cases
+# domain-grounded rather than the agent-agnostic questions a bare LLM invents.
+
 SCENARIO_GEN_PROMPT = """\
-You are a test case generator for an AI agent evaluation system.
+你是被测智能体本身。请基于你自己的知识库 / 知识图谱，出 {count} 道用于
+检验你这类智能体能力的测试题。每道题给出问题和对应的标准答案。
 
-Given the following scenario description, generate {count} NEW test cases
-that thoroughly test the described capability.
-
-{seed_block}
-## Scenario
+{seed_block}## 测试场景 / 主题
 {scenario}
 
-## Additional Context
+## 补充上下文
 {context}
 
-## Output Format
-Return a JSON array. Each element must have:
-- "name": short descriptive name
-- "description": what this case tests
-- "input_messages": [{{"role": "user", "content": "..."}}]
-- "expected_output_criteria": list of natural language criteria for judging correctness
-- "tags": list of relevant tags
+## 输出格式
+只返回一个 JSON 数组，不要输出任何其它文字、解释或 Markdown 代码围栏。
+数组每个元素必须包含：
+- "name": 简短描述性名称
+- "description": 这道题考察什么
+- "input_messages": [{{"role": "user", "content": "向智能体提的问题"}}]
+- "expected_output": 基于你知识库的标准答案（字符串）
+- "expected_output_criteria": 判定回答是否正确的自然语言标准（列表）
+- "tags": 相关标签（列表）
 
-Cover: happy path, edge cases, error conditions, multi-turn if applicable.
-The generated cases should match the SAME DOMAIN, LANGUAGE and STYLE as the seed examples
-above (if any), but vary the question content / parameters / phrasing — do not
-copy the seed questions verbatim.
-Return ONLY the JSON array, no other text.
+要求：题目必须来自你实际掌握的领域知识，覆盖常见问法、边界情况、易错点；
+若给了种子样例，保持相同领域 / 语言 / 风格，但变化问题内容，不要照抄。
+若未给定测试场景，则围绕你最核心的领域能力自由出题。
+再次强调：只返回 JSON 数组本身。
 """
 
 MUTATION_GEN_PROMPT = """\
-You are a test case generator for an AI agent evaluation system.
+你是被测智能体本身。下面给出一道已有的测试题，请用 "{strategy}" 策略，
+基于你自己的知识库生成 {count} 个变体。
 
-Given the following existing test case, generate {count} variants using the
-"{strategy}" strategy.
+策略说明：
+- rephrase: 同一意图，不同措辞 / 语言风格
+- edge_case: 边界值、异常输入、极短 / 极长
+- adversarial: 故意混淆、误导、试图让智能体出错的输入
+- mixed: 上述混合
 
-Strategy descriptions:
-- rephrase: same intent, different wording / language style
-- edge_case: boundary values, unusual inputs, minimal / maximal lengths
-- adversarial: inputs designed to confuse, mislead, or break the agent
-- mixed: a mix of all the above
-
-## Original Test Case
-Name: {name}
-Description: {description}
-Input Messages:
+## 原始测试题
+名称: {name}
+描述: {description}
+输入消息:
 {input_messages}
 
-Expected Output: {expected_output}
-Expected Criteria: {criteria}
+期望答案: {expected_output}
+判定标准: {criteria}
 
-## Output Format
-Return a JSON array. Each element must have:
-- "name": short descriptive name (indicate it is a variant)
-- "description": what this variant specifically tests
+## 输出格式
+只返回一个 JSON 数组，不要输出任何其它文字、解释或 Markdown 代码围栏。
+数组每个元素必须包含：
+- "name": 简短描述性名称（标明是变体）
+- "description": 这个变体具体考察什么
 - "input_messages": [{{"role": "user", "content": "..."}}]
-- "expected_output_criteria": list of natural language criteria
-- "tags": list of relevant tags (include "mutation:{strategy}")
+- "expected_output": 基于你知识库的标准答案（字符串）
+- "expected_output_criteria": 判定标准（列表）
+- "tags": 相关标签（列表，包含 "mutation:{strategy}"）
 
-Return ONLY the JSON array, no other text.
+再次强调：只返回 JSON 数组本身。
 """
 
 FAILURE_GEN_PROMPT = """\
@@ -98,9 +102,25 @@ Return ONLY the JSON array, no other text.
 
 
 class CaseGenerator:
+    """Generates test cases by asking the *agent under test* to author them.
 
-    def __init__(self, llm: BaseChatModel):
-        self.llm = llm
+    ``adapter`` is one of the evaluation agent adapters
+    (``SSEStreamAdapter`` / ``OpenAICompatibleAdapter``). We send each
+    generation instruction as a user turn and parse the JSON array out of the
+    agent's reply, so the questions come from the agent's own knowledge graph
+    rather than a generic LLM.
+    """
+
+    def __init__(self, adapter: Any):
+        self.adapter = adapter
+
+    async def _ask_agent(self, prompt: str) -> str:
+        """Send the generation instruction as a single user turn and return
+        the agent's raw text reply (to be parsed as a JSON array)."""
+        resp: AgentResponse = await self.adapter.invoke(
+            [{"role": "user", "content": prompt}]
+        )
+        return resp.content or ""
 
     async def generate_from_scenario(
         self,
@@ -116,7 +136,7 @@ class CaseGenerator:
             # Pick up to 5 cases as seed/few-shot — enough to anchor the
             # domain and style without dominating the prompt window.
             sample = seed_cases[:5]
-            lines = ["## Seed Examples (existing cases in this dataset — generalize from these, do not duplicate)"]
+            lines = ["## 种子样例（本数据集已有的样例，请据此泛化，不要照抄）"]
             for i, c in enumerate(sample, 1):
                 user_msg = ""
                 for m in (c.input_messages or []):
@@ -130,18 +150,18 @@ class CaseGenerator:
                 lines.append(f"{i}. {user_msg}")
                 if c.expected_output:
                     eo = c.expected_output if len(c.expected_output) <= 200 else c.expected_output[:200] + "…"
-                    lines.append(f"   Expected: {eo}")
+                    lines.append(f"   期望答案: {eo}")
             lines.append("")
             seed_block = "\n".join(lines) + "\n"
 
         prompt = SCENARIO_GEN_PROMPT.format(
             count=count,
-            scenario=scenario,
-            context=context or "None provided",
+            scenario=scenario.strip() or "（未指定，围绕你最核心的领域能力自由出题）",
+            context=context or "无",
             seed_block=seed_block,
         )
-        response = await self.llm.ainvoke(prompt)
-        cases = self._parse_cases(response.content, source="auto_generated")
+        content = await self._ask_agent(prompt)
+        cases = self._parse_cases(content, source="auto_generated")
         if tags:
             for case in cases:
                 case.tags.extend(tags)
@@ -166,8 +186,8 @@ class CaseGenerator:
             criteria=criteria_text,
             strategy=strategy,
         )
-        response = await self.llm.ainvoke(prompt)
-        cases = self._parse_cases(response.content, source="auto_generated")
+        response = await self._ask_agent(prompt)
+        cases = self._parse_cases(response, source="auto_generated")
         for case in cases:
             case.parent_case_id = source_case.id
             if tags:
@@ -198,20 +218,16 @@ class CaseGenerator:
             fix_direction=cluster.suggested_fix_direction,
             sample_errors=sample_errors_text,
         )
-        response = await self.llm.ainvoke(prompt)
-        cases = self._parse_cases(response.content, source="failure_derived")
+        response = await self._ask_agent(prompt)
+        cases = self._parse_cases(response, source="failure_derived")
         for case in cases:
             case.tags.append(f"failure:{cluster.category}")
         return cases
 
     def _parse_cases(self, content: str, source: str) -> list[TestCase]:
-        try:
-            text = content.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1].rsplit("```", 1)[0]
-            raw_cases = json.loads(text)
-        except (json.JSONDecodeError, IndexError):
-            logger.warning("Failed to parse LLM response as JSON")
+        raw_cases = self._extract_json(content)
+        if raw_cases is None:
+            logger.warning("Failed to parse agent response as JSON")
             return []
 
         if not isinstance(raw_cases, list):
@@ -234,3 +250,99 @@ class CaseGenerator:
                 )
             )
         return cases
+
+    @staticmethod
+    def _extract_json(content: str) -> Any | None:
+        """Best-effort extraction of a JSON array/object from an agent reply.
+
+        Agents (unlike a tightly-prompted LLM) frequently wrap the payload in
+        prose ("好的，以下是测试题：…") and/or a ```json fence. For each
+        candidate (whole text → fenced block → first [...]/{...} substring) we
+        try a strict ``json.loads`` first, then a lenient repair pass that fixes
+        the JSON errors LLMs commonly emit — most importantly unescaped double
+        quotes inside string values (observed: 查询"驱动轮"配件) and trailing
+        commas. Returns the parsed object, or None if nothing parses."""
+        if not content:
+            return None
+        text = content.strip()
+
+        import re
+
+        candidates: list[str] = [text]
+        fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
+        if fence:
+            candidates.append(fence.group(1).strip())
+        for open_ch, close_ch in (("[", "]"), ("{", "}")):
+            start = text.find(open_ch)
+            end = text.rfind(close_ch)
+            if start != -1 and end != -1 and end > start:
+                candidates.append(text[start : end + 1])
+
+        for cand in candidates:
+            # strict first — never let the repair pass touch valid JSON
+            try:
+                return json.loads(cand)
+            except json.JSONDecodeError:
+                pass
+            repaired = CaseGenerator._repair_json(cand)
+            if repaired is not None and repaired != cand:
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
+        return None
+
+    @staticmethod
+    def _repair_json(s: str) -> str | None:
+        """Repair the JSON mistakes LLMs commonly make, without a 3rd-party dep.
+
+        Handles:
+        * trailing commas before ] or }
+        * bare (unescaped) double quotes inside string values — the dominant
+          failure (e.g. ``"...查询"驱动轮"配件..."``). We scan char-by-char
+          tracking string state; a `"` seen inside a string that is NOT a
+          legitimate closer (i.e. not followed by a structural char
+          , : ] } or EOF) is escaped to ``\\"``.
+
+        Returns the repaired string, or None if the input doesn't look like JSON.
+        """
+        if not s:
+            return None
+        out: list[str] = []
+        in_str = False
+        escaped = False
+        n = len(s)
+        for i, ch in enumerate(s):
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                if not in_str:
+                    in_str = True
+                    out.append(ch)
+                else:
+                    # look ahead past whitespace for the next non-space char
+                    j = i + 1
+                    while j < n and s[j] in " \t\r\n":
+                        j += 1
+                    nxt = s[j] if j < n else ""
+                    if nxt in ",:]}" or nxt == "":
+                        # legitimate string close
+                        in_str = False
+                        out.append(ch)
+                    else:
+                        # bare quote inside a string value → escape it
+                        out.append('\\"')
+                continue
+            out.append(ch)
+
+        repaired = "".join(out)
+        # drop trailing commas:  , ]  /  , }
+        import re
+        repaired = re.sub(r",(\s*[\]}])", r"\1", repaired)
+        return repaired

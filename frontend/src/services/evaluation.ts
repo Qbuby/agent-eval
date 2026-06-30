@@ -1,12 +1,16 @@
 import api from './client'
+import { triggerExport, type ExportFormat } from '@/lib/download'
 import type {
   BuiltinEvaluator,
   CreateEvaluatorRequest,
+  DryRunRequest,
+  DryRunResponse,
   EvalCaseSourceSummary,
   EvalResultsPage,
   EvalRunDetail,
   EvalRunsPage,
   EvaluatorInstance,
+  EvaluatorVersion,
   RunDetail,
   StartEvalRequest,
   StartEvalResponse,
@@ -34,6 +38,23 @@ export const evaluationApi = {
   },
   deleteEvaluator(id: string) {
     return api.delete<{ id: string; deleted: boolean }>(`/eval/evaluators/${id}`)
+  },
+  dryRunEvaluator(id: string, data: DryRunRequest) {
+    return api.post<DryRunResponse>(`/eval/evaluators/${id}/dry-run`, data)
+  },
+  listEvaluatorVersions(id: string) {
+    return api.get<EvaluatorVersion[]>(`/eval/evaluators/${id}/versions`)
+  },
+  createEvaluatorVersion(
+    id: string,
+    data: { params: Record<string, unknown>; description?: string | null; activate?: boolean },
+  ) {
+    return api.post<EvaluatorVersion>(`/eval/evaluators/${id}/versions`, data)
+  },
+  activateEvaluatorVersion(id: string, versionId: string) {
+    return api.post<EvaluatorInstance>(
+      `/eval/evaluators/${id}/versions/${versionId}/activate`,
+    )
   },
 
   // ── case file upload ──
@@ -82,6 +103,34 @@ export const evaluationApi = {
   },
   getResults(runId: string, params?: { page?: number; page_size?: number }) {
     return api.get<EvalResultsPage>(`/eval/runs/${runId}/results`, { params })
+  },
+  exportResults(runId: string, format: ExportFormat) {
+    return triggerExport({
+      url: `/eval/runs/${runId}/results/export`,
+      params: { format },
+      format,
+      fallbackName: `eval_run_${runId.slice(0, 8)}_results`,
+    })
+  },
+  exportCompare(runIds: string[], format: ExportFormat, alignKey: 'case_id' | 'question' = 'case_id') {
+    return triggerExport({
+      method: 'post',
+      url: '/eval/runs/export-compare',
+      data: { run_ids: runIds, align_key: alignKey, format },
+      format,
+      fallbackName: 'eval_compare',
+    })
+  },
+  // Batch-export per-sample results for the selected runs (same columns as the
+  // single-run detail export, concatenated across runs).
+  exportRunsSummary(runIds: string[], format: ExportFormat) {
+    return triggerExport({
+      method: 'post',
+      url: '/eval/runs/export-summary',
+      data: { run_ids: runIds, format },
+      format,
+      fallbackName: 'eval_runs_results',
+    })
   },
   getResultTrace(resultId: string, project?: string) {
     return api.get<RunDetail>(`/eval/results/${resultId}/trace`, {

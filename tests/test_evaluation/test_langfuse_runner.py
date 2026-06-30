@@ -288,3 +288,28 @@ def test_is_transient_known_signals():
     assert _is_transient(Exception("502 Bad Gateway"))
     assert _is_transient(Exception("timed out"))
     assert not _is_transient(Exception("invalid json"))
+
+
+def test_classify_dns_failure_is_unreachable():
+    """Container DNS bursts surface as ConnectError with these substrings.
+    They mean the agent was never reached, so classify as agent_unreachable
+    (neutral infra failure), not 'unknown'."""
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error
+    assert _classify_agent_error(
+        Exception("[Errno -3] Temporary failure in name resolution")
+    ) == "agent_unreachable"
+    assert _classify_agent_error(
+        Exception("Failed to resolve 'agent.example.com'")
+    ) == "agent_unreachable"
+    assert _classify_agent_error(
+        Exception("Name or service not known")
+    ) == "agent_unreachable"
+
+
+def test_is_transient_dns_failure_retries():
+    """DNS failures must be retried — the resolver recovers once the burst
+    subsides. Previously they matched no hint and failed terminally."""
+    from agent_eval.evaluation.langfuse_runner import _is_transient
+    assert _is_transient(Exception("[Errno -3] Temporary failure in name resolution"))
+    assert _is_transient(Exception("Failed to resolve host"))
+    assert _is_transient(Exception("EAI_AGAIN"))

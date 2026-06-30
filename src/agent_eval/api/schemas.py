@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+# 数据集类型：区分用途不同的两类数据集，避免在各自页面里互相串。
+# - candidate    备选数据集（单轮问答样例，老数据无标记一律按此处理，向后兼容）
+# - conversation 多轮对话集（多轮对话样例，固定 thread_id 逐轮调用）
+_DATASET_TYPES = {"candidate", "conversation"}
+DEFAULT_DATASET_TYPE = "candidate"
 
 
 class CreateDatasetRequest(BaseModel):
@@ -11,6 +18,14 @@ class CreateDatasetRequest(BaseModel):
     description: str = ""
     metadata: dict[str, Any] | None = None
     source_project: str | None = None
+    dataset_type: str = DEFAULT_DATASET_TYPE
+
+    @field_validator("dataset_type")
+    @classmethod
+    def _check_type(cls, v: str) -> str:
+        if v not in _DATASET_TYPES:
+            raise ValueError(f"dataset_type 非法：{v!r}，须为 {sorted(_DATASET_TYPES)} 之一")
+        return v
 
 
 class DatasetResponse(BaseModel):
@@ -21,6 +36,7 @@ class DatasetResponse(BaseModel):
     created_at: datetime | None = None
     metadata: dict[str, Any] = {}
     source_project: str | None = None
+    dataset_type: str = DEFAULT_DATASET_TYPE
 
 
 class VersionResponse(BaseModel):
@@ -38,10 +54,26 @@ class DatasetStatsResponse(BaseModel):
     avg_messages_per_case: float
 
 
+# 多轮对话：合法 message role 白名单。多轮样例必须明确角色语义，
+# 故在入口层收紧（此前完全无校验）。tool 角色保留给 function/tool 结果消息。
+_ALLOWED_ROLES = {"user", "assistant", "system", "tool"}
+
+
+class TurnExpectationInput(BaseModel):
+    """单轮（user→assistant）的期望。turn_index 指向 input_messages 中
+    被评测的 assistant 轮下标（从 0 计）。本期只录入，第二期评估消费。"""
+
+    turn_index: int
+    criteria: list[str] = []
+    expected_output: str | None = None
+
+
 class TestCaseInput(BaseModel):
     name: str
     description: str = ""
     tags: list[str] = []
+    # 受管单值类别名（多轮对话集用，对齐基准测试集的类别）。空=不指定。
+    category: str | None = None
     source: str = "manual"
     input_messages: list[dict[str, Any]]
     agent_config_override: dict[str, Any] | None = None
@@ -52,6 +84,24 @@ class TestCaseInput(BaseModel):
     max_latency_ms: int | None = None
     max_tokens: int | None = None
     scoring_mode: str = "hybrid"
+    # —— 多轮对话扩展（向后兼容：单轮样例不填即可）——
+    conversation_goal: str | None = None
+    turn_expectations: list[TurnExpectationInput] = []
+
+    @field_validator("input_messages")
+    @classmethod
+    def _check_messages(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not v:
+            raise ValueError("input_messages 不能为空")
+        for i, m in enumerate(v):
+            role = m.get("role")
+            if role not in _ALLOWED_ROLES:
+                raise ValueError(
+                    f"消息 #{i + 1} role 非法：{role!r}，须为 {sorted(_ALLOWED_ROLES)} 之一"
+                )
+            if not isinstance(m.get("content"), str):
+                raise ValueError(f"消息 #{i + 1} content 必须是字符串")
+        return v
 
 
 class AddCasesRequest(BaseModel):
@@ -66,8 +116,8 @@ class BatchDeleteRequest(BaseModel):
 class GenerateScenarioRequest(BaseModel):
     dataset: str
     test_scenario: str = Field(
-        description="测试场景: faithfulness, context_recall, answer_relevancy, "
-        "context_precision, context_relevancy, hallucination"
+        default="",
+        description="测试场景/主题（可选，自由文本）。留空则让 agent 围绕其核心领域能力自由出题",
     )
     case_category: str = Field(
         default="normal",
@@ -193,10 +243,14 @@ class EvaluatorConfig(BaseModel):
 
 
 class StartEvalRequest(BaseModel):
-    # Source: exactly one of these three should be set.
+    # Source: exactly one of these four should be set.
     benchmark_version_id: str | None = None
     project_id: str | None = None                # use all benchmark_cases of a project
     case_source_id: str | None = None            # uploaded file (eval_case_sources.id)
+    # 多轮对话集（dataset_type=conversation）的 LangSmith 数据集名。设置后走
+    # 多轮回放评估通路：固定 thread_id 逐轮喂 user 消息，逐轮期望 + 对话级目标
+    # 双重打分。与上面三种单轮源互斥。
+    conversation_dataset: str | None = None
     # Sample selection for benchmark-backed sources:
     case_ids: list[str] | None = None
     filter_tags: list[str] | None = None
@@ -212,6 +266,11 @@ class StartEvalRequest(BaseModel):
     # evaluation service uses this to backfill test_results.langsmith_run_id
     # after the agent call completes. Leave blank to skip backfill.
     langsmith_project: str | None = None
+    # Langfuse trace name where the agent writes its own trace. Symmetric to
+    # langsmith_project: after the run settles, the service pulls Langfuse
+    # traces by (name, time-window), matches each by question text, and
+    # backfills test_results.langfuse_trace_id. Leave blank to skip.
+    langfuse_trace_name: str | None = None
 
 
 class EvalRunSummary(BaseModel):
@@ -222,6 +281,7 @@ class EvalRunSummary(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     langfuse_run_name: str | None = None
+    langfuse_trace_name: str | None = None
     langsmith_project: str | None = None
     agent_config: dict[str, Any] = {}
     summary_scores: dict[str, Any] | None = None
@@ -247,13 +307,22 @@ class EvalResultRow(BaseModel):
     cache_creation_tokens: int | None = None
     cache_read_tokens: int | None = None
     tool_call_count: int | None = None
+    # Time-to-first-token, milliseconds since invoke. Both NULL on adapters
+    # that don't expose intermediate stream events (OpenAI non-streaming).
+    first_thinking_token_ms: int | None = None
+    first_answer_token_ms: int | None = None
     # List of {tool_name, args, output} captured during the agent call.
     # Surfaced so the UI can render per-case tool-call detail without a
     # second round-trip to LangSmith.
     actual_tool_calls: list[dict[str, Any]] | None = None
+    # Ordered CoT timeline captured from the SSE stream:
+    #   {"steps": [{type:"thought"|"tool_call"|"answer", ...}, ...]}
+    # ``None`` for legacy rows or for non-SSE adapters that have no CoT.
+    full_trace: dict[str, Any] | None = None
     error_message: str | None = None
     langfuse_trace_id: str | None = None
     langsmith_run_id: str | None = None
+    attempts_made: int = 1
     scores: dict[str, float] = {}  # dimension -> score
 
 
@@ -285,8 +354,35 @@ class EvaluatorInstance(BaseModel):
     description: str | None = None
     params: dict[str, Any] = {}
     is_active: bool = True
+    # Pointer to the active version row (None for legacy / unversioned
+    # evaluators). The frontend uses it to highlight the active row in
+    # the versions tab.
+    current_version_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class EvaluatorVersion(BaseModel):
+    """One snapshot of an evaluator's params at a point in time."""
+    id: str
+    evaluator_id: str
+    version_number: int
+    params: dict[str, Any] = {}
+    description: str | None = None
+    created_by: str | None = None
+    created_at: datetime | None = None
+
+
+class CreateEvaluatorVersionRequest(BaseModel):
+    """Body for `POST /evaluators/{id}/versions` — appends a new snapshot.
+
+    ``activate`` defaults to True so the common "Save" path immediately
+    routes future invocations to this version. Set False for "Save as
+    draft" workflows that the UI may add later.
+    """
+    params: dict[str, Any] = {}
+    description: str | None = None
+    activate: bool = True
 
 
 class CreateEvaluatorRequest(BaseModel):
@@ -304,6 +400,114 @@ class UpdateEvaluatorRequest(BaseModel):
     description: str | None = None
     params: dict[str, Any] | None = None
     is_active: bool | None = None
+
+
+# ─── Evaluator providers (LLM-judge credentials) ───
+
+# Provider types we know how to call. Stored as a free string in DB so
+# new types can be added without a migration; the API validates the
+# enum on create/update.
+ALLOWED_PROVIDER_TYPES = (
+    "openai",
+    "openai_compatible",
+    "anthropic",
+    "deepseek",
+    "azure",
+    "custom",
+)
+
+
+class EvaluatorProviderResponse(BaseModel):
+    id: str
+    name: str
+    provider_type: str
+    base_url: str | None = None
+    default_model: str | None = None
+    extra_config: dict[str, Any] = {}
+    is_active: bool
+    has_api_key: bool = False
+    api_key_masked: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class CreateEvaluatorProviderRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    provider_type: str = Field(min_length=1, max_length=32)
+    base_url: str | None = Field(default=None, max_length=500)
+    api_key: str | None = Field(default=None, max_length=500)
+    default_model: str | None = Field(default=None, max_length=128)
+    extra_config: dict[str, Any] = {}
+    is_active: bool = True
+
+
+class UpdateEvaluatorProviderRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    provider_type: str | None = Field(default=None, min_length=1, max_length=32)
+    base_url: str | None = Field(default=None, max_length=500)
+    # api_key semantics:
+    #   omitted (field unset)  -> keep existing ciphertext
+    #   ""                     -> clear the stored key
+    #   "<value>"              -> re-encrypt and replace
+    api_key: str | None = Field(default=None, max_length=500)
+    default_model: str | None = Field(default=None, max_length=128)
+    extra_config: dict[str, Any] | None = None
+    is_active: bool | None = None
+
+
+class TestProviderResponse(BaseModel):
+    ok: bool
+    latency_ms: int | None = None
+    detail: str = ""
+    # When ok=true and the provider exposed a /models listing, surface a
+    # trimmed sample so the editor UI can offer a model dropdown without
+    # a second round-trip.
+    models: list[str] = []
+
+
+class ProviderModelsResponse(BaseModel):
+    """Models listing for the editor's model dropdown."""
+    ok: bool
+    models: list[str] = []
+    detail: str = ""
+
+
+# ─── Configurable judge dry-run ───
+#
+# The editor drawer (PR-B) lets the user click "Try" on a sample
+# (input, output, expected) and see exactly what the configured judge
+# returns *before* saving the evaluator. ``params`` is the evaluator
+# config under construction; ``provider_id`` lets the user override
+# the saved provider for a one-off test (e.g. trying gpt-4o vs claude
+# without committing the change).
+
+class DryRunRequest(BaseModel):
+    provider_id: str | None = None
+    params: dict[str, Any] = {}
+    input: str = ""
+    output: str = ""
+    expected_output: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class DryRunScoreItem(BaseModel):
+    name: str
+    value: float
+    reason: str = ""
+    # raw_value 保留模型原始输出（数值/布尔/类别名），UI 在归一分旁边
+    # 展示原始值，便于核对；可能是 number / bool / string，故用 Any。
+    raw_value: Any = None
+
+
+class DryRunResponse(BaseModel):
+    # 单分数范式：``scores`` 至多一个元素，UI 直接展示首项即可。
+    # 旧的 ``aggregate`` 字段（多维度加权平均）已不复存在。
+    scores: list[DryRunScoreItem] = []
+    model: str = ""
+    usage: dict[str, int] = {}
+    raw_content: str = ""
+    rendered_messages: list[dict[str, str]] = []
+    error: str | None = None
 
 
 # ─── Uploaded case sources ───

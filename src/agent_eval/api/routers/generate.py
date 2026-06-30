@@ -6,10 +6,18 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from agent_eval.api.dependencies import get_generator, get_manager
 from agent_eval.api.schemas import GenerateMutateRequest, GenerateScenarioRequest
+from agent_eval.auth.dependencies import require_internal
 from agent_eval.data.case_generator import CaseGenerator
 from agent_eval.data.dataset_manager import DatasetManager
 
-router = APIRouter(prefix="/api/generate", tags=["generate"])
+# Generation is a heavy operation restricted to internal roles (admin|user);
+# external customers get a clean 403. Router-level dependency also blocks
+# anonymous access.
+router = APIRouter(
+    prefix="/api/generate",
+    tags=["generate"],
+    dependencies=[Depends(require_internal())],
+)
 
 
 @router.post("/scenario")
@@ -18,8 +26,18 @@ async def generate_from_scenario(
     gen: CaseGenerator = Depends(get_generator),
     mgr: DatasetManager = Depends(get_manager),
 ):
-    scenario = f"Test scenario: {req.test_scenario}\nCase category: {req.case_category}"
-    tags = [f"scenario:{req.test_scenario}", f"category:{req.case_category}"]
+    # test_scenario is now optional free text. When provided we include it
+    # plus the category; when blank we pass only the category so the agent
+    # generates freely from its own domain knowledge.
+    parts = []
+    if req.test_scenario.strip():
+        parts.append(f"测试场景/主题: {req.test_scenario.strip()}")
+    parts.append(f"样例类别: {req.case_category}")
+    scenario = "\n".join(parts)
+
+    tags = [f"category:{req.case_category}"]
+    if req.test_scenario.strip():
+        tags.append(f"scenario:{req.test_scenario.strip()}")
 
     # Pull a few existing cases from the dataset as seed examples so the LLM
     # generalizes within the same domain/style instead of inventing random
@@ -42,7 +60,7 @@ async def generate_from_scenario(
         tags=tags, seed_cases=seed_cases or None,
     )
     if not cases:
-        raise HTTPException(status_code=422, detail="LLM returned no valid cases")
+        raise HTTPException(status_code=422, detail="agent 未返回有效样例（无法解析出 JSON 数组）")
 
     result = [c.model_dump(mode="json", exclude_none=True) for c in cases]
 
@@ -73,7 +91,7 @@ async def generate_mutations(
         tags=req.tags or None,
     )
     if not cases:
-        raise HTTPException(status_code=422, detail="LLM returned no valid cases")
+        raise HTTPException(status_code=422, detail="agent 未返回有效样例（无法解析出 JSON 数组）")
 
     result = [c.model_dump(mode="json", exclude_none=True) for c in cases]
 

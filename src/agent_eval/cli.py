@@ -24,6 +24,30 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 def _get_provider():
+    # 数据集存储已切到 Langfuse。CLI 是同步入口、不走 config_service 连接预设，
+    # 故直接从 settings.langfuse 同步构造 SDK client（与 API 侧走 config_service
+    # 的 build_langfuse_client 等价，只是连接来源不同）。
+    from agent_eval.config import settings
+    from agent_eval.data.langfuse_provider import LangfuseDatasetProvider
+
+    cfg = settings.langfuse
+    if not cfg.configured:
+        raise RuntimeError(
+            "Langfuse 未配置。请在 .env 设置 LANGFUSE_HOST / LANGFUSE_PUBLIC_KEY / "
+            "LANGFUSE_SECRET_KEY。"
+        )
+    from langfuse import Langfuse
+
+    client = Langfuse(
+        public_key=cfg.public_key,
+        secret_key=cfg.secret_key,
+        host=cfg.host,
+    )
+    return LangfuseDatasetProvider(client)
+
+
+def _get_langsmith_provider():
+    # 仅供仍依赖 LangSmith 的外部导入（pull_external_dataset）使用。
     from agent_eval.config import settings
     from agent_eval.data.langsmith_provider import LangSmithDatasetProvider
 
@@ -519,11 +543,15 @@ def dataset_pull(
     Use this to sync external datasets (not created by this system) into the
     evaluation pipeline.  Without --target, it previews what would be imported.
     """
+    # 拉取源是外部 LangSmith 数据集（保留功能），故源 manager 用 LangSmith；
+    # 写回目标是本系统数据集，已切到 Langfuse，故用默认 manager 落库。
+    from agent_eval.data.dataset_manager import DatasetManager
+    src_mgr = DatasetManager(provider=_get_langsmith_provider())
     mgr = _get_manager()
 
     async def _run():
         console.print(f"Pulling from LangSmith dataset '{source}'...")
-        cases = await mgr.pull_external_dataset(source, limit=limit)
+        cases = await src_mgr.pull_external_dataset(source, limit=limit)
 
         if not cases:
             console.print("[yellow]No examples found in the source dataset.[/yellow]")
@@ -657,25 +685,32 @@ generate_app = typer.Typer(name="generate", help="LLM-powered test case generati
 dataset_app.add_typer(generate_app)
 
 
-def _get_llm():
-    from langchain_openai import ChatOpenAI
-    from agent_eval.config import settings
-
-    kwargs: dict[str, Any] = {
-        "model": settings.llm.model,
-        "temperature": settings.llm.temperature,
-        "max_tokens": settings.llm.max_tokens,
-    }
-    if settings.llm.api_key:
-        kwargs["api_key"] = settings.llm.api_key
-    if settings.llm.base_url:
-        kwargs["base_url"] = settings.llm.base_url
-    return ChatOpenAI(**kwargs)
-
-
 def _get_case_generator():
+    """Build a CaseGenerator backed by an agent endpoint.
+
+    Cases are now authored by the agent under test (KG-grounded), not a bare
+    LLM. The CLI is a local dev tool with no DB config, so it targets the
+    OpenAI-compatible endpoint from env settings (TARGET_AGENT_URL overrides
+    LLM base_url) — the API server sources target_agent.* from the DB instead.
+    """
+    import os
+    from agent_eval.config import settings
     from agent_eval.data.case_generator import CaseGenerator
-    return CaseGenerator(llm=_get_llm())
+    from agent_eval.evaluation.agent_adapter import OpenAICompatibleAdapter
+
+    base_url = os.getenv("TARGET_AGENT_URL") or settings.llm.base_url
+    if not base_url:
+        raise typer.BadParameter(
+            "no agent endpoint configured: set TARGET_AGENT_URL "
+            "(or LLM base_url) to the agent under test"
+        )
+    adapter = OpenAICompatibleAdapter(
+        base_url=base_url,
+        api_key=os.getenv("TARGET_AGENT_API_KEY") or settings.llm.api_key or "",
+        model=settings.llm.model,
+        timeout=float(os.getenv("TARGET_AGENT_TIMEOUT") or 120.0),
+    )
+    return CaseGenerator(adapter=adapter)
 
 
 def _preview_cases(cases: list, title: str = "Generated cases") -> None:

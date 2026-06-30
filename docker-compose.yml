@@ -8,17 +8,21 @@
 #   3. backend    ─ FastAPI 后端（依赖 migrate 完成）
 #   4. frontend   ─ Nginx 静态资源 + /api 反代到 backend
 #
-# 启动方式：
-#   docker compose up -d --build
+# 一步部署：
+#   1) cp .env.example .env  并填写 AUTH_SECRET_KEY、SECURITY_FERNET_KEY、
+#      LANGSMITH_API_KEY、LANGFUSE_*（Langfuse 不用可留空）
+#   2) docker compose up -d --build
 #
 # 访问入口：
 #   前端 UI:  http://localhost
 #   后端 API: http://localhost:8000
 #
 # 环境变量来源：
-#   - .env 文件被 backend 服务通过 env_file 加载（含 LLM/LangSmith key）
-#   - DB_HOST/DB_PORT 在 environment: 段被强制覆盖为容器内地址
+#   - .env 文件被 migrate / backend 通过 env_file 加载（DB / Auth / Crypto / LLM / Langfuse / LangSmith）
+#   - DB_HOST/DB_PORT 在 environment: 段被强制覆盖为容器内 DNS（postgres:5432）
 #   - 修改 PG 密码后需要 `docker compose down -v` 清掉 volume 才能生效
+#   - SECURITY_FERNET_KEY 必填，缺失时 evaluator-providers 接口会 503；
+#     生成方式见 .env.example
 # ─────────────────────────────────────────────────────────────────────
 
 services:
@@ -53,10 +57,11 @@ services:
   #   后端代码里有 SQLAlchemy ORM 模型（src/agent_eval/db_models/tables.py），
   #   定义了 dataset_versions / test_cases / test_runs / test_results /
   #   evaluation_scores / optimizations / loop_control_log / users /
-  #   projects / candidate_cases / benchmark_cases / audit_logs / ... 等 22 张表。
+  #   projects / candidate_cases / benchmark_cases / audit_logs /
+  #   evaluator_configs / evaluator_versions / evaluator_providers / ... 等数十张表。
   #
   #   这些表必须存在于 PG 中后端才能工作。alembic 是「数据库版本控制」工具，
-  #   通过 alembic/versions/ 下的迁移脚本（0001 → 0008）按顺序执行，
+  #   通过 alembic/versions/ 下的迁移脚本（0001 → 当前 head 0015）按顺序执行，
   #   把空数据库一步步建成当前 schema。
   #
   # 这个服务做什么？
@@ -80,6 +85,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: agent-eval-migrate
+    env_file:
+      - .env
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
@@ -87,17 +94,28 @@ services:
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_NAME: ${DB_NAME:-agent_eval}
       AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-change-me-in-production}
+      # 数据 seed 还原路径（容器内）。SEED_DISABLE=1 可强制跳过还原，只建结构。
+      SEED_FILE: /app/deploy/seed/seed.sql
+      SEED_DISABLE: ${SEED_DISABLE:-}
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["alembic", "upgrade", "head"]
+    volumes:
+      # 数据 seed 只读挂载。NOT baked into the image：内含密码哈希 /
+      # Fernet 加密的 provider key / 明文入口码。部署时把 deploy/seed/seed.sql
+      # 随 compose 一起放到宿主，migrate 在空库时还原它（非空库一律跳过）。
+      - ./deploy/seed:/app/deploy/seed:ro
+    # 先按空库门禁还原数据 seed，再 alembic upgrade head 追平结构。
+    command: ["/app/scripts/migrate-and-restore.sh"]
     restart: "no"
 
   # ─────────────────────────────────────────────────────────────────
   # backend：FastAPI + uvicorn
-  #   - env_file 加载 .env 里的 LLM_API_KEY / LANGSMITH_API_KEY 等
+  #   - env_file 加载 .env 里的 LLM / LangSmith / Langfuse / Crypto key
   #   - environment 段覆盖 DB_HOST/DB_PORT，把 .env 里的 localhost 改成
   #     compose 内部 DNS 名 postgres
+  #   - SECURITY_FERNET_KEY 必填：evaluator-providers 接口落库 API key
+  #     时调用 cryptography.Fernet 加密，缺失会 503。生成方式见 .env.example。
   #   - depends_on:
   #       postgres healthy   → PG 可连
   #       migrate completed  → schema 就位
@@ -112,14 +130,39 @@ services:
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
+      # 下列 3 个变量虽然 env_file 已加载，这里显式列出方便排查；
+      # 在 shell 里 export 同名变量可临时覆盖 .env 内容。
+      # SECURITY_FERNET_KEY 留空时 evaluator-providers 接口会 503，
+      # 但 compose 启动不会失败 —— 留 :- 默认空，方便先把库迁了再补 key。
+      SECURITY_FERNET_KEY: ${SECURITY_FERNET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      # 显式覆盖被测 agent 所在宿主网关。留空时 entrypoint 自动探测
+      # （WSL 宿主 resolv.conf nameserver → 默认路由）。非 WSL / 特殊网络
+      # 可在此写死，例如 AGENT_HOST_GATEWAY=172.16.100.211。
+      AGENT_HOST_GATEWAY: ${AGENT_HOST_GATEWAY:-}
     ports:
       - "8000:8000"
-    # 让容器内代码能访问宿主机服务（被测 agent 通常跑在宿主机上，
-    # 例如 http://localhost:18096）。前端 UI 配置 agent URL 时用
-    # http://host.docker.internal:<port>/... 替代 http://localhost:<port>/...
-    # Linux 上 Docker Engine ≥ 20.10 也能解析 host-gateway。
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # 被测 agent 跑在 Windows 宿主上（SSH 隧道 0.0.0.0:18094）。本栈是
+    # WSL2 原生 Docker，compose 的 host-gateway 会把 host.docker.internal
+    # 错误解析到 docker 网桥（WSL VM），连不到 Windows 宿主。改为：把宿主
+    # 的 /etc/resolv.conf 挂进来，entrypoint 读其 nameserver（= WSL→Windows
+    # 宿主网关，WSL 重启会自动更新）注入为 host.docker.internal。配置页
+    # 与评估统一用 http://host.docker.internal:18094/... 这个稳定名字。
+    volumes:
+      - /etc/resolv.conf:/run/host-resolv.conf:ro
+    # judge / agent 调用走外网域名（如 kiro.aidong-ai.com），
+    # 宿主 /etc/resolv.conf 在某些 Docker Desktop / WSL 环境下
+    # 不会被容器继承，导致 "Temporary failure in name resolution"。
+    # 显式指定 DNS 兜底。
+    # ⚠️ 阿里云/腾讯 DNS 放最前：图片代理回源阿里云 OSS（*.aliyuncs.com），
+    # 8.8.8.8/1.1.1.1 在国内对 OSS 域名解析间歇性失败或解析到错误节点，
+    # 导致 img-proxy 偶发 502；国内 DNS 对 OSS 解析稳定。8.8.8.8 留作兜底。
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+      - 8.8.8.8
     depends_on:
       postgres:
         condition: service_healthy

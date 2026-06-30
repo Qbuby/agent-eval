@@ -1,5 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef, memo } from 'react'
+import { useToast, ExportMenu } from '@/components/ui'
 import { tracesApi, datasetsApi } from '@/services'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { ListRunsRequest, RunSummary, Dataset, RunDetail, RunChildMeta } from '@/types'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 
@@ -105,6 +107,7 @@ function computeLatencyStats(
 }
 
 export default function TracesPage() {
+  const toast = useToast()
   const [projectName, setProjectName] = useState('')
   const [allRuns, setAllRuns] = useState<RunSummary[]>([])
   const [page, setPage] = useState(1)
@@ -183,8 +186,7 @@ export default function TracesPage() {
       }
       setHasMore(newItems.length >= 50)
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setError(msg || '查询失败')
+      setError(toToastMessage(formatApiError(err, { fallbackMessage: '查询失败' })))
     } finally {
       setLoading(false)
       setLoadingMore(false)
@@ -246,8 +248,7 @@ export default function TracesPage() {
         (stillMissing.length > 0 ? `，${stillMissing.length} 条无 LLM 子 run` : '')
       )
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setFillModelsMsg(`补齐失败：${msg || '未知错误'}`)
+      setFillModelsMsg(`补齐失败：${toToastMessage(formatApiError(err, { fallbackMessage: '未知错误' }))}`)
     } finally {
       setFillingModels(false)
     }
@@ -423,11 +424,10 @@ export default function TracesPage() {
       setSelectedIds(new Set())
       setImportTarget('')
       setNewDatasetName('')
-      alert(`成功导入 ${res.data.imported} 条用例到 ${target}`)
+      toast.success(`成功导入 ${res.data.imported} 条用例到 ${target}`)
       datasetsApi.list().then(r => setDatasets(r.data)).catch(() => {})
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      alert(msg || '导入失败')
+      toast.error(toToastMessage(formatApiError(err, { fallbackTitle: '导入失败', fallbackMessage: '导入失败' })))
     } finally {
       setImporting(false)
     }
@@ -439,8 +439,8 @@ export default function TracesPage() {
       const res = await tracesApi.getDetail({ run_id: runId, project_name: projectName || undefined })
       setNodeCache(prev => ({ ...prev, [runId]: { loading: false, data: res.data } }))
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      setNodeCache(prev => ({ ...prev, [runId]: { loading: false, error: msg || '加载失败' } }))
+      const msg = toToastMessage(formatApiError(err, { fallbackMessage: '加载失败' }))
+      setNodeCache(prev => ({ ...prev, [runId]: { loading: false, error: msg } }))
     }
   }, [projectName])
 
@@ -472,36 +472,50 @@ export default function TracesPage() {
 
   return (
     <div>
-      <header className="mb-8">
-        <h1 className="text-lg font-light tracking-tight mb-1">调用轨迹</h1>
-        <p className="text-[10px] text-text-tertiary tracking-widest uppercase">EXECUTION RUNS · PERFORMANCE METRICS</p>
+      <header className="mb-6">
+        <h1 className="page-title">调用轨迹</h1>
+        <p className="page-subtitle">执行记录 · 性能指标</p>
       </header>
 
-      <form onSubmit={handleSearch} className="flex gap-2.5 items-center mb-4">
+      <form onSubmit={handleSearch} className="toolbar">
         <input
-          placeholder="Project name..."
+          placeholder="项目名称…"
           value={projectName}
           onChange={(e) => setProjectName(e.target.value)}
           required
-          className="flex-1 max-w-[280px] py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent focus:ring-1 focus:ring-accent/10 placeholder:text-text-tertiary transition-all duration-200"
+          className="input-sm flex-1 max-w-[280px]"
         />
         <button
           type="submit"
           disabled={loading}
-          className="inline-flex items-center gap-1.5 py-2 px-3.5 text-[11px] font-medium tracking-wide rounded-[6px] bg-accent text-white border border-accent cursor-pointer hover:opacity-90 active:scale-[0.97] disabled:opacity-40 transition-all duration-200"
+          className="inline-flex items-center justify-center h-8 px-3 text-[13px] font-medium rounded-md bg-accent text-accent-fg border border-transparent hover:bg-accent-hover active:opacity-90 disabled:opacity-40 transition-[background-color,color,box-shadow] duration-150 ease-standard focus-visible:shadow-focus focus-visible:outline-none gap-1.5"
         >
           {loading ? (
             <span className="inline-block w-3 h-3 border border-white/40 border-t-white rounded-full animate-spin" />
-          ) : 'Query'}
+          ) : '查询'}
         </button>
         {allRuns.length > 0 && (
           <button
             type="button"
             onClick={handleClear}
-            className="inline-flex items-center py-2 px-3 text-[11px] tracking-wide rounded-[6px] border border-border bg-surface text-text-secondary hover:border-accent hover:text-accent transition-all duration-200"
+            className="inline-flex items-center justify-center h-8 px-3 text-[13px] rounded-md border border-border bg-surface text-text-secondary hover:bg-surface-hover transition-colors duration-150 ease-standard focus-visible:shadow-focus focus-visible:outline-none"
           >
             清空
           </button>
+        )}
+        {allRuns.length > 0 && (
+          <ExportMenu
+            size="md"
+            onExport={async (format) => {
+              try {
+                // Export the rows currently loaded + filtered/sorted on screen,
+                // not a fresh full pull from LangSmith.
+                await tracesApi.exportRuns(filteredRuns, format)
+              } catch (e) {
+                toast.error(toToastMessage(formatApiError(e)))
+              }
+            }}
+          />
         )}
         {allRuns.length > 0 && allRuns.some(r => !r.model_name || r.first_tool_call_s == null) && (
           <button
@@ -509,7 +523,7 @@ export default function TracesPage() {
             onClick={handleFillModels}
             disabled={fillingModels}
             title="用多轮时间窗口补齐 model_name 与首次工具调用时延。首次 30-120s，结果缓存 1 小时。"
-            className="inline-flex items-center gap-1.5 py-2 px-3 text-[11px] tracking-wide rounded-[6px] border border-border bg-surface text-text-secondary hover:border-accent hover:text-accent disabled:opacity-40 transition-all duration-200"
+            className="inline-flex items-center gap-1.5 h-8 px-3 text-[13px] rounded-md border border-border bg-surface text-text-secondary hover:bg-surface-hover disabled:opacity-40 transition-colors duration-150 ease-standard"
           >
             {fillingModels ? (
               <>
@@ -523,7 +537,7 @@ export default function TracesPage() {
           <button
             type="button"
             onClick={() => setShowImportModal(true)}
-            className="inline-flex items-center gap-1.5 py-2 px-3.5 text-[11px] font-medium tracking-wide rounded-[6px] bg-[#1a6] text-white border border-[#1a6] cursor-pointer hover:opacity-90 active:scale-[0.97] transition-all duration-200"
+            className="inline-flex items-center h-8 px-3 text-[13px] font-medium rounded-md bg-positive text-white border border-transparent hover:opacity-90 transition-opacity"
           >
             导入到备选数据集 ({selectedIds.size})
           </button>
@@ -531,15 +545,15 @@ export default function TracesPage() {
       </form>
 
       {fillModelsMsg && (
-        <p className="text-[11px] text-text-tertiary mb-3 animate-fade-in">{fillModelsMsg}</p>
+        <p className="text-[12px] text-text-tertiary mb-3 animate-fade-in">{fillModelsMsg}</p>
       )}
 
       {allRuns.length > 0 && (
-        <div className="flex items-center gap-3 mb-4 flex-wrap">
+        <div className="toolbar">
           <select
             value={modelFilter}
             onChange={e => { setModelFilter(e.target.value); setPage(1) }}
-            className="py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
+            className="select-sm"
           >
             <option value="">全部模型</option>
             {modelNames.map(m => <option key={m} value={m}>{m}</option>)}
@@ -547,28 +561,32 @@ export default function TracesPage() {
           <select
             value={sortBy}
             onChange={e => setSortBy(e.target.value as typeof sortBy)}
-            className="py-2 px-2.5 text-[12px] border border-border rounded-[6px] bg-surface outline-none focus:border-accent transition-all"
+            className="select-sm"
           >
             <option value="time">按时间排序</option>
-            <option value="latency_asc">Latency 升序</option>
-            <option value="latency_desc">Latency 降序</option>
+            <option value="latency_asc">时延 ↑</option>
+            <option value="latency_desc">时延 ↓</option>
           </select>
           <button
             onClick={() => setShowChart(v => !v)}
-            className={`py-2 px-3 text-[11px] rounded-[6px] border transition-all ${showChart ? 'border-accent text-accent bg-accent/5' : 'border-border text-text-secondary hover:border-accent'}`}
+            className={`inline-flex items-center h-8 px-3 text-[12px] rounded-md border transition-colors duration-150 ease-standard ${
+              showChart
+                ? 'border-accent text-accent bg-accent/10'
+                : 'border-border text-text-secondary hover:bg-surface-hover'
+            }`}
           >
             {showChart ? '隐藏对比图' : '模型性能对比'}
           </button>
         </div>
       )}
 
-      {error && <p className="text-[11px] text-negative mb-3 animate-fade-in">{error}</p>}
+      {error && <p className="text-[12px] text-negative mb-3 animate-fade-in">{error}</p>}
 
       {showChart && (
-        <div className="border border-border rounded-[6px] bg-surface p-5 mb-5">
+        <div className="card p-5 mb-5">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-[12px] font-medium">模型性能对比</h3>
-            <span className="text-[10px] text-text-tertiary">
+            <h3 className="text-[13px] font-semibold text-text-primary">模型性能对比</h3>
+            <span className="text-[11px] text-text-tertiary">
               对比样本：{chartScopedRuns.length} 条
               {chartQuestions.size > 0 && ` · ${chartQuestions.size} 个问题`}
               （总加载 {allRuns.length} 条）
@@ -576,13 +594,13 @@ export default function TracesPage() {
           </div>
 
           {/* Chart scope filters */}
-          <div className="flex items-start gap-4 flex-wrap mb-4 p-3 bg-accent-subtle/40 rounded-[6px] border border-border">
+          <div className="flex items-start gap-4 flex-wrap mb-4 p-3 bg-fill/5 rounded-lg border border-border">
             <div className="flex items-center gap-2">
-              <label className="text-[10px] tracking-widest uppercase text-text-tertiary">最近</label>
+              <label className="page-eyebrow">最近</label>
               <select
                 value={chartRecentN}
                 onChange={e => setChartRecentN(Number(e.target.value))}
-                className="py-1 px-2 text-[11px] border border-border rounded-[4px] bg-surface outline-none focus:border-accent"
+                className="select-sm"
               >
                 <option value={0}>全部</option>
                 <option value={10}>10 条</option>
@@ -594,11 +612,11 @@ export default function TracesPage() {
             </div>
 
             <div className="flex items-center gap-2">
-              <label className="text-[10px] tracking-widest uppercase text-text-tertiary">状态</label>
+              <label className="page-eyebrow">状态</label>
               <select
                 value={chartStatus}
                 onChange={e => setChartStatus(e.target.value as typeof chartStatus)}
-                className="py-1 px-2 text-[11px] border border-border rounded-[4px] bg-surface outline-none focus:border-accent"
+                className="select-sm"
               >
                 <option value="all">全部</option>
                 <option value="success">success</option>
@@ -607,10 +625,10 @@ export default function TracesPage() {
             </div>
 
             <div className="flex items-start gap-2 flex-1 min-w-[200px]">
-              <label className="text-[10px] tracking-widest uppercase text-text-tertiary mt-1 shrink-0">模型</label>
+              <label className="page-eyebrow mt-1.5 shrink-0">模型</label>
               <div className="flex flex-wrap gap-1.5">
                 {modelNames.length === 0 ? (
-                  <span className="text-[10px] text-text-tertiary">无可选模型</span>
+                  <span className="text-[11px] text-text-tertiary">无可选模型</span>
                 ) : modelNames.map(m => {
                   const on = chartSelectedModels.has(m)
                   return (
@@ -624,10 +642,10 @@ export default function TracesPage() {
                           return next
                         })
                       }}
-                      className={`text-[10px] px-2 py-0.5 rounded-full border transition-all ${
+                      className={`text-[11px] px-2 py-0.5 rounded-full border transition-colors duration-150 ease-standard ${
                         on
-                          ? 'border-accent bg-accent text-white'
-                          : 'border-border bg-surface text-text-secondary hover:border-accent'
+                          ? 'border-transparent bg-accent text-accent-fg'
+                          : 'border-border bg-surface text-text-secondary hover:bg-surface-hover'
                       }`}
                     >
                       {m}
@@ -638,7 +656,7 @@ export default function TracesPage() {
                   <button
                     type="button"
                     onClick={() => setChartSelectedModels(new Set())}
-                    className="text-[10px] px-2 py-0.5 rounded-full border border-border text-text-tertiary hover:border-accent"
+                    className="text-[11px] px-2 py-0.5 rounded-full border border-border text-text-tertiary hover:bg-surface-hover"
                   >
                     清除
                   </button>
@@ -647,17 +665,17 @@ export default function TracesPage() {
             </div>
 
             <div className="flex items-center gap-2 w-full">
-              <label className="inline-flex items-center gap-2 text-[11px] text-text-secondary cursor-pointer select-none">
+              <label className="inline-flex items-center gap-2 text-[12px] text-text-secondary cursor-pointer select-none">
                 <input
                   type="checkbox"
                   checked={excludeTail5}
                   onChange={e => setExcludeTail5(e.target.checked)}
                   className="w-3.5 h-3.5 accent-accent"
                 />
-                <span>排除各模型最慢 5% （避免 outlier 拉高 avg / P95）</span>
+                <span>排除各模型最慢 5%（避免 outlier 拉高 avg / P95）</span>
               </label>
               {excludeTail5 && (
-                <span className="text-[10px] text-text-tertiary">
+                <span className="text-[11px] text-text-tertiary">
                   按 latency 倒序每模型去头；小样本（&lt;20）floor 为 0 不影响
                 </span>
               )}
@@ -665,44 +683,44 @@ export default function TracesPage() {
 
             <div className="flex flex-col gap-2 w-full">
               <div className="flex items-center gap-2 flex-wrap">
-                <label className="text-[10px] tracking-widest uppercase text-text-tertiary shrink-0">问题集</label>
+                <label className="page-eyebrow shrink-0">问题集</label>
                 <button
                   type="button"
                   onClick={() => setShowQuestionPicker(v => !v)}
                   disabled={allQuestions.length === 0}
-                  className="inline-flex items-center gap-1.5 py-1 px-2.5 text-[11px] border border-border rounded-[4px] bg-surface text-text-primary hover:border-accent disabled:opacity-50 transition-all"
-                  title="勾选一批问题后，每个模型用自己在这批问题里的 runs 各算一次 latency 指标，方便横向对比"
+                  className="inline-flex items-center gap-1.5 h-7 px-2.5 text-[12px] border border-border rounded-md bg-surface text-text-primary hover:bg-surface-hover disabled:opacity-50 transition-colors"
+                  title="勾选一批问题后，每个模型用自己在这批问题里的 runs 各算一次 latency 指标"
                 >
                   {chartQuestions.size === 0
-                    ? (allQuestions.length === 0 ? '无可选问题' : `选择问题（共 ${allQuestions.length} 个）`)
-                    : `已选 ${chartQuestions.size} / ${allQuestions.length} 个问题`}
+                    ? (allQuestions.length === 0 ? '无可选问题' : `选择问题（共 ${allQuestions.length}）`)
+                    : `已选 ${chartQuestions.size} / ${allQuestions.length}`}
                   <span className="text-text-tertiary">{showQuestionPicker ? '▴' : '▾'}</span>
                 </button>
                 {chartQuestions.size > 0 && (
                   <button
                     type="button"
                     onClick={() => setChartQuestions(new Set())}
-                    className="text-[10px] px-2 py-0.5 rounded-full border border-border text-text-tertiary hover:border-accent"
+                    className="text-[11px] px-2 py-0.5 rounded-full border border-border text-text-tertiary hover:bg-surface-hover"
                   >
                     清空选择
                   </button>
                 )}
-                <span className="text-[10px] text-text-tertiary ml-auto">
+                <span className="text-[11px] text-text-tertiary ml-auto">
                   空=不按问题过滤；多选=每模型在自己的覆盖子集上算 latency
                 </span>
               </div>
 
               {showQuestionPicker && (
-                <div className="border border-border rounded-[6px] bg-surface p-3 flex flex-col gap-2 max-h-[360px]">
+                <div className="border border-border rounded-lg bg-surface p-3 flex flex-col gap-2 max-h-[360px]">
                   <div className="flex items-center gap-2 flex-wrap">
                     <input
                       type="text"
                       placeholder="搜索问题内容…"
                       value={questionPickerSearch}
                       onChange={e => setQuestionPickerSearch(e.target.value)}
-                      className="flex-1 min-w-[200px] py-1 px-2 text-[11px] border border-border rounded-[4px] bg-surface outline-none focus:border-accent"
+                      className="input-sm flex-1 min-w-[200px]"
                     />
-                    <label className="inline-flex items-center gap-1.5 text-[10px] text-text-secondary cursor-pointer select-none">
+                    <label className="inline-flex items-center gap-1.5 text-[11px] text-text-secondary cursor-pointer select-none">
                       <input
                         type="checkbox"
                         checked={questionPickerCrossOnly}
@@ -722,7 +740,7 @@ export default function TracesPage() {
                           })
                         }}
                         disabled={pickerQuestions.length === 0}
-                        className="text-[10px] px-2 py-0.5 rounded-full border border-border text-text-secondary hover:border-accent disabled:opacity-40"
+                        className="text-[11px] px-2 py-0.5 rounded-full border border-border text-text-secondary hover:bg-surface-hover disabled:opacity-40"
                       >
                         全选当前列表
                       </button>
@@ -736,19 +754,19 @@ export default function TracesPage() {
                           })
                         }}
                         disabled={pickerQuestions.length === 0}
-                        className="text-[10px] px-2 py-0.5 rounded-full border border-border text-text-secondary hover:border-accent disabled:opacity-40"
+                        className="text-[11px] px-2 py-0.5 rounded-full border border-border text-text-secondary hover:bg-surface-hover disabled:opacity-40"
                       >
                         取消选择
                       </button>
                     </div>
                   </div>
-                  <div className="text-[10px] text-text-tertiary">
+                  <div className="text-[11px] text-text-tertiary">
                     显示 {pickerQuestions.length} / {allQuestions.length} 个问题
                     {chartQuestions.size > 0 && `（当前共选中 ${chartQuestions.size} 个）`}
                   </div>
-                  <div className="flex-1 overflow-y-auto border border-border rounded-[4px] bg-accent-subtle/20 divide-y divide-border">
+                  <div className="flex-1 overflow-y-auto border border-border rounded-md bg-fill/5 divide-y divide-separator">
                     {pickerQuestions.length === 0 ? (
-                      <div className="text-center py-6 text-[11px] text-text-tertiary">
+                      <div className="text-center py-6 text-[12px] text-text-tertiary">
                         {questionPickerCrossOnly
                           ? '当前搜索下没有跨模型问题；取消「仅跨模型」试试'
                           : '没有匹配的问题'}
@@ -759,7 +777,7 @@ export default function TracesPage() {
                       return (
                         <label
                           key={q.preview}
-                          className="flex items-start gap-2 py-1.5 px-2 hover:bg-accent-subtle/60 cursor-pointer"
+                          className="flex items-start gap-2 py-1.5 px-2 hover:bg-fill/10 cursor-pointer"
                         >
                           <input
                             type="checkbox"
@@ -774,8 +792,8 @@ export default function TracesPage() {
                             }}
                             className="mt-0.5 w-3 h-3 accent-accent shrink-0"
                           />
-                          <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${
-                            isCross ? 'bg-accent text-white' : 'bg-border text-text-tertiary'
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 tabular-nums ${
+                            isCross ? 'bg-accent text-accent-fg' : 'bg-fill/15 text-text-tertiary'
                           }`}>
                             {q.modelCount}m · {q.runCount}r
                           </span>
@@ -792,9 +810,7 @@ export default function TracesPage() {
           </div>
 
           {latencyStats.length === 0 && firstTokenStats.length === 0 && firstToolCallStats.length === 0 ? (
-            <div className="text-center py-8 text-[11px] text-text-tertiary">
-              当前筛选条件下无数据
-            </div>
+            <div className="empty-state">当前筛选条件下无数据</div>
           ) : (
             <div className="flex flex-col gap-6">
               <DistributionChart
@@ -820,11 +836,11 @@ export default function TracesPage() {
         </div>
       )}
 
-      <div className="border border-border rounded-[3px] overflow-hidden bg-surface">
-        <table className="w-full border-collapse">
+      <div className="table-card">
+        <table className="table-base">
           <thead>
             <tr>
-              <th className="w-8 text-center py-2 px-2 border-b border-border bg-accent-subtle">
+              <th className="w-10 text-center">
                 <input
                   type="checkbox"
                   checked={pageRuns.length > 0 && selectedIds.size === pageRuns.length}
@@ -832,20 +848,20 @@ export default function TracesPage() {
                   className="w-3.5 h-3.5 accent-accent"
                 />
               </th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Name</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Model</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Status</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Input</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Output</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Latency</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Tokens</th>
-              <th className="text-[9px] tracking-[0.1em] uppercase text-text-tertiary text-left py-2 px-3 border-b border-border font-normal bg-accent-subtle">Time</th>
+              <th>名称</th>
+              <th>模型</th>
+              <th>状态</th>
+              <th>输入</th>
+              <th>输出</th>
+              <th className="text-right">时延</th>
+              <th className="text-right">token</th>
+              <th>时间</th>
             </tr>
           </thead>
           <tbody>
             {pageRuns.map((run) => (
-              <tr key={run.id} className="hover:bg-accent-subtle group cursor-default">
-                <td className="text-center py-2.5 px-2 border-b border-border">
+              <tr key={run.id} className="cursor-default">
+                <td className="text-center">
                   <input
                     type="checkbox"
                     checked={selectedIds.has(run.id)}
@@ -853,36 +869,40 @@ export default function TracesPage() {
                     className="w-3.5 h-3.5 accent-accent"
                   />
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-primary max-w-[120px] truncate">
-                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent hover:underline transition-colors">{run.name}</button>
+                <td className="max-w-[140px] truncate">
+                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent transition-colors">
+                    {run.name}
+                  </button>
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-secondary whitespace-nowrap">
+                <td className="text-text-secondary text-[11px] whitespace-nowrap">
                   {run.model_name || '—'}
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[12px]">
-                  <span className={`inline-block px-2 py-0.5 rounded-full text-[9px] tracking-wide font-medium ${
-                    run.status === 'success'
-                      ? 'bg-[#e6f7ed] text-[#1a6]'
-                      : run.status === 'error'
-                        ? 'bg-[#fde8e8] text-[#b33]'
-                        : 'bg-[#f5f5f5] text-[#999]'
-                  }`}>
+                <td>
+                  <span className={
+                    run.status === 'success' ? 'badge badge-positive'
+                    : run.status === 'error' ? 'badge badge-negative'
+                    : 'badge badge-neutral'
+                  }>
                     {run.status}
                   </span>
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-secondary max-w-[180px] truncate">
-                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent transition-colors truncate block w-full">{run.input_preview || '—'}</button>
+                <td className="text-text-secondary text-[11px] max-w-[180px] truncate">
+                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent transition-colors truncate block w-full">
+                    {run.input_preview || '—'}
+                  </button>
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-secondary max-w-[180px] truncate">
-                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent transition-colors truncate block w-full">{run.output_preview || '—'}</button>
+                <td className="text-text-secondary text-[11px] max-w-[180px] truncate">
+                  <button onClick={() => openDetail(run.id)} className="text-left hover:text-accent transition-colors truncate block w-full">
+                    {run.output_preview || '—'}
+                  </button>
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-secondary whitespace-nowrap">
+                <td className="text-right text-text-secondary tabular-nums whitespace-nowrap">
                   {run.latency_s ? `${run.latency_s.toFixed(2)}s` : '—'}
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[12px] text-text-secondary whitespace-nowrap">
+                <td className="text-right text-text-secondary tabular-nums whitespace-nowrap">
                   {run.total_tokens ?? '—'}
                 </td>
-                <td className="py-2.5 px-3 border-b border-border text-[11px] text-text-tertiary whitespace-nowrap">
+                <td className="text-text-tertiary text-[11px] whitespace-nowrap">
                   {run.start_time ? new Date(run.start_time).toLocaleString() : '—'}
                 </td>
               </tr>
@@ -890,34 +910,22 @@ export default function TracesPage() {
           </tbody>
         </table>
         {pageRuns.length === 0 && !loading && (
-          <div className="text-center py-10 text-text-tertiary text-[12px]">输入项目名称查询 Runs</div>
+          <div className="empty-state">输入项目名称查询调用轨迹</div>
         )}
       </div>
 
       {total > 0 && (
-        <div className="flex items-center justify-between mt-4 text-[11px] text-text-secondary">
+        <div className="flex items-center justify-between mt-4 text-[12px] text-text-secondary">
           <span>共 {total} 条结果（已加载 {allRuns.length}）</span>
           <div className="flex items-center gap-2">
-            <button
-              disabled={page <= 1}
-              onClick={() => setPage(p => p - 1)}
-              className="px-2.5 py-1 rounded border border-border bg-surface hover:bg-accent-subtle disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-            >
-              上一页
-            </button>
-            <span>{page} / {totalPages}</span>
-            <button
-              disabled={page >= totalPages}
-              onClick={() => setPage(p => p + 1)}
-              className="px-2.5 py-1 rounded border border-border bg-surface hover:bg-accent-subtle disabled:opacity-40 disabled:cursor-not-allowed transition-all"
-            >
-              下一页
-            </button>
+            <button disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="pager-btn">上一页</button>
+            <span className="tabular-nums">{page} / {totalPages}</span>
+            <button disabled={page >= totalPages} onClick={() => setPage(p => p + 1)} className="pager-btn">下一页</button>
             {hasMore && (
               <button
                 onClick={() => fetchRuns('more')}
                 disabled={loadingMore}
-                className="ml-2 px-2.5 py-1 rounded border border-accent text-accent bg-accent/5 hover:bg-accent/10 disabled:opacity-40 transition-all inline-flex items-center gap-1.5"
+                className="ml-2 inline-flex items-center gap-1.5 h-7 px-2.5 text-[11px] rounded-md border border-accent text-accent bg-accent/10 hover:bg-accent/15 disabled:opacity-40 transition-colors"
               >
                 {loadingMore ? (
                   <>
@@ -932,18 +940,18 @@ export default function TracesPage() {
       )}
 
       {showImportModal && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowImportModal(false)}>
-          <div className="bg-surface border border-border rounded-lg p-6 w-[400px] shadow-lg" onClick={e => e.stopPropagation()}>
-            <h3 className="text-[14px] font-medium mb-4">导入到数据集</h3>
-            <p className="text-[11px] text-text-secondary mb-4">已选择 {selectedIds.size} 条 Runs，将提取为测试用例导入目标数据集。</p>
+        <div className="fixed inset-0 z-50 bg-black/30 dark:bg-black/55 backdrop-blur-[6px] flex items-center justify-center animate-overlay-in" onClick={() => setShowImportModal(false)}>
+          <div className="bg-bg-elevated border border-border/60 rounded-2xl p-6 w-[400px] shadow-xl animate-dialog-in" onClick={e => e.stopPropagation()}>
+            <h3 className="text-[17px] font-display font-semibold tracking-[-0.4px] text-text-primary mb-1">导入到数据集</h3>
+            <p className="text-[12px] text-text-secondary mb-4">已选择 {selectedIds.size} 条 Runs，将提取为测试用例导入目标数据集。</p>
             <div className="mb-4">
-              <label className="text-[11px] text-text-secondary block mb-1.5">目标数据集</label>
+              <label className="field-label">目标数据集</label>
               <select
                 value={importTarget}
                 onChange={e => setImportTarget(e.target.value)}
-                className="w-full py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent"
+                className="input"
               >
-                <option value="">选择数据集...</option>
+                <option value="">选择数据集…</option>
                 {datasets.map(d => (
                   <option key={d.id} value={d.name}>{d.name} ({d.example_count} 条)</option>
                 ))}
@@ -952,28 +960,28 @@ export default function TracesPage() {
             </div>
             {importTarget === '__new__' && (
               <div className="mb-4">
-                <label className="text-[11px] text-text-secondary block mb-1.5">新数据集名称</label>
+                <label className="field-label">新数据集名称</label>
                 <input
                   value={newDatasetName}
                   onChange={e => setNewDatasetName(e.target.value)}
-                  placeholder="输入数据集名称..."
-                  className="w-full py-2 px-3 text-[12px] border border-border rounded-[6px] bg-surface text-text-primary outline-none focus:border-accent"
+                  placeholder="输入数据集名称…"
+                  className="input"
                 />
               </div>
             )}
             <div className="flex justify-end gap-2 mt-6">
               <button
                 onClick={() => setShowImportModal(false)}
-                className="px-3.5 py-2 text-[11px] rounded-[6px] border border-border hover:bg-accent-subtle transition-all"
+                className="inline-flex items-center h-8 px-3 text-[13px] rounded-md border border-border bg-surface text-text-primary hover:bg-surface-hover transition-colors"
               >
                 取消
               </button>
               <button
                 onClick={handleImport}
                 disabled={importing || (!importTarget || (importTarget === '__new__' && !newDatasetName.trim()))}
-                className="px-3.5 py-2 text-[11px] font-medium rounded-[6px] bg-accent text-white border border-accent hover:opacity-90 disabled:opacity-40 transition-all"
+                className="inline-flex items-center h-8 px-3 text-[13px] font-medium rounded-md bg-accent text-accent-fg border border-transparent hover:bg-accent-hover disabled:opacity-40 transition-colors"
               >
-                {importing ? `导入中 (${selectedIds.size} 条)...` : '确认导入'}
+                {importing ? `导入中 (${selectedIds.size} 条)…` : '确认导入'}
               </button>
             </div>
           </div>
@@ -1008,11 +1016,19 @@ interface RunDetailModalProps {
 function RunDetailModal({ rootId, projectName, nodeCache, expanded, onClose, onToggle, onRetry }: RunDetailModalProps) {
   const rootState = nodeCache[rootId]
   return (
-    <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={onClose}>
-      <div className="bg-surface border border-border rounded-lg w-[860px] max-w-[95vw] max-h-[88vh] overflow-y-auto shadow-lg" onClick={e => e.stopPropagation()}>
-        <div className="sticky top-0 bg-surface border-b border-border px-6 py-4 flex justify-between items-center z-10">
-          <h3 className="text-[14px] font-medium">Run 详情</h3>
-          <button onClick={onClose} className="text-text-tertiary hover:text-text-primary text-lg">×</button>
+    <div className="fixed inset-0 z-50 bg-black/30 dark:bg-black/55 backdrop-blur-[6px] flex items-center justify-center animate-overlay-in" onClick={onClose}>
+      <div className="bg-bg-elevated border border-border/60 rounded-2xl w-[860px] max-w-[95vw] max-h-[88vh] overflow-y-auto shadow-xl animate-dialog-in" onClick={e => e.stopPropagation()}>
+        <div className="sticky top-0 bg-bg-elevated/95 backdrop-blur-[6px] border-b border-separator px-6 py-4 flex justify-between items-center z-10">
+          <h3 className="text-[17px] font-display font-semibold tracking-[-0.4px] text-text-primary">调用详情</h3>
+          <button
+            onClick={onClose}
+            aria-label="关闭"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-full text-text-secondary hover:bg-fill/10 hover:text-text-primary transition-colors"
+          >
+            <svg viewBox="0 0 20 20" width="14" height="14" fill="none" aria-hidden="true">
+              <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+            </svg>
+          </button>
         </div>
         <div className="p-6">
           {rootState?.loading && !rootState.data && <LoadingSkeleton />}
@@ -1027,15 +1043,15 @@ function RunDetailModal({ rootId, projectName, nodeCache, expanded, onClose, onT
               <RunDetailBody detail={rootState.data} />
               <div className="mt-6">
                 <div className="flex items-center justify-between mb-2">
-                  <h4 className="text-[12px] font-medium">Children ({rootState.data.children.length})</h4>
+                  <h4 className="text-[12px] font-semibold text-text-primary">子节点 ({rootState.data.children.length})</h4>
                   {rootState.data.children_truncated && (
-                    <span className="text-[10px] text-[#b87b00] bg-[#fff4d6] px-2 py-0.5 rounded">已截断前 100 个子节点</span>
+                    <span className="badge badge-warning">已截断前 100 个子节点</span>
                   )}
                 </div>
                 {rootState.data.children.length === 0 ? (
-                  <div className="text-[11px] text-text-tertiary">无子 Run</div>
+                  <div className="text-[11px] text-text-tertiary">无子节点</div>
                 ) : (
-                  <div className="border border-border rounded-[6px] overflow-hidden">
+                  <div className="border border-border rounded-lg overflow-hidden">
                     {rootState.data.children.map(c => (
                       <RunNodeRow
                         key={c.id}
@@ -1062,13 +1078,13 @@ function RunDetailModal({ rootId, projectName, nodeCache, expanded, onClose, onT
 }
 
 const RUN_TYPE_COLORS: Record<string, { border: string; badge: string }> = {
-  llm: { border: '#3b82f6', badge: 'bg-blue-50 text-blue-700' },
-  tool: { border: '#10b981', badge: 'bg-emerald-50 text-emerald-700' },
-  chain: { border: '#8b5cf6', badge: 'bg-violet-50 text-violet-700' },
-  retriever: { border: '#f59e0b', badge: 'bg-amber-50 text-amber-700' },
-  prompt: { border: '#ec4899', badge: 'bg-pink-50 text-pink-700' },
+  llm: { border: 'rgb(var(--accent))', badge: 'bg-accent/10 text-accent' },
+  tool: { border: 'rgb(var(--positive))', badge: 'bg-positive/10 text-positive' },
+  chain: { border: 'rgb(var(--info))', badge: 'bg-info/15 text-info' },
+  retriever: { border: 'rgb(var(--warning))', badge: 'bg-warning/15 text-warning' },
+  prompt: { border: 'rgb(var(--negative))', badge: 'bg-negative/10 text-negative' },
 }
-const DEFAULT_TYPE_COLOR = { border: '#9ca3af', badge: 'bg-gray-50 text-gray-700' }
+const DEFAULT_TYPE_COLOR = { border: 'rgb(var(--fill) / 0.4)', badge: 'badge badge-neutral' }
 
 interface DistributionChartProps {
   title: string
@@ -1093,33 +1109,33 @@ const DistributionChart = memo(function DistributionChart({ title, stats, emptyH
       <h4 className="text-[11px] font-medium text-text-secondary mb-2">{title}</h4>
       <ResponsiveContainer width="100%" height={240}>
         <BarChart data={stats} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border, #e5e5e5)" />
+          <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--separator) / 0.3)" />
           <XAxis dataKey="model" tick={{ fontSize: 10 }} />
-          <YAxis tick={{ fontSize: 10 }} label={{ value: 'seconds', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
+          <YAxis tick={{ fontSize: 10 }} label={{ value: '秒', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
           <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
           <Legend wrapperStyle={{ fontSize: 10 }} />
-          <Bar dataKey="min" name="Min" fill="#93c5fd" radius={[2, 2, 0, 0]} />
-          <Bar dataKey="avg" name="Avg" fill="#3b82f6" radius={[2, 2, 0, 0]} />
-          <Bar dataKey="median" name="Median" fill="#6366f1" radius={[2, 2, 0, 0]} />
-          <Bar dataKey="p95" name="P95" fill="#a855f7" radius={[2, 2, 0, 0]} />
-          <Bar dataKey="max" name="Max" fill="#f87171" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="min" name="最小" fill="rgb(var(--positive))" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="avg" name="平均" fill="rgb(var(--accent))" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="median" name="中位" fill="rgb(var(--accent-hover))" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="p95" name="P95" fill="rgb(var(--warning))" radius={[2, 2, 0, 0]} />
+          <Bar dataKey="max" name="最大" fill="rgb(var(--negative))" radius={[2, 2, 0, 0]} />
         </BarChart>
       </ResponsiveContainer>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-[11px] border-collapse">
           <thead>
             <tr className="text-text-tertiary">
-              <th className="text-left py-1.5 px-2 font-normal">Model</th>
-              <th className="text-right py-1.5 px-2 font-normal">Runs</th>
+              <th className="text-left py-1.5 px-2 font-normal">模型</th>
+              <th className="text-right py-1.5 px-2 font-normal">样本数</th>
               <th className="text-right py-1.5 px-2 font-normal" title="该模型在选中问题集里覆盖了多少个不同的问题 / 当前选中问题总数">
-                Questions
+                覆盖问题
               </th>
-              <th className="text-right py-1.5 px-2 font-normal">Min</th>
-              <th className="text-right py-1.5 px-2 font-normal">Avg</th>
-              <th className="text-right py-1.5 px-2 font-normal">Median</th>
+              <th className="text-right py-1.5 px-2 font-normal">最小</th>
+              <th className="text-right py-1.5 px-2 font-normal">平均</th>
+              <th className="text-right py-1.5 px-2 font-normal">中位</th>
               <th className="text-right py-1.5 px-2 font-normal">P95</th>
-              <th className="text-right py-1.5 px-2 font-normal">Max</th>
-              <th className="text-right py-1.5 px-2 font-normal">Variance</th>
+              <th className="text-right py-1.5 px-2 font-normal">最大</th>
+              <th className="text-right py-1.5 px-2 font-normal">方差</th>
             </tr>
           </thead>
           <tbody>
@@ -1166,7 +1182,7 @@ const RunNodeRow = memo(function RunNodeRow({
   return (
     <div>
       <div
-        className="flex items-center gap-2 py-1.5 border-b border-border hover:bg-accent-subtle cursor-default text-[11px]"
+        className="flex items-center gap-2 py-1.5 border-b border-separator hover:bg-fill/5 cursor-default text-[11px]"
         style={{ paddingLeft: 12 + depth * 16, borderLeft: `2px solid ${color.border}` }}
       >
         <button
@@ -1190,7 +1206,7 @@ const RunNodeRow = memo(function RunNodeRow({
       </div>
 
       {isOpen && (
-        <div style={{ paddingLeft: 12 + depth * 16 }} className="border-b border-border">
+        <div style={{ paddingLeft: 12 + depth * 16 }} className="border-b border-separator">
           {state?.loading && !state.data && <div className="py-3 px-3 text-[11px] text-text-tertiary">加载中…</div>}
           {state?.error && !state.data && (
             <div className="py-3 px-3 text-[11px] text-negative">
@@ -1199,14 +1215,14 @@ const RunNodeRow = memo(function RunNodeRow({
             </div>
           )}
           {state?.data && (
-            <div className="py-3 px-3 space-y-3 bg-accent-subtle/40">
+            <div className="py-3 px-3 space-y-3 bg-fill/5">
               <RunDetailBody detail={state.data} compact />
               {state.data.children.length > 0 && (
                 <div className="mt-3">
-                  <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">
-                    Children ({state.data.children.length}) {state.data.children_truncated && <span className="ml-2 text-[#b87b00]">已截断</span>}
+                  <div className="page-eyebrow mb-1">
+                    Children ({state.data.children.length}) {state.data.children_truncated && <span className="ml-2 text-warning">已截断</span>}
                   </div>
-                  <div className="border border-border rounded-[4px] bg-surface">
+                  <div className="border border-border rounded-md bg-surface">
                     {state.data.children.map(c => (
                       <RunNodeRow
                         key={c.id}
@@ -1280,11 +1296,11 @@ function formatTokens(detail: RunDetail): string {
 
 function LoadingSkeleton() {
   return (
-    <div className="animate-pulse space-y-3">
-      <div className="h-4 bg-border/40 rounded w-1/3" />
-      <div className="h-16 bg-border/40 rounded" />
-      <div className="h-4 bg-border/40 rounded w-1/4" />
-      <div className="h-24 bg-border/40 rounded" />
+    <div className="space-y-3">
+      <div className="skeleton h-4 w-1/3 rounded" />
+      <div className="skeleton h-16 w-full rounded" />
+      <div className="skeleton h-4 w-1/4 rounded" />
+      <div className="skeleton h-24 w-full rounded" />
     </div>
   )
 }
@@ -1299,14 +1315,14 @@ function JsonField({ label, value, collapsed }: { label: string; value: unknown;
     <div>
       <button
         onClick={() => setOpen(v => !v)}
-        className="flex items-center gap-1 text-[10px] tracking-widest uppercase text-text-tertiary mb-1 hover:text-accent"
+        className="flex items-center gap-1 page-eyebrow mb-1 hover:text-text-primary transition-colors"
       >
         <span>{open ? '▾' : '▸'}</span>
         <span>{label}</span>
-        <span className="normal-case tracking-normal text-[9px] opacity-60">({text.length} chars)</span>
+        <span className="normal-case tracking-normal text-[10px] opacity-60">({text.length} chars)</span>
       </button>
       {open && (
-        <pre className="text-[11px] leading-relaxed whitespace-pre-wrap break-all p-2.5 rounded-[6px] border border-border bg-accent-subtle text-text-primary font-mono max-h-80 overflow-y-auto">
+        <pre className="text-[11px] leading-relaxed whitespace-pre-wrap break-all p-3 rounded-md border border-border bg-fill/5 text-text-primary font-mono max-h-80 overflow-y-auto">
           {text}
         </pre>
       )}
@@ -1318,8 +1334,12 @@ function PreviewField({ label, value, mono, error }: { label: string; value: str
   const text = value || '—'
   return (
     <div>
-      <div className="text-[10px] tracking-widest uppercase text-text-tertiary mb-1">{label}</div>
-      <div className={`text-[12px] leading-relaxed whitespace-pre-wrap break-all p-2.5 rounded-[6px] border border-border bg-accent-subtle ${mono ? 'font-mono text-[11px]' : ''} ${error ? 'text-negative bg-[#fde8e8] border-negative/20' : 'text-text-primary'}`}>
+      <div className="page-eyebrow mb-1">{label}</div>
+      <div className={`text-[12px] leading-relaxed whitespace-pre-wrap break-all p-3 rounded-md border ${
+        error
+          ? 'text-negative bg-negative/5 border-negative/20'
+          : 'text-text-primary border-border bg-fill/5'
+      } ${mono ? 'font-mono text-[11px]' : ''}`}>
         {text}
       </div>
     </div>

@@ -7,18 +7,26 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from pydantic import BaseModel
 from sqlalchemy import select
 
 from agent_eval.api.dependencies import get_extractor
+from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.auth.dependencies import require_internal
 from agent_eval.api.schemas import (
     BuiltinEvaluator,
     CreateEvaluatorRequest,
+    CreateEvaluatorVersionRequest,
+    DryRunRequest,
+    DryRunResponse,
+    DryRunScoreItem,
     EvalCaseSourceSummary,
     EvalRunDetail,
     EvalRunSummary,
     EvalResultRow,
     EvalResultsPage,
     EvaluatorInstance,
+    EvaluatorVersion,
     RunDetailResponse,
     StartEvalRequest,
     UpdateEvaluatorRequest,
@@ -43,7 +51,7 @@ from agent_eval.evaluation.langfuse_runner import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/eval", tags=["eval"])
+router = APIRouter(prefix="/api/eval", tags=["eval"], dependencies=[Depends(require_internal())])
 
 
 @router.get("/evaluators/builtin", response_model=list[BuiltinEvaluator])
@@ -61,16 +69,23 @@ async def list_builtin_evaluators():
 @router.post("/runs/start")
 async def start_eval(req: StartEvalRequest):
     # ── 1. resolve cases ──────────────────────────────────────────
-    sources = [x for x in (req.benchmark_version_id, req.project_id, req.case_source_id) if x]
+    sources = [
+        x for x in (
+            req.benchmark_version_id, req.project_id,
+            req.case_source_id, req.conversation_dataset,
+        ) if x
+    ]
     if not sources:
         raise HTTPException(
             status_code=400,
-            detail="one of benchmark_version_id / project_id / case_source_id is required",
+            detail="one of benchmark_version_id / project_id / case_source_id / "
+            "conversation_dataset is required",
         )
     if len(sources) > 1:
         raise HTTPException(
             status_code=400,
-            detail="provide only one source: benchmark_version_id OR project_id OR case_source_id",
+            detail="provide only one source: benchmark_version_id OR project_id OR "
+            "case_source_id OR conversation_dataset",
         )
 
     cases: list[dict[str, Any]] = []
@@ -78,7 +93,50 @@ async def start_eval(req: StartEvalRequest):
     async with async_session_factory() as session:
         repo = Repository(session)
 
-        if req.case_source_id:
+        if req.conversation_dataset:
+            # ── 多轮对话数据集（直读 LangSmith dataset，保留多轮字段）──
+            # 与 benchmark/file 不同：这条路径不降维成单 question，而是整段
+            # input_messages + conversation_goal + turn_expectations 透传给
+            # runner，由 multiturn 回放逐轮调用 agent 并逐轮+会话级打分。
+            from agent_eval.api.dependencies import get_manager
+
+            mgr = await get_manager()
+            try:
+                ds_cases = await mgr.load_cases(req.conversation_dataset, limit=req.limit)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"读取对话数据集 '{req.conversation_dataset}' 失败：{e}",
+                ) from e
+            for c in ds_cases:
+                msgs = c.input_messages or []
+                if not any(m.get("role") == "user" and m.get("content") for m in msgs):
+                    # 没有任何 user 消息的样例无法回放，跳过。
+                    continue
+                # question 仅作落库/展示的单值快照（首条 user 消息）。
+                first_user = next(
+                    (m.get("content", "") for m in msgs if m.get("role") == "user"), ""
+                )
+                cases.append({
+                    "id": c.id,
+                    "name": c.name or c.id,
+                    "question": first_user,
+                    "expected_output": c.expected_output or "",
+                    "expected_tool_calls": [],
+                    "metadata": {"tags": list(c.tags or [])},
+                    "source": "conversation",
+                    # 多轮标记 + 完整回放/打分输入：runner 据此走 multiturn 分支。
+                    "multi_turn": True,
+                    "input_messages": msgs,
+                    "conversation_goal": c.conversation_goal,
+                    "turn_expectations": [te.model_dump() for te in c.turn_expectations],
+                })
+            if not cases:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"对话数据集 '{req.conversation_dataset}' 没有可回放的多轮样例",
+                )
+        elif req.case_source_id:
             # ── uploaded file ──
             src = await repo.get_eval_case_source(uuid.UUID(req.case_source_id))
             if src is None:
@@ -148,6 +206,12 @@ async def start_eval(req: StartEvalRequest):
                 "tag": row.tag or row.name,
                 "evaluator_type": row.evaluator_type,
                 "params": row.params or {},
+                # Pin to the active version so historical reproductions don't
+                # silently follow future edits. Stored verbatim into
+                # test_runs.evaluator_configs[].evaluator_version_id.
+                "evaluator_version_id": (
+                    str(row.current_version_id) if row.current_version_id else None
+                ),
             })
 
     agent_cfg = req.agent.model_dump()
@@ -160,6 +224,7 @@ async def start_eval(req: StartEvalRequest):
             concurrency=req.concurrency,
             run_name=req.run_name,
             langsmith_project=req.langsmith_project,
+            langfuse_trace_name=req.langfuse_trace_name,
             benchmark_version_id=req.benchmark_version_id,
             eval_case_source_id=req.case_source_id,
         )
@@ -177,6 +242,7 @@ def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRun
         finished_at=row.finished_at,
         langfuse_run_name=row.langfuse_run_name,
         langsmith_project=row.langsmith_project,
+        langfuse_trace_name=row.langfuse_trace_name,
         agent_config=row.agent_config or {},
         summary_scores=row.summary_scores,
         progress=progress or {},
@@ -294,13 +360,236 @@ async def get_run_results(
             cache_creation_tokens=r.cache_creation_tokens,
             cache_read_tokens=r.cache_read_tokens,
             tool_call_count=r.tool_call_count,
+            first_thinking_token_ms=getattr(r, "first_thinking_token_ms", None),
+            first_answer_token_ms=getattr(r, "first_answer_token_ms", None),
             actual_tool_calls=r.actual_tool_calls,
+            full_trace=r.full_trace,
             error_message=r.error_message,
             langfuse_trace_id=r.langfuse_trace_id,
             langsmith_run_id=r.langsmith_run_id,
+            attempts_made=getattr(r, "attempts_made", 1) or 1,
             scores=score_index.get(r.id, {}),
         ))
     return EvalResultsPage(items=items, total=total, page=page, page_size=page_size)
+
+
+async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str, Any]], list[str]]:
+    """Load a run + all its results (no pagination) with scores merged in.
+
+    Returns (run_row, rows, score_dimensions). ``rows`` are plain dicts ready
+    for export; ``score_dimensions`` is the sorted union of every dimension
+    seen so the exporter can give each its own column.
+    """
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        run_row = await repo.get_test_run(run_uuid)
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        results = await repo.get_results_by_run(run_uuid)
+        scores_by_result = await repo.get_scores_by_run(run_uuid)
+
+        # Expected answers live on the benchmark cases, not on the result rows
+        # (the runner computes them for scoring but doesn't persist them). Batch
+        # load reference_answer for every benchmark_case_id seen so the export /
+        # detail view can show 期望答案 alongside 生成答案. Upload-sourced runs
+        # have no benchmark_case_id, so their expected answer can't be recovered.
+        bench_ids = {r.benchmark_case_id for r in results if r.benchmark_case_id}
+        expected_by_case: dict[Any, str] = {}
+        if bench_ids:
+            bench_rows = (await session.execute(
+                select(BenchmarkCaseRow).where(BenchmarkCaseRow.id.in_(bench_ids))
+            )).scalars().all()
+            expected_by_case = {b.id: (b.reference_answer or "") for b in bench_rows}
+
+    dims: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for r in sorted(results, key=lambda x: x.created_at or x.id.hex):
+        score_map = {s.dimension: float(s.score) for s in scores_by_result.get(r.id, [])}
+        dims.update(score_map.keys())
+        rows.append({
+            "id": str(r.id),
+            "benchmark_case_id": str(r.benchmark_case_id) if r.benchmark_case_id else None,
+            "test_case_id": str(r.test_case_id) if r.test_case_id else None,
+            "question": r.question,
+            # Prefer the value snapshotted on the result row (migration 0016+).
+            # Fall back to the benchmark case's reference_answer for older rows
+            # that predate the column but still have a benchmark_case_id.
+            "expected_output": (
+                getattr(r, "expected_output", None)
+                or expected_by_case.get(r.benchmark_case_id, "")
+            ),
+            "status": r.status,
+            "actual_output": r.actual_output,
+            "latency_ms": r.latency_ms,
+            "prompt_tokens": r.prompt_tokens,
+            "completion_tokens": r.completion_tokens,
+            "total_tokens": r.total_tokens,
+            "cache_creation_tokens": r.cache_creation_tokens,
+            "cache_read_tokens": r.cache_read_tokens,
+            "tool_call_count": r.tool_call_count,
+            "first_thinking_token_ms": getattr(r, "first_thinking_token_ms", None),
+            "first_answer_token_ms": getattr(r, "first_answer_token_ms", None),
+            "attempts_made": getattr(r, "attempts_made", 1) or 1,
+            "actual_tool_calls": r.actual_tool_calls,
+            "error_message": r.error_message,
+            "langfuse_trace_id": r.langfuse_trace_id,
+            "langsmith_run_id": r.langsmith_run_id,
+            "scores": score_map,
+            **{f"score::{d}": score_map.get(d) for d in score_map},
+        })
+    return run_row, rows, sorted(dims)
+
+
+@router.get("/runs/{run_id}/results/export")
+async def export_run_results(run_id: str, format: str = Query("csv")):
+    """Export all per-sample results of a run as csv / json / xlsx."""
+    validate_format(format)
+    run_uuid = uuid.UUID(run_id)
+    _run_row, rows, dims = await _collect_run_results(run_uuid)
+
+    columns = [
+        ExportColumn("id", "结果 ID"),
+        ExportColumn("benchmark_case_id", "基准用例 ID"),
+        ExportColumn("question", "问题"),
+        ExportColumn("expected_output", "期望答案"),
+        ExportColumn("status", "状态"),
+        ExportColumn("actual_output", "生成答案"),
+        ExportColumn("latency_ms", "时延(ms)"),
+        ExportColumn("prompt_tokens", "输入 token"),
+        ExportColumn("completion_tokens", "输出 token"),
+        ExportColumn("total_tokens", "总 token"),
+        ExportColumn("cache_creation_tokens", "缓存写入 token"),
+        ExportColumn("cache_read_tokens", "缓存命中 token"),
+        ExportColumn("tool_call_count", "工具调用数"),
+        ExportColumn("first_thinking_token_ms", "首思考 token(ms)"),
+        ExportColumn("first_answer_token_ms", "首答案 token(ms)"),
+        ExportColumn("attempts_made", "尝试次数"),
+        ExportColumn("actual_tool_calls", "工具调用明细"),
+        ExportColumn("error_message", "错误信息"),
+        ExportColumn("langfuse_trace_id", "Langfuse Trace"),
+    ]
+    # One column per score dimension, sorted for stable output.
+    for d in dims:
+        columns.append(ExportColumn(f"score::{d}", f"分数·{d}"))
+
+    return build_export_response(rows, columns, format, f"eval_run_{run_id[:8]}_results")
+
+
+class ExportCompareRequest(BaseModel):
+    run_ids: list[str]
+    align_key: str = "case_id"  # "case_id" | "question"
+    format: str = "csv"
+
+
+@router.post("/runs/export-compare")
+async def export_compare(req: ExportCompareRequest):
+    """Export a per-sample cross-run score matrix (mirrors EvaluationComparePage)."""
+    validate_format(req.format)
+    if not req.run_ids:
+        raise HTTPException(status_code=400, detail="run_ids is required")
+
+    # Load every run's results, then align samples across runs by case id or
+    # normalized question — same keying the compare page uses client-side.
+    run_labels: dict[str, str] = {}
+    all_dims: set[str] = set()
+    aligned: dict[str, dict[str, Any]] = {}
+
+    for run_id in req.run_ids:
+        run_uuid = uuid.UUID(run_id)
+        run_row, rows, dims = await _collect_run_results(run_uuid)
+        all_dims.update(dims)
+        run_labels[run_id] = (
+            getattr(run_row, "langfuse_run_name", None) or run_id[:8]
+        )
+        for r in rows:
+            if req.align_key == "question":
+                q = (r.get("question") or "").strip()
+                if not q:
+                    continue
+                key = " ".join(q.split()).lower()
+                label = q
+            else:
+                key = r.get("benchmark_case_id") or r.get("test_case_id") or ""
+                if not key:
+                    continue
+                label = (r.get("question") or "")[:120] or key
+            slot = aligned.setdefault(key, {"对齐键": key, "样例": label})
+            for d, v in (r.get("scores") or {}).items():
+                slot[f"{run_id}::{d}"] = v
+            slot[f"{run_id}::status"] = r.get("status")
+
+    columns = [ExportColumn("样例", "样例"), ExportColumn("对齐键", "对齐键")]
+    for run_id in req.run_ids:
+        label = run_labels.get(run_id, run_id[:8])
+        columns.append(ExportColumn(f"{run_id}::status", f"{label}·状态"))
+        for d in sorted(all_dims):
+            columns.append(ExportColumn(f"{run_id}::{d}", f"{label}·{d}"))
+
+    rows = sorted(aligned.values(), key=lambda x: str(x.get("样例", "")))
+    return build_export_response(rows, columns, req.format, "eval_compare")
+
+
+class ExportRunsSummaryRequest(BaseModel):
+    run_ids: list[str]
+    format: str = "csv"
+
+
+@router.post("/runs/export-summary")
+async def export_runs_summary(req: ExportRunsSummaryRequest):
+    """Export per-sample results for the selected runs as csv/json/xlsx.
+
+    The columns match the single-run detail export (`/runs/{id}/results/export`)
+    so the batch file is just those rows concatenated across runs — with two
+    leading columns (run id + run name) marking which run each row came from.
+    The frontend posts the run ids the user checked (which may span pages), and
+    we reload each from the DB so the file isn't limited to rows in memory.
+    """
+    validate_format(req.format)
+    if not req.run_ids:
+        raise HTTPException(status_code=400, detail="run_ids is required")
+
+    all_dims: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for run_id in req.run_ids:
+        try:
+            run_uuid = uuid.UUID(run_id)
+        except ValueError:
+            continue
+        run_row, run_rows, dims = await _collect_run_results(run_uuid)
+        all_dims.update(dims)
+        run_name = getattr(run_row, "langfuse_run_name", None) or run_id[:8]
+        for r in run_rows:
+            rows.append({"run_id": run_id, "run_name": run_name, **r})
+
+    # Same columns as the single-run detail export, prefixed with run id / name.
+    columns = [
+        ExportColumn("run_id", "运行 ID"),
+        ExportColumn("run_name", "运行名"),
+        ExportColumn("id", "结果 ID"),
+        ExportColumn("benchmark_case_id", "基准用例 ID"),
+        ExportColumn("question", "问题"),
+        ExportColumn("expected_output", "期望答案"),
+        ExportColumn("status", "状态"),
+        ExportColumn("actual_output", "生成答案"),
+        ExportColumn("latency_ms", "时延(ms)"),
+        ExportColumn("prompt_tokens", "输入 token"),
+        ExportColumn("completion_tokens", "输出 token"),
+        ExportColumn("total_tokens", "总 token"),
+        ExportColumn("cache_creation_tokens", "缓存写入 token"),
+        ExportColumn("cache_read_tokens", "缓存命中 token"),
+        ExportColumn("tool_call_count", "工具调用数"),
+        ExportColumn("first_thinking_token_ms", "首思考 token(ms)"),
+        ExportColumn("first_answer_token_ms", "首答案 token(ms)"),
+        ExportColumn("attempts_made", "尝试次数"),
+        ExportColumn("actual_tool_calls", "工具调用明细"),
+        ExportColumn("error_message", "错误信息"),
+        ExportColumn("langfuse_trace_id", "Langfuse Trace"),
+    ]
+    # One column per score dimension (union across all selected runs).
+    for d in sorted(all_dims):
+        columns.append(ExportColumn(f"score::{d}", f"分数·{d}"))
+
+    return build_export_response(rows, columns, req.format, "eval_runs_results")
 
 
 @router.post("/runs/{run_id}/stop")
@@ -402,6 +691,8 @@ async def reaggregate_run(run_id: str):
                 "cache_creation_tokens": r.cache_creation_tokens,
                 "cache_read_tokens": r.cache_read_tokens,
                 "latency_ms": r.latency_ms,
+                "first_thinking_token_ms": getattr(r, "first_thinking_token_ms", None),
+                "first_answer_token_ms": getattr(r, "first_answer_token_ms", None),
             }
 
         succ = [_cost_row(r) for r in results if r.status == "pass"]
@@ -587,6 +878,7 @@ def _row_to_instance(row) -> EvaluatorInstance:
         description=row.description,
         params=row.params or {},
         is_active=row.is_active,
+        current_version_id=str(row.current_version_id) if row.current_version_id else None,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -615,6 +907,17 @@ async def create_evaluator_instance(req: CreateEvaluatorRequest):
                 description=req.description, params=req.params,
                 is_active=req.is_active,
             )
+            # For versioned evaluators (configurable_judge), seed v1 so the
+            # editor's "versions" tab has something to show on day one and so
+            # runs can pin to a stable evaluator_version_id from the start.
+            if req.evaluator_type == "configurable_judge" and req.params:
+                version = await repo.create_evaluator_version(
+                    evaluator_id=row.id,
+                    params=req.params,
+                    description="initial version",
+                )
+                row.current_version_id = version.id
+                await session.flush()
             await session.commit()
         except Exception as e:
             await session.rollback()
@@ -630,6 +933,21 @@ async def update_evaluator_instance(evaluator_id: str, req: UpdateEvaluatorReque
         row = await repo.update_evaluator_config(uuid.UUID(evaluator_id), **updates)
         if row is None:
             raise HTTPException(status_code=404, detail="evaluator not found")
+        # If the editor pushed a new params payload onto a configurable_judge
+        # evaluator, append it as a new version and route future runs to it.
+        # Tag/name/active changes don't bump a version — those are display-only.
+        new_params = updates.get("params")
+        if (
+            row.evaluator_type == "configurable_judge"
+            and isinstance(new_params, dict)
+            and new_params
+        ):
+            version = await repo.create_evaluator_version(
+                evaluator_id=row.id,
+                params=new_params,
+            )
+            row.current_version_id = version.id
+            await session.flush()
         await session.commit()
     return _row_to_instance(row)
 
@@ -643,6 +961,161 @@ async def delete_evaluator_instance(evaluator_id: str):
             raise HTTPException(status_code=404, detail="evaluator not found")
         await session.commit()
     return {"id": evaluator_id, "deleted": True}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Configurable judge dry-run (PR-B)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@router.post("/evaluators/{evaluator_id}/dry-run", response_model=DryRunResponse)
+async def dry_run_evaluator(evaluator_id: str, req: DryRunRequest):
+    """Score one (input, output, expected) tuple using the params being
+    drafted in the editor — without saving a new version.
+
+    The body wins over the saved row: ``params`` from the request becomes
+    the judge config, and ``provider_id`` (when given) overrides whatever
+    is in ``params['provider_id']``. This lets the user try an unsaved
+    prompt against a different provider in one click.
+    """
+    from agent_eval.evaluation.configurable_judge import run_configurable_judge
+
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        evaluator_row = await repo.get_evaluator_config(uuid.UUID(evaluator_id))
+        if evaluator_row is None:
+            raise HTTPException(status_code=404, detail="evaluator not found")
+
+        params = dict(req.params or evaluator_row.params or {})
+        provider_id = req.provider_id or params.get("provider_id")
+        if not provider_id:
+            raise HTTPException(
+                status_code=400,
+                detail="provider_id is required (in body or params['provider_id'])",
+            )
+        try:
+            provider_uuid = uuid.UUID(provider_id)
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid provider_id: {e}") from e
+
+        provider_row = await repo.get_evaluator_provider(provider_uuid)
+        if provider_row is None:
+            raise HTTPException(status_code=404, detail="provider not found")
+
+    result = await run_configurable_judge(
+        params=params,
+        provider=provider_row,
+        input_text=req.input,
+        output_text=req.output,
+        expected_output=req.expected_output,
+        metadata=req.metadata,
+        evaluator_name=evaluator_row.name or "score",
+    )
+    return DryRunResponse(
+        scores=[
+            DryRunScoreItem(
+                name=s.name,
+                value=s.value,
+                reason=s.reason,
+                raw_value=s.raw_value,
+            )
+            for s in result.scores
+        ],
+        model=result.model,
+        usage={
+            "input_tokens": result.usage.input_tokens,
+            "output_tokens": result.usage.output_tokens,
+            "total_tokens": result.usage.total_tokens,
+        },
+        raw_content=result.raw_content,
+        rendered_messages=result.rendered_messages,
+        error=result.error,
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Evaluator versions (PR-C)
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _row_to_version(row) -> EvaluatorVersion:
+    return EvaluatorVersion(
+        id=str(row.id),
+        evaluator_id=str(row.evaluator_id),
+        version_number=row.version_number,
+        params=row.params or {},
+        description=row.description,
+        created_by=str(row.created_by) if row.created_by else None,
+        created_at=row.created_at,
+    )
+
+
+@router.get("/evaluators/{evaluator_id}/versions", response_model=list[EvaluatorVersion])
+async def list_evaluator_versions(evaluator_id: str):
+    """Versions newest-first. Caller cross-references against the
+    evaluator's ``current_version_id`` to render the active row."""
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        evaluator_row = await repo.get_evaluator_config(uuid.UUID(evaluator_id))
+        if evaluator_row is None:
+            raise HTTPException(status_code=404, detail="evaluator not found")
+        rows = await repo.list_evaluator_versions(uuid.UUID(evaluator_id))
+    return [_row_to_version(r) for r in rows]
+
+
+@router.post("/evaluators/{evaluator_id}/versions", response_model=EvaluatorVersion)
+async def create_evaluator_version(
+    evaluator_id: str, req: CreateEvaluatorVersionRequest,
+):
+    """Append a new version snapshot. With ``activate=true`` (default) also
+    routes future invocations to it. The PUT /evaluators/{id} flow already
+    auto-bumps versions when ``params`` change, so this endpoint is for
+    explicit "save as new version without changing other fields" workflows."""
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        evaluator_row = await repo.get_evaluator_config(uuid.UUID(evaluator_id))
+        if evaluator_row is None:
+            raise HTTPException(status_code=404, detail="evaluator not found")
+        try:
+            version = await repo.create_evaluator_version(
+                evaluator_id=uuid.UUID(evaluator_id),
+                params=req.params,
+                description=req.description,
+            )
+            if req.activate:
+                await repo.set_current_evaluator_version(
+                    uuid.UUID(evaluator_id), version.id,
+                )
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=f"创建版本失败：{e}") from e
+    return _row_to_version(version)
+
+
+@router.post(
+    "/evaluators/{evaluator_id}/versions/{version_id}/activate",
+    response_model=EvaluatorInstance,
+)
+async def activate_evaluator_version(evaluator_id: str, version_id: str):
+    """Make ``version_id`` the active version, copying its params back onto
+    the evaluator row. Returns the updated evaluator so the editor can
+    refresh its form state in one round-trip."""
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        try:
+            row = await repo.set_current_evaluator_version(
+                uuid.UUID(evaluator_id), uuid.UUID(version_id),
+            )
+        except (TypeError, ValueError) as e:
+            raise HTTPException(status_code=400, detail=f"invalid id: {e}") from e
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail="evaluator or version not found, or version belongs to another evaluator",
+            )
+        await session.commit()
+    return _row_to_instance(row)
 
 
 # ───────────────────────────────────────────────────────────────────────────
