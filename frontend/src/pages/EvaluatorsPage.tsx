@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button, useConfirm, useToast } from '@/components/ui'
@@ -12,6 +12,47 @@ export default function EvaluatorsPage() {
   const confirm = useConfirm()
   const toast = useToast()
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [exporting, setExporting] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  async function handleExport() {
+    setExporting(true)
+    try {
+      await evaluationApi.exportEvaluators()
+      toast.success('评估器已导出')
+    } catch (err) {
+      const norm = formatApiError(err, { fallbackTitle: '导出失败' })
+      toast.error(toToastMessage(norm), '导出失败')
+    } finally {
+      setExporting(false)
+    }
+  }
+
+  async function handleImportFile(file: File) {
+    setImporting(true)
+    try {
+      const { data } = await evaluationApi.importEvaluators(file)
+      qc.invalidateQueries({ queryKey: ['evaluator-instances'] })
+      // 汇总一条可读结果：新建 / 更新 / 跳过（跳过附原因）。
+      const parts: string[] = []
+      if (data.created.length) parts.push(`新建 ${data.created.length}`)
+      if (data.updated.length) parts.push(`更新 ${data.updated.length}`)
+      if (data.skipped.length) parts.push(`跳过 ${data.skipped.length}`)
+      const summary = parts.length ? parts.join('，') : '没有可导入的评估器'
+      if (data.skipped.length) {
+        const detail = data.skipped.map(s => `${s.name}：${s.reason}`).join('；')
+        toast.error(`${summary}。跳过原因 — ${detail}`, '导入完成（有跳过）')
+      } else {
+        toast.success(`导入完成：${summary}`)
+      }
+    } catch (err) {
+      const norm = formatApiError(err, { fallbackTitle: '导入失败' })
+      toast.error(toToastMessage(norm), '导入失败')
+    } finally {
+      setImporting(false)
+    }
+  }
 
   const listQuery = useQuery({
     queryKey: ['evaluator-instances'],
@@ -37,6 +78,30 @@ export default function EvaluatorsPage() {
           <Link to="/evaluators/compare">
             <Button variant="ghost" size="sm">对比评估器</Button>
           </Link>
+          <Button variant="ghost" size="sm" onClick={handleExport} disabled={exporting}>
+            {exporting ? '导出中…' : '导出'}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importing}
+          >
+            {importing ? '导入中…' : '导入'}
+          </Button>
+          {/* 隐藏的文件选择器：导入仅接受导出的 JSON。选完即清空 value，
+              以便连续选同一个文件也能再次触发 onChange。 */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            onChange={e => {
+              const f = e.target.files?.[0]
+              e.target.value = ''
+              if (f) void handleImportFile(f)
+            }}
+          />
           <Button variant="primary" size="sm" onClick={() => { setEditing(null); setShowEditor(true) }}>
             新建评估器
           </Button>

@@ -25,6 +25,9 @@ class TurnExpectation(BaseModel):
     turn_index: int
     criteria: list[str] = []
     expected_output: str | None = None
+    # 该轮期望的工具调用（τ-bench 风格客观判定用）。空=该轮不校验工具调用。
+    # 元素结构同 ToolCallExpectation（tool_name + 可选 args_matcher/order）。
+    expected_tool_calls: list[ToolCallExpectation] = []
 
 
 class EvalWeights(BaseModel):

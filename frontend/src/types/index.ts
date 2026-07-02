@@ -573,6 +573,23 @@ export interface EvalResultRow {
   langsmith_run_id?: string | null
   attempts_made?: number
   scores: Record<string, number>
+  // 逐分数项打分明细：dimension -> {reasoning?, checks?}。checks 为 checklist
+  // 评估器逐条判定，详情页据此渲染 ✓/✗/— + 证据，支撑可溯源打分链路。
+  score_details?: Record<string, ScoreDetail>
+}
+
+// checklist 评估器的单条检查判定。verdict: pass=命中, fail=未命中, na=不适用。
+export interface ChecklistItem {
+  id?: string
+  desc?: string
+  verdict: 'pass' | 'fail' | 'na' | string
+  evidence?: string
+}
+
+// 单个分数项的打分明细。reasoning 为 judge 综述；checks 为逐条判定明细。
+export interface ScoreDetail {
+  reasoning?: string
+  checks?: ChecklistItem[]
 }
 
 export interface EvalResultsPage {

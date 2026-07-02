@@ -38,6 +38,7 @@ from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import (
     BenchmarkCaseRow,
     EvaluationScoreRow,
+    EvaluatorProviderRow,
     TestResultRow,
     TestRunRow,
 )
@@ -341,8 +342,14 @@ async def get_run_results(
                 select(EvaluationScoreRow).where(EvaluationScoreRow.result_id.in_(result_ids))
             )).scalars().all()
     score_index: dict[uuid.UUID, dict[str, float]] = {}
+    details_index: dict[uuid.UUID, dict[str, dict]] = {}
     for s in score_rows:
         score_index.setdefault(s.result_id, {})[s.dimension] = float(s.score)
+        # details 落了 checklist 逐条判定 + judge 理由，带给前端做可溯源展示。
+        # 空 details 不占位，前端按需渲染。
+        det = getattr(s, "details", None)
+        if det:
+            details_index.setdefault(s.result_id, {})[s.dimension] = det
 
     items: list[EvalResultRow] = []
     for r in rows:
@@ -369,6 +376,7 @@ async def get_run_results(
             langsmith_run_id=r.langsmith_run_id,
             attempts_made=getattr(r, "attempts_made", 1) or 1,
             scores=score_index.get(r.id, {}),
+            score_details=details_index.get(r.id, {}),
         ))
     return EvalResultsPage(items=items, total=total, page=page, page_size=page_size)
 
@@ -961,6 +969,172 @@ async def delete_evaluator_instance(evaluator_id: str):
             raise HTTPException(status_code=404, detail="evaluator not found")
         await session.commit()
     return {"id": evaluator_id, "deleted": True}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Evaluator import / export（跨环境搬运）
+#
+# 核心难点：configurable_judge 的 params['provider_id'] 是环境相关 UUID、
+# 与 evaluator_providers 无外键。直接导出 UUID 再导到另一套环境必然对不上
+# （dev→线上 provider 不一致的老问题）。故：
+#   导出：把 provider_id 解析成 provider 的 name（唯一自然键），写进
+#         params['_provider_name']，供导入侧重映射。不导出任何密钥。
+#   导入：按 _provider_name 在目标环境查同名 provider → 改写 params
+#         ['provider_id']；同名 provider 不存在则跳过该评估器并报原因。
+# 冲突策略：同名评估器已存在 → 更新（覆盖 params + 追加 version 快照，
+#         复用 update 的 version bump 语义，旧版留痕可回滚）。
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _strip_import_meta(params: dict) -> dict:
+    """去掉导出时注入的 _provider_name（导入重映射后不该落库）。"""
+    return {k: v for k, v in (params or {}).items() if k != "_provider_name"}
+
+
+@router.get("/evaluators/export")
+async def export_evaluators():
+    """导出全部评估器为 JSON。configurable_judge 的 provider_id 换成
+    provider name（_provider_name），供跨环境导入时重映射。不含任何密钥。"""
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        rows = await repo.list_evaluator_configs()
+        providers = await repo.list_evaluator_providers()
+        pid_to_name = {str(p.id): p.name for p in providers}
+
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        # 只导出 configurable_judge（那 6 个多轮 + 3 个单轮 llm-judge）。
+        # 其余老内置项（evaluator_type 为空）无 provider、用户明确不管，跳过。
+        if r.evaluator_type != "configurable_judge":
+            continue
+        params = dict(r.params or {})
+        # provider_id（环境相关 UUID）→ _provider_name（唯一自然键）。
+        # 剥掉原始 provider_id：跨环境导出别的库的 UUID 既无意义、又会误导
+        # 人以为它有效。导入侧只认 _provider_name 重映射回本地 provider_id。
+        pid = params.pop("provider_id", None)
+        params = _strip_import_meta(params)
+        if pid is not None:
+            params["_provider_name"] = pid_to_name.get(str(pid))
+        items.append({
+            "name": r.name,
+            "tag": r.tag,
+            "evaluator_type": r.evaluator_type,
+            "description": r.description,
+            "params": params,
+            "is_active": r.is_active,
+        })
+
+    payload = {"version": 1, "kind": "agent-eval-evaluators", "evaluators": items}
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    from fastapi import Response
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": 'attachment; filename="evaluators-export.json"'
+        },
+    )
+
+
+@router.post("/evaluators/import")
+async def import_evaluators(file: UploadFile = File(...)):
+    """从导出 JSON 导入评估器。按 _provider_name 重映射 provider_id；同名
+    评估器已存在则更新（追加 version），provider 缺失则跳过并报原因。"""
+    try:
+        raw = await file.read()
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"文件不是合法 JSON：{e}") from e
+
+    if not isinstance(payload, dict) or payload.get("kind") != "agent-eval-evaluators":
+        raise HTTPException(
+            status_code=400,
+            detail="不是评估器导出文件（缺 kind=agent-eval-evaluators）",
+        )
+    items = payload.get("evaluators")
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="导出文件里没有评估器")
+
+    created: list[str] = []
+    updated: list[str] = []
+    skipped: list[dict[str, str]] = []
+
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        providers = await repo.list_evaluator_providers()
+        name_to_pid = {p.name: str(p.id) for p in providers}
+        existing = {r.name: r for r in await repo.list_evaluator_configs()}
+
+        for it in items:
+            name = (it.get("name") or "").strip()
+            if not name:
+                skipped.append({"name": "(空)", "reason": "缺 name"})
+                continue
+            etype = it.get("evaluator_type")
+            params = _strip_import_meta(it.get("params") or {})
+
+            # 只导入 configurable_judge（那 9 个）。其余类型不在范围内，跳过。
+            if etype != "configurable_judge":
+                skipped.append({"name": name, "reason": "非 configurable_judge，不在导入范围"})
+                continue
+
+            # provider 重映射：configurable_judge 必须能解析到本地同名 provider。
+            pname = (it.get("params") or {}).get("_provider_name")
+            if not pname:
+                skipped.append({"name": name, "reason": "导出文件未记录 provider name"})
+                continue
+            local_pid = name_to_pid.get(pname)
+            if not local_pid:
+                skipped.append({
+                    "name": name,
+                    "reason": f"本环境无同名 provider «{pname}»，请先创建后重试",
+                })
+                continue
+            params["provider_id"] = local_pid
+
+            try:
+                row = existing.get(name)
+                if row is None:
+                    row = await repo.create_evaluator_config(
+                        name=name,
+                        tag=it.get("tag") or name,
+                        evaluator_type=etype,
+                        description=it.get("description"),
+                        params=params,
+                        is_active=bool(it.get("is_active", True)),
+                    )
+                    if etype == "configurable_judge" and params:
+                        version = await repo.create_evaluator_version(
+                            evaluator_id=row.id, params=params,
+                            description="imported",
+                        )
+                        row.current_version_id = version.id
+                        await session.flush()
+                    created.append(name)
+                else:
+                    # 同名更新：覆盖展示字段 + params，configurable_judge 追加
+                    # version 快照并指向它（旧版留痕，可回滚）。
+                    await repo.update_evaluator_config(
+                        row.id,
+                        tag=it.get("tag") or name,
+                        description=it.get("description"),
+                        params=params,
+                        is_active=bool(it.get("is_active", True)),
+                    )
+                    if etype == "configurable_judge" and params:
+                        version = await repo.create_evaluator_version(
+                            evaluator_id=row.id, params=params,
+                            description="imported (update)",
+                        )
+                        row.current_version_id = version.id
+                        await session.flush()
+                    updated.append(name)
+            except Exception as e:  # noqa: BLE001
+                skipped.append({"name": name, "reason": f"写入失败：{e}"})
+
+        await session.commit()
+
+    return {"created": created, "updated": updated, "skipped": skipped}
 
 
 # ───────────────────────────────────────────────────────────────────────────

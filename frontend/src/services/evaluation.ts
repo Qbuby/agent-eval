@@ -57,6 +57,29 @@ export const evaluationApi = {
     )
   },
 
+  // ── import / export（跨环境搬运那 6 个多轮 + 3 个单轮 configurable_judge）──
+  // 导出走 blob 下载：后端把 provider_id 换成 provider name，不含密钥。
+  exportEvaluators() {
+    return triggerExport({
+      url: '/eval/evaluators/export',
+      format: 'json',
+      fallbackName: 'evaluators-export',
+    })
+  },
+  // 导入回填 provider name→本地 provider_id；同名更新（追加版本），
+  // provider 缺失则跳过。返回 created/updated/skipped 摘要。
+  importEvaluators(file: File) {
+    const fd = new FormData()
+    fd.append('file', file)
+    return api.post<{
+      created: string[]
+      updated: string[]
+      skipped: Array<{ name: string; reason: string }>
+    }>('/eval/evaluators/import', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+  },
+
   // ── case file upload ──
   uploadCases(file: File) {
     const fd = new FormData()
