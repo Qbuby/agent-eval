@@ -324,6 +324,10 @@ class EvalResultRow(BaseModel):
     langsmith_run_id: str | None = None
     attempts_made: int = 1
     scores: dict[str, float] = {}  # dimension -> score
+    # 逐分数项的打分明细：dimension -> {reasoning?, checks?}。checks 为
+    # checklist 评估器的逐条判定 [{id,desc,verdict,evidence}]，支撑可溯源打分链路。
+    # 详情页据此逐条渲染 ✓/✗/— + 证据。无明细的分数项此处缺省。
+    score_details: dict[str, dict[str, Any]] = {}
 
 
 class EvalResultsPage(BaseModel):

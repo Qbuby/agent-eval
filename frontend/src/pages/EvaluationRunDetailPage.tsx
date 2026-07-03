@@ -6,7 +6,7 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
 } from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep, ConversationTrace, TurnExpectation } from '@/types'
+import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
 import MarkdownView from '@/components/MarkdownView'
 import { Button, Drawer, ErrorCard, ExportMenu } from '@/components/ui'
@@ -106,15 +106,19 @@ export default function EvaluationRunDetailPage() {
   }
 
   const counts = run.summary_scores?.counts ?? {}
-  const dimAvg = run.summary_scores?.dimension_averages ?? {}
+  // 按评估器聚合（折叠 .turnN / .conversation）。后端新 run 已折叠，这里再折一次
+  // 兼容旧 run（其 summary 仍是轮次级）——幂等，已折叠的 key 不含轮次后缀不受影响。
+  const dimAvg = collapseDimAvg(run.summary_scores?.dimension_averages ?? {})
   const costSuccess = run.summary_scores?.cost_success ?? {}
   const costFailure = run.summary_scores?.cost_failure ?? {}
   const toolUsage = (run.summary_scores?.tool_usage ?? []) as Array<{
     name: string; calls: number; errors: number; cases: number
   }>
-  const scoreDistribution = (run.summary_scores?.score_distribution ?? null) as null | {
-    buckets: string[]; by_dimension: Record<string, number[]>
-  }
+  const scoreDistribution = collapseScoreDistribution(
+    (run.summary_scores?.score_distribution ?? null) as null | {
+      buckets: string[]; by_dimension: Record<string, number[]>
+    },
+  )
   const items = resultsQuery.data?.items ?? []
   const latencyBars = buildLatencyBuckets(items)
   const radarData = buildRadarData(dimAvg)
@@ -498,14 +502,94 @@ export default function EvaluationRunDetailPage() {
 }
 
 
+// 分数单元格：评估器多了之后逐轮 badge 会堆叠十几个撑爆行高。默认按**评估器**
+// 聚合，每个评估器只显示 1 个 badge（该评估器所有轮/会话的平均分）；点「展开」
+// 才铺开逐轮明细。tone 按聚合均分是否达标判定。
+function ScoreCell({ scores }: { scores: Record<string, number> }) {
+  const [open, setOpen] = useState(false)
+  const entries = Object.entries(scores)
+  if (entries.length === 0) return <span className="text-text-tertiary">—</span>
+
+  // 按评估器名聚合（折叠 .turnN / .conversation）。
+  const grouped: Record<string, number[]> = {}
+  for (const [k, v] of entries) {
+    if (typeof v !== 'number') continue
+    const dim = collapseScoreKey(k)
+    ;(grouped[dim] ??= []).push(v)
+  }
+  const groups = Object.entries(grouped)
+    .map(([dim, vals]) => ({
+      dim,
+      avg: vals.reduce((s, x) => s + x, 0) / vals.length,
+      count: vals.length,
+    }))
+    .sort((a, b) => a.dim.localeCompare(b.dim))
+
+  // 展开态：铺开全部逐轮明细（原始 key）。
+  if (open) {
+    return (
+      <div className="flex flex-col gap-1">
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); setOpen(false) }}
+          className="self-start text-[11px] text-accent hover:text-accent-hover"
+        >
+          收起 ▲
+        </button>
+        <div className="flex flex-wrap gap-1">
+          {entries.map(([n, v]) => {
+            const meta = getScoreMeta(n)
+            const cls = tone(n, v) === 'good' ? 'badge badge-positive' : 'badge badge-negative'
+            return (
+              <span key={n} className={cls} title={`${meta.label} · ${directionMark(meta)} · 合格线 ${meta.threshold}`}>
+                {n}: {v.toFixed(2)}
+              </span>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
+
+  // 收起态（默认）：每评估器 1 个 badge，显示均分；轮次多时括注轮数。
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex flex-wrap gap-1">
+        {groups.map(({ dim, avg, count }) => {
+          const meta = getScoreMeta(dim)
+          const cls = isPassing(dim, avg) ? 'badge badge-positive' : 'badge badge-negative'
+          return (
+            <span
+              key={dim}
+              className={cls}
+              title={`${meta.label} · ${count} 项均分 · ${directionMark(meta)} · 合格线 ${meta.threshold}`}
+            >
+              {meta.label}: {avg.toFixed(2)}
+              {count > 1 && <span className="opacity-60"> ({count})</span>}
+            </span>
+          )
+        })}
+      </div>
+      {entries.length > groups.length && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); setOpen(true) }}
+          className="self-start text-[11px] text-accent hover:text-accent-hover"
+        >
+          展开逐轮（{entries.length}）▼
+        </button>
+      )}
+    </div>
+  )
+}
+
+
 function ResultRow({ row, langfuseHost, selected, onSelect }: {
   row: EvalResultRow
   langfuseHost: string | null
   selected: boolean
   onSelect: () => void
 }) {
-  const scoreEntries = Object.entries(row.scores)
-
   return (
     <tr
       onClick={onSelect}
@@ -540,23 +624,7 @@ function ResultRow({ row, langfuseHost, selected, onSelect }: {
           : <span className="text-text-tertiary">1</span>}
       </td>
       <td>
-        <div className="flex flex-wrap gap-1">
-          {scoreEntries.length === 0 && <span className="text-text-tertiary">—</span>}
-          {scoreEntries.map(([n, v]) => {
-            const meta = getScoreMeta(n)
-            const t = tone(n, v)
-            const cls = t === 'good' ? 'badge badge-positive' : 'badge badge-negative'
-            return (
-              <span
-                key={n}
-                className={cls}
-                title={`${meta.label} · ${directionMark(meta)} · 合格线 ${meta.threshold}\n${meta.description}`}
-              >
-                {meta.label}: {v.toFixed(2)}
-              </span>
-            )
-          })}
-        </div>
+        <ScoreCell scores={row.scores} />
       </td>
       <td>
         {row.langsmith_run_id ? (
@@ -671,6 +739,7 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
           <ConversationResultView
             conversation={row.full_trace.conversation}
             scores={row.scores}
+            scoreDetails={row.score_details}
           />
         </div>
       ) : (
@@ -1033,20 +1102,92 @@ function ReportSection({
 }
 
 
+// checklist 逐条判定明细：把 judge 的每条 pass/fail/na + 证据渲染成清单，
+// 支撑「可验证可溯源」的打分链路——分数 = pass /(pass+fail) 由后端机械算出，
+// 这里把算分依据逐条摊开，评审人可对着证据复核每一条判定。
+function ChecklistDetail({ checks, reasoning }: {
+  checks?: ChecklistItem[]
+  reasoning?: string
+}) {
+  const [open, setOpen] = useState(false)
+  const items = checks ?? []
+  const nPass = items.filter(c => c.verdict === 'pass').length
+  const nFail = items.filter(c => c.verdict === 'fail').length
+  const nNa = items.filter(c => c.verdict === 'na').length
+  const mark = (v: string) =>
+    v === 'pass' ? { s: '✓', cls: 'text-positive' }
+      : v === 'fail' ? { s: '✗', cls: 'text-negative' }
+        : { s: '—', cls: 'text-text-tertiary' }
+
+  return (
+    <div className="rounded-md border border-border bg-fill/5 text-[11px]">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 px-2.5 py-1.5 text-left hover:bg-fill/10 transition-colors"
+      >
+        <span className="text-text-tertiary">{open ? '▾' : '▸'}</span>
+        <span className="font-medium text-text-primary">检查项</span>
+        {items.length > 0 && (
+          <span className="text-text-secondary tabular-nums">
+            <span className="text-positive">{nPass} 通过</span>
+            {nFail > 0 && <span className="text-negative"> · {nFail} 未过</span>}
+            {nNa > 0 && <span className="text-text-tertiary"> · {nNa} 不适用</span>}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="px-2.5 pb-2 space-y-1.5">
+          {items.map((c, ci) => {
+            const m = mark(c.verdict)
+            return (
+              <div key={c.id || ci} className="flex gap-1.5">
+                <span className={`${m.cls} font-bold shrink-0`}>{m.s}</span>
+                <div className="min-w-0">
+                  <div className="text-text-primary">
+                    {c.id && <span className="text-text-tertiary font-mono mr-1">{c.id}</span>}
+                    {c.desc || '（无描述）'}
+                  </div>
+                  {c.evidence && (
+                    <div className="text-text-tertiary mt-0.5">证据：{c.evidence}</div>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+          {items.length === 0 && reasoning && (
+            <div className="text-text-secondary whitespace-pre-wrap">{reasoning}</div>
+          )}
+          {items.length > 0 && reasoning && (
+            <div className="text-text-tertiary border-t border-separator pt-1 mt-1 whitespace-pre-wrap">
+              {reasoning}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
 // 多轮评估结果：把回放出的逐轮 user/assistant 渲染成气泡，每条 user 下方挂
 // 该轮的逐轮分数（score key 形如 `<label>.turn<turn_index>`）。会话级分数
 // （`<label>.conversation`）与逐轮分数已在上方「评分」区统一展示，这里只做
 // 逐轮对齐，方便按轮核对。
 function ConversationResultView({
-  conversation, scores,
+  conversation, scores, scoreDetails,
 }: {
   conversation: ConversationTrace
   scores: Record<string, number>
+  scoreDetails?: Record<string, ScoreDetail>
 }) {
   const turns = conversation.turns ?? []
   // turn_index → 该轮所有分数项（跨多个 evaluator label）。
   const perTurnScores = (turnIndex: number): Array<[string, number]> =>
     Object.entries(scores).filter(([k]) => k.endsWith(`.turn${turnIndex}`))
+  // 会话级分数项（score key 形如 `<label>.conversation`），以整段对话为对象打分。
+  const convScores: Array<[string, number]> =
+    Object.entries(scores).filter(([k]) => k.endsWith('.conversation'))
   // turn_index → 该轮期望（评判要点 / 期望输出），按 turn_index 对齐。
   const expByIndex = new Map<number, TurnExpectation>()
   for (const te of conversation.turn_expectations ?? []) {
@@ -1113,14 +1254,22 @@ function ConversationResultView({
                 </div>
               </div>
               {turnScores.length > 0 && (
-                <div className="flex flex-wrap gap-1 mt-1">
+                <div className="flex flex-col gap-1 mt-1 max-w-[85%] w-full">
                   {turnScores.map(([n, v]) => {
                     const t2 = tone(n, v)
                     const cls = t2 === 'good' ? 'badge badge-positive' : 'badge badge-negative'
+                    const detail = scoreDetails?.[n]
                     return (
-                      <span key={n} className={cls} title={n}>
-                        本轮: {v.toFixed(2)}
-                      </span>
+                      <div key={n} className="flex flex-col gap-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className={cls} title={n}>
+                            {getScoreMeta(collapseScoreKey(n)).label}: {v.toFixed(2)}
+                          </span>
+                        </div>
+                        {(detail?.checks?.length || detail?.reasoning) && (
+                          <ChecklistDetail checks={detail?.checks} reasoning={detail?.reasoning} />
+                        )}
+                      </div>
                     )
                   })}
                 </div>
@@ -1143,6 +1292,35 @@ function ConversationResultView({
 
       {turns.length === 0 && (
         <div className="empty-state text-[12px]">无逐轮回放记录</div>
+      )}
+
+      {/* 会话级评分（score key 形如 `<label>.conversation`）——以整段对话为
+          依据，与逐轮分离展示，逐条 checklist 支撑可溯源打分链路。 */}
+      {convScores.length > 0 && (
+        <div className="rounded-md border border-accent/20 bg-accent/5 px-3 py-2">
+          <div className="text-[10px] uppercase tracking-wide text-text-tertiary mb-1.5">
+            会话级评分
+          </div>
+          <div className="flex flex-col gap-1.5">
+            {convScores.map(([n, v]) => {
+              const t2 = tone(n, v)
+              const cls = t2 === 'good' ? 'badge badge-positive' : 'badge badge-negative'
+              const detail = scoreDetails?.[n]
+              return (
+                <div key={n} className="flex flex-col gap-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className={cls} title={n}>
+                      {getScoreMeta(collapseScoreKey(n)).label}: {v.toFixed(2)}
+                    </span>
+                  </div>
+                  {(detail?.checks?.length || detail?.reasoning) && (
+                    <ChecklistDetail checks={detail?.checks} reasoning={detail?.reasoning} />
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
       )}
     </div>
   )
@@ -1307,6 +1485,49 @@ function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
       )}
     </div>
   )
+}
+
+
+// 多轮 score key 形如 `<评估器名>.turn<N>` / `<评估器名>.conversation`。汇总可视化
+// 按**评估器**聚合，不按轮次（不同样例轮次无固定规律、轮次间不可比）。新 run 的
+// summary 已在后端折叠；这里对前端再折叠一次，兼容旧 run（其 summary 仍是轮次级）。
+const _TURN_SUFFIX = /^(turn\d+|conversation)$/
+function collapseScoreKey(key: string): string {
+  const idx = key.lastIndexOf('.')
+  if (idx <= 0) return key
+  return _TURN_SUFFIX.test(key.slice(idx + 1)) ? key.slice(0, idx) : key
+}
+
+// 把轮次级维度均分折叠回评估器级：同一评估器的各轮/会话分数求（按 count 加权的）
+// 简单平均。旧 run 的 dimension_averages 无 count 信息，退化为对各轮均值再平均，
+// 作为近似展示足够（精确值以新 run 为准）。
+function collapseDimAvg(dimAvg: Record<string, number>): Record<string, number> {
+  const acc: Record<string, { sum: number; n: number }> = {}
+  for (const [k, v] of Object.entries(dimAvg)) {
+    const dim = collapseScoreKey(k)
+    if (!acc[dim]) acc[dim] = { sum: 0, n: 0 }
+    acc[dim].sum += v
+    acc[dim].n += 1
+  }
+  const out: Record<string, number> = {}
+  for (const [dim, { sum, n }] of Object.entries(acc)) {
+    out[dim] = n ? Math.round((sum / n) * 1000) / 1000 : 0
+  }
+  return out
+}
+
+// 分数分布：同一评估器各轮的桶计数逐桶相加，折叠成评估器级分布。
+function collapseScoreDistribution(
+  sd: { buckets: string[]; by_dimension: Record<string, number[]> } | null,
+): { buckets: string[]; by_dimension: Record<string, number[]> } | null {
+  if (!sd) return null
+  const merged: Record<string, number[]> = {}
+  for (const [k, counts] of Object.entries(sd.by_dimension)) {
+    const dim = collapseScoreKey(k)
+    if (!merged[dim]) merged[dim] = counts.map(() => 0)
+    counts.forEach((c, i) => { merged[dim][i] = (merged[dim][i] ?? 0) + c })
+  }
+  return { buckets: sd.buckets, by_dimension: merged }
 }
 
 

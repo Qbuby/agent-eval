@@ -81,9 +81,12 @@ services:
   #   后端镜像里也额外装了 psycopg2-binary 给 alembic 用（不影响应用层 asyncpg）。
   # ─────────────────────────────────────────────────────────────────
   migrate:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    # ⚠️ 不要给 migrate 单独写 build —— 它必须和 backend 用**同一个镜像**，
+    # 否则迁移脚本跑的 /app/alembic 版本可能与 backend 运行时的 ORM 模型漂移
+    # （生产曾出现 migrate=:latest、backend=:main-24 不一致）。这里只 image:
+    # 引用 backend 那一份（同名同 tag），由 backend 的 build 段构建一次、二者共享。
+    # CI 注入 BACKEND_IMAGE / IMAGE_TAG 时，migrate 与 backend 必然同版本。
+    image: ${BACKEND_IMAGE:-agent_eval-backend}:${IMAGE_TAG:-latest}
     container_name: agent-eval-migrate
     env_file:
       - .env
@@ -121,6 +124,10 @@ services:
   #       migrate completed  → schema 就位
   # ─────────────────────────────────────────────────────────────────
   backend:
+    # build 段构建出的镜像同时供 backend 运行与 migrate 迁移使用（见 migrate
+    # 服务），二者共享同一 image 名 + tag，物理上杜绝版本漂移。CI 可注入
+    # BACKEND_IMAGE（registry 全名）/ IMAGE_TAG（如 main-25）统一打 tag。
+    image: ${BACKEND_IMAGE:-agent_eval-backend}:${IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -176,6 +183,10 @@ services:
   #   - 通过 docker 内部 DNS 访问 backend:8000，不依赖宿主机端口
   # ─────────────────────────────────────────────────────────────────
   frontend:
+    # 与 backend 同样显式命名 + 可由 CI 注入 tag（FRONTEND_IMAGE / IMAGE_TAG），
+    # 三个工作负载（backend、migrate 同镜像、frontend）统一打同一 IMAGE_TAG，
+    # 一次发布版本一致。本地 build 段不变，CI 推镜像时复用此 image 名。
+    image: ${FRONTEND_IMAGE:-agent_eval-frontend}:${IMAGE_TAG:-latest}
     build:
       context: ./frontend
       dockerfile: Dockerfile

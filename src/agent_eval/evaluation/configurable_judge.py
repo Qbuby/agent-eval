@@ -104,6 +104,25 @@ DEFAULT_OUTPUT_PROMPT = """严格只输出以下 JSON，不要附加任何其他
 {"score": <数值或布尔或类别字符串>, "reasoning": "<简短理由>"}"""
 
 
+# checklist 评分类型专用的 system 段。value 由后端按通过率机械计算，模型
+# 只需对每个检查项判 pass/fail/na 并给出可复核的证据（引用作答原文/规则依据），
+# 不自行给总分、不做算术。
+CHECKLIST_REASONING_PROMPT = """你是一个严谨、客观的评估执行器。下面会给出一组**编号的二元检查项**。
+你的唯一任务：对每一个检查项，仅依据给定的「AI 回答」内容判定它是 pass（满足）
+还是 fail（不满足）；若该检查项在本样例下不适用，判 na。
+
+严格要求：
+- 只依据给定内容判定，不臆测未提供的信息，不使用检查项以外的任何自定标准。
+- 每一项都要给出 evidence：引用 AI 回答里的相关原文片段，或说明依据哪条规则判 fail。
+- 不要自己计算总分、不要输出分数——总分由系统按你的逐项判定自动计算。"""
+
+CHECKLIST_OUTPUT_PROMPT = """严格只输出以下 JSON，不要附加任何其他文字、Markdown 或代码围栏：
+
+{"checks": [{"id": "<检查项编号，如 F1>", "verdict": "pass|fail|na", "evidence": "<引用作答原文或判定依据，简短>"}], "reasoning": "<一句话总述>"}
+
+必须为上面列出的每一个检查项输出一条对应记录（含数据补充的检查项），verdict 只能是 pass / fail / na 三者之一。"""
+
+
 # 与 DEFAULT_EVALUATION_PROMPT 配对的默认 mapping。前端新建评估器时一并塞入。
 DEFAULT_VARIABLE_MAPPING: dict[str, str] = {
     "Query": "input",
@@ -131,11 +150,16 @@ class JudgeScore:
     name 字段保留是为了让上层 (langfuse_runner) 能用 evaluator label 当 key
     入库——本模块自身只会产出最多一个 JudgeScore。raw_value 保留模型的
     原始输出（数值/布尔/类别名），用于 dry-run UI 展示。
+
+    checklist 评分类型下，``checks`` 携带逐项 pass/fail/na + 证据的明细，
+    value 由后端按 ``通过数 / (通过数 + 失败数)`` **机械算出**（模型只判二元
+    verdict，算术不经模型）。其它 score_type 时 ``checks`` 为 None。
     """
     name: str
     value: float
     reason: str = ""
     raw_value: Any = None
+    checks: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -283,9 +307,16 @@ def _build_messages(
     expected_output: str,
     metadata: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
+    # checklist 类型缺省用 checklist 专用 reasoning/output 模板（要求逐项给
+    # verdict+证据、只输出 checks 数组），避免落回"吐单个 score"的旧契约。
+    is_checklist = (params.get("score_type") or "").lower() == "checklist"
     evaluation_prompt = params.get("evaluation_prompt") or DEFAULT_EVALUATION_PROMPT
-    reasoning_prompt = params.get("reasoning_prompt") or DEFAULT_REASONING_PROMPT
-    output_prompt = params.get("output_prompt") or DEFAULT_OUTPUT_PROMPT
+    reasoning_prompt = params.get("reasoning_prompt") or (
+        CHECKLIST_REASONING_PROMPT if is_checklist else DEFAULT_REASONING_PROMPT
+    )
+    output_prompt = params.get("output_prompt") or (
+        CHECKLIST_OUTPUT_PROMPT if is_checklist else DEFAULT_OUTPUT_PROMPT
+    )
 
     raw_mapping = params.get("variable_mapping")
     if isinstance(raw_mapping, dict):
@@ -383,6 +414,68 @@ def _coerce_bool(raw: Any) -> bool | None:
     return None
 
 
+def _parse_checklist_score(
+    body: dict[str, Any],
+    *,
+    evaluator_name: str,
+) -> tuple[JudgeScore | None, str | None]:
+    """checklist 评分：模型只对每个检查项判 pass/fail/na + 给证据，
+    最终分数由**后端机械计算** ``通过数 / (通过数 + 失败数)``——算术不经模型，
+    保证同一组 verdict 必得同一分数（可验证、可复现）。
+
+    期望 body：``{"checks": [{"id","verdict","evidence"}, ...], "reasoning"}``。
+    verdict 归一：pass/true/yes/1 → pass；fail/false/no/0 → fail；
+    na/n/a/not_applicable/不适用 → na（不计入分母）。
+    - 通过数+失败数 == 0（全 na 或无 check）→ value=1.0，注明无适用检查项。
+    """
+    raw_checks = body.get("checks")
+    if not isinstance(raw_checks, list) or not raw_checks:
+        return None, "checklist judge response missing non-empty 'checks' array"
+
+    norm_checks: list[dict[str, Any]] = []
+    n_pass = n_fail = n_na = 0
+    for i, item in enumerate(raw_checks):
+        if not isinstance(item, dict):
+            continue
+        raw_verdict = str(item.get("verdict") or item.get("result") or "").strip().lower()
+        if raw_verdict in {"pass", "true", "yes", "y", "1", "ok"}:
+            verdict = "pass"
+            n_pass += 1
+        elif raw_verdict in {"fail", "false", "no", "n", "0"}:
+            verdict = "fail"
+            n_fail += 1
+        elif raw_verdict in {"na", "n/a", "not_applicable", "notapplicable", "不适用", "无关"}:
+            verdict = "na"
+            n_na += 1
+        else:
+            # 无法识别的 verdict 一律按 fail 计（保守：不给"看不懂"送分）。
+            verdict = "fail"
+            n_fail += 1
+        norm_checks.append({
+            "id": str(item.get("id") or item.get("name") or f"C{i + 1}"),
+            "desc": str(item.get("desc") or item.get("description") or ""),
+            "verdict": verdict,
+            "evidence": str(item.get("evidence") or item.get("reason") or ""),
+        })
+
+    if not norm_checks:
+        return None, "checklist judge response 'checks' has no valid items"
+
+    denom = n_pass + n_fail
+    value = round(n_pass / denom, 3) if denom > 0 else 1.0
+    reasoning = str(body.get("reasoning") or body.get("reason") or "")
+    summary = f"{n_pass}/{denom} 通过" + (f"（{n_na} 项不适用）" if n_na else "")
+    if denom == 0:
+        summary = f"无适用检查项（{n_na} 项 na）→ 1.0"
+    return JudgeScore(
+        name=evaluator_name,
+        value=value,
+        reason=reasoning or summary,
+        raw_value=summary,
+        checks=norm_checks,
+    ), None
+
+
 def _parse_single_score(
     body: dict[str, Any],
     *,
@@ -396,6 +489,9 @@ def _parse_single_score(
     返回 ``(JudgeScore | None, error_msg | None)``。score_type 不识别或
     解析失败时 JudgeScore 为 None，error_msg 给出原因。
     """
+    if (score_type or "numeric").lower() == "checklist":
+        return _parse_checklist_score(body, evaluator_name=evaluator_name)
+
     raw_score = body.get("score")
     if raw_score is None and "value" in body:  # 兼容用户改了字段名
         raw_score = body.get("value")
@@ -403,6 +499,37 @@ def _parse_single_score(
         # 多维 rubric prompt 常见返回顶级 composite_score（各维度加权求和），
         # 视作总分别名
         raw_score = body.get("composite_score")
+    if raw_score is None:
+        # 宽松兜底：不少 rubric prompt 自定义了总分字段名（如
+        # faithfulness_score / conciseness_score），既不是 score 也不是
+        # composite_score。此处扫顶级形如 ``*_score`` 且值可转数值的字段
+        # 作为总分——子维度对象的键是 d1_xxx（不带 _score 后缀），不会误伤。
+        # 恰好命中一个才采纳；多个总分字段无从判断主分，明确报歧义而非乱猜。
+        def _is_num(v: Any) -> bool:
+            if isinstance(v, bool):
+                return False
+            if isinstance(v, (int, float)):
+                return True
+            if isinstance(v, str):
+                try:
+                    float(v.strip())
+                    return True
+                except ValueError:
+                    return False
+            return False
+
+        candidates = {
+            k: v for k, v in body.items()
+            if isinstance(k, str) and k.endswith("_score") and _is_num(v)
+        }
+        if len(candidates) == 1:
+            raw_score = next(iter(candidates.values()))
+        elif len(candidates) > 1:
+            return None, (
+                "judge response has multiple top-level '*_score' fields "
+                f"({sorted(candidates)}); cannot decide which is the overall "
+                "score — set the prompt to emit a single top-level 'score'"
+            )
     reasoning = str(body.get("reasoning") or body.get("reason") or "")
 
     if raw_score is None:
@@ -564,6 +691,8 @@ __all__ = [
     "DEFAULT_EVALUATION_PROMPT",
     "DEFAULT_REASONING_PROMPT",
     "DEFAULT_OUTPUT_PROMPT",
+    "CHECKLIST_REASONING_PROMPT",
+    "CHECKLIST_OUTPUT_PROMPT",
     "DEFAULT_VARIABLE_MAPPING",
     "TemplateRenderError",
     "run_configurable_judge",

@@ -20,6 +20,7 @@ import type {
   EvalRunSummary,
   EvaluatorInstance,
   StartEvalRequest,
+  TestCase,
   UploadCasesResponse,
 } from '@/types'
 import { configOptionToString, useConfigOptions } from '@/hooks/useConfigOptions'
@@ -460,11 +461,45 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
 
   // ── conversation dataset branch（多轮对话集，dataset_type=conversation）──
   const [convDataset, setConvDataset] = useState('')
+  // 对齐 benchmark 来源的三种选样方式：全部 / 按类别筛选 / 手动勾选。
+  const [convSelectionMode, setConvSelectionMode] = useState<'all' | 'filter' | 'pick'>('all')
+  const [convCategoryId, setConvCategoryId] = useState('')  // ConversationCategoryRow UUID
+  const [convPickedIds, setConvPickedIds] = useState<Set<string>>(new Set())
+  const [convSearch, setConvSearch] = useState('')
   const convDatasetsQuery = useQuery({
     queryKey: ['datasets', 'conversation'],
     queryFn: () => datasetsApi.list({ type: 'conversation' }).then(r => r.data),
     enabled: sourceTab === 'conversation',
   })
+  const convCategoriesQuery = useQuery({
+    queryKey: ['conv-categories-for-eval', convDataset],
+    queryFn: () => datasetsApi.listConvCategories(convDataset).then(r => r.data),
+    enabled: !!convDataset && sourceTab === 'conversation',
+  })
+  // start_eval 用类别 UUID（filter_category_id），但样例列表接口按类别名过滤，
+  // 故按选中的 id 反查出名字供列表查询用。
+  const convCategoryName = useMemo(
+    () => (convCategoriesQuery.data ?? []).find(c => c.id === convCategoryId)?.name,
+    [convCategoriesQuery.data, convCategoryId],
+  )
+  const convCasesQuery = useQuery({
+    queryKey: ['conv-cases-for-eval', convDataset, convCategoryName, convSearch],
+    queryFn: () => datasetsApi.listCasesPaginated(convDataset, {
+      page: 1, page_size: 100,
+      search: convSearch || undefined,
+      category: convCategoryName || undefined,
+    }).then(r => r.data),
+    enabled: !!convDataset && sourceTab === 'conversation',
+  })
+  const convEffectiveCount = useMemo(() => {
+    if (convSelectionMode === 'pick') return convPickedIds.size
+    return convCasesQuery.data?.total ?? 0
+  }, [convCasesQuery.data, convSelectionMode, convPickedIds])
+  const convWillRun = useMemo(() => {
+    if (convSelectionMode === 'pick') return convPickedIds.size
+    if (typeof limit === 'number' && limit > 0) return Math.min(convEffectiveCount, limit)
+    return convEffectiveCount
+  }, [convSelectionMode, convPickedIds, convEffectiveCount, limit])
 
   // ── agent ──
   const [agentType, setAgentType] = useState<'sse' | 'openai' | 'sse_generic'>('sse')
@@ -536,6 +571,9 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       : '上传一个样例文件',
     )
   }
+  if (sourceTab === 'conversation' && convDataset && convSelectionMode === 'pick' && convPickedIds.size === 0) {
+    startBlockers.push('勾选至少 1 条对话样例')
+  }
   if (selectedEvaluatorIds.size === 0) startBlockers.push('勾选至少 1 个评估器')
   if (agentUrl.trim().length === 0) startBlockers.push('填写智能体 URL')
   const canStart = startBlockers.length === 0 && !startMutation.isPending
@@ -575,8 +613,17 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       body.limit = typeof limit === 'number' ? limit : null
     } else if (sourceTab === 'conversation') {
       // 多轮对话集：直读 LangSmith dataset，runner 走 multiturn 回放+逐轮/会话级打分。
+      // 选样方式对齐 benchmark：pick=勾选具体样例(case_ids)，filter=按类别(filter_category_id)+limit，
+      // all=全量+limit。case_ids/filter_category_id 复用 StartEvalRequest 既有字段，后端内存筛。
       body.conversation_dataset = convDataset
-      body.limit = typeof limit === 'number' ? limit : null
+      if (convSelectionMode === 'pick') {
+        body.case_ids = Array.from(convPickedIds)
+      } else if (convSelectionMode === 'filter') {
+        body.filter_category_id = convCategoryId || null
+        body.limit = typeof limit === 'number' ? limit : null
+      } else {
+        body.limit = typeof limit === 'number' ? limit : null
+      }
     } else {
       body.project_id = projectId
       if (selectionMode === 'pick') {
@@ -800,20 +847,40 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
 
         {sourceTab === 'conversation' && (
           <div>
-            <Field label="多轮对话数据集">
-              <select
-                value={convDataset}
-                onChange={e => setConvDataset(e.target.value)}
-                className="input max-w-[360px]"
-              >
-                <option value="">选择对话数据集…</option>
-                {(convDatasetsQuery.data ?? []).map(d => (
-                  <option key={d.name} value={d.name}>
-                    {d.name}（{d.example_count} 条）
-                  </option>
-                ))}
-              </select>
-            </Field>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="多轮对话数据集">
+                <select
+                  value={convDataset}
+                  onChange={e => {
+                    setConvDataset(e.target.value)
+                    setConvCategoryId('')
+                    setConvPickedIds(new Set())
+                  }}
+                  className="input"
+                >
+                  <option value="">选择对话数据集…</option>
+                  {(convDatasetsQuery.data ?? []).map(d => (
+                    <option key={d.name} value={d.name}>
+                      {d.name}（{d.example_count} 条）
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="分类（可选）">
+                <select
+                  value={convCategoryId}
+                  onChange={e => setConvCategoryId(e.target.value)}
+                  disabled={!convDataset}
+                  className="input disabled:opacity-50"
+                >
+                  <option value="">全部分类</option>
+                  {(convCategoriesQuery.data ?? []).map(c => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+
             {convDatasetsQuery.data && convDatasetsQuery.data.length === 0 && (
               <p className="text-[11px] text-text-tertiary mt-2">
                 还没有多轮对话数据集。请先到「多轮对话集」页创建并录入样例。
@@ -823,14 +890,97 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               固定 thread_id 逐轮回放每条样例的 user 消息给智能体，按 turn_expectations 逐轮打分、
               按 conversation_goal 做会话级打分。
             </p>
+
             {convDataset && (
-              <Field label="最多跑多少条（空=全部）">
-                <input
-                  type="number" min={1} value={limit}
-                  onChange={e => setLimit(e.target.value ? Number(e.target.value) : '')}
-                  className="input max-w-[180px] mt-3"
-                />
-              </Field>
+              <>
+                <div className="flex items-center gap-3 mt-3 mb-2">
+                  {(['all', 'filter', 'pick'] as const).map(m => (
+                    <label key={m} className="inline-flex items-center gap-1.5 text-[12px] cursor-pointer">
+                      <input type="radio" checked={convSelectionMode === m} onChange={() => setConvSelectionMode(m)} className="accent-accent" />
+                      {m === 'all' && '全部'}
+                      {m === 'filter' && '按分类筛选'}
+                      {m === 'pick' && '手动勾选'}
+                    </label>
+                  ))}
+                </div>
+
+                {/* 选样汇总横幅（对齐 benchmark） */}
+                <div className={`flex items-center gap-2 mb-3 px-3 py-2 rounded-md border text-[12px] ${
+                  convWillRun === 0
+                    ? 'border-warning/30 bg-warning/10 text-warning'
+                    : 'border-accent/30 bg-accent/5 text-text-primary'
+                }`}>
+                  <span className="text-[14px]">{convWillRun === 0 ? '⚠' : '✓'}</span>
+                  <span>
+                    本次将运行 <span className="font-mono font-medium">{convWillRun}</span> 条样例
+                    {convSelectionMode === 'pick' && convPickedIds.size > 0 && (
+                      <span className="text-text-tertiary ml-1.5">（手动勾选）</span>
+                    )}
+                    {convSelectionMode !== 'pick' && (
+                      <span className="text-text-tertiary ml-1.5">
+                        （命中 {convEffectiveCount} 条
+                        {typeof limit === 'number' && limit > 0 && limit < convEffectiveCount && `，受 limit ${limit} 限制`}
+                        ）
+                      </span>
+                    )}
+                  </span>
+                  {convCasesQuery.isLoading && <span className="text-text-tertiary ml-auto text-[11px]">载入中…</span>}
+                </div>
+
+                {convSelectionMode !== 'pick' && (
+                  <Field label="最多跑多少条（空=全部）">
+                    <input
+                      type="number" min={1} value={limit}
+                      onChange={e => setLimit(e.target.value ? Number(e.target.value) : '')}
+                      className="input max-w-[180px]"
+                    />
+                  </Field>
+                )}
+
+                {convSelectionMode === 'pick' && (
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <input
+                        type="text" placeholder="搜索样例名 / 描述…"
+                        value={convSearch} onChange={e => setConvSearch(e.target.value)}
+                        className="input flex-1"
+                      />
+                      <Button variant="secondary" size="sm" onClick={() => setConvPickedIds(new Set())}>
+                        清空
+                      </Button>
+                    </div>
+                    <div className="border border-border rounded-md max-h-[280px] overflow-y-auto bg-surface">
+                      {convCasesQuery.data?.items.map((c: TestCase) => {
+                        const cid = c.id ?? ''
+                        const checked = convPickedIds.has(cid)
+                        const firstUser = (c.input_messages ?? []).find(m => m.role === 'user')?.content ?? ''
+                        // 展示 question（首条 user 消息）而非样例名；question 为空才退回样例名。
+                        const label = firstUser || c.name
+                        return (
+                          <label key={cid}
+                                 className="flex items-start gap-2 py-1.5 px-2.5 hover:bg-fill/5 cursor-pointer text-[12px] border-b border-separator last:border-b-0">
+                            <input
+                              type="checkbox" checked={checked}
+                              onChange={() => {
+                                const s = new Set(convPickedIds)
+                                if (s.has(cid)) s.delete(cid); else s.add(cid)
+                                setConvPickedIds(s)
+                              }}
+                              className="mt-0.5 accent-accent shrink-0"
+                            />
+                            <span className="flex-1 break-all">
+                              {label.length > 120 ? label.slice(0, 120) + '…' : label}
+                            </span>
+                          </label>
+                        )
+                      })}
+                      {convCasesQuery.data?.items.length === 0 && (
+                        <div className="empty-state">没有匹配的样例</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}

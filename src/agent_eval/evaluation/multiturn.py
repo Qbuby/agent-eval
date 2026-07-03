@@ -27,6 +27,7 @@ langfuse_runner，避免循环依赖。
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Awaitable, Callable
 
@@ -231,20 +232,26 @@ async def score_conversation(
     evaluator_specs: list[dict[str, Any]],
     case_metadata: dict[str, Any] | None,
     case_id: str | None = None,
-) -> tuple[dict[str, float], dict[str, str]]:
+) -> tuple[dict[str, float], dict[str, str], dict[str, list[dict[str, Any]]]]:
     """对回放结果做逐轮 + 会话级打分。
 
-    返回 ``(scores, reasons)``：``scores`` 是扁平 ``{score_key: value}``（聚合 /
-    status 判定用，结构不变）；``reasons`` 是并行 ``{score_key: judge 理由}``，供
-    落库写进 details，详情页展示「按什么打的分」。
+    返回 ``(scores, reasons, checks)``：``scores`` 是扁平 ``{score_key: value}``
+    （聚合 / status 判定用，结构不变）；``reasons`` 是并行 ``{score_key: judge 理由}``；
+    ``checks`` 是并行 ``{score_key: [逐项 pass/fail/na+证据]}``（checklist 评分器才有），
+    一并落库写进 details，详情页据此展示「这一分由哪些检查项通过/未通过得来」。
 
-    只处理 ``configurable_judge`` 评估器（多轮场景下规则类 evaluator 无单一
-    expected 概念，本期不接）。score key 约定：
+    只处理 ``configurable_judge``（LLM-judge）评估器——唯一评估方式。逐轮用
+    criteria/expected_output 作依据，会话级用 conversation_goal。工具调用信息
+    （该轮实际 tool_calls + 期望 expected_tool_calls）序列化后注入 metadata，
+    judge 模板可用 ``{{ActualToolCalls}}`` / ``{{ExpectedToolCalls}}`` 读取，
+    由「多轮-工具调用正确性」judge 据此打分。其余 evaluator_type 跳过。
+    score key 约定：
         - 逐轮：``f"{label}.turn{turn_index}"``
         - 会话级：``f"{label}.conversation"``
     """
     scores: dict[str, float] = {}
     reasons: dict[str, str] = {}
+    checks: dict[str, list[dict[str, Any]]] = {}
 
     # turn_index → 该轮回放记录，便于按期望对齐。
     turn_by_index = {t["turn_index"]: t for t in turns}
@@ -258,7 +265,9 @@ async def score_conversation(
     transcript = build_transcript(turns)
 
     for spec in evaluator_specs:
-        if spec.get("evaluator_type") != "configurable_judge":
+        etype = spec.get("evaluator_type")
+
+        if etype != "configurable_judge":
             continue
         label = spec.get("label") or "judge"
         provider_row = spec.get("_provider")
@@ -276,13 +285,23 @@ async def score_conversation(
                 continue
             criteria = te.get("criteria") or []
             expected = te.get("expected_output") or ""
-            # 该轮没有任何评分依据则跳过（不空跑 judge）。
-            if not criteria and not expected:
+            expected_tc = te.get("expected_tool_calls") or []
+            # 该轮没有任何评分依据则跳过（不空跑 judge）。criteria / expected_output
+            # / expected_tool_calls 三者任一存在即可评（工具类 judge 只靠后者）。
+            if not criteria and not expected and not expected_tc:
                 continue
             # 把该轮 criteria 注入 metadata，judge 模板可用 {{Criteria}} 取。
+            # 同时把「实际工具调用」「期望工具调用」序列化进 metadata，供工具调用
+            # 正确性 judge 用 {{ActualToolCalls}} / {{ExpectedToolCalls}} 读取。
             turn_meta = dict(case_metadata or {})
             turn_meta["turn_criteria"] = "\n".join(criteria) if criteria else ""
             turn_meta["turn_index"] = ti
+            turn_meta["actual_tool_calls"] = json.dumps(
+                turn.get("tool_calls") or [], ensure_ascii=False
+            )
+            turn_meta["expected_tool_calls"] = json.dumps(
+                expected_tc, ensure_ascii=False
+            )
             try:
                 res = await run_configurable_judge(
                     params=params,
@@ -309,11 +328,22 @@ async def score_conversation(
                 scores[f"{label}.turn{ti}"] = float(s.value)
                 if s.reason:
                     reasons[f"{label}.turn{ti}"] = s.reason
+                if s.checks:
+                    checks[f"{label}.turn{ti}"] = s.checks
 
         # ── 会话级打分：以 conversation_goal 为依据，整段对话作 output ──
         if conversation_goal:
             conv_meta = dict(case_metadata or {})
             conv_meta["conversation_goal"] = conversation_goal
+            # 整段对话的实际工具调用（合并各轮），供工具 judge 会话级用
+            # {{ActualToolCalls}} 读取；会话级无逐轮期望，期望列表留空。
+            all_tool_calls: list[dict[str, Any]] = []
+            for t in turns:
+                all_tool_calls.extend(t.get("tool_calls") or [])
+            conv_meta["actual_tool_calls"] = json.dumps(
+                all_tool_calls, ensure_ascii=False
+            )
+            conv_meta["expected_tool_calls"] = json.dumps([], ensure_ascii=False)
             try:
                 res = await run_configurable_judge(
                     params=params,
@@ -339,5 +369,7 @@ async def score_conversation(
                 scores[f"{label}.conversation"] = float(s.value)
                 if s.reason:
                     reasons[f"{label}.conversation"] = s.reason
+                if s.checks:
+                    checks[f"{label}.conversation"] = s.checks
 
-    return scores, reasons
+    return scores, reasons, checks

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,6 +44,23 @@ from agent_eval.evaluation.agent_adapter import (
 from agent_eval.evaluation.configurable_judge import run_configurable_judge
 
 logger = logging.getLogger(__name__)
+
+
+# 多轮 score key 形如 ``<评估器名>.turn<N>`` / ``<评估器名>.conversation``。
+# 汇总可视化按**评估器**聚合（不按轮次）——不同样例的轮次无固定规律、轮次之间
+# 不可比，铺开展示无意义。故按最后一个 "." 拆分，若后段是 turnN / conversation
+# 则折叠回评估器名；否则整串保留（单轮 key 无此后缀，零回归）。
+# 注意：逐样例落库（create_eval_score）仍用完整 key，详情页逐轮展示不受影响。
+_TURN_SUFFIX_RE = re.compile(r"^(turn\d+|conversation)$")
+
+
+def _collapse_score_key(key: str) -> str:
+    idx = key.rfind(".")
+    if idx <= 0:
+        return key
+    if _TURN_SUFFIX_RE.match(key[idx + 1 :]):
+        return key[:idx]
+    return key
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -596,6 +614,7 @@ async def _run_multiturn_case(
     replay: dict[str, Any] = {}
     scores: dict[str, float] = {}
     score_reasons: dict[str, str] = {}
+    score_checks: dict[str, list[dict[str, Any]]] = {}
 
     try:
         try:
@@ -646,7 +665,7 @@ async def _run_multiturn_case(
     # status 判定优先看 error_msg，故部分失败样例即便有分数仍标 error，不会假性 pass。
     if turns:
         try:
-            scores, score_reasons = await multiturn.score_conversation(
+            scores, score_reasons, score_checks = await multiturn.score_conversation(
                 turns=turns,
                 conversation_goal=conversation_goal,
                 turn_expectations=turn_expectations,
@@ -702,6 +721,10 @@ async def _run_multiturn_case(
         # 逐分数项的 judge 理由（score_key → reasoning），落库写进 details，
         # 详情页展示「按什么打的分」。单轮路径无此键，下方落库循环用 .get 兜底。
         "score_reasons": score_reasons,
+        # 逐分数项的 checklist 检查明细（score_key → [{id,desc,verdict,evidence}]），
+        # 落库写进 details.checks，详情页逐条展示 ✓/✗/— + 证据，支撑可溯源打分链路。
+        # 单轮路径无此键，下方落库循环用 .get 兜底。
+        "score_checks": score_checks,
         **usage,
     }
 
@@ -1050,12 +1073,19 @@ async def _execute_run(
                     # 多轮 judge 理由（#137）：score_reasons 仅多轮 case 带，单轮无此键
                     # → .get 兜底空 dict，details 退回 {}，单轮零回归。
                     reasons_map = res.get("score_reasons") or {}
+                    checks_map = res.get("score_checks") or {}
                     for sname, sval in res["scores"].items():
                         reason = reasons_map.get(sname)
+                        checks = checks_map.get(sname)
+                        details: dict[str, Any] = {}
+                        if reason:
+                            details["reasoning"] = reason
+                        if checks:
+                            details["checks"] = checks
                         await repo.create_eval_score(
                             created.id, dimension=sname, score=sval,
                             weight=1.0, weighted_score=sval, scoring_method="eval",
-                            details={"reasoning": reason} if reason else {},
+                            details=details,
                         )
                     await session.commit()
             except Exception as e:
@@ -1079,7 +1109,10 @@ async def _execute_run(
         all_scores: dict[str, list[float]] = {}
         for r in per_case_results:
             for k, v in r["scores"].items():
-                all_scores.setdefault(k, []).append(v)
+                # 汇总按评估器聚合：把 <label>.turnN / <label>.conversation 折叠回
+                # <label>，同一评估器的各轮 + 会话级分数并入一组求均值 / 分布。
+                # 单轮 key（无 turn 后缀）原样保留。逐样例落库不受影响（用完整 key）。
+                all_scores.setdefault(_collapse_score_key(k), []).append(v)
         dim_avg = {k: round(sum(vs) / len(vs), 3) for k, vs in all_scores.items() if vs}
 
         # Per-dimension histogram in fixed buckets so the UI can render a
