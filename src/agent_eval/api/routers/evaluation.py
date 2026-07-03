@@ -37,6 +37,7 @@ from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import (
     BenchmarkCaseRow,
+    ConversationCategoryRow,
     EvaluationScoreRow,
     EvaluatorProviderRow,
     TestResultRow,
@@ -101,19 +102,50 @@ async def start_eval(req: StartEvalRequest):
             # runner，由 multiturn 回放逐轮调用 agent 并逐轮+会话级打分。
             from agent_eval.api.dependencies import get_manager
 
+            # 分类 / 勾选筛选（对齐 benchmark 来源，复用 case_ids / filter_category_id）：
+            # 对话样例真身在 LangSmith，无法服务端按 category/id 过滤，故全量 load 后
+            # 内存筛。filter_category_id 是 ConversationCategoryRow 的 UUID（前端下拉
+            # value），先解析成受管类别名，再按样例 c.category（存的是类别名）匹配。
+            # case_ids 是勾选的样例 id（c.id）。limit 在筛选后再截断。
+            wanted_ids = set(req.case_ids) if req.case_ids else None
+            wanted_category: str | None = None
+            if req.filter_category_id:
+                cat_row = (await session.execute(
+                    select(ConversationCategoryRow).where(
+                        ConversationCategoryRow.id == uuid.UUID(req.filter_category_id)
+                    )
+                )).scalar_one_or_none()
+                if cat_row is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"conversation category not found: {req.filter_category_id}",
+                    )
+                wanted_category = cat_row.name
+
             mgr = await get_manager()
             try:
-                ds_cases = await mgr.load_cases(req.conversation_dataset, limit=req.limit)
+                # 有勾选/分类筛选时先全量 load（不下推 limit），内存筛完再截断；
+                # 无筛选时沿用旧行为，直接把 limit 下推给 provider。
+                load_limit = None if (wanted_ids or wanted_category) else req.limit
+                ds_cases = await mgr.load_cases(req.conversation_dataset, limit=load_limit)
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
                     detail=f"读取对话数据集 '{req.conversation_dataset}' 失败：{e}",
                 ) from e
             for c in ds_cases:
+                # 分类 / 勾选筛选（在跳过无 user 消息之前先筛，limit 语义针对"将跑的样例"）。
+                if wanted_ids is not None and c.id not in wanted_ids:
+                    continue
+                if wanted_category is not None and (c.category or "") != wanted_category:
+                    continue
                 msgs = c.input_messages or []
                 if not any(m.get("role") == "user" and m.get("content") for m in msgs):
                     # 没有任何 user 消息的样例无法回放，跳过。
                     continue
+                # 内存筛选路径下 limit 未下推给 provider，在此按"将跑样例数"截断。
+                if load_limit is None and req.limit and len(cases) >= req.limit:
+                    break
                 # question 仅作落库/展示的单值快照（首条 user 消息）。
                 first_user = next(
                     (m.get("content", "") for m in msgs if m.get("role") == "user"), ""

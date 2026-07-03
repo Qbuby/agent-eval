@@ -499,6 +499,37 @@ def _parse_single_score(
         # 多维 rubric prompt 常见返回顶级 composite_score（各维度加权求和），
         # 视作总分别名
         raw_score = body.get("composite_score")
+    if raw_score is None:
+        # 宽松兜底：不少 rubric prompt 自定义了总分字段名（如
+        # faithfulness_score / conciseness_score），既不是 score 也不是
+        # composite_score。此处扫顶级形如 ``*_score`` 且值可转数值的字段
+        # 作为总分——子维度对象的键是 d1_xxx（不带 _score 后缀），不会误伤。
+        # 恰好命中一个才采纳；多个总分字段无从判断主分，明确报歧义而非乱猜。
+        def _is_num(v: Any) -> bool:
+            if isinstance(v, bool):
+                return False
+            if isinstance(v, (int, float)):
+                return True
+            if isinstance(v, str):
+                try:
+                    float(v.strip())
+                    return True
+                except ValueError:
+                    return False
+            return False
+
+        candidates = {
+            k: v for k, v in body.items()
+            if isinstance(k, str) and k.endswith("_score") and _is_num(v)
+        }
+        if len(candidates) == 1:
+            raw_score = next(iter(candidates.values()))
+        elif len(candidates) > 1:
+            return None, (
+                "judge response has multiple top-level '*_score' fields "
+                f"({sorted(candidates)}); cannot decide which is the overall "
+                "score — set the prompt to emit a single top-level 'score'"
+            )
     reasoning = str(body.get("reasoning") or body.get("reason") or "")
 
     if raw_score is None:
