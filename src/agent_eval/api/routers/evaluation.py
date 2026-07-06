@@ -557,11 +557,25 @@ async def export_compare(req: ExportCompareRequest):
             for d, v in (r.get("scores") or {}).items():
                 slot[f"{run_id}::{d}"] = v
             slot[f"{run_id}::status"] = r.get("status")
+            # 性能 / 成本核心指标：与分数并列进对比矩阵，方便横比各模型的
+            # 延迟、token 消耗、工具调用规模。只取核心几项，避免矩阵列爆炸
+            # （逐样例完整性能明细走 export-summary）。
+            for perf_key in (
+                "latency_ms", "total_tokens", "prompt_tokens",
+                "completion_tokens", "tool_call_count",
+            ):
+                slot[f"{run_id}::{perf_key}"] = r.get(perf_key)
 
     columns = [ExportColumn("样例", "样例"), ExportColumn("对齐键", "对齐键")]
     for run_id in req.run_ids:
         label = run_labels.get(run_id, run_id[:8])
         columns.append(ExportColumn(f"{run_id}::status", f"{label}·状态"))
+        # 性能 / 成本列紧跟状态，与分数列分组清晰。
+        columns.append(ExportColumn(f"{run_id}::latency_ms", f"{label}·时延(ms)"))
+        columns.append(ExportColumn(f"{run_id}::total_tokens", f"{label}·总token"))
+        columns.append(ExportColumn(f"{run_id}::prompt_tokens", f"{label}·输入token"))
+        columns.append(ExportColumn(f"{run_id}::completion_tokens", f"{label}·输出token"))
+        columns.append(ExportColumn(f"{run_id}::tool_call_count", f"{label}·工具调用数"))
         for d in sorted(all_dims):
             columns.append(ExportColumn(f"{run_id}::{d}", f"{label}·{d}"))
 
