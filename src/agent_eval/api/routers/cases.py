@@ -138,6 +138,7 @@ async def _parse_conversation_cases(
     messages_column: str | None,
     goal_column: str | None,
     category: str | None = None,
+    column_map: dict[str, str] | None = None,
 ) -> tuple[list[TestCase], int]:
     """文件字节 → (对话 TestCase 列表, 跳过行数)。preview 与 import 共用。
 
@@ -148,6 +149,11 @@ async def _parse_conversation_cases(
     - 拍平多行：每行一个 turn，按 conversation_id 跨行聚合成一段对话
     问句/检查点 → 逐轮 criteria/expected_output，场景/目标列 → conversation_goal。
     无法构成任何轮次的行按跳过处理，不影响其余样例导入。
+
+    column_map（可选）：拍平布局下语义字段 → 源列名的显式映射，让用户手动指定
+    question / answer / expected_output / criteria / conversation_id / turn_no /
+    goal / name 各对应哪列，覆盖别名自动识别。expected_output 是导入侧唯一能带
+    入「期望答案」的路径。
     """
     try:
         _, row_iter = iter_upload_rows(content, filename)
@@ -156,7 +162,8 @@ async def _parse_conversation_cases(
 
     try:
         conversations, skipped = parse_conversations(
-            row_iter, messages_column=messages_column, goal_column=goal_column
+            row_iter, messages_column=messages_column, goal_column=goal_column,
+            column_map=column_map,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"文件解析失败：{e}") from e
@@ -179,6 +186,84 @@ async def _parse_conversation_cases(
     return cases, skipped
 
 
+def _parse_column_map(raw: str | None) -> dict[str, str] | None:
+    """把前端传来的 column_map JSON 字符串解析成 dict。空/非法 → None（回退
+    别名自动识别）。只保留值为非空字符串的项，避免把空映射当成显式指定。"""
+    if not raw:
+        return None
+    import json
+    try:
+        obj = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(status_code=400, detail="column_map 不是合法 JSON") from None
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=400, detail="column_map 必须是对象")
+    cleaned = {
+        str(k): str(v).strip()
+        for k, v in obj.items()
+        if v not in (None, "") and str(v).strip()
+    }
+    return cleaned or None
+
+
+@router.post(
+    "/api/datasets/{name}/cases/import-conversations/inspect",
+    dependencies=[Depends(require_role(ROLE_ADMIN))],
+)
+async def inspect_conversation_file(
+    name: str,
+    file: UploadFile = File(...),
+):
+    """解析上传文件的列结构：返回列头 + 每列样例值 + 自动建议的字段映射。
+
+    「三步式导入」第一步（字段映射）用它——前端据此渲染「语义字段 → 源列」
+    的下拉，用户可在自动建议基础上手动纠正后再预览。仅读表头与前几行，不写库。
+
+    行内已带对话数组（messages/turns 列，布局 A/B）的文件不需要列映射：这种
+    情况返回空 columns + is_structured=true，前端可直接跳到预览。
+    """
+    from agent_eval.data.benchmark_import import (
+        collect_sample_values,
+        suggest_conversation_column_map,
+    )
+
+    content = await file.read()
+    filename = file.filename or "unknown"
+    try:
+        headers, row_iter = iter_upload_rows(content, filename)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    # 只物化前若干行做样例（避免大文件全量读入）。
+    sample_rows: list[dict] = []
+    for i, row in enumerate(row_iter):
+        if i >= 20:
+            break
+        if isinstance(row, dict):
+            sample_rows.append(row)
+
+    # 行内数组布局（A/B）判定：任一样例行的某个消息列别名能解析成非空 list。
+    from agent_eval.data.benchmark_import import _MESSAGES_COLUMN_ALIASES, _as_list
+    is_structured = False
+    lower_alias = {a.lower() for a in _MESSAGES_COLUMN_ALIASES}
+    for row in sample_rows:
+        for k, v in row.items():
+            if str(k).lower().strip() in lower_alias and _as_list(v) is not None:
+                is_structured = True
+                break
+        if is_structured:
+            break
+
+    samples = collect_sample_values(sample_rows, headers, limit=3)
+    suggested = suggest_conversation_column_map(headers)
+    return {
+        "columns": [h for h in headers if h],
+        "samples": samples,
+        "suggested": suggested,
+        "is_structured": is_structured,
+    }
+
+
 @router.post("/api/datasets/{name}/cases/import-conversations/preview", dependencies=[Depends(require_role(ROLE_ADMIN))])
 async def preview_conversations(
     name: str,
@@ -186,6 +271,7 @@ async def preview_conversations(
     messages_column: str | None = Query(None, description="手动指定消息列（覆盖自动识别）"),
     goal_column: str | None = Query(None, description="手动指定对话目标列（覆盖自动识别）"),
     category: str | None = Query(None, description="为整批导入样例统一指定类别"),
+    column_map: str | None = Query(None, description="语义字段→源列名的 JSON 映射（覆盖别名识别）"),
     mgr: DatasetManager = Depends(get_manager),
 ):
     """解析上传文件但不写库，返回解析结果预览 + 与现有同名样例的新增/更新比对。
@@ -197,7 +283,7 @@ async def preview_conversations(
     filename = file.filename or "unknown"
     cases, skipped = await _parse_conversation_cases(
         content, filename, messages_column=messages_column, goal_column=goal_column,
-        category=category,
+        category=category, column_map=_parse_column_map(column_map),
     )
 
     # 与现有同名样例比对：命中→update，否则→new（按名 upsert 的预演）。
@@ -220,6 +306,11 @@ async def preview_conversations(
             "first_user": first_user[:80],
             "has_assistant": any(m.get("role") == "assistant" for m in c.input_messages),
             "checkpoints": sum(len(te.criteria or []) for te in c.turn_expectations),
+            # 带期望答案（expected_output）的轮数：让用户在预览里确认「期望答案」
+            # 列有没有被正确映射进来。
+            "expected_answers": sum(
+                1 for te in c.turn_expectations if te.expected_output
+            ),
             "goal": (c.conversation_goal or "")[:80],
             "action": "update" if c.name in existing_names else "new",
         })
@@ -244,18 +335,22 @@ async def import_conversations(
     messages_column: str | None = Query(None, description="手动指定消息列（覆盖自动识别）"),
     goal_column: str | None = Query(None, description="手动指定对话目标列（覆盖自动识别）"),
     category: str | None = Query(None, description="为整批导入样例统一指定类别"),
+    column_map: str | None = Query(None, description="语义字段→源列名的 JSON 映射（覆盖别名识别）"),
     mgr: DatasetManager = Depends(get_manager),
 ):
     """从 CSV / JSON / JSONL / XLSX 文件批量导入多轮对话样例到数据集。
 
     按名 upsert：与现有同名样例命中则复用其 example_id（Langfuse
     create_dataset_item(id=) 天然 upsert → 按最新导入更新字段），否则新增。
+
+    column_map（可选，JSON 串）：与 preview 一致的语义字段→源列名映射，确保
+    「用户在映射步骤确认的字段」和真正落库的解析口径完全一致。
     """
     content = await file.read()
     filename = file.filename or "unknown"
     cases, skipped = await _parse_conversation_cases(
         content, filename, messages_column=messages_column, goal_column=goal_column,
-        category=category,
+        category=category, column_map=_parse_column_map(column_map),
     )
 
     if not cases:

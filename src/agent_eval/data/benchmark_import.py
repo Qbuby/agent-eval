@@ -399,6 +399,15 @@ _CHECKPOINT_KEYS = (
     "expected_checkpoints", "checkpoints", "criteria", "expected_criteria",
     "assertions", "checks", "key_points", "检查点", "要点", "评分点", "关键点",
 )
+# 期望答案（标准答案）列别名。与 answer 区分：answer 是 agent 实际生成的回复
+# （存档进 assistant 消息），expected_output 是人工设定的「应该答成什么样」，
+# 写进 turn_expectations[].expected_output，供逐轮打分作参照。多数文件没有这一
+# 列（留空供人工后补），但若有标准答案列，应能映射进来。
+_EXPECTED_ANSWER_KEYS = (
+    "expected_output", "expected_answer", "reference_answer", "gold_answer",
+    "standard_answer", "ground_truth", "reference", "期望答案", "标准答案",
+    "参考答案", "正确答案", "参考回复",
+)
 # 拍平布局里用于把多行聚合成同一段对话的分组键。
 _CONV_ID_KEYS = (
     "conversation_id", "conv_id", "dialog_id", "dialogue_id", "session_id",
@@ -441,6 +450,47 @@ def _first_value(row: dict[str, Any], low: dict[str, str], keys) -> Any:
         if val not in (None, ""):
             return val
     return None
+
+
+# 语义字段名 → 对应的别名元组。column_map 未显式指定该字段时，回退到别名识别。
+_ROLE_ALIAS_KEYS: dict[str, tuple[str, ...]] = {
+    "question": _QUESTION_KEYS,
+    "answer": _ANSWER_KEYS,
+    "expected_output": _EXPECTED_ANSWER_KEYS,
+    "criteria": _CHECKPOINT_KEYS,
+    "conversation_id": _CONV_ID_KEYS,
+    "turn_no": _TURN_NO_KEYS,
+    "goal": _GOAL_ROW_KEYS,
+    "name": _NAME_KEYS,
+    "description": _DESC_KEYS,
+}
+
+
+def _mapped_value(
+    row: dict[str, Any],
+    low: dict[str, str],
+    role: str,
+    column_map: dict[str, str] | None,
+) -> Any:
+    """取某语义字段（role）的值。
+
+    优先级：column_map 里为该 role 显式指定的源列 > 别名自动识别。显式映射
+    命中列名（大小写不敏感）就只认那一列——即使该行此列为空也不回退，保证
+    「用户指定了 X 列作问句」的语义确定，不会悄悄换列。列名在本行不存在时才
+    回退别名（兼容 JSON/JSONL 各行键不齐的情况）。
+    """
+    if column_map:
+        col = column_map.get(role)
+        if col:
+            real = col if col in row else low.get(str(col).lower().strip())
+            if real is not None:
+                val = row.get(real)
+                return val if val not in (None, "") else None
+            # 显式列名整个文件都没有 → 落回别名识别（容错）。
+    keys = _ROLE_ALIAS_KEYS.get(role)
+    if not keys:
+        return None
+    return _first_value(row, low, keys)
 
 
 def _as_list(raw: Any) -> list | None:
@@ -552,11 +602,18 @@ def _conversation_from_list(
 
 
 def _parse_flattened(
-    rows: list[tuple[dict[str, Any], dict[str, str]]], *, goal_column: str | None
+    rows: list[tuple[dict[str, Any], dict[str, str]]], *, goal_column: str | None,
+    column_map: dict[str, str] | None = None,
 ) -> tuple[list[ParsedConversation], int]:
     """拍平布局（布局 C）：每行一个 turn，按 conversation_id 聚合成对话。
 
     无分组键的行各自成一段单轮对话。返回 (conversations, skipped_rows)。
+
+    column_map（可选）：语义字段 → 源列名的显式映射（question / answer /
+    expected_output / criteria / conversation_id / turn_no / goal / name）。
+    未指定的字段回退别名自动识别。expected_output 显式映射时写入该轮
+    turn_expectations 的 expected_output（这是导入侧唯一能带入「期望答案」的
+    路径——answer 仍作 assistant 消息存档，二者独立）。
     """
     groups: dict[str, list[tuple[dict[str, Any], dict[str, str]]]] = {}
     order: list[str] = []
@@ -566,11 +623,11 @@ def _parse_flattened(
     # 后续 turn 行为空。空 id 行沿用上一个非空分组键，归属同一段对话。
     last_gid: str | None = None
     for row, low in rows:
-        q = _first_value(row, low, _QUESTION_KEYS)
+        q = _mapped_value(row, low, "question", column_map)
         if q in (None, ""):
             skipped += 1
             continue
-        gid = _first_value(row, low, _CONV_ID_KEYS)
+        gid = _mapped_value(row, low, "conversation_id", column_map)
         if gid not in (None, ""):
             last_gid = str(gid).strip()
             key = last_gid
@@ -591,7 +648,7 @@ def _parse_flattened(
 
         def _turn_sort(it: tuple[dict[str, Any], dict[str, str]]):
             r, lw = it
-            tv = _first_value(r, lw, _TURN_NO_KEYS)
+            tv = _mapped_value(r, lw, "turn_no", column_map)
             try:
                 return (0, int(float(tv)))
             except (TypeError, ValueError):
@@ -604,26 +661,45 @@ def _parse_flattened(
         goal: str | None = None
         name = ""
         for r, lw in items:
-            q = _first_value(r, lw, _QUESTION_KEYS)
+            q = _mapped_value(r, lw, "question", column_map)
             idx = len(messages)
             messages.append({"role": "user", "content": str(q).strip()})
-            # answer 是 agent 实际「生成的答案」，作 assistant 消息存档进对话流，
-            # 不写入 expected_output（期望答案留空，供人工后补）。与 _expand_qa_turns
-            # 语义一致。
-            a = _first_value(r, lw, _ANSWER_KEYS)
+            # answer 是 agent 实际「生成的答案」，作 assistant 消息存档进对话流。
+            a = _mapped_value(r, lw, "answer", column_map)
             if a not in (None, ""):
                 messages.append({"role": "assistant", "content": str(a).strip()})
-            criteria = _checkpoints_to_list(_first_value(r, lw, _CHECKPOINT_KEYS))
-            if criteria:
-                turn_exp.append({"turn_index": idx, "criteria": criteria})
+            criteria = _checkpoints_to_list(
+                _mapped_value(r, lw, "criteria", column_map)
+            )
+            # 期望答案（标准答案）：只在用户/别名显式命中该列时写入，作该 user
+            # 轮的 expected_output。turn_index 对齐 user 消息下标（== idx）。
+            expected = _mapped_value(r, lw, "expected_output", column_map)
+            expected_s = str(expected).strip() if expected not in (None, "") else None
+            if criteria or expected_s:
+                te: dict[str, Any] = {"turn_index": idx}
+                if criteria:
+                    te["criteria"] = criteria
+                if expected_s:
+                    te["expected_output"] = expected_s
+                turn_exp.append(te)
             if goal is None:
-                g = resolve_conversation_goal(r, goal_column=goal_column)
-                if not g:
-                    gv = _first_value(r, lw, _GOAL_ROW_KEYS)
+                if column_map and column_map.get("goal"):
+                    gv = _mapped_value(r, lw, "goal", column_map)
                     g = str(gv).strip() if gv not in (None, "") else None
+                else:
+                    g = resolve_conversation_goal(r, goal_column=goal_column)
+                    if not g:
+                        gv = _first_value(r, lw, _GOAL_ROW_KEYS)
+                        g = str(gv).strip() if gv not in (None, "") else None
                 goal = g
-            if not name and not key.startswith("__standalone_"):
-                name = key
+            if not name:
+                nv = _mapped_value(r, lw, "name", column_map) if (
+                    column_map and column_map.get("name")
+                ) else None
+                if nv not in (None, ""):
+                    name = str(nv).strip()
+                elif not key.startswith("__standalone_"):
+                    name = key
         if messages:
             conversations.append(ParsedConversation(
                 input_messages=messages,
@@ -640,11 +716,17 @@ def parse_conversations(
     *,
     messages_column: str | None = None,
     goal_column: str | None = None,
+    column_map: dict[str, str] | None = None,
 ) -> tuple[list[ParsedConversation], int]:
     """把上传文件的所有行解析成多轮对话样例，自动适配三种布局。
 
     - 行内带消息/turns 数组列 → 单行即一段对话（布局 A chat / B QA-turn）。
     - 其余行 → 按 conversation_id 跨行聚合的拍平布局（布局 C）。
+
+    column_map（可选）：拍平布局下语义字段 → 源列名的显式映射，让用户手动
+    指定 question / answer / expected_output / criteria / conversation_id /
+    turn_no / goal / name 各自对应哪一列，覆盖别名自动识别。仅作用于布局 C
+    （行内数组的 A/B 布局结构自解释，不需要列映射）。
 
     返回 (conversations, skipped_rows)。skipped_rows 为既不含对话数组、也不含
     问句列、无法构成任何轮次的行数。
@@ -684,7 +766,9 @@ def parse_conversations(
             flattened.append((row, low))
 
     if flattened:
-        flat_convs, flat_skipped = _parse_flattened(flattened, goal_column=goal_column)
+        flat_convs, flat_skipped = _parse_flattened(
+            flattened, goal_column=goal_column, column_map=column_map,
+        )
         conversations.extend(flat_convs)
         skipped += flat_skipped
 
@@ -706,6 +790,35 @@ def collect_sample_values(
                 s = str(val).strip()
                 samples[h].append(s[:200])
     return samples
+
+
+# 多轮对话导入映射步骤支持的语义角色（顺序即 UI 展示顺序）。
+CONVERSATION_ROLES: tuple[str, ...] = (
+    "question", "answer", "expected_output", "criteria",
+    "conversation_id", "turn_no", "goal", "name",
+)
+
+
+def suggest_conversation_column_map(headers: list[str]) -> dict[str, str | None]:
+    """为多轮对话拍平布局的每个语义角色，按别名表建议一个源列（供导入映射
+    步骤的默认值）。返回 {role: 命中的源列名 or None}。
+
+    大小写不敏感，精确/别名皆可。同一源列不会被两个角色重复占用（先到先得，
+    按 CONVERSATION_ROLES 顺序），避免 question/answer 别名交叠时错配。"""
+    lower_map = {str(h).lower().strip(): h for h in headers if h}
+    used: set[str] = set()
+    suggestion: dict[str, str | None] = {}
+    for role in CONVERSATION_ROLES:
+        keys = _ROLE_ALIAS_KEYS.get(role, ())
+        picked: str | None = None
+        for k in keys:
+            real = lower_map.get(k.lower())
+            if real is not None and real not in used:
+                picked = real
+                used.add(real)
+                break
+        suggestion[role] = picked
+    return suggestion
 
 
 def auto_match_columns(

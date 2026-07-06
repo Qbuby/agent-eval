@@ -4,7 +4,11 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, ExportMenu, useConfirm, useToast } from '@/components/ui'
 import { datasetsApi } from '@/services'
 import { useAuthStore } from '@/stores/auth'
-import type { ConversationImportPreview } from '@/services/datasets'
+import type {
+  ConversationImportPreview,
+  ConversationColumnMap,
+  ConversationInspectResult,
+} from '@/services/datasets'
 import ConversationView from '@/components/ConversationView'
 import ConversationEditor from '@/components/ConversationEditor'
 import type { TestCase } from '@/types'
@@ -17,6 +21,19 @@ function isConversation(c: TestCase): boolean {
   if (c.turn_expectations && c.turn_expectations.length > 0) return true
   return (c.input_messages?.length ?? 0) > 1
 }
+
+// 拍平多行布局的字段映射项：语义字段 key + 展示标签 + 说明。用户在「字段映射」
+// 步为每项指定源列（下拉），覆盖别名自动识别。仅 question 为必填。
+const IMPORT_FIELD_DEFS: { key: keyof ConversationColumnMap; label: string; hint: string; required?: boolean }[] = [
+  { key: 'question', label: '用户问句', hint: '每行的用户输入（必填）', required: true },
+  { key: 'answer', label: '助手回复', hint: '智能体实际回复，存为 assistant 消息' },
+  { key: 'expected_output', label: '期望答案', hint: '标准/参考答案，写入该轮期望输出' },
+  { key: 'criteria', label: '评分点', hint: '检查点/要点，写入该轮评分标准' },
+  { key: 'conversation_id', label: '会话 ID', hint: '同值的多行聚合成一段对话（如 session_id）' },
+  { key: 'turn_no', label: '轮次序号', hint: '同一会话内的排序依据' },
+  { key: 'goal', label: '对话目标', hint: '会话级目标/场景' },
+  { key: 'name', label: '对话名称', hint: '样例名，缺省用会话 ID' },
+]
 
 function emptyCase(): TestCase {
   return {
@@ -53,8 +70,12 @@ export default function ConversationDatasetDetailPage() {
   const fileRef = useRef<HTMLInputElement>(null)
   // 批量选择（example_id 集合）。
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-  // 两步式导入：选文件 → 预览（解析结果 + 新增/更新比对）→ 确认导入。
+  // 三步式导入：选文件 → 字段映射（拍平多行布局才需要）→ 解析预览 → 确认导入。
+  // step 驱动弹窗内容：'file' 选文件、'map' 映射列、'preview' 看解析结果。
+  const [importStep, setImportStep] = useState<'file' | 'map' | 'preview'>('file')
   const [importFile, setImportFile] = useState<File | null>(null)
+  const [importInspect, setImportInspect] = useState<ConversationInspectResult | null>(null)
+  const [columnMap, setColumnMap] = useState<ConversationColumnMap>({})
   const [importPreview, setImportPreview] = useState<ConversationImportPreview | null>(null)
   // 导入时为整批样例统一指定的类别（空串=不指定）。
   const [importCategory, setImportCategory] = useState('')
@@ -97,18 +118,43 @@ export default function ConversationDatasetDetailPage() {
     onError: (e) => toast.error(toToastMessage(formatApiError(e)), '保存失败'),
   })
 
-  // 两步式导入第一步：预览解析结果（不写库）。
+  // 三步式导入第一步：inspect 文件结构（列头 + 样例值 + 自动建议映射）。
+  // is_structured=true（行内已带对话数组，布局 A/B）时无需列映射，直接跳预览。
+  const inspectMutation = useMutation({
+    mutationFn: (file: File) =>
+      datasetsApi.inspectConversationFile(name, file).then(r => r.data),
+    onSuccess: (data, file) => {
+      setImportInspect(data)
+      if (data.is_structured) {
+        // 结构自解释，跳过映射步直接预览。
+        previewMutation.mutate(file)
+      } else {
+        // 用自动建议初始化映射，进映射步让用户确认/纠正。
+        setColumnMap(data.suggested || {})
+        setImportStep('map')
+      }
+    },
+    onError: (e) => toast.error(toToastMessage(formatApiError(e)), '解析文件失败'),
+  })
+
+  // 第二步（或结构化文件的第一步）：预览解析结果（不写库），带列映射。
   const previewMutation = useMutation({
     mutationFn: (file: File) =>
-      datasetsApi.previewConversations(name, file, { category: importCategory || undefined }).then(r => r.data),
-    onSuccess: (data) => setImportPreview(data),
+      datasetsApi.previewConversations(name, file, {
+        category: importCategory || undefined,
+        columnMap: Object.keys(columnMap).length > 0 ? columnMap : undefined,
+      }).then(r => r.data),
+    onSuccess: (data) => { setImportPreview(data); setImportStep('preview') },
     onError: (e) => toast.error(toToastMessage(formatApiError(e)), '预览失败'),
   })
 
   // 第二步：确认导入（按名 upsert，重复样例按最新导入更新字段）。整批可统一指定类别。
   const importMutation = useMutation({
     mutationFn: (file: File) =>
-      datasetsApi.importConversations(name, file, { category: importCategory || undefined }),
+      datasetsApi.importConversations(name, file, {
+        category: importCategory || undefined,
+        columnMap: Object.keys(columnMap).length > 0 ? columnMap : undefined,
+      }),
     onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ['conv-cases'] })
       queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
@@ -184,7 +230,10 @@ export default function ConversationDatasetDetailPage() {
 
   function closeImport() {
     setShowImport(false)
+    setImportStep('file')
     setImportFile(null)
+    setImportInspect(null)
+    setColumnMap({})
     setImportPreview(null)
     setImportCategory('')
     if (fileRef.current) fileRef.current.value = ''
@@ -529,19 +578,31 @@ export default function ConversationDatasetDetailPage() {
         footer={
           <>
             <Button variant="secondary" size="md" onClick={closeImport}>取消</Button>
-            {!importPreview ? (
+            {importStep === 'file' && (
               <Button
                 variant="primary"
                 size="md"
-                loading={previewMutation.isPending}
+                loading={inspectMutation.isPending}
                 onClick={() => {
                   const f = fileRef.current?.files?.[0]
-                  if (f) { setImportFile(f); previewMutation.mutate(f) }
+                  if (f) { setImportFile(f); inspectMutation.mutate(f) }
                 }}
+              >
+                下一步：识别字段
+              </Button>
+            )}
+            {importStep === 'map' && (
+              <Button
+                variant="primary"
+                size="md"
+                disabled={!importFile || !columnMap.question}
+                loading={previewMutation.isPending}
+                onClick={() => { if (importFile) previewMutation.mutate(importFile) }}
               >
                 下一步：解析预览
               </Button>
-            ) : (
+            )}
+            {importStep === 'preview' && importPreview && (
               <Button
                 variant="primary"
                 size="md"
@@ -555,13 +616,13 @@ export default function ConversationDatasetDetailPage() {
           </>
         }
       >
-        {!importPreview ? (
+        {importStep === 'file' && (
           <div className="space-y-4">
             <p className="text-[12px] text-text-secondary">
-              支持 CSV / JSON / JSONL / Excel。每行（或每个 JSON 对象）= 一个完整对话样例，
-              消息列放消息数组（JSON/JSONL 天然是数组，CSV/Excel 单元格放 JSON 字符串）。
-              自动识别 messages / conversation / 对话 等列名，可选 conversation_goal / 对话目标 列。
-              同名样例会按最新导入更新（去重），不会重复新增。
+              支持 CSV / JSON / JSONL / Excel。两种布局都支持：①「消息数组」列
+              （messages / conversation / 对话，单元格放 JSON 数组）；②「拍平多行」——
+              每行一个 turn，同一 conversation_id（或 session_id）的多行聚合成一段多轮对话。
+              下一步可手动指定问句 / 期望答案 / 评分点等字段对应哪一列。同名样例按最新导入更新（去重）。
             </p>
             <div>
               <label htmlFor={importFileId} className="field-label">选择文件</label>
@@ -582,7 +643,94 @@ export default function ConversationDatasetDetailPage() {
               </p>
             </div>
           </div>
-        ) : (
+        )}
+
+        {importStep === 'map' && importInspect && (
+          <div className="space-y-4">
+            <p className="text-[12px] text-text-secondary">
+              为每个字段指定源文件的列（已按列名自动匹配，可手动纠正）。
+              <span className="text-action-danger">问句列必填</span>；
+              「期望答案」写入每轮的标准答案，「评分点」写入每轮 criteria，二者独立可选。
+            </p>
+            <div className="space-y-2">
+              {IMPORT_FIELD_DEFS.map(fd => (
+                <div key={fd.key} className="grid grid-cols-[120px_1fr] items-center gap-2">
+                  <label className="text-[12px]">
+                    {fd.label}
+                    {fd.required && <span className="text-action-danger"> *</span>}
+                  </label>
+                  <select
+                    className="input text-[12px]"
+                    value={columnMap[fd.key] ?? ''}
+                    onChange={e => setColumnMap(prev => {
+                      const next = { ...prev }
+                      if (e.target.value) next[fd.key] = e.target.value
+                      else delete next[fd.key]
+                      return next
+                    })}
+                  >
+                    <option value="">（不映射）</option>
+                    {importInspect.columns.map(col => (
+                      <option key={col} value={col}>
+                        {col}
+                        {importInspect.samples[col]?.length
+                          ? ` — 例: ${importInspect.samples[col][0].slice(0, 30)}`
+                          : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ))}
+            </div>
+            <div>
+              <div className="text-[12px] mb-1 text-text-secondary">列预览（前 3 行样例）</div>
+              <div className="border border-border rounded-md overflow-auto max-h-[220px]">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-fill/5 sticky top-0">
+                    <tr>
+                      {importInspect.columns.map(col => {
+                        const role = (Object.keys(columnMap) as (keyof ConversationColumnMap)[])
+                          .find(k => columnMap[k] === col)
+                        const label = IMPORT_FIELD_DEFS.find(fd => fd.key === role)?.label
+                        const cls = role === 'question' ? 'text-action-primary font-medium'
+                          : role === 'expected_output' ? 'text-action-success font-medium'
+                          : role ? 'text-text-primary font-medium' : 'text-text-tertiary'
+                        return (
+                          <th key={col} className={`text-left px-2 py-1 whitespace-nowrap ${cls}`}>
+                            {col}{label ? ` · ${label}` : ''}
+                          </th>
+                        )
+                      })}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[0, 1, 2].map(rowIdx => (
+                      <tr key={rowIdx} className="border-t border-separator">
+                        {importInspect.columns.map(col => (
+                          <td key={col} className="px-2 py-1 align-top max-w-[220px] truncate text-text-secondary">
+                            {importInspect.samples[col]?.[rowIdx] ?? ''}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            {!columnMap.question && (
+              <p className="text-[11px] text-action-danger">请先指定「问句」列才能继续。</p>
+            )}
+            <button
+              type="button"
+              onClick={() => { setImportStep('file'); setImportInspect(null); setColumnMap({}) }}
+              className="text-[11px] text-text-tertiary hover:text-text-primary transition-colors"
+            >
+              ‹ 重新选择文件
+            </button>
+          </div>
+        )}
+
+        {importStep === 'preview' && importPreview && (
           <div className="space-y-4">
             <div className="flex gap-2 flex-wrap text-[12px]">
               <span className="badge badge-info">共 {importPreview.total} 段</span>
@@ -594,7 +742,7 @@ export default function ConversationDatasetDetailPage() {
             </div>
             {importPreview.total === 0 ? (
               <p className="text-[12px] text-action-danger">
-                未解析到任何多轮对话样例，请检查文件格式或换一个文件。
+                未解析到任何多轮对话样例，请返回上一步检查字段映射或换一个文件。
               </p>
             ) : (
               <div>
@@ -607,6 +755,7 @@ export default function ConversationDatasetDetailPage() {
                         <th className="text-center px-2 py-1 font-medium w-14">轮数</th>
                         <th className="text-left px-2 py-1 font-medium">首句</th>
                         <th className="text-center px-2 py-1 font-medium w-14">要点</th>
+                        <th className="text-center px-2 py-1 font-medium w-16">期望答案</th>
                         <th className="text-center px-2 py-1 font-medium w-16">动作</th>
                       </tr>
                     </thead>
@@ -617,6 +766,7 @@ export default function ConversationDatasetDetailPage() {
                           <td className="px-2 py-1 text-center align-top">{s.turns}</td>
                           <td className="px-2 py-1 align-top max-w-[200px] truncate text-text-secondary">{s.first_user || '—'}</td>
                           <td className="px-2 py-1 text-center align-top text-text-secondary">{s.checkpoints}</td>
+                          <td className="px-2 py-1 text-center align-top text-text-secondary">{s.expected_answers}</td>
                           <td className="px-2 py-1 text-center align-top">
                             <span className={s.action === 'update' ? 'badge badge-warning' : 'badge badge-positive'}>
                               {s.action === 'update' ? '更新' : '新增'}
@@ -631,10 +781,18 @@ export default function ConversationDatasetDetailPage() {
             )}
             <button
               type="button"
-              onClick={() => { setImportPreview(null); setImportFile(null); if (fileRef.current) fileRef.current.value = '' }}
+              onClick={() => {
+                // 回到映射步（结构化文件无映射步，回到选文件步）。
+                if (importInspect && !importInspect.is_structured) {
+                  setImportStep('map'); setImportPreview(null)
+                } else {
+                  setImportStep('file'); setImportPreview(null); setImportInspect(null)
+                  setImportFile(null); if (fileRef.current) fileRef.current.value = ''
+                }
+              }}
               className="text-[11px] text-text-tertiary hover:text-text-primary transition-colors"
             >
-              ‹ 重新选择文件
+              ‹ 上一步
             </button>
           </div>
         )}
