@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
 import { useQueries } from '@tanstack/react-query'
 import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
+  BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from 'recharts'
 import { evaluationApi } from '@/services'
 import { Drawer, ExportMenu } from '@/components/ui'
@@ -88,6 +88,7 @@ export default function EvaluationComparePage() {
 
   // ─── Sample alignment ─────────────────────────────────────────────────────
   const [alignKey, setAlignKey] = useState<AlignKey>('case_id')
+  const [dimView, setDimView] = useState<'agg' | 'trend'>('agg')
   const [selectedAlignKey, setSelectedAlignKey] = useState<string | null>(null)
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [exportError, setExportError] = useState<string | null>(null)
@@ -134,7 +135,9 @@ export default function EvaluationComparePage() {
     return out
   }, [runs, aligned, selectedKeys, usingSubset])
 
-  const dimensionChart = useMemo(() => buildDimensionChart(runs, statsByRun), [runs, statsByRun])
+  const dimAggChart = useMemo(() => buildDimensionAggChart(runs, statsByRun), [runs, statsByRun])
+  const dimTrendChart = useMemo(() => buildTurnTrendChart(runs, statsByRun), [runs, statsByRun])
+  const hasMultiTurnDims = dimTrendChart.series.length > 0
   const costChart = useMemo(() => buildCostChart(runs, statsByRun), [runs, statsByRun])
   const passRateChart = useMemo(() => buildPassRateChart(runs, statsByRun), [runs, statsByRun])
 
@@ -291,21 +294,72 @@ export default function EvaluationComparePage() {
             </section>
           )}
 
-          {dimensionChart.data.length > 0 && (
+          {dimAggChart.data.length > 0 && (
             <section className="card p-4 mb-5">
-              <h3 className="page-eyebrow mb-3">维度平均分（0-1）{usingSubset && ' · 子集'}</h3>
-              <ResponsiveContainer width="100%" height={260}>
-                <BarChart data={dimensionChart.data} margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--separator) / 0.3)" />
-                  <XAxis dataKey="dimension" tick={{ fontSize: 10 }} interval={0} angle={-15} textAnchor="end" height={50} />
-                  <YAxis tick={{ fontSize: 10 }} domain={[0, 1]} />
-                  <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
-                  <Legend wrapperStyle={{ fontSize: 10 }} />
-                  {dimensionChart.runKeys.map((k, i) => (
-                    <Bar key={k} dataKey={k} fill={BAR_COLORS[i % BAR_COLORS.length]} radius={[3, 3, 0, 0]} />
-                  ))}
-                </BarChart>
-              </ResponsiveContainer>
+              <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
+                <h3 className="page-eyebrow">维度平均分（0-1）{usingSubset && ' · 子集'}</h3>
+                {hasMultiTurnDims && (
+                  <div className="inline-flex rounded-md border border-border overflow-hidden text-[11px]">
+                    {(['agg', 'trend'] as const).map(v => (
+                      <button
+                        key={v}
+                        onClick={() => setDimView(v)}
+                        className={`px-2.5 py-1 transition-colors ${
+                          dimView === v
+                            ? 'bg-accent/10 text-accent'
+                            : 'text-text-secondary hover:bg-fill/5'
+                        }`}
+                      >
+                        {v === 'agg' ? '聚合' : '逐轮趋势'}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {(!hasMultiTurnDims || dimView === 'agg') ? (
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={dimAggChart.data} margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--separator) / 0.3)" />
+                    <XAxis dataKey="dimension" tick={{ fontSize: 10 }} interval={0} angle={-15} textAnchor="end" height={50} />
+                    <YAxis tick={{ fontSize: 10 }} domain={[0, 1]} />
+                    <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
+                    <Legend wrapperStyle={{ fontSize: 10 }} />
+                    {dimAggChart.runKeys.map((k, i) => (
+                      <Bar key={k} dataKey={k} fill={BAR_COLORS[i % BAR_COLORS.length]} radius={[3, 3, 0, 0]} />
+                    ))}
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <ResponsiveContainer width="100%" height={300}>
+                  <LineChart data={dimTrendChart.data} margin={{ top: 5, right: 16, left: 0, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--separator) / 0.3)" />
+                    <XAxis dataKey="turnLabel" tick={{ fontSize: 10 }} interval={0} height={30} />
+                    <YAxis tick={{ fontSize: 10 }} domain={[0, 1]} />
+                    <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
+                    <Legend wrapperStyle={{ fontSize: 10 }} />
+                    {dimTrendChart.series.map((s, i) => (
+                      <Line
+                        key={s.key}
+                        type="monotone"
+                        dataKey={s.key}
+                        name={s.label}
+                        stroke={BAR_COLORS[i % BAR_COLORS.length]}
+                        strokeWidth={2}
+                        dot={{ r: 2 }}
+                        connectNulls
+                      />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              )}
+              {hasMultiTurnDims && (
+                <p className="mt-2 text-[10px] text-text-tertiary">
+                  {dimView === 'agg'
+                    ? '多轮维度按各轮均值聚合成一根柱；切「逐轮趋势」看每轮变化。'
+                    : '每条线 = 一个运行的一个维度，x 轴为对话轮次。会话级分数不在此图，见上方卡片。'}
+                </p>
+              )}
             </section>
           )}
 
@@ -378,7 +432,7 @@ function ABSummarySection({ runs, aRun, bRun, aStats, bStats, usingSubset, onCha
 
   const dimsA = aStats.dimensionAverages
   const dimsB = bStats.dimensionAverages
-  const allDims = Array.from(new Set([...Object.keys(dimsA), ...Object.keys(dimsB)]))
+  const dimGroups = buildDimGroups(dimsA, dimsB)
 
   const costA = aStats.costSuccess
   const costB = bStats.costSuccess
@@ -422,26 +476,14 @@ function ABSummarySection({ runs, aRun, bRun, aStats, bStats, usingSubset, onCha
         />
       </div>
 
-      {/* Dimension averages */}
-      {allDims.length > 0 && (
+      {/* Dimension averages — 多轮维度按 base 聚合成一张卡，可展开逐轮 */}
+      {dimGroups.length > 0 && (
         <div className="mb-4">
           <div className="field-label">维度均分</div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {allDims.map(dim => {
-              const meta = getScoreMeta(dim)
-              const va = dimsA[dim]
-              const vb = dimsB[dim]
-              return (
-                <DeltaCard
-                  key={dim}
-                  label={`${meta.label} · ${directionMark(meta)}`}
-                  a={va != null ? va.toFixed(3) : '—'}
-                  b={vb != null ? vb.toFixed(3) : '—'}
-                  delta={deltaPct(vb, va)}
-                  direction={meta.direction}
-                />
-              )
-            })}
+            {dimGroups.map(g => (
+              <DimensionGroupCard key={g.base} group={g} />
+            ))}
           </div>
         </div>
       )}
@@ -528,6 +570,83 @@ function DeltaCard({ label, a, b, delta, direction, neutral }: {
           </span>
         )}
       </div>
+    </div>
+  )
+}
+
+// 维度分组卡：单轮维度=普通 DeltaCard 行为；多轮维度=聚合均值 + 可展开逐轮 mini 明细
+function DimensionGroupCard({ group }: { group: DimGroup }) {
+  const [open, setOpen] = useState(false)
+  const meta = getScoreMeta(group.base)
+  const label = `${meta.label} · ${directionMark(meta)}`
+  const delta = deltaPct(group.aggB, group.aggA)
+  const sign = delta == null ? '' : delta > 0 ? '+' : ''
+  const trend = delta == null ? null : (delta === 0 ? 'flat' : (delta > 0 ? 'up' : 'down'))
+  let cls = 'text-text-tertiary'
+  if (trend && trend !== 'flat') {
+    const goodDir = meta.direction === 'higher_better' ? 'up' : 'down'
+    cls = trend === goodDir ? 'text-positive' : 'text-negative'
+  }
+  const fmt = (v: number | null) => (v == null ? '—' : v.toFixed(3))
+
+  return (
+    <div className="border border-border rounded-md p-3 bg-fill/5">
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className="text-[10px] text-text-tertiary">{label}</span>
+        {group.isMultiTurn && (
+          <span className="badge badge-info text-[9px]">{group.turnCount} 轮 · 均值</span>
+        )}
+      </div>
+      <div className="flex items-baseline gap-2">
+        <span className="font-mono text-[12px] text-text-secondary">{fmt(group.aggA)}</span>
+        <span className="text-text-tertiary text-[11px]">→</span>
+        <span className="font-mono text-[14px] text-text-primary">{fmt(group.aggB)}</span>
+        {delta != null && (
+          <span className={`ml-auto font-mono text-[12px] ${cls}`}>
+            {trend === 'up' && '▲ '}
+            {trend === 'down' && '▼ '}
+            {trend === 'flat' && '— '}
+            {sign}{delta.toFixed(1)}%
+          </span>
+        )}
+      </div>
+      {group.isMultiTurn && (
+        <>
+          <button
+            onClick={() => setOpen(o => !o)}
+            className="mt-2 text-[10px] text-accent hover:text-accent-hover transition-colors"
+          >
+            {open ? '▾ 收起逐轮' : '▸ 展开逐轮'}
+          </button>
+          {open && (
+            <div className="mt-2 flex flex-col gap-1 border-t border-border/60 pt-2">
+              {group.subs.map(s => {
+                const d = deltaPct(s.b, s.a)
+                const st = d == null ? null : (d === 0 ? 'flat' : (d > 0 ? 'up' : 'down'))
+                let scls = 'text-text-tertiary'
+                if (st && st !== 'flat') {
+                  const gd = meta.direction === 'higher_better' ? 'up' : 'down'
+                  scls = st === gd ? 'text-positive' : 'text-negative'
+                }
+                return (
+                  <div key={s.key} className="flex items-baseline gap-2 text-[10px]">
+                    <span className="text-text-tertiary w-14 shrink-0">{s.label}</span>
+                    <span className="font-mono text-text-secondary">{fmt(s.a)}</span>
+                    <span className="text-text-tertiary">→</span>
+                    <span className="font-mono text-text-primary">{fmt(s.b)}</span>
+                    {d != null && (
+                      <span className={`ml-auto font-mono ${scls}`}>
+                        {st === 'up' && '▲'}{st === 'down' && '▼'}{st === 'flat' && '—'}
+                        {d > 0 ? '+' : ''}{d.toFixed(1)}%
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </>
+      )}
     </div>
   )
 }
@@ -1004,6 +1123,96 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '…' : s
 }
 
+// ─── 多轮维度解析 ─────────────────────────────────────────────────────────
+// 多轮评估的 score key 形如 `<base>.turn<N>` / `<base>.conversation`；单轮维度
+// 无后缀。对比页把逐轮键按 base 聚合，避免 26+ 个维度把卡片区/图表撑爆。
+
+type DimKind = 'turn' | 'conversation' | 'plain'
+
+interface ParsedDim {
+  base: string
+  turn: number | null   // turn 序号；conversation / plain 为 null
+  kind: DimKind
+}
+
+function parseDimKey(key: string): ParsedDim {
+  const mTurn = key.match(/^(.*)\.turn(\d+)$/)
+  if (mTurn) return { base: mTurn[1], turn: Number(mTurn[2]), kind: 'turn' }
+  const mConv = key.match(/^(.*)\.conversation$/)
+  if (mConv) return { base: mConv[1], turn: null, kind: 'conversation' }
+  return { base: key, turn: null, kind: 'plain' }
+}
+
+function meanOf(vals: Array<number | null | undefined>): number | null {
+  const nums = vals.filter((v): v is number => typeof v === 'number')
+  if (nums.length === 0) return null
+  return nums.reduce((s, v) => s + v, 0) / nums.length
+}
+
+interface DimGroupSub {
+  key: string
+  label: string          // 「第N轮」/「会话级」/ 维度名（plain）
+  kind: DimKind
+  turn: number | null
+  a: number | null
+  b: number | null
+}
+
+interface DimGroup {
+  base: string
+  isMultiTurn: boolean
+  turnCount: number
+  aggA: number | null
+  aggB: number | null
+  subs: DimGroupSub[]
+}
+
+function sortSubs<T extends { kind: DimKind; turn: number | null }>(a: T, b: T): number {
+  // conversation 级排最后；turn 按序号升序
+  if (a.kind === 'conversation' && b.kind !== 'conversation') return 1
+  if (b.kind === 'conversation' && a.kind !== 'conversation') return -1
+  return (a.turn ?? 0) - (b.turn ?? 0)
+}
+
+function buildDimGroups(
+  dimsA: Record<string, number>,
+  dimsB: Record<string, number>,
+): DimGroup[] {
+  const allKeys = Array.from(new Set([...Object.keys(dimsA), ...Object.keys(dimsB)]))
+  const byBase = new Map<string, ParsedDim[]>()
+  for (const k of allKeys) {
+    const p = parseDimKey(k)
+    const arr = byBase.get(p.base) ?? []
+    arr.push(p)
+    byBase.set(p.base, arr)
+  }
+  const groups: DimGroup[] = []
+  for (const [base, parsed] of byBase) {
+    const isMultiTurn = parsed.some(p => p.kind !== 'plain')
+    const turnCount = parsed.filter(p => p.kind === 'turn').length
+    const baseLabel = getScoreMeta(base).label
+    const subs: DimGroupSub[] = parsed
+      .slice()
+      .sort(sortSubs)
+      .map(p => ({
+        key: p.kind === 'turn' ? `${base}.turn${p.turn}` : p.kind === 'conversation' ? `${base}.conversation` : base,
+        label: p.kind === 'turn' ? `第 ${p.turn} 轮` : p.kind === 'conversation' ? '会话级' : baseLabel,
+        kind: p.kind,
+        turn: p.turn,
+        a: dimsA[p.kind === 'turn' ? `${base}.turn${p.turn}` : p.kind === 'conversation' ? `${base}.conversation` : base] ?? null,
+        b: dimsB[p.kind === 'turn' ? `${base}.turn${p.turn}` : p.kind === 'conversation' ? `${base}.conversation` : base] ?? null,
+      }))
+    const aggA = meanOf(subs.map(s => s.a))
+    const aggB = meanOf(subs.map(s => s.b))
+    groups.push({ base, isMultiTurn, turnCount, aggA, aggB, subs })
+  }
+  // 单轮维度排前，多轮维度排后；同类按 base 名排序
+  return groups.sort((x, y) => {
+    if (x.isMultiTurn !== y.isMultiTurn) return x.isMultiTurn ? 1 : -1
+    return x.base.localeCompare(y.base)
+  })
+}
+
 function buildPassRateChart(
   runs: EvalRunDetail[],
   statsByRun: Record<string, RunStats>,
@@ -1017,7 +1226,9 @@ function buildPassRateChart(
     .filter((x): x is { run: string; passRate: number } => x !== null)
 }
 
-function buildDimensionChart(
+// 聚合视图：多轮维度按 base 折叠成一根柱（跨轮 + 会话级取均值），单轮维度原样。
+// x 轴 = base 维度名，每个 run 一根柱。把 26+ 个逐轮键压到几个 base。
+function buildDimensionAggChart(
   runs: EvalRunDetail[],
   statsByRun: Record<string, RunStats>,
 ): {
@@ -1025,23 +1236,78 @@ function buildDimensionChart(
   runKeys: string[]
 } {
   const runKeys: string[] = []
-  const seen = new Set<string>()
-  const byDim: Record<string, Record<string, number>> = {}
+  // base -> runKey -> { sum, count }
+  const byBase = new Map<string, Map<string, { sum: number; count: number }>>()
+  const baseOrder: string[] = []
   for (const r of runs) {
     const key = runLabel(r)
     runKeys.push(key)
     const dims = statsByRun[r.id]?.dimensionAverages ?? {}
     for (const [d, v] of Object.entries(dims)) {
-      seen.add(d)
-      byDim[d] ||= {}
-      byDim[d][key] = Math.round(v * 100) / 100
+      if (typeof v !== 'number') continue
+      const { base } = parseDimKey(d)
+      if (!byBase.has(base)) { byBase.set(base, new Map()); baseOrder.push(base) }
+      const inner = byBase.get(base)!
+      const acc = inner.get(key) ?? { sum: 0, count: 0 }
+      acc.sum += v
+      acc.count += 1
+      inner.set(key, acc)
     }
   }
-  const data = Array.from(seen).map(d => ({
-    dimension: d,
-    ...byDim[d],
-  }))
+  const data = baseOrder.map(base => {
+    const row: Record<string, number | string> = { dimension: getScoreMeta(base).label }
+    const inner = byBase.get(base)!
+    for (const [runKey, { sum, count }] of inner) {
+      if (count > 0) row[runKey] = Math.round((sum / count) * 100) / 100
+    }
+    return row
+  })
   return { data, runKeys }
+}
+
+// 逐轮趋势视图：折线图。x 轴 = 轮次；每条线 = 一个 run × 一个 base 维度。
+// 只纳入带 turn 的多轮维度；会话级 / 单轮维度不进折线（前者在卡片、后者无轮次）。
+function buildTurnTrendChart(
+  runs: EvalRunDetail[],
+  statsByRun: Record<string, RunStats>,
+): {
+  data: Array<Record<string, number | string>>
+  series: Array<{ key: string; label: string }>
+} {
+  const turnsSeen = new Set<number>()
+  const series: Array<{ key: string; label: string }> = []
+  const seriesSeen = new Set<string>()
+  // seriesKey -> turn -> value
+  const values = new Map<string, Map<number, number>>()
+
+  for (const r of runs) {
+    const runKey = runLabel(r)
+    const dims = statsByRun[r.id]?.dimensionAverages ?? {}
+    for (const [d, v] of Object.entries(dims)) {
+      if (typeof v !== 'number') continue
+      const p = parseDimKey(d)
+      if (p.kind !== 'turn' || p.turn == null) continue
+      turnsSeen.add(p.turn)
+      const seriesKey = `${r.id}::${p.base}`
+      if (!seriesSeen.has(seriesKey)) {
+        seriesSeen.add(seriesKey)
+        series.push({ key: seriesKey, label: `${runKey} · ${getScoreMeta(p.base).label}` })
+      }
+      if (!values.has(seriesKey)) values.set(seriesKey, new Map())
+      values.get(seriesKey)!.set(p.turn, Math.round(v * 100) / 100)
+    }
+  }
+
+  const turns = Array.from(turnsSeen).sort((a, b) => a - b)
+  const data = turns.map(t => {
+    const row: Record<string, number | string> = { turnLabel: `第${t}轮` }
+    for (const s of series) {
+      const val = values.get(s.key)?.get(t)
+      if (val != null) row[s.key] = val
+    }
+    return row
+  })
+  return { data, series }
 }
 
 function buildCostChart(
