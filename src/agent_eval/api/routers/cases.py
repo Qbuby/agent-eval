@@ -9,11 +9,7 @@ from sqlalchemy import func, select
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
 from agent_eval.api.schemas import AddCasesRequest, BatchDeleteRequest, TestCaseInput
-from agent_eval.auth.dependencies import (
-    ROLE_ADMIN,
-    require_internal,
-    require_role,
-)
+from agent_eval.auth.dependencies import require_internal
 from agent_eval.data.benchmark_import import (
     iter_upload_rows,
     parse_conversations,
@@ -111,7 +107,7 @@ async def update_case(
     return {"updated": example_id}
 
 
-@router.delete("/api/cases/{example_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
+@router.delete("/api/cases/{example_id}")
 async def delete_case(
     example_id: str,
     mgr: DatasetManager = Depends(get_manager),
@@ -121,7 +117,7 @@ async def delete_case(
     return {"deleted": example_id}
 
 
-@router.post("/api/cases/batch-delete", dependencies=[Depends(require_role(ROLE_ADMIN))])
+@router.post("/api/cases/batch-delete")
 async def batch_delete_cases(
     req: BatchDeleteRequest,
     mgr: DatasetManager = Depends(get_manager),
@@ -208,7 +204,6 @@ def _parse_column_map(raw: str | None) -> dict[str, str] | None:
 
 @router.post(
     "/api/datasets/{name}/cases/import-conversations/inspect",
-    dependencies=[Depends(require_role(ROLE_ADMIN))],
 )
 async def inspect_conversation_file(
     name: str,
@@ -264,7 +259,7 @@ async def inspect_conversation_file(
     }
 
 
-@router.post("/api/datasets/{name}/cases/import-conversations/preview", dependencies=[Depends(require_role(ROLE_ADMIN))])
+@router.post("/api/datasets/{name}/cases/import-conversations/preview")
 async def preview_conversations(
     name: str,
     file: UploadFile = File(...),
@@ -326,7 +321,6 @@ async def preview_conversations(
 
 @router.post(
     "/api/datasets/{name}/cases/import-conversations",
-    dependencies=[Depends(require_role(ROLE_ADMIN))],
 )
 async def import_conversations(
     name: str,
@@ -509,7 +503,7 @@ async def list_conv_categories(name: str):
         return [_conv_cat_dict(r) for r in result.scalars().all()]
 
 
-@router.post("/api/datasets/{name}/categories", dependencies=[Depends(require_role(ROLE_ADMIN))])
+@router.post("/api/datasets/{name}/categories")
 async def create_conv_category(name: str, req: CreateConvCategoryRequest):
     """新建类别。幂等：同 (dataset_name, name) 已存在则直接返回现有行。"""
     cat_name = (req.name or "").strip()
@@ -535,7 +529,7 @@ async def create_conv_category(name: str, req: CreateConvCategoryRequest):
     return _conv_cat_dict(row)
 
 
-@router.put("/api/datasets/categories/{category_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
+@router.put("/api/datasets/categories/{category_id}")
 async def update_conv_category(
     category_id: str,
     req: UpdateConvCategoryRequest,
@@ -594,7 +588,7 @@ async def update_conv_category(
     return {**_conv_cat_dict(row), "synced_cases": synced}
 
 
-@router.delete("/api/datasets/categories/{category_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
+@router.delete("/api/datasets/categories/{category_id}")
 async def delete_conv_category(category_id: str, mgr: DatasetManager = Depends(get_manager)):
     """删除类别。保护性拒删：该类别下仍有样例则 409，要求先移除/改类。"""
     async with async_session_factory() as session:

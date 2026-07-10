@@ -53,6 +53,9 @@ export default function ConversationDatasetDetailPage() {
   const navigate = useNavigate()
   const confirm = useConfirm()
   const toast = useToast()
+  // 内部角色（admin | user）均可写：新建/编辑/导入/删样例/类别管理全放开，用 canWrite。
+  // 唯一例外「删除整个数据集」（本页底部按钮）仍限 admin，单独用 isAdmin gate。
+  const canWrite = useAuthStore((s) => s.canWrite)()
   const isAdmin = useAuthStore((s) => s.isAdmin)()
   const reactId = useId()
   const importFileId = `${reactId}-conv-import-file`
@@ -299,7 +302,7 @@ export default function ConversationDatasetDetailPage() {
           <option value="">全部类别</option>
           {(categories ?? []).map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
         </select>
-        {isAdmin && categoryFilter && (() => {
+        {canWrite && categoryFilter && (() => {
           const cat = (categories ?? []).find(c => c.name === categoryFilter)
           if (!cat) return null
           return (
@@ -325,11 +328,11 @@ export default function ConversationDatasetDetailPage() {
             </>
           )
         })()}
-        {isAdmin && (
+        {canWrite && (
           <button className="text-action text-[12px]" onClick={() => setShowAddCategory(true)}>+ 类别</button>
         )}
         <div className="flex-1" />
-        {isAdmin && selectedIds.size > 0 && (
+        {canWrite && selectedIds.size > 0 && (
           <Button
             variant="danger"
             size="sm"
@@ -355,7 +358,7 @@ export default function ConversationDatasetDetailPage() {
             }
           }}
         />
-        {isAdmin && (
+        {canWrite && (
           <>
             <Button variant="secondary" size="sm" onClick={() => setShowImport(true)}>
               导入对话
@@ -363,22 +366,25 @@ export default function ConversationDatasetDetailPage() {
             <Button variant="primary" size="sm" onClick={openNew}>
               新建对话样例
             </Button>
-            <Button
-              variant="secondary"
-              size="sm"
-              loading={deleteDsMutation.isPending}
-              onClick={async () => {
-                const ok = await confirm({
-                  title: '删除数据集',
-                  description: `确定删除对话数据集「${name}」及其全部样例？此操作不可撤销。`,
-                  confirmText: '删除', danger: true,
-                })
-                if (ok) deleteDsMutation.mutate()
-              }}
-            >
-              删除数据集
-            </Button>
           </>
+        )}
+        {/* 删除整个数据集：唯一保留 admin 专属的写操作（内部 user 不可）。 */}
+        {isAdmin && (
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={deleteDsMutation.isPending}
+            onClick={async () => {
+              const ok = await confirm({
+                title: '删除数据集',
+                description: `确定删除对话数据集「${name}」及其全部样例？此操作不可撤销。`,
+                confirmText: '删除', danger: true,
+              })
+              if (ok) deleteDsMutation.mutate()
+            }}
+          >
+            删除数据集
+          </Button>
         )}
       </div>
 
@@ -386,7 +392,7 @@ export default function ConversationDatasetDetailPage() {
         <table className="table-base">
           <thead>
             <tr>
-              {isAdmin && (
+              {canWrite && (
                 <th className="w-10 text-center">
                   <input
                     type="checkbox"
@@ -413,7 +419,7 @@ export default function ConversationDatasetDetailPage() {
               const userTurns = (c.input_messages ?? []).filter(m => m.role === 'user').length
               return (
                 <tr key={c.id} className="group">
-                  {isAdmin && (
+                  {canWrite && (
                     <td className="text-center">
                       <input
                         type="checkbox"
@@ -448,8 +454,8 @@ export default function ConversationDatasetDetailPage() {
                   <td className="text-right">
                     <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
                       <button onClick={() => setViewing(c)} className="text-action">查看</button>
-                      {isAdmin && <button onClick={() => openEdit(c)} className="text-action">编辑</button>}
-                      {isAdmin && (
+                      {canWrite && <button onClick={() => openEdit(c)} className="text-action">编辑</button>}
+                      {canWrite && (
                       <button
                         onClick={async () => {
                           const ok = await confirm({
@@ -478,7 +484,7 @@ export default function ConversationDatasetDetailPage() {
         </table>
         {cases.length === 0 && !isLoading && (
           <div className="empty-state">
-            {isAdmin ? '暂无多轮对话样例。点击「新建对话样例」或「导入对话」创建。' : '暂无多轮对话样例。'}
+            {canWrite ? '暂无多轮对话样例。点击「新建对话样例」或「导入对话」创建。' : '暂无多轮对话样例。'}
             {allCases.length > 0 && '（本页有单轮样例,请到「备选数据集」管理）'}
           </div>
         )}

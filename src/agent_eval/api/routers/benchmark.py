@@ -9,11 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
-from agent_eval.auth.dependencies import (
-    ROLE_ADMIN,
-    require_internal,
-    require_role,
-)
+from agent_eval.auth.dependencies import require_internal
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
     BenchmarkCaseRow, BenchmarkVersionRow, CandidateCaseRow, CategoryRow,
@@ -25,8 +21,8 @@ from agent_eval.data.benchmark_import import (
     parse_upload_file, resolve_extra_fields, resolve_question_answer,
 )
 
-# Router-level login gate: every endpoint requires an authenticated user.
-# Preserves the auth.enabled bypass; destructive case deletion requires admin.
+# Router-level login gate: every endpoint requires an authenticated internal
+# user (admin|user). Preserves the auth.enabled bypass.
 router = APIRouter(
     prefix="/api/benchmark",
     tags=["benchmark"],
@@ -200,7 +196,7 @@ async def update_benchmark_case(case_id: str, req: BenchmarkCaseUpdate):
     return {"updated": case_id}
 
 
-@router.delete("/cases/{case_id}", dependencies=[Depends(require_role(ROLE_ADMIN))])
+@router.delete("/cases/{case_id}")
 async def delete_benchmark_case(case_id: str):
     async with async_session_factory() as session:
         result = await session.execute(select(BenchmarkCaseRow).where(BenchmarkCaseRow.id == case_id))
