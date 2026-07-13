@@ -84,6 +84,10 @@ export default function EvaluationRunDetailPage() {
   const langfuseHost = deriveLangfuseHost(run)
 
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
+  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，仅指执行异常）+ 分数低于阈值（阈值 + 指定维度）。
+  const [abnormalMode, setAbnormalMode] = useState<'all' | 'only' | 'exclude'>('all')
+  const [threshold, setThreshold] = useState('')
+  const [thresholdDim, setThresholdDim] = useState('')
 
   useEffect(() => {
     if (!run) return
@@ -119,7 +123,20 @@ export default function EvaluationRunDetailPage() {
       buckets: string[]; by_dimension: Record<string, number[]>
     },
   )
-  const items = resultsQuery.data?.items ?? []
+  const allItems = resultsQuery.data?.items ?? []
+  // 供「低分维度」下拉：折叠逐轮后的评估器维度全集（跨所有样例）。
+  const filterDims = collectFilterDims(allItems)
+  // 执行异常状态集合（仅执行异常，不含 fail —— fail 是判分未过而非跑挂）。
+  const thr = threshold.trim() === '' ? null : Number(threshold)
+  const thrValid = thr != null && !Number.isNaN(thr)
+  const items = allItems.filter((r: EvalResultRow) => {
+    const isAbnormal = ABNORMAL_STATUSES.has(r.status)
+    if (abnormalMode === 'only' && !isAbnormal) return false
+    if (abnormalMode === 'exclude' && isAbnormal) return false
+    if (thrValid && !rowBelowThreshold(r, thr, thresholdDim)) return false
+    return true
+  })
+  const filterActive = abnormalMode !== 'all' || thrValid
   const latencyBars = buildLatencyBuckets(items)
   const radarData = buildRadarData(dimAvg)
   const selectedRow = selectedRowId
@@ -422,7 +439,10 @@ export default function EvaluationRunDetailPage() {
 
       <section>
         <div className="section-row">
-          <div className="page-eyebrow">样例结果 · 共 {resultsQuery.data?.total ?? 0} 条</div>
+          <div className="page-eyebrow">
+            样例结果 · 共 {resultsQuery.data?.total ?? 0} 条
+            {filterActive && <span className="text-text-tertiary">（筛出 {items.length}）</span>}
+          </div>
           {langfuseHost && run.summary_scores?.langfuse_dataset && (
             <a
               href={`${langfuseHost}/datasets`}
@@ -433,6 +453,65 @@ export default function EvaluationRunDetailPage() {
             </a>
           )}
         </div>
+
+        {/* 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常）+ 分数低于阈值（阈值 + 维度）。纯前端过滤当前已加载的样例。 */}
+        <div className="toolbar mb-2">
+          <div className="flex items-center gap-1.5 text-[12px]">
+            <span className="text-text-tertiary">异常样例</span>
+            <span className="text-[10px] text-text-tertiary">(error / 不可达 / 超时)</span>
+            <div className="inline-flex rounded-md border border-border overflow-hidden text-[11px]">
+              {([
+                ['all', '不筛'],
+                ['only', '仅异常'],
+                ['exclude', '排除异常'],
+              ] as const).map(([mode, label]) => (
+                <button
+                  key={mode}
+                  onClick={() => setAbnormalMode(mode)}
+                  className={`px-2.5 py-1 transition-colors ${
+                    abnormalMode === mode
+                      ? 'bg-accent/10 text-accent'
+                      : 'text-text-secondary hover:bg-fill/5'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center gap-1.5 text-[12px]">
+            <span className="text-text-tertiary">分数低于</span>
+            <input
+              type="number"
+              step="0.05"
+              min="0"
+              max="1"
+              value={threshold}
+              onChange={e => setThreshold(e.target.value)}
+              placeholder="阈值"
+              className="input-sm w-[80px]"
+            />
+            <select
+              value={thresholdDim}
+              onChange={e => setThresholdDim(e.target.value)}
+              className="input-sm w-[160px]"
+            >
+              <option value="">任一维度</option>
+              {filterDims.map(d => (
+                <option key={d} value={d}>{getScoreMeta(d).label}</option>
+              ))}
+            </select>
+          </div>
+          {filterActive && (
+            <button
+              onClick={() => { setAbnormalMode('all'); setThreshold(''); setThresholdDim('') }}
+              className="text-action text-[11px]"
+            >
+              清除筛选
+            </button>
+          )}
+        </div>
+
         {exportError && (
           <div className="mb-2">
             <ErrorCard error={exportError} />
@@ -470,7 +549,9 @@ export default function EvaluationRunDetailPage() {
               ))}
               {items.length === 0 && !resultsQuery.isLoading && (
                 <tr><td colSpan={11} className="empty-state">
-                  {run.status === 'running' ? '还没产出样例结果…' : '没有样例结果'}
+                  {filterActive
+                    ? '没有符合筛选条件的样例。'
+                    : run.status === 'running' ? '还没产出样例结果…' : '没有样例结果'}
                 </td></tr>
               )}
             </tbody>
@@ -1496,6 +1577,38 @@ function collapseScoreKey(key: string): string {
   const idx = key.lastIndexOf('.')
   if (idx <= 0) return key
   return _TURN_SUFFIX.test(key.slice(idx + 1)) ? key.slice(0, idx) : key
+}
+
+// 「执行异常」状态：agent 跑挂 / 不可达 / 超时 / 报错。不含 fail —— fail 是判分
+// 未达合格线（跑通了但没答好），不是执行异常，快筛「异常样例」时不纳入。
+const ABNORMAL_STATUSES = new Set(['error', 'agent_unreachable', 'agent_timeout'])
+
+// 收集所有样例出现过的评估器维度（折叠 .turnN / .conversation），供「低分维度」
+// 下拉选择。按名排序，稳定展示。
+function collectFilterDims(items: EvalResultRow[]): string[] {
+  const set = new Set<string>()
+  for (const r of items) {
+    for (const k of Object.keys(r.scores ?? {})) {
+      if (typeof r.scores[k] === 'number') set.add(collapseScoreKey(k))
+    }
+  }
+  return Array.from(set).sort((a, b) => a.localeCompare(b))
+}
+
+// 判定一条样例是否「低于阈值」：dim 为空 = 任一维度低于阈值即命中；dim 指定
+// = 该维度（折叠逐轮后取其各轮/会话均值）低于阈值。无该维度分数的样例不命中。
+function rowBelowThreshold(row: EvalResultRow, thr: number, dim: string): boolean {
+  const entries = Object.entries(row.scores ?? {}).filter(
+    ([, v]) => typeof v === 'number',
+  ) as Array<[string, number]>
+  if (entries.length === 0) return false
+  if (!dim) {
+    return entries.some(([, v]) => v < thr)
+  }
+  const vals = entries.filter(([k]) => collapseScoreKey(k) === dim).map(([, v]) => v)
+  if (vals.length === 0) return false
+  const avg = vals.reduce((s, v) => s + v, 0) / vals.length
+  return avg < thr
 }
 
 // 把轮次级维度均分折叠回评估器级：同一评估器的各轮/会话分数求（按 count 加权的）

@@ -715,6 +715,29 @@ function SampleAlignmentSection({
 }) {
   const [search, setSearch] = useState('')
   const [diffOnly, setDiffOnly] = useState(false)
+  // 交叉对齐：仅保留所有 run 都运行过的样例（每个 run 都有该样例的结果行），
+  // 排除「某次未运行」的样例，让对比只落在可比的公共子集上。
+  const [crossOnly, setCrossOnly] = useState(false)
+  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，任一 run 执行异常）+ 分数低于阈值（阈值 + 维度）。
+  const [abnormalMode, setAbnormalMode] = useState<'all' | 'only' | 'exclude'>('all')
+  const [threshold, setThreshold] = useState('')
+  const [thresholdDim, setThresholdDim] = useState('')
+
+  // 供「低分维度」下拉：跨所有 run、所有已对齐样例出现过的评估器维度全集。
+  const filterDims = useMemo(() => {
+    const set = new Set<string>()
+    for (const a of aligned) {
+      for (const row of Object.values(a.byRun)) {
+        for (const [k, v] of Object.entries(row?.scores ?? {})) {
+          if (typeof v === 'number') set.add(collapseCompareDim(k))
+        }
+      }
+    }
+    return Array.from(set).sort((x, y) => x.localeCompare(y))
+  }, [aligned])
+
+  const thr = threshold.trim() === '' ? null : Number(threshold)
+  const thrValid = thr != null && !Number.isNaN(thr)
 
   const filtered = useMemo(() => {
     let rows = aligned
@@ -725,8 +748,20 @@ function SampleAlignmentSection({
     if (diffOnly) {
       rows = rows.filter(r => sampleHasDifference(r, runs))
     }
+    if (abnormalMode === 'only') {
+      rows = rows.filter(r => alignedHasAbnormal(r, runs))
+    } else if (abnormalMode === 'exclude') {
+      rows = rows.filter(r => !alignedHasAbnormal(r, runs))
+    }
+    if (thrValid) {
+      rows = rows.filter(r => alignedBelowThreshold(r, runs, thr, thresholdDim))
+    }
+    if (crossOnly) {
+      // 交叉对齐：只保留所有 run 都运行过的样例，排除任一 run「未运行」的行。
+      rows = rows.filter(r => runs.every(run => r.byRun[run.id]))
+    }
     return rows
-  }, [aligned, search, diffOnly, runs])
+  }, [aligned, search, diffOnly, abnormalMode, thrValid, thr, thresholdDim, crossOnly, runs])
 
   const fullCoverage = aligned.filter(a => runs.every(r => a.byRun[r.id])).length
   const visibleAllSelected = filtered.length > 0 && filtered.every(r => selectedKeys.has(r.key))
@@ -784,12 +819,76 @@ function SampleAlignmentSection({
           />
           只看分数有差异的
         </label>
+        <label className="inline-flex items-center gap-1.5 text-[12px] cursor-pointer">
+          <input
+            type="checkbox"
+            checked={crossOnly}
+            onChange={e => setCrossOnly(e.target.checked)}
+            className="accent-accent"
+          />
+          仅交叉样例
+          <span className="text-[10px] text-text-tertiary">(所有 run 都运行过)</span>
+        </label>
+        <div className="flex items-center gap-1.5 text-[12px]">
+          <span className="text-text-tertiary">异常样例</span>
+          <span className="text-[10px] text-text-tertiary">(任一 run error/不可达/超时)</span>
+          <div className="inline-flex rounded-md border border-border overflow-hidden text-[11px]">
+            {([
+              ['all', '不筛'],
+              ['only', '仅异常'],
+              ['exclude', '排除异常'],
+            ] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                onClick={() => setAbnormalMode(mode)}
+                className={`px-2.5 py-1 transition-colors ${
+                  abnormalMode === mode
+                    ? 'bg-accent/10 text-accent'
+                    : 'text-text-secondary hover:bg-fill/5'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center gap-1.5 text-[12px]">
+          <span className="text-text-tertiary">分数低于</span>
+          <input
+            type="number"
+            step="0.05"
+            min="0"
+            max="1"
+            value={threshold}
+            onChange={e => setThreshold(e.target.value)}
+            placeholder="阈值"
+            className="input-sm w-[80px]"
+          />
+          <select
+            value={thresholdDim}
+            onChange={e => setThresholdDim(e.target.value)}
+            className="input-sm w-[150px]"
+          >
+            <option value="">任一维度</option>
+            {filterDims.map(d => (
+              <option key={d} value={d}>{getScoreMeta(d).label}</option>
+            ))}
+          </select>
+        </div>
         <span className="text-[11px] text-text-tertiary">
           共 {aligned.length} 组（{fullCoverage} 组全 run 覆盖） · 显示 {filtered.length}
           {selectedKeys.size > 0 && (
             <> · 已选 <span className="text-accent font-mono">{selectedKeys.size}</span></>
           )}
         </span>
+        {(abnormalMode !== 'all' || thrValid) && (
+          <button
+            onClick={() => { setAbnormalMode('all'); setThreshold(''); setThresholdDim('') }}
+            className="text-action text-[11px]"
+          >
+            清除快筛
+          </button>
+        )}
         {selectedKeys.size > 0 && (
           <button
             onClick={() => onSetSelected(new Set())}
@@ -933,6 +1032,43 @@ function sampleHasDifference(a: AlignedSample, runs: EvalRunDetail[]): boolean {
     if (Math.max(...vals) - Math.min(...vals) >= 0.01) return true
   }
   return false
+}
+
+// 「执行异常」状态：agent 跑挂 / 不可达 / 超时 / 报错。不含 fail —— fail 是判分
+// 未达合格线（跑通了但没答好），不是执行异常。
+const ABNORMAL_STATUSES = new Set(['error', 'agent_unreachable', 'agent_timeout'])
+
+// 折叠逐轮 score key（`<base>.turn<N>` / `<base>.conversation`）到评估器级 base。
+function collapseCompareDim(key: string): string {
+  return parseDimKey(key).base
+}
+
+// 对齐样例是否「异常」：任一 run 上该样例执行异常即命中。
+function alignedHasAbnormal(a: AlignedSample, runs: EvalRunDetail[]): boolean {
+  return runs.some(r => {
+    const row = a.byRun[r.id]
+    return row != null && ABNORMAL_STATUSES.has(row.status)
+  })
+}
+
+// 对齐样例是否「低于阈值」：任一 run 上该样例低于阈值即命中。dim 为空 = 任一维度
+// 低于阈值；dim 指定 = 该维度（折叠逐轮后取各轮/会话均值）低于阈值。
+function alignedBelowThreshold(
+  a: AlignedSample, runs: EvalRunDetail[], thr: number, dim: string,
+): boolean {
+  return runs.some(r => {
+    const row = a.byRun[r.id]
+    if (!row) return false
+    const entries = Object.entries(row.scores ?? {}).filter(
+      ([, v]) => typeof v === 'number',
+    ) as Array<[string, number]>
+    if (entries.length === 0) return false
+    if (!dim) return entries.some(([, v]) => v < thr)
+    const vals = entries.filter(([k]) => collapseCompareDim(k) === dim).map(([, v]) => v)
+    if (vals.length === 0) return false
+    const avg = vals.reduce((s, v) => s + v, 0) / vals.length
+    return avg < thr
+  })
 }
 
 
