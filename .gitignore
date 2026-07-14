@@ -44,3 +44,7 @@ deploy/seed/*.sql
 
 # Local IDE / tool config (not shared)
 .claude/
+
+# Local experiments — prompt tuning harness, dimension alignment drafts
+_prompt_tuning/
+scripts/_aligned/

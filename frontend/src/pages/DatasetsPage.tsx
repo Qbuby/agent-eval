@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { Button, useConfirm, useToast } from '@/components/ui'
 import { datasetsApi } from '@/services'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import { useAuthStore } from '@/stores/auth'
 import type { CreateDatasetRequest } from '@/types'
 
 export default function DatasetsPage() {
@@ -11,6 +12,8 @@ export default function DatasetsPage() {
   const navigate = useNavigate()
   const confirm = useConfirm()
   const toast = useToast()
+  // 「删除整个数据集」仅内部 admin 可见；内部 user 写操作全放开但不含删库。
+  const isAdmin = useAuthStore((s) => s.isAdmin)()
   const [deletingName, setDeletingName] = useState<string | null>(null)
   const [showCreate, setShowCreate] = useState(false)
   const [form, setForm] = useState<CreateDatasetRequest>({ name: '', description: '', source_project: '', dataset_type: 'candidate' })
@@ -167,33 +170,36 @@ export default function DatasetsPage() {
                 <span className="text-[12px] text-text-secondary truncate">{ds.description || '—'}</span>
               </div>
             </div>
-            <button
-              onClick={async (e) => {
-                e.preventDefault()
-                e.stopPropagation()
-                const ok = await confirm({
-                  title: '删除数据集',
-                  description: `确定删除数据集 "${ds.name}"？`,
-                  confirmText: '删除',
-                  danger: true,
-                })
-                if (!ok) return
-                setDeletingName(ds.name)
-                try {
-                  await deleteMutation.mutateAsync(ds.name)
-                  toast.success('数据集已删除')
-                } catch (err) {
-                  const norm = formatApiError(err, { fallbackTitle: '删除失败' })
-                  toast.error(toToastMessage(norm), '删除失败')
-                } finally {
-                  setDeletingName(null)
-                }
-              }}
-              disabled={deletingName === ds.name}
-              className="text-[11px] text-text-tertiary hover:text-negative active:opacity-80 transition-colors disabled:opacity-50"
-            >
-              {deletingName === ds.name ? '删除中…' : '删除'}
-            </button>
+            {/* 删除整个数据集：唯一保留 admin 专属的写操作（内部 user 不可）。 */}
+            {isAdmin && (
+              <button
+                onClick={async (e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  const ok = await confirm({
+                    title: '删除数据集',
+                    description: `确定删除数据集 "${ds.name}"？`,
+                    confirmText: '删除',
+                    danger: true,
+                  })
+                  if (!ok) return
+                  setDeletingName(ds.name)
+                  try {
+                    await deleteMutation.mutateAsync(ds.name)
+                    toast.success('数据集已删除')
+                  } catch (err) {
+                    const norm = formatApiError(err, { fallbackTitle: '删除失败' })
+                    toast.error(toToastMessage(norm), '删除失败')
+                  } finally {
+                    setDeletingName(null)
+                  }
+                }}
+                disabled={deletingName === ds.name}
+                className="text-[11px] text-text-tertiary hover:text-negative active:opacity-80 transition-colors disabled:opacity-50"
+              >
+                {deletingName === ds.name ? '删除中…' : '删除'}
+              </button>
+            )}
           </div>
         ))}
       </div>

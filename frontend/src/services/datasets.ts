@@ -24,9 +24,31 @@ export interface ConversationImportPreview {
     first_user: string
     has_assistant: boolean
     checkpoints: number
+    expected_answers: number
     goal: string
     action: 'new' | 'update'
   }[]
+}
+
+// 语义字段 → 源列名的映射。拍平多行布局（同 session_id 多行=多轮）下，用户可
+// 手动指定每个字段对应哪一列，覆盖别名自动识别。所有字段可选，缺失回退别名。
+export interface ConversationColumnMap {
+  question?: string        // 用户问句列（必需，缺失该行跳过）
+  answer?: string          // 助手回复列 → assistant 消息（存档实际回复）
+  expected_output?: string // 期望答案/标准答案列 → 该轮 expected_output
+  criteria?: string        // 评分点/检查点列 → 该轮 criteria
+  conversation_id?: string // 会话聚合键（如 session_id）
+  turn_no?: string         // 轮次序号列（排序用）
+  goal?: string            // 对话目标列
+  name?: string            // 对话名列
+}
+
+// 导入前的文件结构自省：列头 + 每列样例值 + 自动建议映射。
+export interface ConversationInspectResult {
+  columns: string[]
+  samples: Record<string, string[]>
+  suggested: ConversationColumnMap
+  is_structured: boolean  // true=行内已带对话数组（布局A/B），无需列映射
 }
 
 export const datasetsApi = {
@@ -79,10 +101,23 @@ export const datasetsApi = {
   addCases(name: string, data: AddCasesRequest) {
     return api.post<{ added: number; ids: string[] }>(`/datasets/${name}/cases`, data)
   },
+  // 三步式导入第一步：自省文件列结构，返回列头/样例/建议映射（不写库）。
+  inspectConversationFile(name: string, file: File) {
+    const form = new FormData()
+    form.append('file', file)
+    return api.post<ConversationInspectResult>(
+      `/datasets/${name}/cases/import-conversations/inspect`,
+      form,
+      { headers: { 'Content-Type': 'multipart/form-data' } },
+    )
+  },
   importConversations(
     name: string,
     file: File,
-    opts?: { split?: string; messagesColumn?: string; goalColumn?: string; category?: string },
+    opts?: {
+      split?: string; messagesColumn?: string; goalColumn?: string;
+      category?: string; columnMap?: ConversationColumnMap
+    },
   ) {
     const form = new FormData()
     form.append('file', file)
@@ -91,6 +126,8 @@ export const datasetsApi = {
     if (opts?.messagesColumn) params.messages_column = opts.messagesColumn
     if (opts?.goalColumn) params.goal_column = opts.goalColumn
     if (opts?.category) params.category = opts.category
+    if (opts?.columnMap && Object.keys(opts.columnMap).length > 0)
+      params.column_map = JSON.stringify(opts.columnMap)
     return api.post<{ added: number; updated: number; skipped: number; ids: string[] }>(
       `/datasets/${name}/cases/import-conversations`,
       form,
@@ -101,7 +138,10 @@ export const datasetsApi = {
   previewConversations(
     name: string,
     file: File,
-    opts?: { messagesColumn?: string; goalColumn?: string; category?: string },
+    opts?: {
+      messagesColumn?: string; goalColumn?: string;
+      category?: string; columnMap?: ConversationColumnMap
+    },
   ) {
     const form = new FormData()
     form.append('file', file)
@@ -109,6 +149,8 @@ export const datasetsApi = {
     if (opts?.messagesColumn) params.messages_column = opts.messagesColumn
     if (opts?.goalColumn) params.goal_column = opts.goalColumn
     if (opts?.category) params.category = opts.category
+    if (opts?.columnMap && Object.keys(opts.columnMap).length > 0)
+      params.column_map = JSON.stringify(opts.columnMap)
     return api.post<ConversationImportPreview>(
       `/datasets/${name}/cases/import-conversations/preview`,
       form,
