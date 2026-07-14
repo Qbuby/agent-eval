@@ -549,9 +549,10 @@ def _expand_qa_turns(turns: list) -> tuple[list[dict[str, str]], list[dict[str, 
     交替后即 0,2,4...）。
 
     注意：answer 是评测时 agent 实际「生成的答案」（如 multichat_results 输出），
-    而非预设的标准答案，故只作 assistant 消息存档、**不写入 expected_output**
-    ——期望答案留空，供人工后补。评测回放只重放 user 轮（见 multiturn
-    ._user_turn_indices），夹带的 assistant 历史不会被当成输入重放。
+    而非预设的标准答案，故只作 assistant 消息存档、**不写入 expected_output**。
+    期望答案单独从 _EXPECTED_ANSWER_KEYS（标准答案/参考答案/期望输出…）取，写入
+    该轮 turn_expectation.expected_output，两个键集互不覆盖。评测回放只重放 user
+    轮（见 multiturn._user_turn_indices），夹带的 assistant 历史不会被当成输入重放。
     """
     messages: list[dict[str, str]] = []
     turn_expectations: list[dict[str, Any]] = []
@@ -569,8 +570,14 @@ def _expand_qa_turns(turns: list) -> tuple[list[dict[str, str]], list[dict[str, 
             messages.append({"role": "assistant", "content": str(a).strip()})
 
         criteria = _checkpoints_to_list(_first_value(t, low, _CHECKPOINT_KEYS))
-        if criteria:
-            turn_expectations.append({"turn_index": idx, "criteria": criteria})
+        expected = _first_value(t, low, _EXPECTED_ANSWER_KEYS)
+        if criteria or expected not in (None, ""):
+            te: dict[str, Any] = {"turn_index": idx}
+            if criteria:
+                te["criteria"] = criteria
+            if expected not in (None, ""):
+                te["expected_output"] = str(expected).strip()
+            turn_expectations.append(te)
     return messages, turn_expectations
 
 

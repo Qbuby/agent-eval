@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any
 
 from agent_eval.evaluation.agent_adapter import AgentResponse
@@ -192,6 +193,121 @@ class CaseGenerator:
             case.parent_case_id = source_case.id
             if tags:
                 case.tags.extend(tags)
+        return cases
+
+    async def fill_expected_from_agent(
+        self,
+        cases: list[TestCase],
+        *,
+        agent_cfg: dict[str, Any],
+        http_client: Any = None,
+        concurrency: int = 3,
+    ) -> list[TestCase]:
+        """Run each case's question(s) against the agent-under-test and store the
+        agent's *actual* reply as the expected output — turning ``expected_output``
+        from "a description of the right answer" into "the answer the agent gives".
+
+        - Single-turn (one user message): invoke once, overwrite ``expected_output``.
+        - Multi-turn (multiple user messages): replay the whole conversation once
+          (server-memory agents keep context via a fixed thread_id) and write each
+          turn's assistant reply back into the matching ``turn_expectations[i]``
+          (aligned by ``turn_index``); also fill the case-level ``expected_output``
+          with the final turn's reply so single-value consumers still see something.
+
+        Empty / failed replies never overwrite an existing value (guards against a
+        truncated stream silently blanking a good answer). Cases are processed
+        concurrently (bounded by ``concurrency``). Mutates and returns ``cases``.
+        """
+        import asyncio
+
+        from agent_eval.evaluation import multiturn
+        from agent_eval.evaluation.langfuse_runner import (
+            _invoke_with_retry,
+            _make_adapter,
+            _retry_policy_from_cfg,
+        )
+
+        if not cases:
+            return cases
+
+        agent_type = (agent_cfg or {}).get("type", "sse")
+        retry_policy = _retry_policy_from_cfg(agent_cfg)
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def _invoke(adp: Any, msgs: list[dict[str, Any]]):
+            return await _invoke_with_retry(adp, msgs, policy=retry_policy)
+
+        def _user_msgs(case: TestCase) -> list[dict[str, Any]]:
+            return [
+                m for m in (case.input_messages or [])
+                if isinstance(m, dict) and m.get("role") == "user"
+            ]
+
+        async def _fill_single(case: TestCase) -> None:
+            users = _user_msgs(case)
+            if not users:
+                return
+            # Reuse self.adapter (already open, thread_id=None) for single-turn;
+            # each single-turn invoke is independent so no context bleed.
+            question = str(users[-1].get("content", "")).strip()
+            if not question:
+                return
+            try:
+                resp, _ = await _invoke(self.adapter, [{"role": "user", "content": question}])
+            except Exception as e:  # noqa: BLE001 — one bad case shouldn't sink the batch
+                logger.warning("fill_expected single-turn failed for %s: %s", case.name, e)
+                return
+            answer = (resp.content or "").strip()
+            if answer:
+                case.expected_output = answer
+
+        async def _fill_multi(case: TestCase) -> None:
+            # Multi-turn needs a *fresh* adapter with a stable thread_id so the
+            # server-side agent keeps conversation context across turns.
+            thread_id = f"gen-{(case.name or 'conv')[:24]}-{uuid.uuid4().hex[:8]}"
+            adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+            try:
+                replay = await multiturn.replay_conversation(
+                    adapter=adapter,
+                    agent_type=agent_type,
+                    input_messages=case.input_messages or [],
+                    invoke=_invoke,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("fill_expected multi-turn failed for %s: %s", case.name, e)
+                return
+            finally:
+                try:
+                    await adapter.close()
+                except Exception:
+                    pass
+
+            turns = replay.get("turns") or []
+            # Map input_messages index -> assistant reply for this turn.
+            by_index = {
+                t["turn_index"]: (t.get("assistant") or "").strip()
+                for t in turns
+                if isinstance(t, dict) and t.get("turn_index") is not None
+            }
+            # Per-turn backfill: align turn_expectations[i].turn_index to replay.
+            for te in (case.turn_expectations or []):
+                ans = by_index.get(te.turn_index)
+                if ans:
+                    te.expected_output = ans
+            # Case-level expected_output = last turn's reply (single-value view).
+            if turns:
+                last = (turns[-1].get("assistant") or "").strip()
+                if last:
+                    case.expected_output = last
+
+        async def _run(case: TestCase) -> None:
+            async with sem:
+                if len(_user_msgs(case)) > 1:
+                    await _fill_multi(case)
+                else:
+                    await _fill_single(case)
+
+        await asyncio.gather(*(_run(c) for c in cases))
         return cases
 
     async def generate_from_failures(

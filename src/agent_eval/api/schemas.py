@@ -126,6 +126,15 @@ class GenerateScenarioRequest(BaseModel):
     count: int = 5
     context: str = ""
     dry_run: bool = True
+    agent_endpoint_url: str | None = Field(
+        default=None,
+        description="被测 agent 端点 URL（可选）。留空则用 target_agent.endpoint_url 默认；"
+        "传入时须为已配置的 endpoint 预设之一，api_key/timeout/type 仍取共享 target_agent.* 配置",
+    )
+    run_agent: bool = Field(
+        default=False,
+        description="生成后是否让被测 agent 实跑一遍问题、用真实回答覆盖 expected_output（多轮逐轮回填）。默认关，开启会成倍增加耗时。",
+    )
 
 
 class GenerateMutateRequest(BaseModel):
@@ -137,6 +146,14 @@ class GenerateMutateRequest(BaseModel):
     tags: list[str] = []
     split: str | None = None
     dry_run: bool = False
+    agent_endpoint_url: str | None = Field(
+        default=None,
+        description="被测 agent 端点 URL（可选）。留空则用 target_agent.endpoint_url 默认",
+    )
+    run_agent: bool = Field(
+        default=False,
+        description="生成后是否让被测 agent 实跑一遍问题、用真实回答覆盖 expected_output（多轮逐轮回填）。默认关，开启会成倍增加耗时。",
+    )
 
 
 class ListRunsRequest(BaseModel):
@@ -271,6 +288,9 @@ class StartEvalRequest(BaseModel):
     # traces by (name, time-window), matches each by question text, and
     # backfills test_results.langfuse_trace_id. Leave blank to skip.
     langfuse_trace_name: str | None = None
+    # 飞书完成通知目标 open_id 列表（机器人触发评估时注入触发者；与全局固定
+    # 接收者合并去重）。HTTP/UI 触发通常留空——UI 用户无飞书身份。
+    notify_open_ids: list[str] = Field(default_factory=list)
 
 
 class EvalRunSummary(BaseModel):
@@ -418,6 +438,10 @@ ALLOWED_PROVIDER_TYPES = (
     "deepseek",
     "azure",
     "custom",
+    # agent：不调 LLM API，而是直接 SSE 连一个 agent 端点（典型是被测的
+    # LangGraph v2 目标 agent），把 agent 的回复当作 judge 输出再解析出分。
+    # base_url 存 SSE URL；extra_config 可放 mode/language/headers/payload_template。
+    "agent",
 )
 
 

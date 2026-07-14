@@ -205,6 +205,13 @@ export const candidatesApi = {
   create(data: { question: string; answer?: string; project_id?: string; dataset_name?: string; category?: string; tags?: string[]; source?: string }) {
     return api.post<{ id: string; status: string }>('/candidates', data)
   },
+  // 批量创建备选样例（生成页在 candidate 数据集上「确认添加」走这里，落 candidate_cases）。
+  batchCreate(data: {
+    dataset_name: string
+    cases: { question: string; answer?: string; category?: string; tags?: string[]; source?: string }[]
+  }) {
+    return api.post<{ added: number; ids: string[] }>('/candidates/batch', data)
+  },
   categories(params?: { dataset_name?: string; project_id?: string }) {
     return api.get<{ categories: string[] }>('/candidates/categories', { params })
   },

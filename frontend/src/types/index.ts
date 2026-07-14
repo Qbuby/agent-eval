@@ -108,6 +108,8 @@ export interface GenerateScenarioRequest {
   count?: number
   context?: string
   dry_run?: boolean
+  agent_endpoint_url?: string
+  run_agent?: boolean
 }
 
 export interface GenerateMutateRequest {
@@ -119,6 +121,8 @@ export interface GenerateMutateRequest {
   tags?: string[]
   split?: string
   dry_run?: boolean
+  agent_endpoint_url?: string
+  run_agent?: boolean
 }
 
 export interface ListRunsRequest {

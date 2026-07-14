@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
+from agent_eval.governance.helpers import log_audit
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
 from agent_eval.auth.dependencies import (
     ROLE_ADMIN,
@@ -43,6 +44,27 @@ class CandidateCreate(BaseModel):
     tags: list[str] = []
     category: str | None = None  # 自由文本类别名
     source: str = "manual"
+
+
+class CandidateBatchItem(BaseModel):
+    # 单条备选样例（批量入库用）。字段与 CandidateCreate 同构，但 dataset_name
+    # 统一在批量请求顶层给定，逐条不再重复。
+    question: str
+    answer: str | None = None
+    key_points: list[str] | None = None
+    negative_points: list[str] | None = None
+    tags: list[str] = []
+    category: str | None = None
+    source: str = "generated"
+
+
+class CandidateBatchCreate(BaseModel):
+    # 批量创建备选样例：整批共用 dataset_name / source，cases 逐条给内容。
+    # 生成页「确认添加」在 candidate 数据集上走此端点（question=首条 user 消息、
+    # answer=expected_output、status 由有无 answer 决定）。
+    dataset_name: str
+    source: str = "generated"
+    cases: list[CandidateBatchItem]
 
 
 class CandidateUpdate(BaseModel):
@@ -197,6 +219,48 @@ async def create_candidate(req: CandidateCreate):
         await session.commit()
         await session.refresh(row)
     return {"id": str(row.id), "status": status}
+
+
+@router.post("/batch")
+async def create_candidates_batch(req: CandidateBatchCreate):
+    """批量创建备选样例（生成页「确认添加」在 candidate 数据集上走这里）。
+
+    整批共用 dataset_name / source；逐条按有无 answer 定 status（有→ready、
+    无→pending），一次事务提交。返回 {added, ids}。question 为空的条目跳过。
+    """
+    rows: list[CandidateCaseRow] = []
+    for item in req.cases:
+        question = (item.question or "").strip()
+        if not question:
+            continue
+        has_answer = bool(item.answer and item.answer.strip())
+        rows.append(CandidateCaseRow(
+            dataset_name=req.dataset_name,
+            category=item.category,
+            source=item.source,
+            question=question,
+            answer=item.answer,
+            key_points=item.key_points,
+            negative_points=item.negative_points,
+            tags=item.tags,
+            status="ready" if has_answer else "pending",
+        ))
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="没有可入库的样例（问题均为空）")
+
+    async with async_session_factory() as session:
+        session.add_all(rows)
+        await session.commit()
+        for row in rows:
+            await session.refresh(row)
+        ids = [str(row.id) for row in rows]
+
+    await log_audit(
+        "candidate", "batch", "create",
+        details={"dataset": req.dataset_name, "count": len(ids), "ids": ids[:10]},
+    )
+    return {"added": len(ids), "ids": ids}
 
 
 @router.put("/{case_id}")
