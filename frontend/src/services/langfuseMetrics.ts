@@ -80,6 +80,29 @@ export interface LangfuseObservation {
   total_tokens: number | null
   calculated_total_cost: number | null
   time_to_first_token_s: number | null
+  parent_observation_id?: string | null
+  // 原始 input/output（透传），供逐 observation 内容展开。
+  input?: unknown
+  output?: unknown
+}
+
+/** 一条语义执行链步骤（对齐前端 CotStep 契约，供 TraceTimeline 直接渲染）。 */
+export interface LangfuseSemanticStep {
+  type: 'thought' | 'tool_call' | 'answer'
+  content?: string
+  tool_name?: string
+  args?: unknown
+  output?: unknown
+  started_at?: number | null
+  duration_ms?: number | null
+}
+
+/** 服务端从 observations 归一化的语义执行链（CoT + 工具链）。 */
+export interface LangfuseSemanticTrace {
+  steps?: LangfuseSemanticStep[]
+  tool_calls?: Array<Record<string, unknown>>
+  format?: string
+  complete?: boolean
 }
 
 /** GET /langfuse-metrics/traces/{id} —— trace 全字段 + observations。 */
@@ -104,6 +127,8 @@ export interface LangfuseTraceDetail {
   output: unknown
   cache_hit_rate: number | null // 恒 null
   observations: LangfuseObservation[]
+  // 服务端从 observations 归一化的语义执行链；无可识别内容时为 null。
+  semantic_trace?: LangfuseSemanticTrace | null
   [key: string]: unknown // trace 全字段透传，容忍后端额外字段
 }
 
@@ -179,6 +204,12 @@ export const langfuseMetricsApi = {
           observations: r.data.observations ?? [],
         } as LangfuseTraceDetail,
       }))
+  },
+  /** 把选中的 trace 导入备选数据集（含答案 / 思维链 / 工具链 / 来源快照）。 */
+  importToCandidates(data: { trace_ids: string[]; dataset_name?: string; project_id?: string; category?: string }) {
+    return api
+      .post<{ imported: number; skipped: number }>('/langfuse-metrics/import-candidates', data)
+      .then((r) => ({ data: r.data }))
   },
   /** 手动触发一次轮询。 */
   poll() {

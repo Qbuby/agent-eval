@@ -163,6 +163,16 @@ class LangSmithDatasetProvider:
 
         return cases
 
+    async def get_case(self, example_id: str) -> TestCase | None:
+        # 按 id 读单条 example，转成 TestCase。不存在/取回失败返回 None。
+        try:
+            ex = await to_thread(self.client.read_example, example_id=example_id)
+        except Exception:
+            return None
+        if ex is None:
+            return None
+        return converter.example_to_test_case(ex)
+
     async def update_case(self, example_id: str, case: TestCase) -> None:
         params = converter.case_to_example(case)
         await to_thread(

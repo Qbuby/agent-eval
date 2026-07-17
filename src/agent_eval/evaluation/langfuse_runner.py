@@ -41,6 +41,11 @@ from agent_eval.evaluation.agent_adapter import (
     OpenAICompatibleAdapter,
     SSEStreamAdapter,
 )
+from agent_eval.evaluation.acceptance import (
+    aggregate_semantics,
+    project_case,
+    validate_acceptance_policy,
+)
 from agent_eval.evaluation.configurable_judge import run_configurable_judge
 
 logger = logging.getLogger(__name__)
@@ -615,6 +620,10 @@ async def _run_multiturn_case(
     scores: dict[str, float] = {}
     score_reasons: dict[str, str] = {}
     score_checks: dict[str, list[dict[str, Any]]] = {}
+    # 逐轮/会话级 judge 因 provider/传输错误没出分的维度数与最后一条错误，
+    # 由 score_conversation 透出，用于 status 判定（同单轮：判 error 而非静默 skipped）。
+    judge_failed_dims = 0
+    last_judge_error: str | None = None
 
     try:
         try:
@@ -665,7 +674,10 @@ async def _run_multiturn_case(
     # status 判定优先看 error_msg，故部分失败样例即便有分数仍标 error，不会假性 pass。
     if turns:
         try:
-            scores, score_reasons, score_checks = await multiturn.score_conversation(
+            (
+                scores, score_reasons, score_checks,
+                judge_failed_dims, last_judge_error,
+            ) = await multiturn.score_conversation(
                 turns=turns,
                 conversation_goal=conversation_goal,
                 turn_expectations=turn_expectations,
@@ -676,19 +688,21 @@ async def _run_multiturn_case(
         except Exception as e:
             logger.warning("multiturn scoring crashed on case %s: %s", case.get("id"), e)
 
-    # status 判定：回放成功但「零有效评分」必须区分于「通过」——多轮场景下
-    # 内建评估器（exact_match 等）不接、或样例无 turn_expectations/goal 时，
-    # scores 会是空 dict；此时判 skipped（未评分），不能默认 pass 假性通过。
-    status = "pass"
+    # 这里只记录执行与评分事实；质量是否达标由显式 acceptance_policy 投影。
     if error_msg:
-        if error_type in ("agent_unreachable", "agent_timeout"):
-            status = error_type
-        else:
-            status = "error"
-    elif not scores:
+        status = "execution_error"
+    elif judge_failed_dims > 0:
+        status = "evaluation_error"
+        error_type = "judge_error"
+        if not error_msg:
+            error_msg = (
+                f"部分评估维度失败（{judge_failed_dims} 个未出分）"
+                + (f"：{last_judge_error}" if last_judge_error else "")
+            )
+    elif scores:
+        status = "scored"
+    else:
         status = "skipped"
-    elif any(v < 0.5 for v in scores.values()):
-        status = "fail"
 
     return {
         "case_id": case.get("id"),
@@ -840,6 +854,11 @@ async def _run_one_case(
 
     # ── Run evaluators (no Langfuse server write; scores stay in local DB) ──
     scores: dict[str, float] = {}
+    # 记录「本该出分却因 provider/传输错误没出分」的评估器数与最后一条错误。
+    # 用于状态判定：judge 端挂了（ReadError 等）不能和「本就没配评估器」一样
+    # 静默折叠进 skipped；多评估器时部分维度失败也不能让幸存维度独自判 pass。
+    judge_failed_dims = 0
+    last_judge_error: str | None = None
     if not error_msg:
         for spec in evaluator_specs:
             etype = spec.get("evaluator_type")
@@ -876,12 +895,16 @@ async def _run_one_case(
                         "configurable_judge[%s] crashed on case %s: %s",
                         label, case.get("id"), e,
                     )
+                    judge_failed_dims += 1
+                    last_judge_error = f"{label}: {type(e).__name__}: {e}"
                     continue
                 if judge_result.error and not judge_result.scores:
                     logger.warning(
                         "configurable_judge[%s] error on case %s: %s",
                         label, case.get("id"), judge_result.error,
                     )
+                    judge_failed_dims += 1
+                    last_judge_error = f"{label}: {judge_result.error}"
                     continue
                 # Single-score paradigm: configurable_judge produces at most
                 # one JudgeScore per evaluator; we use evaluator label as the
@@ -913,18 +936,20 @@ async def _run_one_case(
             except Exception as e:
                 logger.warning("evaluator %s crashed on case %s: %s", label, case.get("id"), e)
 
-    # status: pass if all evaluator scores >= 0.5 and no error
-    status = "pass"
+    # 这里只记录执行与评分事实；质量是否达标由显式 acceptance_policy 投影。
     if error_msg:
-        # Surface infrastructure failures separately from "agent answered
-        # but answered wrong". UI then renders agent_unreachable as a
-        # neutral grey instead of red, and the run summary can flag it.
-        if error_type in ("agent_unreachable", "agent_timeout"):
-            status = error_type
-        else:
-            status = "error"
-    elif scores and any(v < 0.5 for v in scores.values()):
-        status = "fail"
+        status = "execution_error"
+    elif judge_failed_dims > 0:
+        status = "evaluation_error"
+        error_type = "judge_error"
+        error_msg = (
+            f"{judge_failed_dims} 个评估维度失败未出分"
+            + (f"：{last_judge_error}" if last_judge_error else "")
+        )
+    elif scores:
+        status = "scored"
+    else:
+        status = "skipped"
 
     return {
         "case_id": case.get("id"),
@@ -962,11 +987,17 @@ async def _execute_run(
     langsmith_project: str | None,
     cancel_event: asyncio.Event,
     handle: _RunHandle,
+    acceptance_policy: dict[str, Any] | None = None,
     langfuse_trace_name: str | None = None,
+    notify_open_ids: list[str] | None = None,
 ) -> None:
     """Background task body. Invokes agent for each case, runs evaluators,
     persists results. After all cases settle, optionally kicks off the
-    LangSmith and/or Langfuse trace backfill (non-blocking)."""
+    LangSmith and/or Langfuse trace backfill (non-blocking).
+
+    ``notify_open_ids``：run 完成后额外通知的飞书 open_id 列表（叠加全局固定
+    接收者）。仅内存透传，不落库——进程重启丢失无所谓（run 会被 sweep 成
+    interrupted，本就不该再补发完成通知）。"""
     handle.progress["total"] = len(cases)
     retry_policy = await _resolve_retry_policy(agent_cfg)
     logger.info(
@@ -1020,8 +1051,17 @@ async def _execute_run(
                 handle.progress["failed"] += 1
                 handle.progress["completed"] += 1
                 return
+            projection = project_case(
+                stored_status=res.get("status"),
+                error_type=res.get("error_type"),
+                scores=res.get("scores") or {},
+                acceptance_policy=acceptance_policy,
+            )
+            res.update(projection)
             per_case_results.append(res)
-            if res["status"] == "error":
+            if projection["execution_status"] == "abnormal" or projection[
+                "evaluation_status"
+            ] in {"error", "unknown"}:
                 handle.progress["failed"] += 1
             handle.progress["completed"] += 1
 
@@ -1100,12 +1140,27 @@ async def _execute_run(
             await http_client.aclose()
         except Exception:
             pass
-        # Aggregate
-        # skipped（回放成功但零有效评分）单独成桶，不混进 fail——否则
-        # 「没评」会被当成「没通过」，污染通过率与失败分析。
-        succ = [r for r in per_case_results if r["status"] == "pass"]
-        skipped = [r for r in per_case_results if r["status"] == "skipped"]
-        fail = [r for r in per_case_results if r["status"] not in ("pass", "skipped")]
+        # 统一聚合执行事实、评分事实和可选验收结论。无策略时 acceptance
+        # 仅标记 configured=false，绝不从分数猜测 pass/fail。
+        semantics = aggregate_semantics(per_case_results, acceptance_policy)
+        facts = semantics["facts"]
+        acceptance = semantics["acceptance"]
+        scored_cases = [
+            row for row in per_case_results
+            if row.get("evaluation_status") == "completed"
+        ]
+        execution_abnormal_cases = [
+            row for row in per_case_results
+            if row.get("execution_status") == "abnormal"
+        ]
+        accepted_cases = [
+            row for row in per_case_results
+            if row.get("acceptance_decision") == "pass"
+        ]
+        not_accepted_cases = [
+            row for row in per_case_results
+            if row.get("acceptance_decision") == "fail"
+        ]
         all_scores: dict[str, list[float]] = {}
         for r in per_case_results:
             for k, v in r["scores"].items():
@@ -1176,40 +1231,30 @@ async def _execute_run(
         }
 
         summary: dict[str, Any] = {
-            "counts": {
-                "total": len(per_case_results),
-                "passed": len(succ),
-                "failed": len(fail),
-                # skipped：回放成功但无有效评估器产出分数（多轮零评估），
-                # 与 failed 区分，避免「没评」被读成「没通过」。
-                "skipped": len(skipped),
-                "unreachable": sum(
-                    1 for r in per_case_results
-                    if r["status"] in ("agent_unreachable", "agent_timeout")
-                ),
-            },
+            "facts": facts,
+            "acceptance": acceptance,
             "dimension_averages": dim_avg,
             "score_distribution": {
                 "buckets": bucket_labels,
                 "by_dimension": score_distribution,
             },
             "tool_usage": tool_usage,
-            "cost_success": _aggregate_cost(succ),
-            "cost_failure": _aggregate_cost(fail),
+            "cost_scored": _aggregate_cost(scored_cases),
+            "cost_execution_abnormal": _aggregate_cost(execution_abnormal_cases),
             "retry_stats": retry_stats,
             "run_name": run_name,
         }
-        # If most samples couldn't reach the agent, surface that on the run
-        # so the detail page can render a banner instead of leaving the user
-        # to scan 30 rows of "All connection attempts failed".
+        if acceptance_policy is not None:
+            summary["cost_accepted"] = _aggregate_cost(accepted_cases)
+            summary["cost_not_accepted"] = _aggregate_cost(not_accepted_cases)
+        # 如果多数样例执行异常，在详情页集中提示，而不是让用户逐行扫描。
         if per_case_results:
-            unreach_ratio = summary["counts"]["unreachable"] / len(per_case_results)
-            if unreach_ratio >= 0.5:
+            abnormal_ratio = facts["execution_abnormal"] / len(per_case_results)
+            if abnormal_ratio >= 0.5:
                 agent_url = (agent_cfg or {}).get("url", "")
                 summary["runtime_error"] = (
-                    f"{summary['counts']['unreachable']}/{len(per_case_results)} 样例无法连到被测 agent "
-                    f"({agent_url})。请确认 agent 服务在线、网络可达；如在容器内访问宿主机请用 host.docker.internal "
-                    "或宿主机 LAN IP 而非 localhost。"
+                    f"{facts['execution_abnormal']}/{len(per_case_results)} 样例执行异常 "
+                    f"({agent_url})。请确认 Agent 服务在线且网络可达，并查看样例的执行错误详情。"
                 )
         # Resolve active data-source connection presets (fall back to env).
         from agent_eval.config_service import config_service as _cfg_svc
@@ -1240,6 +1285,16 @@ async def _execute_run(
                 status = "failed"
             await repo.finish_test_run(uuid.UUID(run_id), summary, status=status)
             await session.commit()
+
+        # Fire-and-forget 飞书完成通知（best-effort，不阻塞、不影响 run 收尾）。
+        # 合并调用方传入的 notify_open_ids + 全局固定接收者，去重后逐个推卡片。
+        asyncio.create_task(
+            _notify_run_complete(
+                run_id=run_id, run_name=run_name,
+                summary=summary, status=status,
+                notify_open_ids=notify_open_ids,
+            )
+        )
 
         # Fire-and-forget LangSmith backfill. Don't block the run's completion
         # on slow LangSmith queries — users can refresh the detail page and
@@ -1302,6 +1357,88 @@ async def _execute_run(
             asyncio.create_task(_sync_then_pull())
 
         _RUN_REGISTRY.pop(run_id, None)
+
+
+async def _notify_run_complete(
+    *,
+    run_id: str,
+    run_name: str,
+    summary: dict[str, Any],
+    status: str,
+    notify_open_ids: list[str] | None,
+) -> None:
+    """评估 run 结束后推飞书完成卡片。全程 best-effort，异常只 log。
+
+    收件人 = 调用方传入的 ``notify_open_ids``（机器人触发者 / 定时任务配置）
+    ∪ 全局固定接收者（``settings.feishu.notify_open_ids_list``），去重。
+    卡片正文含执行/评分事实、可选验收结论及 ``generate_run_report`` 分析摘要。
+    无收件人或飞书未配置时直接跳过（不报错）。
+    """
+    try:
+        from agent_eval.config import settings
+
+        recipients: list[str] = []
+        for oid in (notify_open_ids or []):
+            if oid and oid not in recipients:
+                recipients.append(oid)
+        for oid in settings.feishu.notify_open_ids_list:
+            if oid and oid not in recipients:
+                recipients.append(oid)
+        if not recipients:
+            return
+        if not settings.feishu.configured:
+            logger.info("run %s complete but feishu unconfigured; skip notify", run_id)
+            return
+
+        facts = (summary or {}).get("facts") or {}
+        acceptance = (summary or {}).get("acceptance") or {}
+        total = int(facts.get("total") or 0)
+        execution_success = int(facts.get("execution_success") or 0)
+        execution_abnormal = int(facts.get("execution_abnormal") or 0)
+        evaluation_completed = int(facts.get("evaluation_completed") or 0)
+        skipped = int(facts.get("skipped") or 0)
+        icon = "✅" if status == "completed" else "⚠️"
+        head = (
+            f"{icon} **评估完成：{run_name}**\n"
+            f"- 运行状态：**{status}**\n"
+            f"- Agent 执行：成功 **{execution_success}/{total}**，异常 **{execution_abnormal}**\n"
+            f"- Judge 评分：完成 **{evaluation_completed}**，跳过 **{skipped}**\n"
+        )
+        if acceptance.get("configured"):
+            pass_rate = acceptance.get("pass_rate")
+            rate_text = (
+                f"{float(pass_rate) * 100:.1f}%"
+                if pass_rate is not None else "无数据"
+            )
+            head += (
+                f"- 显式验收：通过率 **{rate_text}**，结论 "
+                f"**{acceptance.get('run_decision') or 'undetermined'}**\n"
+            )
+        else:
+            head += "- 显式验收：**仅评分，未配置验收规则**\n"
+
+        # 分析摘要（LLM 叙述，失败自动退规则摘要；这里再兜一层，绝不阻断通知）。
+        try:
+            from agent_eval.feishu.report_llm import generate_run_report
+            report = await generate_run_report(summary, run_name=run_name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("notify: report generation failed for %s: %s", run_id, e)
+            report = ""
+
+        body = head
+        if report:
+            body += "\n" + report.strip()
+        body += f"\n\n_run_id: {run_id}_"
+
+        from agent_eval.feishu.service import get_service
+        svc = get_service()
+        for oid in recipients:
+            try:
+                await svc.send_card(oid, body)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("notify: send_card to %s failed: %s", oid, e)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("run-complete notify crashed for %s: %s", run_id, e)
 
 
 async def _backfill_langsmith_traces(
@@ -1729,6 +1866,8 @@ async def start_run(
     langfuse_trace_name: str | None = None,
     benchmark_version_id: str | None = None,
     eval_case_source_id: str | None = None,
+    acceptance_policy: dict[str, Any] | None = None,
+    notify_open_ids: list[str] | None = None,
 ) -> str:
     """Create a test_runs row, register an asyncio task, return run_id.
 
@@ -1756,6 +1895,7 @@ async def start_run(
             langsmith_project=langsmith_project,
             langfuse_trace_name=langfuse_trace_name,
             evaluator_configs=evaluator_specs,
+            acceptance_policy=acceptance_policy,
             status="running",
         )
         await session.commit()
@@ -1770,10 +1910,12 @@ async def start_run(
         evaluator_specs=evaluator_specs,
         concurrency=concurrency,
         run_name=run_name,
+        acceptance_policy=acceptance_policy,
         langsmith_project=langsmith_project,
         langfuse_trace_name=langfuse_trace_name,
         cancel_event=cancel_event,
         handle=handle,
+        notify_open_ids=notify_open_ids,
     ))
     _RUN_REGISTRY[run_id] = handle
     return run_id
@@ -1796,3 +1938,222 @@ async def sweep_orphaned_runs() -> int:
             n += 1
         await session.commit()
         return n
+
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 缺分维度补评（#7）：不重跑 agent，只对「本应出分却缺失」的 judge 维度重打分。
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _expected_judge_dims(
+    *,
+    specs: list[dict[str, Any]],
+    is_multiturn: bool,
+    turn_expectations: list[dict[str, Any]] | None,
+    turn_indices: set[int] | None,
+    has_goal: bool,
+) -> set[str]:
+    """枚举一个 case「本应出分」的 configurable_judge 维度键集合。
+
+    单轮：每个 configurable_judge 评估器的 label 即一个维度。
+    多轮：每评估器 label 下，对每个「有评分依据且回放里存在」的轮产出
+    ``{label}.turn{i}``；有会话目标再加 ``{label}.conversation``。
+    与打分侧 score key 约定严格一致（multiturn.score_conversation）。
+    """
+    dims: set[str] = set()
+    exp_by_index: dict[int, dict[str, Any]] = {}
+    for te in turn_expectations or []:
+        ti = te.get("turn_index")
+        if isinstance(ti, int):
+            exp_by_index[ti] = te
+    for spec in specs:
+        if spec.get("evaluator_type") != "configurable_judge":
+            continue
+        label = spec.get("label") or "judge"
+        if not is_multiturn:
+            dims.add(label)
+            continue
+        for ti, te in exp_by_index.items():
+            if turn_indices is not None and ti not in turn_indices:
+                continue
+            criteria = te.get("criteria") or []
+            expected = te.get("expected_output") or ""
+            expected_tc = te.get("expected_tool_calls") or []
+            if not criteria and not expected and not expected_tc:
+                continue
+            dims.add(f"{label}.turn{ti}")
+        if has_goal:
+            dims.add(f"{label}.conversation")
+    return dims
+
+
+async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
+    """对一个已完成 run 里「缺分维度」补评——复用已存 agent 回答，不重跑 agent。
+
+    做法：
+      1. 从 run.evaluator_configs 重建 configurable_judge specs 并解析 provider；
+      2. 逐条 result 用已存的问题/回答（多轮用 full_trace.conversation）重建评分
+         输入，算出「本应出分」维度与「已出分」维度之差 = 缺失维度；
+      3. 只对缺失维度重打 judge（多轮走 score_conversation 的 only_dims 过滤），
+         成功的分数**新增**入库（evaluation_scores 无 (result,dim) 唯一约束，故
+         先删该 result 下同名旧行再插，避免重复行）；
+      4. 按「本应出分维度是否已全部齐全」重算每条 result 的 status：
+         齐全→scored（清 judge_error）；仍缺→保持 evaluation_error。
+      5. 不触碰 execution_error（agent 没答的样例无回答可评）。
+
+    返回统计：{run_id, results_scanned, dimensions_recovered, results_completed,
+              results_still_missing}。汇总刷新由上层 reaggregate 负责。
+    """
+    from agent_eval.evaluation import multiturn
+
+    run_uuid = uuid.UUID(run_id)
+
+    # ── 重建 specs（从 run 快照）并解析 provider ──
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        run_row = await repo.get_test_run(run_uuid)
+        if run_row is None:
+            raise ValueError("run not found")
+        specs = [dict(s) for s in (run_row.evaluator_configs or [])]
+
+    judge_specs = [s for s in specs if s.get("evaluator_type") == "configurable_judge"]
+    if not judge_specs:
+        return {
+            "run_id": run_id, "results_scanned": 0, "dimensions_recovered": 0,
+            "results_completed": 0, "results_still_missing": 0,
+            "note": "no configurable_judge evaluators on this run",
+        }
+    await _resolve_judge_providers(judge_specs)
+
+    dims_recovered = 0
+    results_completed = 0
+    results_still_missing = 0
+    results_scanned = 0
+
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        results = await repo.get_results_by_run(run_uuid)
+        scores_by_result = await repo.get_scores_by_run(run_uuid)
+
+        for r in results:
+            # 只补「评分不全」的样例；execution_error（agent 没答）不补。
+            if r.status not in ("evaluation_error", "scored", "skipped"):
+                continue
+            existing_rows = scores_by_result.get(r.id, [])
+            existing_dims = {row.dimension for row in existing_rows}
+
+            full_trace = r.full_trace if isinstance(r.full_trace, dict) else {}
+            conv = full_trace.get("conversation") if isinstance(full_trace, dict) else None
+            is_multiturn = isinstance(conv, dict) and bool(conv.get("turns"))
+
+            if is_multiturn:
+                turns = conv.get("turns") or []
+                goal = conv.get("goal")
+                turn_exps = conv.get("turn_expectations") or []
+                turn_idxs = {t.get("turn_index") for t in turns if isinstance(t.get("turn_index"), int)}
+                expected_dims = _expected_judge_dims(
+                    specs=judge_specs, is_multiturn=True,
+                    turn_expectations=turn_exps, turn_indices=turn_idxs,
+                    has_goal=bool(goal),
+                )
+            else:
+                # 单轮：必须有回答才可评。
+                if not (r.actual_output or "").strip():
+                    continue
+                expected_dims = _expected_judge_dims(
+                    specs=judge_specs, is_multiturn=False,
+                    turn_expectations=None, turn_indices=None, has_goal=False,
+                )
+
+            missing = expected_dims - existing_dims
+            if not missing:
+                continue
+            results_scanned += 1
+
+            # ── 重打缺失维度 ──
+            new_scores: dict[str, float] = {}
+            new_reasons: dict[str, str] = {}
+            new_checks: dict[str, list[dict[str, Any]]] = {}
+            if is_multiturn:
+                (
+                    new_scores, new_reasons, new_checks, _fd, _le,
+                ) = await multiturn.score_conversation(
+                    turns=turns,
+                    conversation_goal=goal,
+                    turn_expectations=turn_exps,
+                    evaluator_specs=judge_specs,
+                    case_metadata=None,
+                    case_id=str(r.id),
+                    only_dims=missing,
+                )
+            else:
+                for spec in judge_specs:
+                    label = spec.get("label") or "judge"
+                    if label not in missing:
+                        continue
+                    provider_row = spec.get("_provider")
+                    if provider_row is None:
+                        continue
+                    try:
+                        jr = await run_configurable_judge(
+                            params=spec.get("params") or {},
+                            provider=provider_row,
+                            input_text=r.question or "",
+                            output_text=r.actual_output or "",
+                            expected_output=r.expected_output or "",
+                            metadata=None,
+                            evaluator_name=label,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("rescore single[%s] crashed on result %s: %s", label, r.id, e)
+                        continue
+                    if jr.error and not jr.scores:
+                        continue
+                    for s in jr.scores:
+                        new_scores[label] = float(s.value)
+
+            if not new_scores:
+                results_still_missing += 1
+                continue
+
+            # ── 落库：删同名旧行（防重复）后插新分 ──
+            for dim, val in new_scores.items():
+                for old in existing_rows:
+                    if old.dimension == dim:
+                        await session.delete(old)
+                details: dict[str, Any] = {}
+                reason = new_reasons.get(dim)
+                checks = new_checks.get(dim)
+                if reason:
+                    details["reasoning"] = reason
+                if checks:
+                    details["checks"] = checks
+                await repo.create_eval_score(
+                    r.id, dimension=dim, score=val,
+                    weight=1.0, weighted_score=val, scoring_method="eval",
+                    details=details,
+                )
+                dims_recovered += 1
+
+            # ── 重算该 result 的完整性状态 ──
+            now_dims = (existing_dims | set(new_scores.keys()))
+            still_missing = expected_dims - now_dims
+            if not still_missing:
+                if r.status == "evaluation_error":
+                    r.status = "scored"
+                    r.error_type = None
+                    r.error_message = None
+                results_completed += 1
+            else:
+                results_still_missing += 1
+
+        await session.commit()
+
+    return {
+        "run_id": run_id,
+        "results_scanned": results_scanned,
+        "dimensions_recovered": dims_recovered,
+        "results_completed": results_completed,
+        "results_still_missing": results_still_missing,
+    }

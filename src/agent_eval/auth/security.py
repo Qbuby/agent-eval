@@ -71,3 +71,39 @@ def decode_refresh_token(token: str) -> dict | None:
         return payload
     except jwt.PyJWTError:
         return None
+
+
+# ── 飞书 OAuth state（CSRF 防护，无存储）──────────────────────────────
+# 用签名 JWT 而非内存 dict / DB 表承载授权发起态：回调端点与 bot 长连接同进程，
+# 但进程重启 / 多 worker 时内存 dict 不共享；签名 state 天然跨重启、跨 worker、
+# 免迁移，复用同一 HS256 + secret_key。攻击者无法伪造签名，故无法把授权结果
+# 绑到受害者账号；飞书 code 本身 5 分钟单次使用兜底重放。
+
+
+def sign_oauth_state(user_id: uuid.UUID, open_id: str, *, ttl_seconds: int = 300) -> str:
+    """签发飞书 OAuth 授权发起态。携带发起授权的 user_id + open_id，回调校验后
+    据此把换得的 token 绑到正确账号（因签名不可伪造，绑定对象可信）。"""
+    payload = {
+        "sub": str(user_id),
+        "open_id": open_id,
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+        "type": "feishu_oauth_state",
+    }
+    return jwt.encode(payload, settings.auth.secret_key, algorithm=settings.auth.algorithm)
+
+
+def verify_oauth_state(state: str) -> tuple[uuid.UUID, str] | None:
+    """校验回调带回的 state。返回 (user_id, open_id)；无效 / 过期 / 类型不符 / 被篡改
+    一律返回 None（回调据此给「链接失效，请重新授权」而非崩溃）。"""
+    try:
+        payload = jwt.decode(
+            state, settings.auth.secret_key, algorithms=[settings.auth.algorithm]
+        )
+    except jwt.PyJWTError:
+        return None
+    if payload.get("type") != "feishu_oauth_state":
+        return None
+    try:
+        return uuid.UUID(payload["sub"]), payload.get("open_id", "")
+    except (KeyError, ValueError):
+        return None

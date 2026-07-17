@@ -68,6 +68,9 @@ class DatasetManager:
             dataset_name, as_of=as_of, splits=splits, tags=tags, limit=limit
         )
 
+    async def get_case(self, example_id: str) -> TestCase:
+        return await self.provider.get_case(example_id)
+
     async def update_case(self, example_id: str, case: TestCase) -> None:
         await self.provider.update_case(example_id, case)
 

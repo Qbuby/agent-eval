@@ -259,6 +259,28 @@ class EvaluatorConfig(BaseModel):
     params: dict[str, Any] = {}  # e.g. llm_judge: {prompt_template, dimensions}
 
 
+class AcceptanceCriterion(BaseModel):
+    evaluator_id: str
+    evaluator_version_id: str | None = None
+    dimension_key: str
+    direction: str
+    threshold: float
+    reducer: str = "conversation_or_mean"
+
+
+class AcceptanceRunRule(BaseModel):
+    min_case_pass_rate: float = Field(ge=0.0, le=1.0)
+    min_decision_coverage: float = Field(ge=0.0, le=1.0)
+
+
+class AcceptancePolicy(BaseModel):
+    version: int = 1
+    mode: str = "threshold"
+    case_rule: str = "all"
+    criteria: list[AcceptanceCriterion] = Field(min_length=1)
+    run_rule: AcceptanceRunRule
+
+
 class StartEvalRequest(BaseModel):
     # Source: exactly one of these four should be set.
     benchmark_version_id: str | None = None
@@ -277,6 +299,8 @@ class StartEvalRequest(BaseModel):
     agent: EvalAgentConfig
     # Evaluator instances by id (evaluator_configs table). Empty list is not allowed.
     evaluator_ids: list[str] = Field(default_factory=list)
+    # 缺省为 None：仅评分，不产生隐式通过/失败结论。
+    acceptance_policy: AcceptancePolicy | None = None
     concurrency: int = Field(default=3, ge=1, le=20)
     run_name: str | None = None
     # LangSmith project where the agent will write its own trace. The
@@ -304,7 +328,10 @@ class EvalRunSummary(BaseModel):
     langfuse_trace_name: str | None = None
     langsmith_project: str | None = None
     agent_config: dict[str, Any] = {}
+    acceptance_policy: dict[str, Any] | None = None
     summary_scores: dict[str, Any] | None = None
+    facts: dict[str, Any] = {}
+    acceptance: dict[str, Any] = {}
     progress: dict[str, int] = {}  # {total, completed, failed} — populated for running
     created_at: datetime | None = None
 
@@ -317,7 +344,13 @@ class EvalResultRow(BaseModel):
     id: str
     benchmark_case_id: str | None = None
     test_case_id: str | None = None
+    # status 保留原始持久化值以兼容导出；以下三字段是当前只读语义投影。
     status: str
+    execution_status: str = "unknown"
+    evaluation_status: str = "unknown"
+    acceptance_decision: str | None = None
+    decision_source: str = "current"
+    criterion_results: list[dict[str, Any]] = []
     actual_output: str | None = None
     question: str | None = None
     latency_ms: int | None = None
@@ -340,6 +373,7 @@ class EvalResultRow(BaseModel):
     # ``None`` for legacy rows or for non-SSE adapters that have no CoT.
     full_trace: dict[str, Any] | None = None
     error_message: str | None = None
+    error_type: str | None = None
     langfuse_trace_id: str | None = None
     langsmith_run_id: str | None = None
     attempts_made: int = 1

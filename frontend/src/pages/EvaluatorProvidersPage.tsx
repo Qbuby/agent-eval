@@ -14,6 +14,7 @@ const PROVIDER_TYPES: { value: string; label: string; hint?: string }[] = [
   { value: 'deepseek', label: 'DeepSeek' },
   { value: 'azure', label: 'Azure OpenAI' },
   { value: 'custom', label: 'Custom', hint: '其他 OpenAI 兼容端点' },
+  { value: 'agent', label: 'Agent (SSE)', hint: '直接 SSE 连目标 agent 当裁判' },
 ]
 
 export default function EvaluatorProvidersPage() {
@@ -203,6 +204,8 @@ function ProviderEditor({
     apiKey: `${reactId}-apikey`,
     model: `${reactId}-model`,
     active: `${reactId}-active`,
+    agentMode: `${reactId}-agentmode`,
+    agentLanguage: `${reactId}-agentlang`,
   }
 
   const [name, setName] = useState(editing?.name || '')
@@ -211,9 +214,21 @@ function ProviderEditor({
   const [apiKey, setApiKey] = useState('')  // never prefill - user has to re-type to change
   const [defaultModel, setDefaultModel] = useState(editing?.default_model || '')
   const [isActive, setIsActive] = useState(editing ? editing.is_active : true)
+  // agent (SSE) 专属：SSE 事件模式 + 传给 agent 的 language，落进 extra_config。
+  const [agentMode, setAgentMode] = useState<string>(
+    (editing?.extra_config?.mode as string) || 'langgraph_v2',
+  )
+  const [agentLanguage, setAgentLanguage] = useState<string>(
+    (editing?.extra_config?.language as string) || '请用中文回复',
+  )
+  const isAgent = providerType === 'agent'
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      // agent 类型把 SSE 模式 / language 收进 extra_config；其他类型不带。
+      const extraConfig = isAgent
+        ? { mode: agentMode, language: agentLanguage }
+        : undefined
       if (editing) {
         const body: Record<string, unknown> = {
           name, provider_type: providerType,
@@ -221,6 +236,7 @@ function ProviderEditor({
           default_model: defaultModel || null,
           is_active: isActive,
         }
+        if (extraConfig) body.extra_config = extraConfig
         // Only include api_key in payload when user typed something:
         // empty string would mean "clear", undefined means "keep existing".
         if (apiKey !== '') body.api_key = apiKey
@@ -232,6 +248,7 @@ function ProviderEditor({
         api_key: apiKey || null,
         default_model: defaultModel || null,
         is_active: isActive,
+        ...(extraConfig ? { extra_config: extraConfig } : {}),
       }
       return evaluatorProvidersApi.create(body).then(r => r.data)
     },
@@ -299,44 +316,85 @@ function ProviderEditor({
 
         <div>
           <label htmlFor={ids.baseUrl} className="field-label">
-            Base URL{providerType === 'openai' && <span className="text-text-tertiary"> · 可选（默认 api.openai.com）</span>}
+            {isAgent ? 'Agent SSE URL' : 'Base URL'}
+            {providerType === 'openai' && <span className="text-text-tertiary"> · 可选（默认 api.openai.com）</span>}
+            {isAgent && <span className="text-text-tertiary"> · 必填</span>}
           </label>
           <input
             id={ids.baseUrl}
             type="text" value={baseUrl} onChange={e => setBaseUrl(e.target.value)}
-            placeholder="https://kiro.aidong-ai.com/v1"
+            placeholder={isAgent
+              ? 'http://host.docker.internal:18094/api/agent/langgraph'
+              : 'https://kiro.aidong-ai.com/v1'}
             className="input font-mono"
           />
         </div>
 
-        <div>
-          <label htmlFor={ids.apiKey} className="field-label">
-            API Key
-            {editing && (
-              <span className="text-text-tertiary"> · 留空保持原样，输入空格后清空</span>
-            )}
-          </label>
-          <input
-            id={ids.apiKey}
-            type="password" value={apiKey} onChange={e => setApiKey(e.target.value)}
-            placeholder={editing && editing.has_api_key ? editing.api_key_masked : 'sk-...'}
-            className="input font-mono"
-            autoComplete="new-password"
-          />
-        </div>
+        {isAgent && (
+          <>
+            <div>
+              <label htmlFor={ids.agentMode} className="field-label">SSE 模式</label>
+              <select
+                id={ids.agentMode}
+                value={agentMode}
+                onChange={e => setAgentMode(e.target.value)}
+                className="input"
+              >
+                <option value="langgraph_v2">LangGraph v2（astream_events）</option>
+                <option value="generic">Generic（payload.response）</option>
+              </select>
+              <div className="mt-1.5 text-[10px] text-text-tertiary">
+                目标 agent 的流式协议。默认 LangGraph v2，与被测 agent 一致。
+              </div>
+            </div>
+            <div>
+              <label htmlFor={ids.agentLanguage} className="field-label">Language 参数</label>
+              <input
+                id={ids.agentLanguage}
+                type="text" value={agentLanguage} onChange={e => setAgentLanguage(e.target.value)}
+                placeholder="请用中文回复"
+                className="input"
+              />
+              <div className="mt-1.5 text-[10px] text-text-tertiary">
+                随请求传给 agent 的 language（LangGraph v2 模式）。
+              </div>
+            </div>
+          </>
+        )}
 
-        <div>
-          <label htmlFor={ids.model} className="field-label">默认模型（可选）</label>
-          <input
-            id={ids.model}
-            type="text" value={defaultModel} onChange={e => setDefaultModel(e.target.value)}
-            placeholder="例如：gpt-4o-mini / claude-3-5-sonnet-20241022"
-            className="input font-mono"
-          />
-          <div className="mt-1.5 text-[10px] text-text-tertiary">
-            评估器没指定 model 时回退到这个值。可在评估器编辑器里覆盖。
+        {/* agent (SSE) 端点无 API Key / 模型概念 —— 端点本身就是裁判，隐藏这两项。 */}
+        {!isAgent && (
+          <div>
+            <label htmlFor={ids.apiKey} className="field-label">
+              API Key
+              {editing && (
+                <span className="text-text-tertiary"> · 留空保持原样，输入空格后清空</span>
+              )}
+            </label>
+            <input
+              id={ids.apiKey}
+              type="password" value={apiKey} onChange={e => setApiKey(e.target.value)}
+              placeholder={editing && editing.has_api_key ? editing.api_key_masked : 'sk-...'}
+              className="input font-mono"
+              autoComplete="new-password"
+            />
           </div>
-        </div>
+        )}
+
+        {!isAgent && (
+          <div>
+            <label htmlFor={ids.model} className="field-label">默认模型（可选）</label>
+            <input
+              id={ids.model}
+              type="text" value={defaultModel} onChange={e => setDefaultModel(e.target.value)}
+              placeholder="例如：gpt-4o-mini / claude-3-5-sonnet-20241022"
+              className="input font-mono"
+            />
+            <div className="mt-1.5 text-[10px] text-text-tertiary">
+              评估器没指定 model 时回退到这个值。可在评估器编辑器里覆盖。
+            </div>
+          </div>
+        )}
 
         <label htmlFor={ids.active} className="inline-flex items-center gap-2 text-[12px] cursor-pointer">
           <input

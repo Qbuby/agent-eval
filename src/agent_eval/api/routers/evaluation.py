@@ -39,9 +39,14 @@ from agent_eval.db_models.tables import (
     BenchmarkCaseRow,
     ConversationCategoryRow,
     EvaluationScoreRow,
-    EvaluatorProviderRow,
     TestResultRow,
     TestRunRow,
+)
+from agent_eval.evaluation.acceptance import (
+    aggregate_semantics,
+    project_case,
+    project_stored_summary,
+    validate_acceptance_policy,
 )
 from agent_eval.evaluation.langfuse_runner import (
     BUILTIN_EVALUATORS,
@@ -49,6 +54,7 @@ from agent_eval.evaluation.langfuse_runner import (
     get_run_progress,
     request_stop,
     rerun_backfill,
+    rescore_missing_dimensions,
     start_run,
 )
 
@@ -68,8 +74,19 @@ async def list_builtin_evaluators():
     ]
 
 
-@router.post("/runs/start")
-async def start_eval(req: StartEvalRequest):
+async def resolve_eval_start_args(
+    req: StartEvalRequest, session, repo,
+) -> dict[str, Any]:
+    """把 ``StartEvalRequest`` 解析成 ``start_run`` 的 kwargs（不含 notify）。
+
+    HTTP ``/runs/start`` 与定时调度器 ``EvalScheduler`` 共用这一条解析链路，
+    保证两条触发路径的样例/评估器解析行为完全一致，避免逻辑分叉。调用方需
+    传入一个打开的 ``session`` 及其 ``Repository``（租户上下文由调用方在外层
+    设定——HTTP 靠依赖注入，调度器靠 set_tenant_context）。
+
+    校验失败照旧抛 ``HTTPException``（HTTP 直接返回；调度器把它当普通异常捕获
+    并记入任务 error）。返回 dict 可直接 ``start_run(**args, notify_open_ids=...)``。
+    """
     # ── 1. resolve cases ──────────────────────────────────────────
     sources = [
         x for x in (
@@ -92,181 +109,212 @@ async def start_eval(req: StartEvalRequest):
 
     cases: list[dict[str, Any]] = []
 
-    async with async_session_factory() as session:
-        repo = Repository(session)
+    if req.conversation_dataset:
+        # ── 多轮对话数据集（直读 LangSmith dataset，保留多轮字段）──
+        # 与 benchmark/file 不同：这条路径不降维成单 question，而是整段
+        # input_messages + conversation_goal + turn_expectations 透传给
+        # runner，由 multiturn 回放逐轮调用 agent 并逐轮+会话级打分。
+        from agent_eval.api.dependencies import get_manager
 
-        if req.conversation_dataset:
-            # ── 多轮对话数据集（直读 LangSmith dataset，保留多轮字段）──
-            # 与 benchmark/file 不同：这条路径不降维成单 question，而是整段
-            # input_messages + conversation_goal + turn_expectations 透传给
-            # runner，由 multiturn 回放逐轮调用 agent 并逐轮+会话级打分。
-            from agent_eval.api.dependencies import get_manager
-
-            # 分类 / 勾选筛选（对齐 benchmark 来源，复用 case_ids / filter_category_id）：
-            # 对话样例真身在 LangSmith，无法服务端按 category/id 过滤，故全量 load 后
-            # 内存筛。filter_category_id 是 ConversationCategoryRow 的 UUID（前端下拉
-            # value），先解析成受管类别名，再按样例 c.category（存的是类别名）匹配。
-            # case_ids 是勾选的样例 id（c.id）。limit 在筛选后再截断。
-            wanted_ids = set(req.case_ids) if req.case_ids else None
-            wanted_category: str | None = None
-            if req.filter_category_id:
-                cat_row = (await session.execute(
-                    select(ConversationCategoryRow).where(
-                        ConversationCategoryRow.id == uuid.UUID(req.filter_category_id)
-                    )
-                )).scalar_one_or_none()
-                if cat_row is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"conversation category not found: {req.filter_category_id}",
-                    )
-                wanted_category = cat_row.name
-
-            mgr = await get_manager()
-            try:
-                # 有勾选/分类筛选时先全量 load（不下推 limit），内存筛完再截断；
-                # 无筛选时沿用旧行为，直接把 limit 下推给 provider。
-                load_limit = None if (wanted_ids or wanted_category) else req.limit
-                ds_cases = await mgr.load_cases(req.conversation_dataset, limit=load_limit)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"读取对话数据集 '{req.conversation_dataset}' 失败：{e}",
-                ) from e
-            for c in ds_cases:
-                # 分类 / 勾选筛选（在跳过无 user 消息之前先筛，limit 语义针对"将跑的样例"）。
-                if wanted_ids is not None and c.id not in wanted_ids:
-                    continue
-                if wanted_category is not None and (c.category or "") != wanted_category:
-                    continue
-                msgs = c.input_messages or []
-                if not any(m.get("role") == "user" and m.get("content") for m in msgs):
-                    # 没有任何 user 消息的样例无法回放，跳过。
-                    continue
-                # 内存筛选路径下 limit 未下推给 provider，在此按"将跑样例数"截断。
-                if load_limit is None and req.limit and len(cases) >= req.limit:
-                    break
-                # question 仅作落库/展示的单值快照（首条 user 消息）。
-                first_user = next(
-                    (m.get("content", "") for m in msgs if m.get("role") == "user"), ""
+        # 分类 / 勾选筛选（对齐 benchmark 来源，复用 case_ids / filter_category_id）：
+        # 对话样例真身在 LangSmith，无法服务端按 category/id 过滤，故全量 load 后
+        # 内存筛。filter_category_id 是 ConversationCategoryRow 的 UUID（前端下拉
+        # value），先解析成受管类别名，再按样例 c.category（存的是类别名）匹配。
+        # case_ids 是勾选的样例 id（c.id）。limit 在筛选后再截断。
+        wanted_ids = set(req.case_ids) if req.case_ids else None
+        wanted_category: str | None = None
+        if req.filter_category_id:
+            cat_row = (await session.execute(
+                select(ConversationCategoryRow).where(
+                    ConversationCategoryRow.id == uuid.UUID(req.filter_category_id)
                 )
-                cases.append({
-                    "id": c.id,
-                    "name": c.name or c.id,
-                    "question": first_user,
-                    "expected_output": c.expected_output or "",
-                    "expected_tool_calls": [],
-                    "metadata": {"tags": list(c.tags or [])},
-                    "source": "conversation",
-                    # 多轮标记 + 完整回放/打分输入：runner 据此走 multiturn 分支。
-                    "multi_turn": True,
-                    "input_messages": msgs,
-                    "conversation_goal": c.conversation_goal,
-                    "turn_expectations": [te.model_dump() for te in c.turn_expectations],
-                })
-            if not cases:
+            )).scalar_one_or_none()
+            if cat_row is None:
                 raise HTTPException(
-                    status_code=400,
-                    detail=f"对话数据集 '{req.conversation_dataset}' 没有可回放的多轮样例",
+                    status_code=404,
+                    detail=f"conversation category not found: {req.filter_category_id}",
                 )
-        elif req.case_source_id:
-            # ── uploaded file ──
-            src = await repo.get_eval_case_source(uuid.UUID(req.case_source_id))
-            if src is None:
-                raise HTTPException(status_code=404, detail="case_source not found")
-            raw_cases = src.cases or []
-            if req.limit:
-                raw_cases = raw_cases[: req.limit]
-            for c in raw_cases:
-                cases.append({
-                    "id": c.get("name") or f"case-{len(cases)+1}",
-                    "name": c.get("name") or f"case-{len(cases)+1}",
-                    "question": c.get("question") or "",
-                    "expected_output": c.get("expected_output") or "",
-                    "expected_tool_calls": [],
-                    "metadata": c.get("metadata") or {},
-                    "source": "file",
-                })
-        else:
-            # ── benchmark dataset ──
-            stmt = select(BenchmarkCaseRow)
-            if req.benchmark_version_id:
-                stmt = stmt.where(BenchmarkCaseRow.version_id == uuid.UUID(req.benchmark_version_id))
-            else:
-                stmt = stmt.where(BenchmarkCaseRow.project_id == uuid.UUID(req.project_id))
-            if req.case_ids:
-                stmt = stmt.where(BenchmarkCaseRow.id.in_([uuid.UUID(x) for x in req.case_ids]))
-            if req.filter_category_id:
-                stmt = stmt.where(BenchmarkCaseRow.category_id == uuid.UUID(req.filter_category_id))
-            if req.filter_tags:
-                stmt = stmt.where(BenchmarkCaseRow.tags.overlap(req.filter_tags))
-            if req.limit:
-                stmt = stmt.limit(req.limit)
-            bench_rows = (await session.execute(stmt)).scalars().all()
-            for b in bench_rows:
-                expected_tool_calls = []
-                if isinstance(b.extra_fields, dict):
-                    for t in (b.extra_fields.get("expected_tool_calls") or []):
-                        nm = t.get("tool_name") or t.get("name") if isinstance(t, dict) else None
-                        if nm:
-                            expected_tool_calls.append({"tool_name": nm})
-                cases.append({
-                    "id": str(b.id),
-                    "name": str(b.id)[:8],
-                    "question": b.question,
-                    "expected_output": b.reference_answer or "",
-                    "expected_tool_calls": expected_tool_calls,
-                    "metadata": {"tags": list(b.tags or [])},
-                    "source": "benchmark",
-                })
+            wanted_category = cat_row.name
 
+        mgr = await get_manager()
+        try:
+            # 有勾选/分类筛选时先全量 load（不下推 limit），内存筛完再截断；
+            # 无筛选时沿用旧行为，直接把 limit 下推给 provider。
+            load_limit = None if (wanted_ids or wanted_category) else req.limit
+            ds_cases = await mgr.load_cases(req.conversation_dataset, limit=load_limit)
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"读取对话数据集 '{req.conversation_dataset}' 失败：{e}",
+            ) from e
+        for c in ds_cases:
+            # 分类 / 勾选筛选（在跳过无 user 消息之前先筛，limit 语义针对"将跑的样例"）。
+            if wanted_ids is not None and c.id not in wanted_ids:
+                continue
+            if wanted_category is not None and (c.category or "") != wanted_category:
+                continue
+            msgs = c.input_messages or []
+            if not any(m.get("role") == "user" and m.get("content") for m in msgs):
+                # 没有任何 user 消息的样例无法回放，跳过。
+                continue
+            # 内存筛选路径下 limit 未下推给 provider，在此按"将跑样例数"截断。
+            if load_limit is None and req.limit and len(cases) >= req.limit:
+                break
+            # question 仅作落库/展示的单值快照（首条 user 消息）。
+            first_user = next(
+                (m.get("content", "") for m in msgs if m.get("role") == "user"), ""
+            )
+            cases.append({
+                "id": c.id,
+                "name": c.name or c.id,
+                "question": first_user,
+                "expected_output": c.expected_output or "",
+                "expected_tool_calls": [],
+                "metadata": {"tags": list(c.tags or [])},
+                "source": "conversation",
+                # 多轮标记 + 完整回放/打分输入：runner 据此走 multiturn 分支。
+                "multi_turn": True,
+                "input_messages": msgs,
+                "conversation_goal": c.conversation_goal,
+                "turn_expectations": [te.model_dump() for te in c.turn_expectations],
+            })
         if not cases:
-            raise HTTPException(status_code=400, detail="no cases match the selection")
-
-        # ── 2. resolve evaluator instances ──
-        if not req.evaluator_ids:
-            raise HTTPException(status_code=400, detail="at least one evaluator_id is required")
-        evaluator_specs: list[dict[str, Any]] = []
-        for eid in req.evaluator_ids:
-            row = await repo.get_evaluator_config(uuid.UUID(eid))
-            if row is None:
-                raise HTTPException(status_code=404, detail=f"evaluator not found: {eid}")
-            if not row.is_active:
-                raise HTTPException(status_code=400, detail=f"evaluator inactive: {row.name}")
-            evaluator_specs.append({
-                "id": str(row.id),
-                "label": row.name,
-                "tag": row.tag or row.name,
-                "evaluator_type": row.evaluator_type,
-                "params": row.params or {},
-                # Pin to the active version so historical reproductions don't
-                # silently follow future edits. Stored verbatim into
-                # test_runs.evaluator_configs[].evaluator_version_id.
-                "evaluator_version_id": (
-                    str(row.current_version_id) if row.current_version_id else None
-                ),
+            raise HTTPException(
+                status_code=400,
+                detail=f"对话数据集 '{req.conversation_dataset}' 没有可回放的多轮样例",
+            )
+    elif req.case_source_id:
+        # ── uploaded file ──
+        src = await repo.get_eval_case_source(uuid.UUID(req.case_source_id))
+        if src is None:
+            raise HTTPException(status_code=404, detail="case_source not found")
+        raw_cases = src.cases or []
+        if req.limit:
+            raw_cases = raw_cases[: req.limit]
+        for c in raw_cases:
+            cases.append({
+                "id": c.get("name") or f"case-{len(cases)+1}",
+                "name": c.get("name") or f"case-{len(cases)+1}",
+                "question": c.get("question") or "",
+                "expected_output": c.get("expected_output") or "",
+                "expected_tool_calls": [],
+                "metadata": c.get("metadata") or {},
+                "source": "file",
+            })
+    else:
+        # ── benchmark dataset ──
+        stmt = select(BenchmarkCaseRow)
+        if req.benchmark_version_id:
+            stmt = stmt.where(BenchmarkCaseRow.version_id == uuid.UUID(req.benchmark_version_id))
+        else:
+            stmt = stmt.where(BenchmarkCaseRow.project_id == uuid.UUID(req.project_id))
+        if req.case_ids:
+            stmt = stmt.where(BenchmarkCaseRow.id.in_([uuid.UUID(x) for x in req.case_ids]))
+        if req.filter_category_id:
+            stmt = stmt.where(BenchmarkCaseRow.category_id == uuid.UUID(req.filter_category_id))
+        if req.filter_tags:
+            stmt = stmt.where(BenchmarkCaseRow.tags.overlap(req.filter_tags))
+        if req.limit:
+            stmt = stmt.limit(req.limit)
+        bench_rows = (await session.execute(stmt)).scalars().all()
+        for b in bench_rows:
+            expected_tool_calls = []
+            if isinstance(b.extra_fields, dict):
+                for t in (b.extra_fields.get("expected_tool_calls") or []):
+                    nm = t.get("tool_name") or t.get("name") if isinstance(t, dict) else None
+                    if nm:
+                        expected_tool_calls.append({"tool_name": nm})
+            cases.append({
+                "id": str(b.id),
+                "name": str(b.id)[:8],
+                "question": b.question,
+                "expected_output": b.reference_answer or "",
+                "expected_tool_calls": expected_tool_calls,
+                "metadata": {"tags": list(b.tags or [])},
+                "source": "benchmark",
             })
 
-    agent_cfg = req.agent.model_dump()
+    if not cases:
+        raise HTTPException(status_code=400, detail="no cases match the selection")
 
+    # ── 2. resolve evaluator instances ──
+    if not req.evaluator_ids:
+        raise HTTPException(status_code=400, detail="at least one evaluator_id is required")
+    evaluator_specs: list[dict[str, Any]] = []
+    for eid in req.evaluator_ids:
+        row = await repo.get_evaluator_config(uuid.UUID(eid))
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"evaluator not found: {eid}")
+        if not row.is_active:
+            raise HTTPException(status_code=400, detail=f"evaluator inactive: {row.name}")
+        evaluator_specs.append({
+            "id": str(row.id),
+            "label": row.name,
+            "tag": row.tag or row.name,
+            "evaluator_type": row.evaluator_type,
+            "params": row.params or {},
+            # Pin to the active version so historical reproductions don't
+            # silently follow future edits. Stored verbatim into
+            # test_runs.evaluator_configs[].evaluator_version_id.
+            "evaluator_version_id": (
+                str(row.current_version_id) if row.current_version_id else None
+            ),
+        })
+
+    policy = None
+    if req.acceptance_policy is not None:
+        raw_policy = req.acceptance_policy.model_dump()
+        specs_by_id = {spec["id"]: spec for spec in evaluator_specs}
+        for criterion in raw_policy["criteria"]:
+            spec = specs_by_id.get(criterion["evaluator_id"])
+            if spec is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "acceptance criterion evaluator_id must be selected for this run: "
+                        f"{criterion['evaluator_id']}"
+                    ),
+                )
+            criterion["evaluator_version_id"] = spec.get("evaluator_version_id")
+        try:
+            policy = validate_acceptance_policy(raw_policy)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # start_run 的 kwargs（notify_open_ids 由调用方按触发来源另行注入）。
+    return {
+        "cases": cases,
+        "agent_cfg": req.agent.model_dump(),
+        "evaluator_specs": evaluator_specs,
+        "acceptance_policy": policy,
+        "concurrency": req.concurrency,
+        "run_name": req.run_name,
+        "langsmith_project": req.langsmith_project,
+        "langfuse_trace_name": req.langfuse_trace_name,
+        "benchmark_version_id": req.benchmark_version_id,
+        "eval_case_source_id": req.case_source_id,
+    }
+
+
+@router.post("/runs/start")
+async def start_eval(req: StartEvalRequest):
+    """HTTP 发起一次评估：解析 → start_run。解析主体见
+    ``resolve_eval_start_args``（与定时调度器共用）。"""
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        args = await resolve_eval_start_args(req, session, repo)
     try:
-        run_id = await start_run(
-            cases=cases,
-            agent_cfg=agent_cfg,
-            evaluator_specs=evaluator_specs,
-            concurrency=req.concurrency,
-            run_name=req.run_name,
-            langsmith_project=req.langsmith_project,
-            langfuse_trace_name=req.langfuse_trace_name,
-            benchmark_version_id=req.benchmark_version_id,
-            eval_case_source_id=req.case_source_id,
-        )
+        # notify_open_ids 由调用方（机器人经 body 注入触发者 open_id）透传给
+        # 完成通知；resolve 不含 notify，避免与调度器的显式透传冲突。
+        run_id = await start_run(**args, notify_open_ids=req.notify_open_ids or None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"failed to start run: {e}") from e
-    return {"run_id": run_id, "status": "running", "case_count": len(cases)}
+    return {"run_id": run_id, "status": "running", "case_count": len(args["cases"])}
 
 
 def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRunSummary:
+    acceptance_policy = getattr(row, "acceptance_policy", None)
+    summary = project_stored_summary(row.summary_scores, acceptance_policy)
     return EvalRunSummary(
         id=str(row.id),
         benchmark_version_id=str(row.benchmark_version_id) if row.benchmark_version_id else None,
@@ -277,7 +325,10 @@ def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRun
         langsmith_project=row.langsmith_project,
         langfuse_trace_name=row.langfuse_trace_name,
         agent_config=row.agent_config or {},
-        summary_scores=row.summary_scores,
+        acceptance_policy=acceptance_policy,
+        summary_scores=summary,
+        facts=summary.get("facts") or {},
+        acceptance=summary.get("acceptance") or {},
         progress=progress or {},
         created_at=row.created_at,
     )
@@ -365,6 +416,9 @@ async def get_run_results(
     run_uuid = uuid.UUID(run_id)
     async with async_session_factory() as session:
         repo = Repository(session)
+        run_row = await repo.get_test_run(run_uuid)
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="run not found")
         rows, total = await repo.get_results_paginated(run_uuid, page=page, page_size=page_size)
         # Pull scores for these rows
         result_ids = [r.id for r in rows]
@@ -373,6 +427,7 @@ async def get_run_results(
             score_rows = (await session.execute(
                 select(EvaluationScoreRow).where(EvaluationScoreRow.result_id.in_(result_ids))
             )).scalars().all()
+    acceptance_policy = getattr(run_row, "acceptance_policy", None)
     score_index: dict[uuid.UUID, dict[str, float]] = {}
     details_index: dict[uuid.UUID, dict[str, dict]] = {}
     for s in score_rows:
@@ -385,11 +440,23 @@ async def get_run_results(
 
     items: list[EvalResultRow] = []
     for r in rows:
+        scores = score_index.get(r.id, {})
+        projection = project_case(
+            stored_status=r.status,
+            error_type=r.error_type,
+            scores=scores,
+            acceptance_policy=acceptance_policy,
+        )
         items.append(EvalResultRow(
             id=str(r.id),
             benchmark_case_id=str(r.benchmark_case_id) if r.benchmark_case_id else None,
             test_case_id=str(r.test_case_id) if r.test_case_id else None,
             status=r.status,
+            execution_status=projection["execution_status"],
+            evaluation_status=projection["evaluation_status"],
+            acceptance_decision=projection["acceptance_decision"],
+            decision_source=projection["decision_source"],
+            criterion_results=projection["criterion_results"],
             actual_output=r.actual_output,
             question=r.question,
             latency_ms=r.latency_ms,
@@ -404,10 +471,11 @@ async def get_run_results(
             actual_tool_calls=r.actual_tool_calls,
             full_trace=r.full_trace,
             error_message=r.error_message,
+            error_type=r.error_type,
             langfuse_trace_id=r.langfuse_trace_id,
             langsmith_run_id=r.langsmith_run_id,
             attempts_made=getattr(r, "attempts_made", 1) or 1,
-            scores=score_index.get(r.id, {}),
+            scores=scores,
             score_details=details_index.get(r.id, {}),
         ))
     return EvalResultsPage(items=items, total=total, page=page, page_size=page_size)
@@ -441,10 +509,17 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
             )).scalars().all()
             expected_by_case = {b.id: (b.reference_answer or "") for b in bench_rows}
 
+    acceptance_policy = getattr(run_row, "acceptance_policy", None)
     dims: set[str] = set()
     rows: list[dict[str, Any]] = []
     for r in sorted(results, key=lambda x: x.created_at or x.id.hex):
         score_map = {s.dimension: float(s.score) for s in scores_by_result.get(r.id, [])}
+        projection = project_case(
+            stored_status=r.status,
+            error_type=getattr(r, "error_type", None),
+            scores=score_map,
+            acceptance_policy=acceptance_policy,
+        )
         dims.update(score_map.keys())
         rows.append({
             "id": str(r.id),
@@ -459,6 +534,11 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
                 or expected_by_case.get(r.benchmark_case_id, "")
             ),
             "status": r.status,
+            "execution_status": projection["execution_status"],
+            "evaluation_status": projection["evaluation_status"],
+            "acceptance_decision": projection["acceptance_decision"],
+            "decision_source": projection["decision_source"],
+            "criterion_results": projection["criterion_results"],
             "actual_output": r.actual_output,
             "latency_ms": r.latency_ms,
             "prompt_tokens": r.prompt_tokens,
@@ -472,6 +552,7 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
             "attempts_made": getattr(r, "attempts_made", 1) or 1,
             "actual_tool_calls": r.actual_tool_calls,
             "error_message": r.error_message,
+            "error_type": getattr(r, "error_type", None),
             "langfuse_trace_id": r.langfuse_trace_id,
             "langsmith_run_id": r.langsmith_run_id,
             "scores": score_map,
@@ -480,19 +561,18 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
     return run_row, rows, sorted(dims)
 
 
-@router.get("/runs/{run_id}/results/export")
-async def export_run_results(run_id: str, format: str = Query("csv")):
-    """Export all per-sample results of a run as csv / json / xlsx."""
-    validate_format(format)
-    run_uuid = uuid.UUID(run_id)
-    _run_row, rows, dims = await _collect_run_results(run_uuid)
-
+def _run_export_columns(dims: list[str]) -> list[ExportColumn]:
+    """单次结果导出的列谱（CSV/xlsx/JSON 与 Bitable 共用）。"""
     columns = [
         ExportColumn("id", "结果 ID"),
         ExportColumn("benchmark_case_id", "基准用例 ID"),
         ExportColumn("question", "问题"),
         ExportColumn("expected_output", "期望答案"),
-        ExportColumn("status", "状态"),
+        ExportColumn("execution_status", "Agent 执行状态"),
+        ExportColumn("evaluation_status", "Judge 评分状态"),
+        ExportColumn("acceptance_decision", "验收结论"),
+        ExportColumn("decision_source", "结论来源"),
+        ExportColumn("status", "兼容状态"),
         ExportColumn("actual_output", "生成答案"),
         ExportColumn("latency_ms", "时延(ms)"),
         ExportColumn("prompt_tokens", "输入 token"),
@@ -505,13 +585,22 @@ async def export_run_results(run_id: str, format: str = Query("csv")):
         ExportColumn("first_answer_token_ms", "首答案 token(ms)"),
         ExportColumn("attempts_made", "尝试次数"),
         ExportColumn("actual_tool_calls", "工具调用明细"),
+        ExportColumn("criterion_results", "验收规则明细"),
+        ExportColumn("error_type", "错误类型"),
         ExportColumn("error_message", "错误信息"),
         ExportColumn("langfuse_trace_id", "Langfuse Trace"),
     ]
-    # One column per score dimension, sorted for stable output.
     for d in dims:
         columns.append(ExportColumn(f"score::{d}", f"分数·{d}"))
+    return columns
 
+@router.get("/runs/{run_id}/results/export")
+async def export_run_results(run_id: str, format: str = Query("csv")):
+    """Export all per-sample results of a run as csv / json / xlsx."""
+    validate_format(format)
+    run_uuid = uuid.UUID(run_id)
+    _run_row, rows, dims = await _collect_run_results(run_uuid)
+    columns = _run_export_columns(dims)
     return build_export_response(rows, columns, format, f"eval_run_{run_id[:8]}_results")
 
 
@@ -527,22 +616,259 @@ async def export_compare(req: ExportCompareRequest):
     validate_format(req.format)
     if not req.run_ids:
         raise HTTPException(status_code=400, detail="run_ids is required")
+    matrix, columns = await _build_compare_matrix(req.run_ids, req.align_key)
+    return build_export_response(matrix, columns, req.format, "eval_compare")
 
-    # Load every run's results, then align samples across runs by case id or
-    # normalized question — same keying the compare page uses client-side.
+
+class CompareReportRequest(BaseModel):
+    run_ids: list[str]
+    align_key: str = "case_id"  # "case_id" | "question"
+    # 对比页子集模式传当前勾选的矩阵对齐键；为空表示完整运行。
+    aligned_keys: list[str] | None = None
+
+
+_COMPARE_PERF_FIELDS = {
+    "status", "execution_status", "evaluation_status", "acceptance_decision",
+    "decision_source", "error_type", "latency_ms", "total_tokens",
+    "prompt_tokens", "completion_tokens", "tool_call_count",
+}
+
+
+def _score_values(slot: dict[str, Any], run_id: str) -> dict[str, float]:
+    """Return only evaluator scores for one run from a comparison-matrix row."""
+    prefix = f"{run_id}::"
+    values: dict[str, float] = {}
+    for key, value in slot.items():
+        if not key.startswith(prefix):
+            continue
+        dimension = key[len(prefix):]
+        if dimension in _COMPARE_PERF_FIELDS or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            values[dimension] = float(value)
+    return values
+
+
+def _sample_mean_score(slot: dict[str, Any], run_id: str) -> float | None:
+    """取某 run 的真实评分维度均值，不混入时延/token/工具调用等性能列。"""
+    vals = list(_score_values(slot, run_id).values())
+    return sum(vals) / len(vals) if vals else None
+
+
+def _subset_run_summary(
+    matrix: list[dict[str, Any]],
+    run_id: str,
+    name: str,
+    acceptance_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按选中矩阵行重算执行、评分与可选验收语义。"""
+    present = [slot for slot in matrix if f"{run_id}::execution_status" in slot]
+    cases = [
+        {
+            "status": slot.get(f"{run_id}::status"),
+            "error_type": slot.get(f"{run_id}::error_type"),
+            "scores": _score_values(slot, run_id),
+            "decision_source": slot.get(f"{run_id}::decision_source"),
+        }
+        for slot in present
+    ]
+    semantics = aggregate_semantics(cases, acceptance_policy)
+
+    dim_values: dict[str, list[float]] = {}
+    for slot in present:
+        for dimension, value in _score_values(slot, run_id).items():
+            dim_values.setdefault(dimension, []).append(value)
+    raw_dim_avg = {
+        dimension: sum(values) / len(values)
+        for dimension, values in dim_values.items() if values
+    }
+
+    def _cost_row(slot: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "latency_ms": slot.get(f"{run_id}::latency_ms"),
+            "total_tokens": slot.get(f"{run_id}::total_tokens"),
+            "prompt_tokens": slot.get(f"{run_id}::prompt_tokens"),
+            "completion_tokens": slot.get(f"{run_id}::completion_tokens"),
+            "tool_call_count": slot.get(f"{run_id}::tool_call_count"),
+        }
+
+    projections = semantics["projections"]
+    scored = [
+        _cost_row(slot) for slot, projection in zip(present, projections)
+        if projection["evaluation_status"] == "completed"
+    ]
+    execution_abnormal = [
+        _cost_row(slot) for slot, projection in zip(present, projections)
+        if projection["execution_status"] == "abnormal"
+    ]
+    summary: dict[str, Any] = {
+        "name": name,
+        "total": len(present),
+        "facts": semantics["facts"],
+        "acceptance": semantics["acceptance"],
+        "dimension_averages": raw_dim_avg,
+        "cost_scored": _aggregate_cost(scored),
+        "cost_execution_abnormal": _aggregate_cost(execution_abnormal),
+    }
+    if acceptance_policy is not None:
+        accepted = [
+            _cost_row(slot) for slot, projection in zip(present, projections)
+            if projection["acceptance_decision"] == "pass"
+        ]
+        not_accepted = [
+            _cost_row(slot) for slot, projection in zip(present, projections)
+            if projection["acceptance_decision"] == "fail"
+        ]
+        summary["cost_accepted"] = _aggregate_cost(accepted)
+        summary["cost_not_accepted"] = _aggregate_cost(not_accepted)
+    return summary
+
+@router.post("/runs/compare-report")
+async def compare_report(req: CompareReportRequest):
+    """为多 run 对比生成 LLM 叙述式解读（markdown）。
+
+    完整模式读取各 run 持久化汇总；子集模式按 ``aligned_keys`` 过滤全量矩阵并
+    重算同口径汇总。交叉优劣只使用真实评分维度，不混入性能/成本列。
+    """
+    from agent_eval.feishu.report_llm import (
+        _collapse_dim_avg,
+        generate_compare_report,
+    )
+
+    if not req.run_ids:
+        raise HTTPException(status_code=400, detail="run_ids is required")
+
+    run_rows: dict[str, Any] = {}
+    run_names: dict[str, str] = {}
+    async with async_session_factory() as session:
+        for rid in req.run_ids:
+            row = (await session.execute(
+                select(TestRunRow).where(TestRunRow.id == uuid.UUID(rid))
+            )).scalar_one_or_none()
+            if row is None:
+                continue
+            run_rows[rid] = row
+            run_names[rid] = row.langfuse_run_name or rid[:8]
+
+    valid_ids = [rid for rid in req.run_ids if rid in run_rows]
+    if not valid_ids:
+        raise HTTPException(status_code=404, detail="no valid runs")
+
+    matrix: list[dict[str, Any]] = []
+    try:
+        matrix, _cols = await _build_compare_matrix(valid_ids, req.align_key)
+        if req.aligned_keys is not None:
+            wanted = set(req.aligned_keys)
+            matrix = [slot for slot in matrix if slot.get("对齐键") in wanted]
+    except Exception:  # noqa: BLE001
+        logger.exception("compare-report matrix build failed")
+
+    runs_summary: list[dict[str, Any]] = []
+    if req.aligned_keys is not None:
+        for rid in valid_ids:
+            summary = _subset_run_summary(
+                matrix,
+                rid,
+                run_names[rid],
+                getattr(run_rows[rid], "acceptance_policy", None),
+            )
+            summary["dimension_averages"] = _collapse_dim_avg(
+                summary["dimension_averages"]
+            )
+            runs_summary.append(summary)
+    else:
+        for rid in valid_ids:
+            row = run_rows[rid]
+            ss = project_stored_summary(
+                row.summary_scores,
+                getattr(row, "acceptance_policy", None),
+            )
+            facts = ss.get("facts") or {}
+            item = {
+                "name": run_names[rid],
+                "total": int(facts.get("total") or 0),
+                "facts": facts,
+                "acceptance": ss.get("acceptance") or {},
+                "dimension_averages": _collapse_dim_avg(ss.get("dimension_averages")),
+                "cost_scored": ss.get("cost_scored") or {},
+                "cost_execution_abnormal": ss.get("cost_execution_abnormal") or {},
+            }
+            if (ss.get("acceptance") or {}).get("configured"):
+                item["cost_accepted"] = ss.get("cost_accepted") or {}
+                item["cost_not_accepted"] = ss.get("cost_not_accepted") or {}
+            runs_summary.append(item)
+
+    # 交叉样例质量差（仅前两个有效 run 视作 A/B）。矩阵 key 一律用 run_id；
+    # 显示 label 只进入报告文案，避免同名 run 或 label/run_id 混用导致全 0。
+    align_stats: dict[str, Any] | None = None
+    if len(valid_ids) >= 2 and matrix:
+        a_id, b_id = valid_ids[:2]
+        common = diverging = a_better = b_better = 0
+        for slot in matrix:
+            a = _sample_mean_score(slot, a_id)
+            b = _sample_mean_score(slot, b_id)
+            if a is None or b is None:
+                continue
+            common += 1
+            if abs(a - b) > 1e-9:
+                diverging += 1
+                if a > b:
+                    a_better += 1
+                else:
+                    b_better += 1
+        align_stats = {
+            "a_name": run_names[a_id], "b_name": run_names[b_id],
+            "common": common, "diverging": diverging,
+            "a_better": a_better, "b_better": b_better,
+        }
+
+    report = await generate_compare_report(runs_summary, align_stats=align_stats)
+    return {
+        "run_ids": valid_ids,
+        "scope": "selected_subset" if req.aligned_keys is not None else "full_runs",
+        "report": report,
+    }
+
+
+def _compare_columns(
+    run_ids: list[str], run_labels: dict[str, str], all_dims: set[str],
+) -> list[ExportColumn]:
+    """对比矩阵列谱（CSV/xlsx/JSON 与 Bitable 共用）。"""
+    columns = [ExportColumn("样例", "样例"), ExportColumn("对齐键", "对齐键")]
+    for run_id in run_ids:
+        label = run_labels.get(run_id, run_id[:8])
+        columns.extend([
+            ExportColumn(f"{run_id}::execution_status", f"{label}·Agent执行"),
+            ExportColumn(f"{run_id}::evaluation_status", f"{label}·Judge评分"),
+            ExportColumn(f"{run_id}::acceptance_decision", f"{label}·验收结论"),
+            ExportColumn(f"{run_id}::decision_source", f"{label}·结论来源"),
+            ExportColumn(f"{run_id}::status", f"{label}·兼容状态"),
+            ExportColumn(f"{run_id}::latency_ms", f"{label}·时延(ms)"),
+            ExportColumn(f"{run_id}::total_tokens", f"{label}·总token"),
+            ExportColumn(f"{run_id}::prompt_tokens", f"{label}·输入token"),
+            ExportColumn(f"{run_id}::completion_tokens", f"{label}·输出token"),
+            ExportColumn(f"{run_id}::tool_call_count", f"{label}·工具调用数"),
+            ExportColumn(f"{run_id}::error_type", f"{label}·错误类型"),
+        ])
+        for d in sorted(all_dims):
+            columns.append(ExportColumn(f"{run_id}::{d}", f"{label}·{d}"))
+    return columns
+
+
+async def _build_compare_matrix(
+    run_ids: list[str], align_key: str,
+) -> tuple[list[dict[str, Any]], list[ExportColumn]]:
+    """跑出对比矩阵的 rows + columns（export-compare 与 Bitable 导出共用）。"""
     run_labels: dict[str, str] = {}
     all_dims: set[str] = set()
     aligned: dict[str, dict[str, Any]] = {}
-
-    for run_id in req.run_ids:
+    for run_id in run_ids:
         run_uuid = uuid.UUID(run_id)
         run_row, rows, dims = await _collect_run_results(run_uuid)
         all_dims.update(dims)
-        run_labels[run_id] = (
-            getattr(run_row, "langfuse_run_name", None) or run_id[:8]
-        )
+        run_labels[run_id] = getattr(run_row, "langfuse_run_name", None) or run_id[:8]
         for r in rows:
-            if req.align_key == "question":
+            if align_key == "question":
                 q = (r.get("question") or "").strip()
                 if not q:
                     continue
@@ -556,31 +882,135 @@ async def export_compare(req: ExportCompareRequest):
             slot = aligned.setdefault(key, {"对齐键": key, "样例": label})
             for d, v in (r.get("scores") or {}).items():
                 slot[f"{run_id}::{d}"] = v
-            slot[f"{run_id}::status"] = r.get("status")
-            # 性能 / 成本核心指标：与分数并列进对比矩阵，方便横比各模型的
-            # 延迟、token 消耗、工具调用规模。只取核心几项，避免矩阵列爆炸
-            # （逐样例完整性能明细走 export-summary）。
+            for semantic_key in (
+                "status", "execution_status", "evaluation_status",
+                "acceptance_decision", "decision_source", "error_type",
+            ):
+                slot[f"{run_id}::{semantic_key}"] = r.get(semantic_key)
             for perf_key in (
                 "latency_ms", "total_tokens", "prompt_tokens",
                 "completion_tokens", "tool_call_count",
             ):
                 slot[f"{run_id}::{perf_key}"] = r.get(perf_key)
+    columns = _compare_columns(run_ids, run_labels, all_dims)
+    matrix = sorted(aligned.values(), key=lambda x: str(x.get("样例", "")))
+    return matrix, columns
 
-    columns = [ExportColumn("样例", "样例"), ExportColumn("对齐键", "对齐键")]
-    for run_id in req.run_ids:
-        label = run_labels.get(run_id, run_id[:8])
-        columns.append(ExportColumn(f"{run_id}::status", f"{label}·状态"))
-        # 性能 / 成本列紧跟状态，与分数列分组清晰。
-        columns.append(ExportColumn(f"{run_id}::latency_ms", f"{label}·时延(ms)"))
-        columns.append(ExportColumn(f"{run_id}::total_tokens", f"{label}·总token"))
-        columns.append(ExportColumn(f"{run_id}::prompt_tokens", f"{label}·输入token"))
-        columns.append(ExportColumn(f"{run_id}::completion_tokens", f"{label}·输出token"))
-        columns.append(ExportColumn(f"{run_id}::tool_call_count", f"{label}·工具调用数"))
-        for d in sorted(all_dims):
-            columns.append(ExportColumn(f"{run_id}::{d}", f"{label}·{d}"))
+class ExportBitableRequest(BaseModel):
+    app_token: str  # 多维表格 app_token（表所在的 base）
+    table_id: str   # 目标数据表 id
+    include_report: bool = False  # 附带一份 LLM 分析报告到概览（预留）
 
-    rows = sorted(aligned.values(), key=lambda x: str(x.get("样例", "")))
-    return build_export_response(rows, columns, req.format, "eval_compare")
+
+class ExportCompareBitableRequest(BaseModel):
+    run_ids: list[str]
+    align_key: str = "case_id"  # "case_id" | "question"
+    app_token: str
+    table_id: str
+
+
+async def _bitable_token_or_401(user: Any) -> str:
+    """取当前用户可用的飞书 user_access_token；无则抛 400 引导去授权。
+
+    Bitable 用 user OAuth（访问用户私人多维表格），不能走 app 身份。token
+    过期会在 get_valid_user_token 内自动 refresh；refresh 也失效则为 None，
+    此时提示用户在飞书里重新授权（工具链路会主动发授权卡片）。
+    """
+    if user is None:
+        # dev 模式（auth 关）无用户上下文，拿不到 OAuth token。
+        raise HTTPException(status_code=400, detail="需要登录用户以使用其飞书授权访问多维表格")
+    from agent_eval.feishu.oauth import get_valid_user_token
+
+    token = await get_valid_user_token(user.id)
+    if not token:
+        raise HTTPException(
+            status_code=428,  # Precondition Required：需先完成飞书授权
+            detail="尚未完成飞书多维表格授权或授权已过期，请在飞书里点击授权链接后重试",
+        )
+    return token
+
+
+@router.post("/runs/{run_id}/export-bitable")
+async def export_run_to_bitable(
+    run_id: str, req: ExportBitableRequest, user=Depends(require_internal()),
+):
+    """把单次评估结果逐样例写入用户指定的飞书多维表格。
+
+    复用 _collect_run_results 的 rows + _run_export_columns 的列谱（与 CSV/xlsx
+    导出同一数据源），只把序列化目的地换成 Bitable 记录。用当前用户的 OAuth
+    token 访问其私人多维表格。
+    """
+    from agent_eval.api.bitable_export import write_rows_to_bitable
+
+    run_uuid = uuid.UUID(run_id)
+    run_row, rows, dims = await _collect_run_results(run_uuid)
+    columns = _run_export_columns(dims)
+    result = await write_rows_to_bitable(
+        app_token=req.app_token,
+        table_id=req.table_id,
+        rows=rows,
+        columns=columns,
+    )
+    resp: dict[str, Any] = {"ok": result["failed"] == 0, **result}
+    # include_report：附带一份 LLM 分析报告到响应（前端/机器人据此展示），
+    # 生成失败绝不阻断导出主流程（report_llm 内部已兜底为规则摘要）。
+    if req.include_report:
+        from agent_eval.feishu.report_llm import generate_run_report
+
+        run_name = getattr(run_row, "langfuse_run_name", None) or run_id[:8]
+        summary = project_stored_summary(
+            getattr(run_row, "summary_scores", None),
+            getattr(run_row, "acceptance_policy", None),
+        )
+        resp["report"] = await generate_run_report(summary, run_name=run_name)
+    return resp
+
+
+@router.get("/runs/{run_id}/report")
+async def get_run_report(run_id: str):
+    """为一次评估运行生成 LLM 叙述式分析报告（markdown 文本）。
+
+    读该 run 的 ``summary_scores`` 交 ``report_llm`` 解读；LLM 不可用时
+    退回规则摘要（不抛）。前端「单次结果」页与机器人 ``analyze_run`` 共用。
+    """
+    from agent_eval.feishu.report_llm import generate_run_report
+
+    run_uuid = uuid.UUID(run_id)
+    async with async_session_factory() as session:
+        run_row = (await session.execute(
+            select(TestRunRow).where(TestRunRow.id == run_uuid)
+        )).scalar_one_or_none()
+        if run_row is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        summary = project_stored_summary(
+            run_row.summary_scores,
+            getattr(run_row, "acceptance_policy", None),
+        )
+        run_name = run_row.langfuse_run_name or run_id[:8]
+
+    report = await generate_run_report(summary, run_name=run_name)
+    return {"run_id": run_id, "run_name": run_name, "report": report}
+
+
+@router.post("/runs/export-compare-bitable")
+async def export_compare_to_bitable(
+    req: ExportCompareBitableRequest, user=Depends(require_internal()),
+):
+    """把多 run 对比矩阵写入用户指定的飞书多维表格（复用 _build_compare_matrix）。"""
+    from agent_eval.api.bitable_export import write_rows_to_bitable
+
+    if not req.run_ids:
+        raise HTTPException(status_code=400, detail="run_ids is required")
+    token = await _bitable_token_or_401(user)
+    rows, columns = await _build_compare_matrix(req.run_ids, req.align_key)
+    result = await write_rows_to_bitable(
+        user_access_token=token,
+        app_token=req.app_token,
+        table_id=req.table_id,
+        rows=rows,
+        columns=columns,
+    )
+    return {"ok": result["failed"] == 0, **result}
 
 
 class ExportRunsSummaryRequest(BaseModel):
@@ -652,6 +1082,28 @@ async def stop_run(run_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="run not found or already finished")
     return {"run_id": run_id, "status": "stopping"}
+
+
+@router.post("/runs/{run_id}/rescore")
+async def rescore_run(run_id: str):
+    """对已完成 run 里「缺分维度」补评。
+
+    复用已存的 agent 回答（不重跑 agent），只对评分缺失的维度
+    重打 judge；维度齐全的样例从 evaluation_error 恢复为 scored。
+    补评完成后复用 reaggregate 刷新汇总。
+    """
+    try:
+        stats = await rescore_missing_dimensions(run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"rescore failed: {e}") from e
+    # 补评改了逐样例分数/状态，立即重算汇总使列表/详情页一致。
+    try:
+        await reaggregate_run(run_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("rescore: reaggregate after rescore failed for %s: %s", run_id, e)
+    return {"run_id": run_id, **stats}
 
 
 @router.post("/runs/{run_id}/reaggregate")
@@ -733,15 +1185,13 @@ async def reaggregate_run(run_id: str):
                 tool_stats[nm]["cases"] += 1
         tool_usage = sorted(tool_stats.values(), key=lambda x: (-x["calls"], x["name"]))
 
-        # cost (success/failure split) — build minimal dicts that
-        # _aggregate_cost knows how to read.
         def _cost_row(r):
             return {
                 "prompt_tokens": r.prompt_tokens,
                 "completion_tokens": r.completion_tokens,
                 "total_tokens": r.total_tokens,
                 "tool_call_count": r.tool_call_count,
-                "message_count": None,  # not persisted on test_results
+                "message_count": None,
                 "cache_creation_tokens": r.cache_creation_tokens,
                 "cache_read_tokens": r.cache_read_tokens,
                 "latency_ms": r.latency_ms,
@@ -749,27 +1199,53 @@ async def reaggregate_run(run_id: str):
                 "first_answer_token_ms": getattr(r, "first_answer_token_ms", None),
             }
 
-        succ = [_cost_row(r) for r in results if r.status == "pass"]
-        fail = [_cost_row(r) for r in results if r.status != "pass"]
+        policy = getattr(run_row, "acceptance_policy", None)
+        cases = [
+            {
+                "status": r.status,
+                "error_type": getattr(r, "error_type", None),
+                "scores": scores_by_result.get(r.id, {}),
+            }
+            for r in results
+        ]
+        semantics = aggregate_semantics(cases, policy)
+        projections = semantics["projections"]
+        scored = [
+            _cost_row(r) for r, projection in zip(results, projections)
+            if projection["evaluation_status"] == "completed"
+        ]
+        execution_abnormal = [
+            _cost_row(r) for r, projection in zip(results, projections)
+            if projection["execution_status"] == "abnormal"
+        ]
 
         merged = dict(run_row.summary_scores or {})
+        for legacy_key in ("counts", "cost_success", "cost_failure"):
+            merged.pop(legacy_key, None)
+        merged["facts"] = semantics["facts"]
+        merged["acceptance"] = semantics["acceptance"]
         merged["dimension_averages"] = dim_avg
         merged["score_distribution"] = {
             "buckets": bucket_labels,
             "by_dimension": score_distribution,
         }
         merged["tool_usage"] = tool_usage
-        merged["cost_success"] = _aggregate_cost(succ)
-        merged["cost_failure"] = _aggregate_cost(fail)
-        merged["counts"] = {
-            "total": len(results),
-            "passed": len(succ),
-            "failed": len(fail),
-            "unreachable": sum(
-                1 for r in results
-                if r.status in ("agent_unreachable", "agent_timeout")
-            ),
-        }
+        merged["cost_scored"] = _aggregate_cost(scored)
+        merged["cost_execution_abnormal"] = _aggregate_cost(execution_abnormal)
+        if policy is not None:
+            accepted = [
+                _cost_row(r) for r, projection in zip(results, projections)
+                if projection["acceptance_decision"] == "pass"
+            ]
+            not_accepted = [
+                _cost_row(r) for r, projection in zip(results, projections)
+                if projection["acceptance_decision"] == "fail"
+            ]
+            merged["cost_accepted"] = _aggregate_cost(accepted)
+            merged["cost_not_accepted"] = _aggregate_cost(not_accepted)
+        else:
+            merged.pop("cost_accepted", None)
+            merged.pop("cost_not_accepted", None)
 
         run_row.summary_scores = merged
         await session.commit()

@@ -234,6 +234,15 @@ async def _fetch_models(
     in ``detail`` — at worst the body preview from a 4xx response surfaces
     the URL path the provider used.
     """
+    # Agent (SSE) providers have no /models listing and judging can take
+    # >30s per call — a short ping here would false-negative. The real
+    # connectivity check is the evaluator dry-run path.
+    if provider_type == "agent":
+        return (
+            True, None,
+            "Agent (SSE) 端点：请用评估器 dry-run 验证连通性",
+            [],
+        )
     url = _models_endpoint(provider_type, base_url)
     if url is None:
         return (

@@ -62,7 +62,7 @@ _TRANSIENT_HTTPX_EXC = (
     httpx.RemoteProtocolError,
     httpx.PoolTimeout,
 )
-_RETRY_ATTEMPTS = 3
+_RETRY_ATTEMPTS = 5
 _RETRY_BASE_DELAY = 0.2  # seconds; exponential, jittered
 
 
@@ -359,6 +359,127 @@ class AzureOpenAIJudgeClient(_BaseJudgeClient):
     _parse_response = OpenAICompatJudgeClient._parse_response  # type: ignore[assignment]
 
 
+class AgentSSEJudgeClient(_BaseJudgeClient):
+    """"Agent-as-judge" dialect — instead of an LLM API, this posts the judge
+    prompt to an SSE agent endpoint (typically the same LangGraph v2 agent
+    under test) and treats the agent's streamed reply as the judge output.
+
+    Reuses ``SSEStreamAdapter`` for the actual streaming. Two differences from
+    the LLM clients:
+
+      * No system channel — SSE agents take a single ``question``. We flatten
+        the system+user messages into one question string (system first, then
+        a blank line, then the user prompt).
+      * No ``/chat/completions`` HTTP shape — the base ``ainvoke`` (build
+        request / parse response) doesn't apply, so we override ``ainvoke``
+        entirely and never open the base class's httpx client.
+
+    ``base_url`` holds the agent's SSE URL. ``extra_config`` may carry:
+      * ``mode``     — ``"langgraph_v2"`` (default) or ``"generic"``
+      * ``language`` — passed to the agent (default ``"请用中文回复"``)
+      * ``headers``  — extra request headers (dict)
+      * ``payload_template`` — for ``generic`` mode payload construction
+    """
+
+    provider_type = "agent"
+
+    # 追加到 question 末尾的硬约束。SSE 业务 agent 默认把 judge prompt 当普通
+    # 问题用散文回答，不吐 JSON —— 这里再钉一遍输出契约，尽量让它直接吐可解析
+    # JSON。即便它仍不听，configurable_judge 侧还有散文兜底抽分作为第二道保险。
+    _JSON_CONTRACT = (
+        "\n\n---\n"
+        "【输出要求（务必遵守）】你现在是评分器，不是问答助手。"
+        "不要解答上面的问题本身，只需按要求对「AI 回答」打分。"
+        "最终必须只输出一个 JSON 对象，形如 "
+        '{"score": <0到1之间的数值>, "reasoning": "<简短理由>"}，'
+        "不要输出任何额外文字、解释或 Markdown 代码围栏。"
+    )
+
+    def _flatten_question(self, messages: list[dict[str, Any]]) -> str:
+        system_parts: list[str] = []
+        user_parts: list[str] = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content") or ""
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+            else:
+                user_parts.append(content)
+        system = "\n\n".join(system_parts)
+        user = "\n\n".join(user_parts)
+        if system and user:
+            combined = f"{system}\n\n{user}"
+        else:
+            combined = system or user
+        return f"{combined}{self._JSON_CONTRACT}"
+
+    async def ainvoke(self, messages: list[dict[str, Any]]) -> JudgeInvocation:
+        # Import here to avoid a module-level cycle (agent_adapter is a
+        # sibling under evaluation/ and imports nothing from this module,
+        # but keeping the import local matches the "judge_clients is
+        # dependency-light" intent and avoids surprises if that changes).
+        from agent_eval.evaluation.agent_adapter import SSEStreamAdapter
+
+        question = self._flatten_question(messages)
+        mode = self.extra_config.get("mode") or "langgraph_v2"
+        language = self.extra_config.get("language") or "请用中文回复"
+        headers = self.extra_config.get("headers") or None
+        payload_template = self.extra_config.get("payload_template") or None
+
+        if not self.base_url:
+            raise JudgeClientError("agent: base_url (SSE 端点) is required")
+
+        adapter = SSEStreamAdapter(
+            url=self.base_url,
+            headers=headers if isinstance(headers, dict) else None,
+            payload_template=payload_template if isinstance(payload_template, dict) else None,
+            timeout=self.timeout,
+            mode=mode,
+            language=language,
+        )
+        try:
+            resp = await adapter.invoke([{"role": "user", "content": question}])
+        except httpx.HTTPStatusError as e:
+            preview = ""
+            try:
+                preview = e.response.text[:300].replace("\n", " ")
+            except Exception:
+                pass
+            raise JudgeClientError(
+                f"agent: HTTP {e.response.status_code}: {preview}"
+            ) from e
+        except httpx.HTTPError as e:
+            raise JudgeClientError(
+                f"agent: connection error: {type(e).__name__}: {e}"
+            ) from e
+        except Exception as e:
+            raise JudgeClientError(
+                f"agent: unexpected error: {type(e).__name__}: {e}"
+            ) from e
+        finally:
+            await adapter.close()
+
+        raw = resp.raw_response if isinstance(resp.raw_response, dict) else {}
+        return JudgeInvocation(
+            content=resp.content or "",
+            usage=JudgeUsage(),
+            model="agent",
+            raw_response=raw,
+        )
+
+    async def __aenter__(self) -> "AgentSSEJudgeClient":
+        # No persistent httpx client — each ainvoke owns its adapter.
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+
 # ────────────────────────────────────────────────────────────────────────
 # Factory
 # ────────────────────────────────────────────────────────────────────────
@@ -374,6 +495,7 @@ _DIALECTS: dict[str, type[_BaseJudgeClient]] = {
     "custom": OpenAICompatJudgeClient,
     "anthropic": AnthropicJudgeClient,
     "azure": AzureOpenAIJudgeClient,
+    "agent": AgentSSEJudgeClient,
 }
 
 
@@ -403,10 +525,15 @@ def build_judge_client(
 
     resolved_model = model or provider.default_model
     if not resolved_model:
-        raise JudgeClientError(
-            f"provider '{provider.name}' has no default_model and the "
-            "evaluator did not specify one — set one before saving."
-        )
+        # Agent (SSE) providers don't take a model — the endpoint IS the
+        # judge. Use a placeholder so the "no model" guard doesn't block them.
+        if provider.provider_type == "agent":
+            resolved_model = "agent"
+        else:
+            raise JudgeClientError(
+                f"provider '{provider.name}' has no default_model and the "
+                "evaluator did not specify one — set one before saving."
+            )
 
     api_key = decrypt_secret(provider.api_key_encrypted) if provider.api_key_encrypted else None
 

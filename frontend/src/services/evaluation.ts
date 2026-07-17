@@ -127,6 +127,21 @@ export const evaluationApi = {
   getResults(runId: string, params?: { page?: number; page_size?: number }) {
     return api.get<EvalResultsPage>(`/eval/runs/${runId}/results`, { params })
   },
+  async getAllResults(runId: string): Promise<EvalResultsPage> {
+    const pageSize = 200
+    const first = (await api.get<EvalResultsPage>(`/eval/runs/${runId}/results`, {
+      params: { page: 1, page_size: pageSize },
+    })).data
+    const items = [...first.items]
+    const pageCount = Math.ceil(first.total / pageSize)
+    for (let page = 2; page <= pageCount; page += 1) {
+      const next = (await api.get<EvalResultsPage>(`/eval/runs/${runId}/results`, {
+        params: { page, page_size: pageSize },
+      })).data
+      items.push(...next.items)
+    }
+    return { ...first, items, page: 1, page_size: items.length }
+  },
   exportResults(runId: string, format: ExportFormat) {
     return triggerExport({
       url: `/eval/runs/${runId}/results/export`,
@@ -143,6 +158,25 @@ export const evaluationApi = {
       format,
       fallbackName: 'eval_compare',
     })
+  },
+
+  // 单次评估 LLM 解读（markdown）。后端 LLM 不可用时降级规则摘要，仍返回字符串。
+  getRunReport(runId: string) {
+    return api.get<{ run_id: string; run_name: string; report: string }>(
+      `/eval/runs/${runId}/report`,
+    )
+  },
+
+  // 多 run 对比 LLM 解读（markdown）。alignKeys 传入时按当前勾选子集重算。
+  getCompareReport(runIds: string[], alignKey = 'case_id', alignedKeys?: string[]) {
+    return api.post<{
+      run_ids: string[]
+      report: string
+      scope: 'full_runs' | 'selected_subset'
+    }>(
+      `/eval/runs/compare-report`,
+      { run_ids: runIds, align_key: alignKey, aligned_keys: alignedKeys },
+    )
   },
   // Batch-export per-sample results for the selected runs (same columns as the
   // single-run detail export, concatenated across runs).
@@ -201,5 +235,16 @@ export const evaluationApi = {
       tool_usage_count: number
       case_count: number
     }>(`/eval/runs/${runId}/reaggregate`)
+  },
+  // 补评缺分维度：复用已存 agent 回答，只对评分缺失的维度重打 judge。
+  rescoreRun(runId: string) {
+    return api.post<{
+      run_id: string
+      results_scanned: number
+      dimensions_recovered: number
+      results_completed: number
+      results_still_missing: number
+      note?: string
+    }>(`/eval/runs/${runId}/rescore`)
   },
 }

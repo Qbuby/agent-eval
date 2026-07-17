@@ -193,34 +193,45 @@ class SSEStreamAdapter:
         usage_seen = False
 
         start = time.perf_counter()
-        async with self._client.stream("POST", self.url, json=payload, headers=self._headers) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    if self.mode == "generic" and data.strip():
-                        full_text.append(data)
-                    continue
+        # 流式读取途中对端切断（judge 的大 payload 常触发被测 agent 或上游网关
+        # 在发完 [DONE] 前 RST 连接）会抛 httpx.ReadError / RemoteProtocolError。
+        # 不让它冒泡——保留已累积的 full_text/steps/usage，标记 truncated，交给
+        # 上层散文兜底 (_salvage_prose_score) 从部分内容抽分，而不是整维 skipped。
+        # 零字节即断时 full_text 为空，自然降级为空 content（上层判 skipped）。
+        # 注意：ConnectError/ConnectTimeout（真连不上，无 partial 可救）与
+        # HTTPStatusError（上游明确 4xx/5xx 拒绝）不在此捕获，照常冒泡。
+        truncated = False
+        try:
+            async with self._client.stream("POST", self.url, json=payload, headers=self._headers) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        if self.mode == "generic" and data.strip():
+                            full_text.append(data)
+                        continue
 
-                if self.mode == "langgraph_v2":
-                    if self._handle_langgraph_event(
-                        obj, full_text, tool_calls, active_tools, usage_acc,
-                        steps, thought_state, start,
-                    ):
-                        usage_seen = True
-                else:
-                    payload_data = obj.get("payload", {})
-                    if payload_data.get("type") == "done":
-                        break
-                    response_text = payload_data.get("response", "")
-                    if isinstance(response_text, str) and response_text:
-                        full_text.append(response_text)
+                    if self.mode == "langgraph_v2":
+                        if self._handle_langgraph_event(
+                            obj, full_text, tool_calls, active_tools, usage_acc,
+                            steps, thought_state, start,
+                        ):
+                            usage_seen = True
+                    else:
+                        payload_data = obj.get("payload", {})
+                        if payload_data.get("type") == "done":
+                            break
+                        response_text = payload_data.get("response", "")
+                        if isinstance(response_text, str) and response_text:
+                            full_text.append(response_text)
+        except (httpx.ReadError, httpx.RemoteProtocolError):
+            truncated = True
 
         latency_ms = (time.perf_counter() - start) * 1000
         # Flush any unterminated thought (rare — server cut the stream early).
@@ -247,6 +258,10 @@ class SSEStreamAdapter:
         # Build raw_response carrying tool_calls, usage, and the ordered CoT
         # step list so the runner can persist it into test_results.full_trace.
         raw: dict[str, Any] = {}
+        if truncated:
+            # 流被中途切断——已累积内容可能不完整。上层据此把「拿到部分答案」
+            # 与「连接彻底失败/无评分」区分开，并允许散文兜底对部分文本抽分。
+            raw["truncated"] = True
         if tool_calls:
             raw["tool_calls"] = tool_calls
         if steps:

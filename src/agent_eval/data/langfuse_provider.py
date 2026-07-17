@@ -227,6 +227,16 @@ class LangfuseDatasetProvider:
 
         return cases
 
+    async def get_case(self, example_id: str) -> TestCase | None:
+        # 按 id 取单条 dataset item，转成 TestCase。不存在/取回失败返回 None。
+        try:
+            item = await to_thread(self.client.api.dataset_items.get, example_id)
+        except Exception:
+            return None
+        if item is None:
+            return None
+        return converter.dataset_item_to_test_case(item)
+
     async def update_case(self, example_id: str, case: TestCase) -> None:
         # Langfuse upsert 需要 dataset_name，但 update 入参不带。先按 id 取回
         # 现有 item 学到它的 dataset_name，再用同 id upsert（== 更新）。

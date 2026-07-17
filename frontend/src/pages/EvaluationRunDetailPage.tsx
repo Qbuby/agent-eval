@@ -6,8 +6,9 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
 } from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail, RunDetail, CotStep, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail } from '@/types'
+import type { EvalResultRow, EvalRunDetail, RunDetail, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
+import { CotTimeline, ToolCallsTable } from '@/components/TraceTimeline'
 import MarkdownView from '@/components/MarkdownView'
 import { Button, Drawer, ErrorCard, ExportMenu } from '@/components/ui'
 import {
@@ -16,6 +17,12 @@ import {
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { NormalizedError } from '@/lib/errors'
 import type { ExportFormat } from '@/lib/download'
+import { exportRunReport } from '@/lib/reportExport'
+import { collapseScoreKey, collapseDimAvg } from '@/lib/dimensionCollapse'
+import {
+  deriveFacts, deriveAcceptance, deriveCostScored, deriveCostAbnormal,
+  acceptancePassRateText, runDecisionLabel, type EvalFacts, type EvalAcceptance,
+} from '@/lib/evalSemantics'
 
 export default function EvaluationRunDetailPage() {
   const { runId } = useParams<{ runId: string }>()
@@ -33,15 +40,11 @@ export default function EvaluationRunDetailPage() {
     },
   })
 
-  const [resultsPage] = useState(1)
-  const resultsPageSize = 50
   const [exportError, setExportError] = useState<NormalizedError | null>(null)
+  const [reportBusy, setReportBusy] = useState(false)
   const resultsQuery = useQuery({
-    queryKey: ['eval-results', runId, resultsPage],
-    queryFn: () =>
-      evaluationApi
-        .getResults(runId!, { page: resultsPage, page_size: resultsPageSize })
-        .then(r => r.data),
+    queryKey: ['eval-results', runId],
+    queryFn: () => evaluationApi.getAllResults(runId!),
     enabled: !!runId,
     refetchInterval: () => (runQuery.data?.status === 'running' ? 5000 : false),
   })
@@ -80,6 +83,14 @@ export default function EvaluationRunDetailPage() {
     },
   })
 
+  const rescoreMutation = useMutation({
+    mutationFn: () => evaluationApi.rescoreRun(runId!).then(r => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['eval-run', runId] })
+      qc.invalidateQueries({ queryKey: ['eval-results', runId] })
+    },
+  })
+
   const run = runQuery.data
   const langfuseHost = deriveLangfuseHost(run)
 
@@ -109,12 +120,13 @@ export default function EvaluationRunDetailPage() {
     )
   }
 
-  const counts = run.summary_scores?.counts ?? {}
+  const facts = deriveFacts(run.summary_scores ?? run)
+  const acceptance = deriveAcceptance(run.summary_scores ?? run)
   // 按评估器聚合（折叠 .turnN / .conversation）。后端新 run 已折叠，这里再折一次
   // 兼容旧 run（其 summary 仍是轮次级）——幂等，已折叠的 key 不含轮次后缀不受影响。
   const dimAvg = collapseDimAvg(run.summary_scores?.dimension_averages ?? {})
-  const costSuccess = run.summary_scores?.cost_success ?? {}
-  const costFailure = run.summary_scores?.cost_failure ?? {}
+  const costScored = deriveCostScored(run.summary_scores)
+  const costAbnormal = deriveCostAbnormal(run.summary_scores)
   const toolUsage = (run.summary_scores?.tool_usage ?? []) as Array<{
     name: string; calls: number; errors: number; cases: number
   }>
@@ -187,6 +199,36 @@ export default function EvaluationRunDetailPage() {
           <Button
             variant="secondary"
             size="sm"
+            loading={reportBusy}
+            onClick={async () => {
+              if (!runId) return
+              setReportBusy(true)
+              // 先取 LLM 解读（几秒），拿到后嵌入报告；解读是增强项，
+              // 请求失败也照样导出无解读的基础报告，不阻断下载。
+              let analysis: string | undefined
+              try {
+                const res = await evaluationApi.getRunReport(runId)
+                analysis = res.data?.report || undefined
+                setExportError(null)
+              } catch {
+                setExportError(null)
+              }
+              try {
+                const reportItems = (await evaluationApi.getAllResults(runId)).items
+                exportRunReport(run, reportItems, (d) => getScoreMeta(d).label, analysis)
+              } catch (e) {
+                setExportError(formatApiError(e))
+              } finally {
+                setReportBusy(false)
+              }
+            }}
+            title="导出本次评估的 HTML 分析报告（含 AI 解读 + 合格率/维度/分布/工具统计）"
+          >
+            导出报告
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
             loading={langfusePullMutation.isPending}
             onClick={() => langfusePullMutation.mutate()}
             title="向 Langfuse 拉一次 observation 级评估器分数"
@@ -201,6 +243,15 @@ export default function EvaluationRunDetailPage() {
             title="从样例分数重新计算维度平均、工具调用统计、分数分布"
           >
             重算汇总
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={rescoreMutation.isPending}
+            onClick={() => rescoreMutation.mutate()}
+            title="对评分未出全的样例（evaluation_error）复用已存回答，只补缺失维度的 judge 打分"
+          >
+            补评缺分维度
           </Button>
         </div>
       </header>
@@ -237,6 +288,23 @@ export default function EvaluationRunDetailPage() {
         </div>
       )}
 
+      {rescoreMutation.data && (
+        <div className="mb-3 text-[12px] text-text-secondary border border-border bg-fill/5 rounded-md px-3 py-2">
+          已补评：扫描 {rescoreMutation.data.results_scanned} 条缺分样例，
+          补回维度 {rescoreMutation.data.dimensions_recovered} 个，
+          恢复完整 {rescoreMutation.data.results_completed} 条
+          {rescoreMutation.data.results_still_missing > 0 ? `，仍缺 ${rescoreMutation.data.results_still_missing} 条（上游 judge 仍未出分，可稍后再点）` : ''}
+        </div>
+      )}
+      {rescoreMutation.isError && (
+        <div className="mb-3">
+          <ErrorCard
+            error={formatApiError(rescoreMutation.error, { fallbackTitle: '补评失败' })}
+            variant="compact"
+          />
+        </div>
+      )}
+
       {run.summary_scores?.runtime_error && (
         <section className="mb-5 border border-warning/30 bg-warning/10 rounded-lg px-4 py-3">
           <div className="flex items-start gap-2">
@@ -252,9 +320,17 @@ export default function EvaluationRunDetailPage() {
       )}
 
       <section className="grid grid-cols-4 gap-3 mb-5">
-        <MetaCard label="总数" value={counts.total ?? run.progress.total ?? '—'} />
-        <MetaCard label="通过" value={counts.passed ?? 0} hint="pass (所有指标≥0.5)" />
-        <MetaCard label="失败" value={counts.failed ?? 0} hint="fail / error" />
+        <MetaCard label="总数" value={facts.total || run.progress.total || '—'} />
+        <MetaCard
+          label="Agent 执行"
+          value={facts.execution_success}
+          hint={`成功 · 异常 ${facts.execution_abnormal}`}
+        />
+        <MetaCard
+          label="Judge 评分"
+          value={facts.evaluation_completed}
+          hint={`完成 · 跳过 ${facts.skipped}`}
+        />
         <MetaCard label="启动 → 完成" value={fmtDuration(run.started_at, run.finished_at)} />
       </section>
 
@@ -427,12 +503,13 @@ export default function EvaluationRunDetailPage() {
         radarData={radarData}
         scoreDistribution={scoreDistribution}
         toolUsage={toolUsage}
-        counts={counts}
+        facts={facts}
+        acceptance={acceptance}
       />
 
       <section className="grid grid-cols-2 gap-3 mb-5">
-        <CostCard title="成功样例的成本" data={costSuccess} />
-        <CostCard title="失败样例的成本" data={costFailure} />
+        <CostCard title="评分样例的成本" data={costScored} />
+        <CostCard title="执行异常样例的成本" data={costAbnormal} />
       </section>
 
       <RetryStatsCard stats={run.summary_scores?.retry_stats} />
@@ -1066,21 +1143,21 @@ function deriveLangfuseHost(run: EvalRunDetail | null | undefined): string | nul
 }
 
 function ReportSection({
-  dimAvg, radarData, scoreDistribution, toolUsage, counts,
+  dimAvg, radarData, scoreDistribution, toolUsage, facts, acceptance,
 }: {
   dimAvg: Record<string, number>
   radarData: Array<{ dimension: string; score: number; fullMark: number }>
   scoreDistribution: { buckets: string[]; by_dimension: Record<string, number[]> } | null
   toolUsage: Array<{ name: string; calls: number; errors: number; cases: number }>
-  counts: Record<string, number>
+  facts: EvalFacts
+  acceptance: EvalAcceptance
 }) {
   const hasDims = Object.keys(dimAvg).length > 0
   const hasTools = toolUsage.length > 0
   if (!hasDims && !hasTools) return null
 
-  const passRate = counts.total
-    ? ((counts.passed ?? 0) / counts.total * 100).toFixed(1)
-    : '—'
+  // 验收通过率仅在配置了显式验收策略时展示；否则明确「仅评分」，不编造合格率。
+  const passRateText = acceptancePassRateText(acceptance)
 
   return (
     <section className="card p-4 mb-5">
@@ -1088,21 +1165,30 @@ function ReportSection({
 
       <div className="flex items-center gap-4 mb-5 pb-4 border-b border-separator">
         <div className="text-center">
-          <div className="text-[28px] font-display font-semibold tracking-[-0.5px] tabular-nums">{passRate}%</div>
-          <div className="text-[10px] text-text-tertiary">合格率</div>
+          {passRateText != null ? (
+            <>
+              <div className="text-[28px] font-display font-semibold tracking-[-0.5px] tabular-nums">{passRateText}</div>
+              <div className="text-[10px] text-text-tertiary">验收通过率 · {runDecisionLabel(acceptance.run_decision)}</div>
+            </>
+          ) : (
+            <>
+              <div className="text-[15px] font-medium text-text-secondary">仅评分</div>
+              <div className="text-[10px] text-text-tertiary">未配置验收规则</div>
+            </>
+          )}
         </div>
         <div className="flex-1 grid grid-cols-3 gap-2 text-center text-[11px]">
           <div>
-            <div className="font-mono text-[14px]">{counts.total ?? 0}</div>
+            <div className="font-mono text-[14px]">{facts.total}</div>
             <div className="text-text-tertiary">总样例</div>
           </div>
           <div>
-            <div className="font-mono text-[14px] text-positive">{counts.passed ?? 0}</div>
-            <div className="text-text-tertiary">通过</div>
+            <div className="font-mono text-[14px] text-positive">{facts.evaluation_completed}</div>
+            <div className="text-text-tertiary">评分完成</div>
           </div>
           <div>
-            <div className="font-mono text-[14px] text-negative">{counts.failed ?? 0}</div>
-            <div className="text-text-tertiary">失败</div>
+            <div className="font-mono text-[14px] text-negative">{facts.execution_abnormal}</div>
+            <div className="text-text-tertiary">执行异常</div>
           </div>
         </div>
       </div>
@@ -1408,176 +1494,10 @@ function ConversationResultView({
 }
 
 
-function CotTimeline({ steps }: { steps: CotStep[] }) {
-  return (
-    <div className="border border-border rounded-md bg-surface overflow-hidden">
-      {steps.map((step, i) => (
-        <CotStepRow key={i} step={step} index={i} last={i === steps.length - 1} />
-      ))}
-    </div>
-  )
-}
+// CotTimeline / CotStepRow / ToolCallsTable / isToolCallError / ToolResultBadge
+// 已抽到 @/components/TraceTimeline（与 tracing 详情页共用），此处改为 import。
 
-function CotStepRow({ step, index, last }: { step: CotStep; index: number; last: boolean }) {
-  const [open, setOpen] = useState(step.type !== 'thought')
-  const dur = step.duration_ms != null ? `${step.duration_ms}ms` : null
-  const border = last ? '' : 'border-b border-separator'
-
-  if (step.type === 'thought' || step.type === 'answer') {
-    const isAnswer = step.type === 'answer'
-    const tagCls = isAnswer ? 'badge badge-positive' : 'badge badge-neutral'
-    const tagLabel = isAnswer ? '答复' : '思考'
-    const text = step.content || ''
-    const long = text.length > 200
-    const preview = long && !open ? `${text.slice(0, 200)}…` : text
-    return (
-      <div className={`px-3 py-2 ${border} ${isAnswer ? 'bg-positive/5' : ''}`}>
-        <div className="flex items-center gap-2 mb-1">
-          <span className="text-[10px] text-text-tertiary tabular-nums w-5 text-right">{index + 1}</span>
-          <span className={tagCls}>{tagLabel}</span>
-          {dur && <span className="text-[10px] text-text-tertiary tabular-nums">{dur}</span>}
-          {long && (
-            <button
-              type="button"
-              onClick={() => setOpen(o => !o)}
-              className="ml-auto text-[10px] text-accent hover:text-accent-hover transition-colors"
-            >
-              {open ? '收起' : '展开'}
-            </button>
-          )}
-        </div>
-        <pre className="font-mono text-[11px] whitespace-pre-wrap text-text-primary">{preview || '（空）'}</pre>
-      </div>
-    )
-  }
-
-  const argsStr =
-    step.args == null ? '' : typeof step.args === 'string' ? step.args : JSON.stringify(step.args, null, 2)
-  const outStr =
-    step.output == null ? '' : typeof step.output === 'string' ? step.output : JSON.stringify(step.output, null, 2)
-  const failed = isToolCallError(step)
-  return (
-    <div className={`px-3 py-2 ${failed ? 'bg-negative/5' : 'bg-warning/5'} ${border}`}>
-      <div className="flex items-center gap-2 mb-1">
-        <span className="text-[10px] text-text-tertiary tabular-nums w-5 text-right">{index + 1}</span>
-        <span className="badge badge-warning">工具</span>
-        <span className="text-[11px] font-mono">{step.tool_name || '?'}</span>
-        <ToolResultBadge failed={failed} />
-        {dur && <span className="text-[10px] text-text-tertiary tabular-nums">{dur}</span>}
-        <button
-          type="button"
-          onClick={() => setOpen(o => !o)}
-          className="ml-auto text-[10px] text-accent hover:text-accent-hover transition-colors"
-        >
-          {open ? '收起' : '展开'}
-        </button>
-      </div>
-      {open && (
-        <div className="space-y-1.5 pl-7">
-          {argsStr && (
-            <div>
-              <div className="text-[10px] text-text-tertiary mb-0.5">参数</div>
-              <pre className="font-mono text-[10px] bg-surface border border-border rounded-md p-1.5 max-h-[140px] overflow-auto whitespace-pre-wrap">{argsStr}</pre>
-            </div>
-          )}
-          {outStr && (
-            <div>
-              <div className="text-[10px] text-text-tertiary mb-0.5">输出</div>
-              <pre className="font-mono text-[10px] bg-surface border border-border rounded-md p-1.5 max-h-[160px] overflow-auto whitespace-pre-wrap">{outStr}</pre>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-
-// 判定单次工具调用是否失败。口径对齐后端 evaluation.py / langfuse_runner.py：
-// output 为 dict 时看 error / isError 是否 truthy；为字符串时看是否以 "error" 开头。
-function isToolCallError(call: { output?: unknown }): boolean {
-  const out = call.output
-  if (out && typeof out === 'object' && !Array.isArray(out)) {
-    const o = out as Record<string, unknown>
-    return Boolean(o.error) || Boolean(o.isError)
-  }
-  if (typeof out === 'string') {
-    return out.trim().toLowerCase().startsWith('error')
-  }
-  return false
-}
-
-function ToolResultBadge({ failed }: { failed: boolean }) {
-  return failed
-    ? <span className="badge badge-negative" title="工具调用失败">失败</span>
-    : <span className="badge badge-positive" title="工具调用成功">成功</span>
-}
-
-function ToolCallsTable({ calls }: { calls: Array<Record<string, unknown>> }) {
-  const grouped: Record<string, { count: number; errors: number }> = {}
-  for (const c of calls) {
-    const name = (c.tool_name || c.name || 'unknown') as string
-    const slot = grouped[name] ?? (grouped[name] = { count: 0, errors: 0 })
-    slot.count++
-    if (isToolCallError(c)) slot.errors++
-  }
-  const entries = Object.entries(grouped).sort((a, b) => b[1].count - a[1].count)
-
-  return (
-    <div className="table-card">
-      <table className="table-base">
-        <thead>
-          <tr>
-            <th>工具</th>
-            <th className="text-right w-20">次数</th>
-            <th className="text-right w-20">失败</th>
-          </tr>
-        </thead>
-        <tbody>
-          {entries.map(([name, { count, errors }]) => (
-            <tr key={name}>
-              <td className="font-mono text-[11px]">{name}</td>
-              <td className="text-right tabular-nums">{count}</td>
-              <td className={`text-right tabular-nums ${errors > 0 ? 'text-negative' : ''}`}>
-                {errors || '—'}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {calls.length > 5 && (
-        <details className="px-2 py-1 border-t border-separator">
-          <summary className="text-[10px] text-text-tertiary cursor-pointer">展开全部调用详情</summary>
-          <div className="mt-1 max-h-[200px] overflow-y-auto">
-            {calls.map((c, i) => (
-              <div key={i} className="flex items-center gap-2 py-0.5 border-b border-separator last:border-0">
-                <span className="text-[10px] text-text-tertiary w-4 text-right">{i + 1}</span>
-                <ToolResultBadge failed={isToolCallError(c)} />
-                <span className="font-mono text-[10px]">{(c.tool_name || c.name || '?') as string}</span>
-                {c.args != null && (
-                  <span className="text-[10px] text-text-tertiary truncate max-w-[200px]">
-                    {typeof c.args === 'string' ? c.args : JSON.stringify(c.args).slice(0, 80)}
-                  </span>
-                )}
-              </div>
-            ))}
-          </div>
-        </details>
-      )}
-    </div>
-  )
-}
-
-
-// 多轮 score key 形如 `<评估器名>.turn<N>` / `<评估器名>.conversation`。汇总可视化
-// 按**评估器**聚合，不按轮次（不同样例轮次无固定规律、轮次间不可比）。新 run 的
-// summary 已在后端折叠；这里对前端再折叠一次，兼容旧 run（其 summary 仍是轮次级）。
-const _TURN_SUFFIX = /^(turn\d+|conversation)$/
-function collapseScoreKey(key: string): string {
-  const idx = key.lastIndexOf('.')
-  if (idx <= 0) return key
-  return _TURN_SUFFIX.test(key.slice(idx + 1)) ? key.slice(0, idx) : key
-}
+// collapseScoreKey / collapseDimAvg 已抽到 @/lib/dimensionCollapse（与 reportExport 共用）。
 
 // 「执行异常」状态：agent 跑挂 / 不可达 / 超时 / 报错。不含 fail —— fail 是判分
 // 未达合格线（跑通了但没答好），不是执行异常，快筛「异常样例」时不纳入。
@@ -1609,24 +1529,6 @@ function rowBelowThreshold(row: EvalResultRow, thr: number, dim: string): boolea
   if (vals.length === 0) return false
   const avg = vals.reduce((s, v) => s + v, 0) / vals.length
   return avg < thr
-}
-
-// 把轮次级维度均分折叠回评估器级：同一评估器的各轮/会话分数求（按 count 加权的）
-// 简单平均。旧 run 的 dimension_averages 无 count 信息，退化为对各轮均值再平均，
-// 作为近似展示足够（精确值以新 run 为准）。
-function collapseDimAvg(dimAvg: Record<string, number>): Record<string, number> {
-  const acc: Record<string, { sum: number; n: number }> = {}
-  for (const [k, v] of Object.entries(dimAvg)) {
-    const dim = collapseScoreKey(k)
-    if (!acc[dim]) acc[dim] = { sum: 0, n: 0 }
-    acc[dim].sum += v
-    acc[dim].n += 1
-  }
-  const out: Record<string, number> = {}
-  for (const [dim, { sum, n }] of Object.entries(acc)) {
-    out[dim] = n ? Math.round((sum / n) * 1000) / 1000 : 0
-  }
-  return out
 }
 
 // 分数分布：同一评估器各轮的桶计数逐桶相加，折叠成评估器级分布。

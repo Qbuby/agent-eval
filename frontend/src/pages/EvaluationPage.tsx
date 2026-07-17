@@ -24,6 +24,10 @@ import type {
   UploadCasesResponse,
 } from '@/types'
 import { configOptionToString, useConfigOptions } from '@/hooks/useConfigOptions'
+import {
+  deriveFacts, deriveAcceptance, deriveCostScored, deriveCostAbnormal,
+  acceptancePassRateText, runDecisionLabel,
+} from '@/lib/evalSemantics'
 
 type Tab = 'history' | 'new'
 
@@ -162,7 +166,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
           type="number" min={0} max={100} step={5}
           value={minPassRate}
           onChange={e => { setMinPassRate(e.target.value); setPage(1) }}
-          placeholder="通过率 ≥ %"
+          placeholder="验收通过率 ≥ %"
           className="input-sm w-[110px]"
         />
         {filtersActive && (
@@ -223,7 +227,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
               <Th>智能体</Th>
               <Th>运行名</Th>
               <Th>进度 / 总数</Th>
-              <Th>通过率</Th>
+              <Th>验收通过率</Th>
               <Th>平均时延</Th>
               <Th>启动时间</Th>
               <Th>操作</Th>
@@ -307,14 +311,16 @@ function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
   onClick: () => void
   onDelete: () => void
 }) {
-  const counts = run.summary_scores?.counts
-  const total = counts?.total ?? run.progress.total ?? 0
-  const completed = run.progress.completed ?? counts?.total ?? 0
-  const passed = counts?.passed ?? 0
-  const passRate = total > 0 ? `${Math.round((passed / total) * 100)}%` : '—'
+  const facts = deriveFacts(run.summary_scores ?? run)
+  const acceptance = deriveAcceptance(run.summary_scores ?? run)
+  const total = facts.total || run.progress.total || 0
+  const completed = run.progress.completed ?? facts.total ?? 0
+  // 通过率仅在配置了显式验收策略时展示；否则标「仅评分」，绝不用分数编造。
+  const passRateText = acceptancePassRateText(acceptance)
+  const qualityText = passRateText ?? '仅评分'
   const avgLatency = firstDefined(
-    run.summary_scores?.cost_success?.avg_latency_ms,
-    run.summary_scores?.cost_failure?.avg_latency_ms,
+    deriveCostScored(run.summary_scores)?.avg_latency_ms,
+    deriveCostAbnormal(run.summary_scores)?.avg_latency_ms,
   )
 
   const agent = run.agent_config as { model?: string; url?: string; type?: string }
@@ -350,7 +356,13 @@ function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
       <Td>
         {run.status === 'running' ? `${completed}/${total || '?'}` : `${total}`}
       </Td>
-      <Td>{passRate}</Td>
+      <Td>
+        <span title={acceptance.configured
+          ? `运行结论：${runDecisionLabel(acceptance.run_decision)}`
+          : '未配置验收规则，仅评分'}>
+          {qualityText}
+        </span>
+      </Td>
       <Td>{avgLatency != null ? `${Math.round(avgLatency)}ms` : '—'}</Td>
       <Td>{fmtTime(run.started_at)}</Td>
       <Td>

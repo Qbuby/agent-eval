@@ -14,10 +14,14 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts'
-import { Button, Drawer, SkeletonRow, ErrorCard } from '@/components/ui'
-import { formatApiError } from '@/lib/errors'
+import { Button, Dialog, Drawer, SkeletonRow, ErrorCard, useToast } from '@/components/ui'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import { langfuseMetricsApi } from '@/services/langfuseMetrics'
+import { datasetsApi } from '@/services'
+import { candidatesApi } from '@/services/benchmark'
 import MarkdownView from '@/components/MarkdownView'
+import { CotTimeline, ToolCallsTable } from '@/components/TraceTimeline'
+import type { CotStep } from '@/types'
 import type { LangfuseObservation } from '@/services/langfuseMetrics'
 
 const TRACE_PAGE_SIZE = 20
@@ -638,13 +642,58 @@ function TraceDetailDrawer({
   traceId: string | null
   onClose: () => void
 }) {
+  const toast = useToast()
+  const [importing, setImporting] = useState(false)
+  const [showImport, setShowImport] = useState(false)
+  const [importDataset, setImportDataset] = useState('')
+  const [importCategory, setImportCategory] = useState('')
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ['lf-trace', traceId],
     queryFn: () => langfuseMetricsApi.trace(traceId!).then((r) => r.data),
     enabled: !!traceId,
   })
 
+  // 备选数据集下拉（type=candidate，与 /datasets 备选数据集页同源）+ 所选数据集
+  // 下已出现过的自由文本类别下拉（candidatesApi.categories）。
+  const { data: candidateDatasets } = useQuery({
+    queryKey: ['datasets', 'candidate'],
+    queryFn: () => datasetsApi.list({ type: 'candidate' }).then((r) => r.data),
+  })
+  const { data: datasetCategories } = useQuery({
+    queryKey: ['candidate-categories', importDataset],
+    queryFn: () => candidatesApi.categories({ dataset_name: importDataset }).then((r) => r.data.categories),
+    enabled: !!importDataset,
+  })
+
   const observations: LangfuseObservation[] = data?.observations ?? []
+
+  // 导入本条 trace 到备选数据集（连同答案 / 思维链 / 工具链 / 来源快照 + 目标数据集/类别）。
+  const handleImport = async () => {
+    if (!traceId) return
+    if (!importDataset) {
+      toast.error('请选择目标备选数据集')
+      return
+    }
+    setImporting(true)
+    try {
+      const res = await langfuseMetricsApi.importToCandidates({
+        trace_ids: [traceId],
+        dataset_name: importDataset,
+        category: importCategory.trim() || undefined,
+      })
+      const { imported, skipped } = res.data
+      if (imported > 0) {
+        toast.success('已导入到备选数据集')
+        setShowImport(false)
+      } else {
+        toast.error(skipped ? '该 trace 无可用问题，已跳过' : '未导入任何样例')
+      }
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '导入失败' })))
+    } finally {
+      setImporting(false)
+    }
+  }
 
   return (
     <Drawer
@@ -675,22 +724,36 @@ function TraceDetailDrawer({
             <DetailItem label="缓存命中率" value="N/A" />
           </div>
 
+          {/* 导入到备选数据集：弹窗选目标项目 + 类别后落库（含答案 / 思维链 / 工具链 / 来源快照）。 */}
+          <div className="flex justify-end">
+            <Button variant="primary" size="sm" onClick={() => setShowImport(true)}>
+              导入到备选数据集
+            </Button>
+          </div>
+
           {data.has_error && <div className="text-[12px] text-negative">该 trace 含错误标记</div>}
 
-          {/* input / output —— 非字符串统一序列化成 ```json 代码块再交给 MarkdownView。 */}
+          {/* 语义执行链（思维链 + 工具调用）：服务端从 observations 归一化。优先展示，
+              让用户先看执行过程；只在有可识别内容时渲染，无则跳过。 */}
+          {Array.isArray(data.semantic_trace?.steps) && data.semantic_trace!.steps!.length > 0 && (
+            <div>
+              <div className="field-label">思维链（{data.semantic_trace!.steps!.length} 步）</div>
+              <CotTimeline steps={data.semantic_trace!.steps as CotStep[]} />
+            </div>
+          )}
+          {Array.isArray(data.semantic_trace?.tool_calls) && data.semantic_trace!.tool_calls!.length > 0 && (
+            <div>
+              <div className="field-label">工具调用（{data.semantic_trace!.tool_calls!.length}）</div>
+              <ToolCallsTable calls={data.semantic_trace!.tool_calls as Array<Record<string, unknown>>} />
+            </div>
+          )}
+
+          {/* Input —— 非字符串统一序列化成 ```json 代码块再交给 MarkdownView。 */}
           {data.input != null && (
             <div>
               <div className="field-label">Input</div>
               <div className="bg-fill/5 rounded-md p-3">
                 <MarkdownView text={toDisplayText(data.input)} />
-              </div>
-            </div>
-          )}
-          {data.output != null && (
-            <div>
-              <div className="field-label">Output</div>
-              <div className="bg-fill/5 rounded-md p-3">
-                <MarkdownView text={toDisplayText(data.output)} />
               </div>
             </div>
           )}
@@ -754,8 +817,73 @@ function TraceDetailDrawer({
               </div>
             )}
           </div>
+
+          {/* Output 元数据较冗长（含 todos/messages 全量结构），放到最后展示，
+              让语义化的思维链 / 工具链 / observations 优先呈现。 */}
+          {data.output != null && (
+            <div>
+              <div className="field-label">Output</div>
+              <div className="bg-fill/5 rounded-md p-3">
+                <MarkdownView text={toDisplayText(data.output)} />
+              </div>
+            </div>
+          )}
         </div>
       )}
+
+      {/* 导入到备选数据集：选目标项目 + 类别后落库（含答案/思维链/工具链/来源快照）。 */}
+      <Dialog
+        open={showImport}
+        onClose={() => setShowImport(false)}
+        title="导入到备选数据集"
+        description="将本条 trace 连同答案、思维链、工具调用链和来源 trace_id 快照导入备选数据集。"
+        width={460}
+        footer={
+          <>
+            <Button variant="secondary" size="md" onClick={() => setShowImport(false)}>取消</Button>
+            <Button variant="primary" size="md" loading={importing} onClick={handleImport}>
+              确认导入
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <div>
+            <label className="field-label">目标备选数据集</label>
+            <select
+              value={importDataset}
+              onChange={(e) => { setImportDataset(e.target.value); setImportCategory('') }}
+              className="input"
+            >
+              <option value="">选择备选数据集…</option>
+              {candidateDatasets?.map((d) => <option key={d.name} value={d.name}>{d.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="field-label">类别（可选）</label>
+            {importDataset && (datasetCategories?.length ?? 0) > 0 ? (
+              <select
+                value={importCategory}
+                onChange={(e) => setImportCategory(e.target.value)}
+                className="input"
+              >
+                <option value="">不指定类别</option>
+                {datasetCategories?.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            ) : (
+              <input
+                value={importCategory}
+                onChange={(e) => setImportCategory(e.target.value)}
+                placeholder="自由文本类别名（可空）"
+                className="input"
+              />
+            )}
+            <p className="text-[11px] text-text-tertiary mt-1">
+              有参考答案的样例状态为「待导入」，无答案的进入暂存区。
+            </p>
+          </div>
+        </div>
+      </Dialog>
     </Drawer>
   )
 }
