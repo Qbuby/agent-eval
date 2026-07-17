@@ -53,19 +53,20 @@ async def get_extractor() -> TraceExtractor:
     return TraceExtractor(**kwargs)
 
 
-async def get_generator():
-    """Build a CaseGenerator backed by the *agent under test* (same endpoint
-    used for evaluation), sourced from the saved ``target_agent.*`` config.
+async def resolve_target_agent_cfg(endpoint_url: str | None = None) -> dict[str, Any]:
+    """Resolve the *agent under test* config dict from the saved ``target_agent.*``
+    settings. ``endpoint_url`` overrides the saved ``target_agent.endpoint_url``
+    default (the sample-generation UI passes one of the pre-configured endpoint
+    presets); api_key / timeout / type still come from the shared config.
 
-    Cases are authored by the agent from its own knowledge graph, so this
-    deliberately does NOT use a bare LLM. Yields the generator and closes the
-    adapter's HTTP client afterwards (FastAPI cleanup dependency)."""
+    Returns the ``agent_cfg`` dict consumed by ``_make_adapter``. Raises 400 if no
+    endpoint is configured. Kept separate from adapter construction so callers
+    that need to build a *per-case* adapter (e.g. multi-turn replay needs a fixed
+    thread_id) can reuse the resolved config."""
     from fastapi import HTTPException
 
-    from agent_eval.evaluation.langfuse_runner import _make_adapter
-
-    endpoint_url = await config_service.get("target_agent.endpoint_url")
-    if not endpoint_url:
+    resolved_url = endpoint_url or await config_service.get("target_agent.endpoint_url")
+    if not resolved_url:
         raise HTTPException(
             status_code=400,
             detail="未配置测试目标 agent 端点（在 配置 → target_agent.endpoint_url 中设置），"
@@ -82,14 +83,33 @@ async def get_generator():
     # optional target_agent.type override (key may be absent → defaults sse).
     agent_type = (await config_service.get("target_agent.type")) or "sse"
 
-    agent_cfg: dict[str, Any] = {
+    return {
         "type": agent_type,
-        "url": endpoint_url,
+        "url": resolved_url,
         "api_key": api_key,
         "timeout": timeout,
     }
 
-    adapter = _make_adapter(agent_cfg)
+
+async def build_generator_adapter(endpoint_url: str | None = None):
+    """Build the *agent under test* HTTP adapter from the resolved config.
+
+    Cases are authored by the agent from its own knowledge graph, so this
+    deliberately does NOT use a bare LLM. When omitted the saved default endpoint
+    is used (back-compat). Returns the built adapter; the caller owns closing it
+    (``await adapter.close()``)."""
+    from agent_eval.evaluation.langfuse_runner import _make_adapter
+
+    agent_cfg = await resolve_target_agent_cfg(endpoint_url)
+    return _make_adapter(agent_cfg)
+
+
+async def get_generator():
+    """FastAPI cleanup dependency: yield a CaseGenerator on the saved default
+    endpoint and close the adapter afterwards. Endpoints that need to target a
+    caller-chosen endpoint build the generator directly via
+    ``build_generator_adapter`` instead."""
+    adapter = await build_generator_adapter()
     try:
         yield CaseGenerator(adapter=adapter)
     finally:
