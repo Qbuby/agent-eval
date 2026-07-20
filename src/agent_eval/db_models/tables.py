@@ -119,6 +119,8 @@ class TestRunRow(Base, TenantMixin):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     eval_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     summary_scores: Mapped[dict | None] = mapped_column(JSONB)
+    # 发起运行时显式配置的验收策略不可变快照；NULL 表示仅评分。
+    acceptance_policy: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     langfuse_run_name: Mapped[str | None] = mapped_column(Text)
     langsmith_project: Mapped[str | None] = mapped_column(Text)
     # Per-run Langfuse trace name: the回拉键 used to fetch traces by name+time
@@ -131,6 +133,67 @@ class TestRunRow(Base, TenantMixin):
     # Soft-delete: list endpoints filter out non-null deleted_at by default;
     # the row stays in DB so historical reports / langfuse links still work.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ScheduledEvalTaskRow(Base, TenantMixin):
+    """定时评估任务：按 interval / 每日定点自动发起一次评估 run。
+
+    ``spec`` 存一份等价 ``StartEvalRequest`` 的 dump（样例来源 / agent / 评估器 /
+    并发 / 名称等），调度器到点时用它复跑 ``resolve_eval_start_args`` +
+    ``start_run``——与 HTTP ``/runs/start`` 完全同一条解析链路，避免逻辑分叉。
+
+    ``schedule`` 形如 ``{"kind": "interval", "seconds": 3600}`` 或
+    ``{"kind": "daily", "at": "09:00"}``。``next_run_at`` 由 ``compute_next_run``
+    在每次触发后推进；调度器单循环扫 ``enabled and next_run_at <= now``。
+
+    ``notify_open_ids`` 是该任务完成后额外通知的飞书 open_id 列表（叠加全局
+    固定接收者）。``created_by`` 记录建任务的飞书 open_id（可空，便于溯源）。
+    """
+
+    __tablename__ = "scheduled_eval_tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # 等价 StartEvalRequest 的 JSON dump（样例来源四选一 + agent + evaluator_ids + ...）。
+    spec: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # {"kind": "interval", "seconds": int} | {"kind": "daily", "at": "HH:MM"}
+    schedule: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # 额外通知的飞书 open_id 列表（与全局固定接收者合并去重）。
+    notify_open_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 最近一次由本任务发起的 test_runs.id（字符串存，便于回链，不设外键约束）。
+    last_run_id: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str | None] = mapped_column(Text)  # 建任务的飞书 open_id（可空）
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class FeishuConversationMessageRow(Base, TenantMixin):
+    """飞书机器人多轮对话的历史消息（每条一行，供下一轮编排注入上下文）。
+
+    机器人此前无状态——每条消息独立进 orchestration，无法引用上文。这张表按
+    ``(tenant_id, open_id)`` 归档每轮的 user / assistant 文本，取数时按时间正序
+    取最近 N 条注入到 LLM 的 messages，实现多轮记忆。
+
+    只存**文本**：图片以 base64 传入编排是一次性的，不回灌历史（否则撑爆上下文与
+    DB）；纯图无字幕的轮次 user 侧存占位 ``[图片]``。二次确认（确认/取消）的问答
+    不入历史，避免污染上下文。租户隔离靠 TenantMixin（按当前上下文盖章 + 过滤）。
+    """
+
+    __tablename__ = "feishu_conversation_messages"
+    __table_args__ = (
+        Index("ix_feishu_conv_tenant_open_created", "tenant_id", "open_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    open_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)  # user | assistant
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class TestResultRow(Base, TenantMixin):
@@ -254,6 +317,21 @@ class UserRow(Base):
     )
     # superadmin = 内部 admin，监听器对其读查询不注入租户过滤（全租户可见）。
     is_superadmin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 飞书机器人绑定：飞书用户 open_id ↔ 本系统 user。唯一（一个飞书用户绑一个
+    # 系统账号），nullable（绝大多数用户没绑飞书）。机器人据此以该 user 的
+    # role/tenant 代表其执行权限内操作。
+    feishu_open_id: Mapped[str | None] = mapped_column(
+        String(128), unique=True, nullable=True, index=True
+    )
+    # 飞书 union_id：同一飞书用户在同一开发者企业下跨应用稳定唯一，比 open_id
+    # （应用级）更适合作长期身份键。与 feishu_open_id 并存：查绑定时 union_id
+    # 优先、open_id 兜底；老用户下次发消息时懒回填 union_id。通知投递仍用 open_id。
+    feishu_union_id: Mapped[str | None] = mapped_column(
+        String(128), unique=True, nullable=True, index=True
+    )
+    # 飞书昵称（contact.v3.user.get 拉取），供机器人在对话里自然称呼用户；
+    # 与用于登录/唯一约束的 username 分离，不影响既有账号体系。
+    display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
@@ -270,6 +348,39 @@ class RefreshTokenRow(Base):
     token: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class FeishuOAuthTokenRow(Base):
+    """飞书 user OAuth（authorization code 模式）换得的 user_access_token 加密存储。
+
+    绑到本系统 UserRow（一个 user 一条，user_id unique）。**不挂 TenantMixin**：
+    bot 在无请求上下文的常驻进程里按 user_id 直接取 token，挂 mixin 会被读过滤
+    挡掉（同 UserRow/EntryCodeRow 的取舍）。access/refresh token 均 Fernet 加密
+    存 BYTEA。refresh_token 单次使用——每次刷新须整条替换 access+refresh+两个
+    过期时刻。open_id 冗余一列便于回调/发卡直接用，免二次查 users。
+    tenant_id 仅记录归属（非 TenantMixin，无监听器盖章），插入须显式带。
+    """
+    __tablename__ = "feishu_oauth_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+        unique=True, nullable=False, index=True,
+    )
+    open_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"),
+        nullable=False, default=INTERNAL_TENANT_ID,
+    )
+    access_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
+    refresh_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary)
+    access_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    refresh_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scope: Mapped[str | None] = mapped_column(String(512))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
 
 class SystemConfigRow(Base):

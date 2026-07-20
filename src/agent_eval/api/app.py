@@ -9,8 +9,9 @@ from fastapi.responses import JSONResponse
 from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
     admin, admin_entry_codes, admin_tenants, auth, benchmark, candidates, cases, config,
-    datasets, evaluation, evaluator_providers, feedback_review, generate, governance,
-    img_proxy, langfuse_metrics, portal, projects, routing, scheduler, traces,
+    datasets, evaluation, evaluator_providers, feedback_review, feishu_oauth, generate,
+    governance, img_proxy, langfuse_metrics, portal, projects, routing, scheduled_tasks,
+    scheduler, traces,
 )
 from agent_eval.config import settings
 from agent_eval.logging_config import setup_logging
@@ -49,8 +50,32 @@ async def lifespan(app: FastAPI):
     langfuse_metrics.set_service(lf_metrics)
     await lf_metrics.start()
 
+    # 飞书机器人长连接（未配置时 start() 内部直接跳过，不影响启动）。
+    from agent_eval.feishu.service import get_service as get_feishu_service
+    feishu_svc = get_feishu_service()
+    try:
+        await feishu_svc.start()
+    except Exception as e:
+        logger.warning("feishu bot start failed (continuing without it): %s", e)
+
+    # 定时评估调度器（按 scheduled_eval_tasks 到点自动发起评估 + 完成通知）。
+    from agent_eval.scheduler.eval_scheduler import get_eval_scheduler
+    eval_sched = get_eval_scheduler()
+    try:
+        await eval_sched.start()
+    except Exception as e:
+        logger.warning("eval scheduler start failed (continuing without it): %s", e)
+
     yield
 
+    try:
+        await eval_sched.stop()
+    except Exception as e:
+        logger.warning("eval scheduler stop failed: %s", e)
+    try:
+        await feishu_svc.stop()
+    except Exception as e:
+        logger.warning("feishu bot stop failed: %s", e)
     await lf_metrics.stop()
     await warmer.stop()
     await svc.stop()
@@ -113,6 +138,7 @@ def create_app() -> FastAPI:
     app.include_router(governance.router)
     app.include_router(routing.router)
     app.include_router(scheduler.router)
+    app.include_router(scheduled_tasks.router)
     app.include_router(evaluation.router)
     app.include_router(evaluator_providers.router)
     app.include_router(admin.router)
@@ -125,6 +151,10 @@ def create_app() -> FastAPI:
     app.include_router(feedback_review.router)
     app.include_router(langfuse_metrics.router)
     app.include_router(img_proxy.router)
+    # 飞书 Bitable OAuth 回调（公开端点，浏览器 302 跳回无 JWT）。仅在
+    # bitable 集成已配（含公网 redirect_uri）时挂载，否则不暴露该公开路由。
+    if settings.feishu.bitable_configured:
+        app.include_router(feishu_oauth.router)
 
     @app.get("/health")
     async def health():

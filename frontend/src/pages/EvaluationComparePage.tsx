@@ -8,6 +8,11 @@ import { evaluationApi } from '@/services'
 import { Drawer, ExportMenu } from '@/components/ui'
 import { directionMark, getScoreMeta, isPassing, tone } from '@/lib/scoreSemantics'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import { exportCompareReport } from '@/lib/reportExport'
+import {
+  deriveFacts, deriveAcceptance, deriveCostScored, aggregateProjectedRows,
+  acceptancePassRateText, runDecisionLabel, type EvalFacts, type EvalAcceptance,
+} from '@/lib/evalSemantics'
 import type { EvalResultRow, EvalRunDetail, EvalResultsPage } from '@/types'
 
 // Token-driven bar palette — pulls from CSS vars so light/dark theme stays in sync.
@@ -21,8 +26,6 @@ const BAR_COLORS = [
   'rgb(var(--positive) / 0.7)',
   'rgb(var(--info) / 0.7)',
 ]
-const RESULTS_PAGE_SIZE = 200
-
 const COST_METRIC_DEFS: Array<{
   key: string
   label: string
@@ -41,8 +44,8 @@ const COST_METRIC_DEFS: Array<{
 type AlignKey = 'case_id' | 'question'
 
 interface RunStats {
-  total: number
-  passed: number
+  facts: EvalFacts
+  acceptance: EvalAcceptance
   dimensionAverages: Record<string, number>
   costSuccess: Record<string, number>
 }
@@ -61,10 +64,8 @@ export default function EvaluationComparePage() {
 
   const resultsQueries = useQueries({
     queries: ids.map(id => ({
-      queryKey: ['eval-results-compare', id],
-      queryFn: () => evaluationApi
-        .getResults(id, { page: 1, page_size: RESULTS_PAGE_SIZE })
-        .then(r => r.data),
+      queryKey: ['eval-results-compare-all', id],
+      queryFn: () => evaluationApi.getAllResults(id),
       enabled: !!id,
     })),
   })
@@ -92,6 +93,7 @@ export default function EvaluationComparePage() {
   const [selectedAlignKey, setSelectedAlignKey] = useState<string | null>(null)
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set())
   const [exportError, setExportError] = useState<string | null>(null)
+  const [reportBusy, setReportBusy] = useState(false)
 
   // 切换对齐键后，旧的 selected key 失效（case_id ≠ 问题文本哈希）
   useEffect(() => {
@@ -121,15 +123,13 @@ export default function EvaluationComparePage() {
       }
     } else {
       for (const run of runs) {
-        const total = run.summary_scores?.counts?.total ?? 0
-        const passed = run.summary_scores?.counts?.passed ?? 0
         const dimensionAverages = run.summary_scores?.dimension_averages ?? {}
-        const rawCost = (run.summary_scores?.cost_success ?? {}) as Record<string, number | null>
-        const costSuccess: Record<string, number> = {}
-        for (const [k, v] of Object.entries(rawCost)) {
-          if (typeof v === 'number') costSuccess[k] = v
+        out[run.id] = {
+          facts: deriveFacts(run.summary_scores ?? run),
+          acceptance: deriveAcceptance(run.summary_scores ?? run),
+          dimensionAverages,
+          costSuccess: deriveCostScored(run.summary_scores),
         }
-        out[run.id] = { total, passed, dimensionAverages, costSuccess }
       }
     }
     return out
@@ -168,19 +168,54 @@ export default function EvaluationComparePage() {
             <h1 className="page-title">运行对比</h1>
             <p className="page-subtitle">{ids.length} 个运行 · 维度分 · 成本 · 通过率 · 样例对齐</p>
           </div>
-          {ids.length > 0 && (
-            <ExportMenu
-              label="导出对比"
-              onExport={async (format) => {
-                try {
-                  await evaluationApi.exportCompare(ids, format, alignKey)
-                  setExportError(null)
-                } catch (e) {
-                  setExportError(toToastMessage(formatApiError(e)))
-                }
-              }}
-            />
-          )}
+          <div className="flex items-center gap-2 mt-1 shrink-0">
+            {ids.length > 0 && (
+              <ExportMenu
+                label="导出对比"
+                onExport={async (format) => {
+                  try {
+                    await evaluationApi.exportCompare(ids, format, alignKey)
+                    setExportError(null)
+                  } catch (e) {
+                    setExportError(toToastMessage(formatApiError(e)))
+                  }
+                }}
+              />
+            )}
+            {runs.length > 0 && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={reportBusy}
+                title="导出对比 HTML 分析报告（含 AI 解读 / 通过率 / 维度得分 / 成本对比）"
+                onClick={async () => {
+                  setReportBusy(true)
+                  // 先取 LLM 对比解读（同步等）；失败则仍导出无解读的基础报告。
+                  let analysis: string | undefined
+                  try {
+                    const res = await evaluationApi.getCompareReport(
+                      ids,
+                      alignKey,
+                      usingSubset ? Array.from(selectedKeys) : undefined,
+                    )
+                    analysis = res.data.report
+                    setExportError(null)
+                  } catch {
+                    setExportError('AI 解读生成失败，已导出基础对比报告')
+                  }
+                  try {
+                    exportCompareReport(runs, statsByRun, (d) => getScoreMeta(d).label, analysis)
+                  } catch (e) {
+                    setExportError(toToastMessage(formatApiError(e)))
+                  } finally {
+                    setReportBusy(false)
+                  }
+                }}
+              >
+                {reportBusy ? '生成中…' : '导出报告'}
+              </button>
+            )}
+          </div>
         </div>
         {exportError && <p className="text-[12px] text-negative mt-2">{exportError}</p>}
       </header>
@@ -211,9 +246,11 @@ export default function EvaluationComparePage() {
               </thead>
               <tbody>
                 {runs.map((r, i) => {
-                  const total = r.summary_scores?.counts?.total ?? 0
-                  const passed = r.summary_scores?.counts?.passed ?? 0
-                  const cs = r.summary_scores?.cost_success ?? {}
+                  const rowFacts = deriveFacts(r.summary_scores ?? r)
+                  const rowAcc = deriveAcceptance(r.summary_scores ?? r)
+                  const total = rowFacts.total
+                  const rowRateText = acceptancePassRateText(rowAcc)
+                  const cs = deriveCostScored(r.summary_scores)
                   const model = (r.agent_config as { model?: string; type?: string }).model
                     || (r.agent_config as { type?: string }).type
                     || '—'
@@ -227,7 +264,7 @@ export default function EvaluationComparePage() {
                       </td>
                       <td>{model}</td>
                       <td className="text-right tabular-nums">{total}</td>
-                      <td className="text-right tabular-nums">{total ? `${Math.round((passed / total) * 100)}%` : '—'}</td>
+                      <td className="text-right tabular-nums" title={rowAcc.configured ? `运行结论：${runDecisionLabel(rowAcc.run_decision)}` : '未配置验收规则'}>{rowRateText ?? '仅评分'}</td>
                       <td className="text-right tabular-nums">
                         {cs.avg_latency_ms != null ? `${Math.round(cs.avg_latency_ms as number)}ms` : '—'}
                       </td>
@@ -426,8 +463,9 @@ function ABSummarySection({ runs, aRun, bRun, aStats, bStats, usingSubset, onCha
   onChangeA: (id: string) => void
   onChangeB: (id: string) => void
 }) {
-  const passRateA = aStats.total > 0 ? aStats.passed / aStats.total : null
-  const passRateB = bStats.total > 0 ? bStats.passed / bStats.total : null
+  // 通过率仅在两侧都配置了显式验收策略时才对比；否则不编造。
+  const passRateA = aStats.acceptance.configured ? aStats.acceptance.pass_rate : null
+  const passRateB = bStats.acceptance.configured ? bStats.acceptance.pass_rate : null
   const passRateDelta = deltaPct(passRateB, passRateA)
 
   const dimsA = aStats.dimensionAverages
@@ -460,16 +498,16 @@ function ABSummarySection({ runs, aRun, bRun, aStats, bStats, usingSubset, onCha
       {/* Pass rate */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
         <DeltaCard
-          label="通过率"
-          a={passRateA != null ? `${(passRateA * 100).toFixed(1)}%` : '—'}
-          b={passRateB != null ? `${(passRateB * 100).toFixed(1)}%` : '—'}
+          label="验收通过率"
+          a={passRateA != null ? `${(passRateA * 100).toFixed(1)}%` : (aStats.acceptance.configured ? '无数据' : '仅评分')}
+          b={passRateB != null ? `${(passRateB * 100).toFixed(1)}%` : (bStats.acceptance.configured ? '无数据' : '仅评分')}
           delta={passRateDelta}
           direction="higher_better"
         />
         <DeltaCard
           label="样例数"
-          a={String(aStats.total)}
-          b={String(bStats.total)}
+          a={String(aStats.facts.total)}
+          b={String(bStats.facts.total)}
           delta={null}
           direction="higher_better"
           neutral
@@ -1181,8 +1219,7 @@ function SampleCompareDetail({ aligned, runs }: {
 // ─── Stats helpers ──────────────────────────────────────────────────────────
 
 function computeStatsFromRows(rows: EvalResultRow[]): RunStats {
-  const total = rows.length
-  const passed = rows.filter(r => r.status === 'pass').length
+  const { facts, acceptance } = aggregateProjectedRows(rows)
 
   // 维度均分：所有行（不仅成功），按各维度独立计 N
   const dimSum: Record<string, { sum: number; count: number }> = {}
@@ -1200,8 +1237,8 @@ function computeStatsFromRows(rows: EvalResultRow[]): RunStats {
     if (count > 0) dimensionAverages[d] = sum / count
   }
 
-  // 成本：仅成功样例
-  const successRows = rows.filter(r => r.status === 'pass')
+  // 成本：仅评分完成的样例（执行成功且 judge 出分）
+  const successRows = rows.filter(r => r.evaluation_status === 'completed')
   const costSuccess: Record<string, number> = {}
   const avgField = (key: keyof EvalResultRow, dest: string) => {
     const vals: number[] = []
@@ -1235,7 +1272,7 @@ function computeStatsFromRows(rows: EvalResultRow[]): RunStats {
   }
   if (hasCache && denom > 0) costSuccess.cache_hit_rate = read / denom
 
-  return { total, passed, dimensionAverages, costSuccess }
+  return { facts, acceptance, dimensionAverages, costSuccess }
 }
 
 
@@ -1353,11 +1390,13 @@ function buildPassRateChart(
   runs: EvalRunDetail[],
   statsByRun: Record<string, RunStats>,
 ): Array<{ run: string; passRate: number }> {
+  // 通过率图只画配置了显式验收策略、且有通过率的运行；仅评分的运行不参与，
+  // 避免把「无验收结论」画成 0%。
   return runs
     .map(r => {
       const s = statsByRun[r.id]
-      if (!s || s.total === 0) return null
-      return { run: runLabel(r), passRate: Math.round((s.passed / s.total) * 1000) / 10 }
+      if (!s || !s.acceptance.configured || s.acceptance.pass_rate == null) return null
+      return { run: runLabel(r), passRate: Math.round(s.acceptance.pass_rate * 1000) / 10 }
     })
     .filter((x): x is { run: string; passRate: number } => x !== null)
 }

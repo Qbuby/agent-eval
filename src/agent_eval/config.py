@@ -124,6 +124,54 @@ class LoggingSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="LOG_", env_file=_ENV_FILE, extra="ignore")
 
 
+class FeishuSettings(BaseSettings):
+    """飞书机器人集成。长连接（ws.Client）主动连飞书，无需公网回调。
+
+    - ``enabled`` 关时不拉起长连接（默认关，凭证缺失也不影响 backend 启动）。
+    - ``app_id`` / ``app_secret``：飞书自建应用凭证（开了长连接 + im 消息权限）。
+    - ``judge_provider``：内置 agent 编排用哪个 evaluator_provider 的 name
+      作 LLM（缺省用 kiro）。
+    """
+    enabled: bool = False
+    app_id: str = ""
+    app_secret: str = ""
+    judge_provider: str = "kiro"
+    # 编排 LLM 的模型串（覆盖 provider.default_model）。空则回退 provider 默认。
+    # 只影响机器人，不动 kiro provider 的 default_model（评估器不受影响）。
+    judge_model: str = "claude-opus-4-8"
+
+    # ── 多维表格集成（Bitable）——用 user OAuth（user_access_token）访问 ──
+    # bitable_enabled 关时不注册 Bitable 工具、不挂 OAuth 回调路由。
+    bitable_enabled: bool = False
+    # OAuth 回调地址：必须公网可达，且与飞书应用后台「安全设置 > 重定向 URL」
+    # 完全一致。形如 https://<公网域名>/api/integrations/feishu/oauth/callback。
+    oauth_redirect_uri: str = ""
+    # 申请的用户授权 scope（空格分隔）。Bitable 读写至少需 bitable:app；
+    # 必须含 offline_access 才会返回 refresh_token（否则 access 过期只能重新授权）。
+    oauth_scopes: str = "bitable:app offline_access"
+
+    # ── 评估完成通知：全局固定接收者 ──
+    # 逗号分隔的飞书 open_id 列表。任一评估 run 完成后，除触发者 / 定时任务配置的
+    # 收件人外，这里的每个 open_id 也会收到完成卡片（合并去重）。空则只通知触发者。
+    notify_open_ids: str = ""
+
+    model_config = SettingsConfigDict(env_prefix="FEISHU_", env_file=_ENV_FILE, extra="ignore")
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.enabled and self.app_id and self.app_secret)
+
+    @property
+    def bitable_configured(self) -> bool:
+        """Bitable 集成是否可用：bot 已配 + 显式开 bitable + 配了 OAuth 回调。"""
+        return bool(self.configured and self.bitable_enabled and self.oauth_redirect_uri)
+
+    @property
+    def notify_open_ids_list(self) -> list[str]:
+        """全局固定通知接收者（逗号分隔 → 去空白的 open_id 列表）。"""
+        return [s.strip() for s in self.notify_open_ids.split(",") if s.strip()]
+
+
 class Settings(BaseSettings):
     db: DatabaseSettings = DatabaseSettings()
     llm: LLMSettings = LLMSettings()
@@ -136,6 +184,7 @@ class Settings(BaseSettings):
     routing: RoutingSettings = RoutingSettings()
     governance: GovernanceSettings = GovernanceSettings()
     logging: LoggingSettings = LoggingSettings()
+    feishu: FeishuSettings = FeishuSettings()
 
 
 settings = Settings()

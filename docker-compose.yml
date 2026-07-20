@@ -149,6 +149,10 @@ services:
       # （WSL 宿主 resolv.conf nameserver → 默认路由）。非 WSL / 特殊网络
       # 可在此写死，例如 AGENT_HOST_GATEWAY=172.16.100.211。
       AGENT_HOST_GATEWAY: ${AGENT_HOST_GATEWAY:-}
+      # 评估完成通知的全局固定接收者（env_file 已加载，显式列出便于排查）。
+      # Bitable 导入/导出走 app 身份（tenant_access_token，SDK 自动换取），
+      # 无需 OAuth，故此处不再需要 REDIRECT_URI / SCOPES。
+      FEISHU_NOTIFY_OPEN_IDS: ${FEISHU_NOTIFY_OPEN_IDS:-}
     ports:
       - "8000:8000"
     # 被测 agent 跑在 Windows 宿主上（SSH 隧道 0.0.0.0:18094）。本栈是

@@ -16,20 +16,22 @@ INTERNAL_TENANT_ID）。所以这里直连 ``async_session_factory()`` 查询即
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import distinct, func, select
 from sqlalchemy.orm import load_only
 
 from agent_eval.auth.dependencies import require_internal
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
+    CandidateCaseRow,
     LangfuseMetricsCursorRow,
     LangfuseObservationMetricRow,
     LangfuseTraceMetricRow,
 )
+from agent_eval.governance.helpers import log_audit
 
 # 内部角色（admin + 内部普通 user）可见：require_internal = admin|user。
 # 这三张表由后台无租户上下文写入（落 INTERNAL_TENANT_ID）；内部 user 登录态虽非
@@ -99,6 +101,103 @@ def _input_preview(value, max_len: int = 300) -> str | None:
     if len(text) > max_len:
         return text[:max_len] + "…"
     return text
+
+
+# --------------------------------------------------------------------------- #
+# 语义执行链（CoT + 工具链）构建：从 observation 明细拼出有序步骤
+# --------------------------------------------------------------------------- #
+def _obs_content_blocks(value) -> list[dict]:
+    """把 observation.output/input 归一成 content block 列表（对齐 compute._content_blocks）。
+
+    支持 ``{"content": [...]}`` / ``{"content": "str"}`` / ``[block,...]`` /
+    单个带 type 的块 / 顶层字符串。无法解析返回 ``[]``。
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [b for b in value if isinstance(b, dict)]
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, list):
+            return [b for b in content if isinstance(b, dict)]
+        if isinstance(content, str):
+            return [{"type": "text", "text": content}]
+        if "type" in value:
+            return [value]
+        return []
+    if isinstance(value, str):
+        return [{"type": "text", "text": value}]
+    return []
+
+
+def _text_from_blocks(blocks: list[dict], block_type: str) -> str:
+    """拼接指定 type 的块文本（thinking / text 等）。空则返回 ""。"""
+    parts = [
+        b.get("text") or b.get("thinking") or ""
+        for b in blocks
+        if b.get("type") == block_type
+    ]
+    return "\n".join(p for p in parts if isinstance(p, str) and p.strip()).strip()
+
+
+def _build_semantic_trace(obs_rows: list) -> dict | None:
+    """从一条 trace 的 observation 明细拼出语义执行链（steps + tool_calls）。
+
+    口径（对齐 compute.py，且**绝不臆造 CoT**）：
+      - GENERATION：output 里显式的 ``thinking`` 块 → ``thought`` 步骤；
+        ``text`` 块 → ``answer`` 步骤。二者都无则跳过（不把普通模型步骤伪造成思考）。
+      - TOOL：一条工具调用步骤（tool_call），args=input、output=output，
+        level==ERROR 或 output 含 error → 失败。
+    steps 按 start_time 升序（obs_rows 调用方已排好）。无可识别内容返回 None。
+    """
+    steps: list[dict] = []
+    tool_calls: list[dict] = []
+    for o in obs_rows:
+        otype = (o.type or "").upper()
+        started = o.start_time.timestamp() if o.start_time is not None else None
+        dur_ms = int(float(o.latency_s) * 1000) if o.latency_s is not None else None
+        if otype == "TOOL":
+            out = o.output
+            # level==ERROR 时把错误折进 output，让前端 isToolCallError 命中
+            if (o.level or "").upper() == "ERROR" and not (
+                isinstance(out, dict) and out.get("error")
+            ):
+                out = {"error": o.status_message or "tool error", "raw": out}
+            tc = {
+                "tool_name": o.name or "",
+                "args": o.input,
+                "output": out,
+                "started_at": started,
+                "duration_ms": dur_ms,
+            }
+            tool_calls.append(tc)
+            steps.append({"type": "tool_call", **tc})
+        elif otype == "GENERATION":
+            blocks = _obs_content_blocks(o.output)
+            thinking = _text_from_blocks(blocks, "thinking")
+            if thinking:
+                steps.append({
+                    "type": "thought",
+                    "content": thinking,
+                    "started_at": started,
+                    "duration_ms": dur_ms,
+                })
+            answer = _text_from_blocks(blocks, "text")
+            if answer:
+                steps.append({
+                    "type": "answer",
+                    "content": answer,
+                    "started_at": started,
+                    "duration_ms": dur_ms,
+                })
+    if not steps and not tool_calls:
+        return None
+    return {
+        "steps": steps,
+        "tool_calls": tool_calls,
+        "format": "langfuse_observations",
+        "complete": True,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -174,6 +273,10 @@ class ObservationDetail(BaseModel):
     total_tokens: int | None = None
     calculated_total_cost: float | None = None
     time_to_first_token_s: float | None = None
+    parent_observation_id: str | None = None
+    # 原始 input/output（透传 JSONB），供详情抽屉展开单个 observation 内容。
+    input: dict | list | str | None = None
+    output: dict | list | str | None = None
 
 
 class TraceDetailResponse(BaseModel):
@@ -209,6 +312,10 @@ class TraceDetailResponse(BaseModel):
     trace_metadata: dict | None = None
     scores: list | None = None
     observations: list[ObservationDetail]
+    # 服务端归一化的语义执行链（思考 / 工具调用 / 答复），从 observations 拼出。
+    # 只把 GENERATION 里显式的 thinking / text 块与 TOOL observation 转成步骤，
+    # 不臆造 CoT；无可识别内容时为 None，前端回退到 observations 表 + 原始 JSON。
+    semantic_trace: dict | None = None
 
 
 class PollResponse(BaseModel):
@@ -513,9 +620,14 @@ async def get_trace_detail(langfuse_trace_id: str) -> TraceDetailResponse:
             total_tokens=o.total_tokens,
             calculated_total_cost=_float(o.calculated_total_cost),
             time_to_first_token_s=_float(o.time_to_first_token_s),
+            parent_observation_id=o.parent_observation_id,
+            input=o.input,
+            output=o.output,
         )
         for o in obs_rows
     ]
+
+    semantic_trace = _build_semantic_trace(obs_rows)
 
     return TraceDetailResponse(
         langfuse_trace_id=t.langfuse_trace_id,
@@ -550,6 +662,7 @@ async def get_trace_detail(langfuse_trace_id: str) -> TraceDetailResponse:
         trace_metadata=t.trace_metadata,
         scores=t.scores,
         observations=observations,
+        semantic_trace=semantic_trace,
     )
 
 
@@ -620,3 +733,136 @@ async def get_poll_status() -> PollStatusResponse:
         consecutive_failures=cursor.consecutive_failures,
         last_error=cursor.last_error,
     )
+
+
+# --------------------------------------------------------------------------- #
+# 导入到备选数据集：把选中的 trace 连同答案 / 思维链 / 工具链 / 来源快照落库
+# --------------------------------------------------------------------------- #
+def _text_from_value(value) -> str:
+    """从 trace/observation 的 input/output 提取可读文本。
+
+    依次尝试：字符串原文 → content blocks 的 text 拼接 → messages 里最后一条
+    user/assistant 文本 → 顶层 input/output/text/answer 字段。取不到返回 ""。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        blocks = _obs_content_blocks(value)
+        return _text_from_blocks(blocks, "text")
+    if isinstance(value, dict):
+        # content blocks（Anthropic / LangGraph message 结构）
+        blocks = _obs_content_blocks(value)
+        txt = _text_from_blocks(blocks, "text")
+        if txt:
+            return txt
+        # messages 列表：取最后一条带文本的消息
+        messages = value.get("messages")
+        if isinstance(messages, list):
+            for msg in reversed(messages):
+                if isinstance(msg, dict):
+                    mtxt = _text_from_value(msg.get("content"))
+                    if mtxt:
+                        return mtxt
+        for key in ("input", "question", "query", "output", "text", "answer", "result"):
+            v = value.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
+def _question_from_trace_input(trace_input) -> str:
+    """从 trace.input 提取用户问题：优先 messages 里最后一条 user，回退整体文本。"""
+    if isinstance(trace_input, dict):
+        messages = trace_input.get("messages")
+        if isinstance(messages, list):
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    txt = _text_from_value(msg.get("content"))
+                    if txt:
+                        return txt
+    return _text_from_value(trace_input)
+
+
+class ImportCandidatesRequest(BaseModel):
+    trace_ids: list[str]
+    dataset_name: str | None = None  # 备选数据集名；空则用 trace name / "langfuse"
+    project_id: str | None = None    # 目标项目（candidate_cases.project_id）
+    category: str | None = None      # 自由文本类别名（candidate_cases.category）
+
+
+@router.post("/import-candidates")
+async def import_traces_to_candidates(req: ImportCandidatesRequest) -> dict:
+    """把选中的 Langfuse trace 导入备选数据集（candidate_cases）。
+
+    每条 trace：question=trace.input 里的用户问题，answer=trace.output 文本，
+    并把答案 / 思维链 steps / 工具链 tool_calls / 来源（trace_id、environment）
+    快照写入 ``extra_metadata``，供后续评测复用。question 为空的 trace 跳过。
+    有答案→status=ready，否则 pending。
+    """
+    if not req.trace_ids:
+        raise HTTPException(status_code=400, detail="未选择任何 trace")
+
+    T = LangfuseTraceMetricRow
+    O = LangfuseObservationMetricRow
+    imported = 0
+    skipped = 0
+    imported_at = datetime.now(timezone.utc).isoformat()
+
+    async with async_session_factory() as session:
+        for trace_id in req.trace_ids:
+            t = (
+                await session.execute(select(T).where(T.langfuse_trace_id == trace_id))
+            ).scalar_one_or_none()
+            if t is None:
+                skipped += 1
+                continue
+
+            question = _question_from_trace_input(t.input)
+            if not question:
+                skipped += 1
+                continue
+            answer = _text_from_value(t.output)
+
+            obs_rows = (
+                await session.execute(
+                    select(O)
+                    .where(O.langfuse_trace_id == trace_id)
+                    .order_by(O.start_time.asc().nulls_last())
+                )
+            ).scalars().all()
+            semantic = _build_semantic_trace(obs_rows) or {}
+
+            extra_metadata = {
+                "source": "langfuse_trace",
+                "langfuse_trace_id": trace_id,
+                "environment": t.environment,
+                "trace_name": t.name,
+                "imported_at": imported_at,
+            }
+            if semantic.get("steps"):
+                extra_metadata["steps"] = semantic["steps"]
+            if semantic.get("tool_calls"):
+                extra_metadata["tool_calls"] = semantic["tool_calls"]
+
+            dataset_name = (req.dataset_name or "").strip() or (t.name or "langfuse")
+            session.add(CandidateCaseRow(
+                project_id=req.project_id or None,
+                category=(req.category or "").strip() or None,
+                dataset_name=dataset_name,
+                source="langfuse_trace",
+                question=question,
+                answer=answer or None,
+                extra_metadata=extra_metadata,
+                status="ready" if answer else "pending",
+            ))
+            imported += 1
+
+        await session.commit()
+
+    await log_audit(
+        "candidate", "import-langfuse", "create",
+        details={"imported": imported, "skipped": skipped, "trace_ids": req.trace_ids[:10]},
+    )
+    return {"imported": imported, "skipped": skipped}

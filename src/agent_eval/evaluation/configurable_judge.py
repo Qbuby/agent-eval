@@ -74,6 +74,11 @@ from agent_eval.evaluation.judge_clients import (
 
 logger = logging.getLogger(__name__)
 
+# 完整性补评：单次 judge 调用未出分（网络耗尽 / 流截断 / 不可解析）时，以
+# 升级超时有界重跑，力求每个评估维度都拿到分。穷尽仍失败则如实返回 error，
+# 绝不伪造分数（与「judge 挂了不静默 skip、不让幸存维度独自判 pass」一致）。
+_JUDGE_COMPLETENESS_ATTEMPTS = 3
+
 
 # ────────────────────────────────────────────────────────────────────────
 # Defaults — 与 Langfuse 模板默认值对齐
@@ -360,6 +365,94 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         return None
 
 
+# agent-as-judge 兜底：SSE 业务 agent 往往无视"只输出 JSON"的判决契约，
+# 直接吐一段中文散文（有时含"评分：0.8""得分 85 分""score: 0.9"之类）。
+# JSON 抽取失败时，退而从散文里正则捞一个数值分作总分——只在 numeric/boolean
+# 场景启用（categorical/checklist 无法从散文可靠还原），且仅对 agent 类型
+# provider 生效（不放松 LLM judge 的严格 JSON 契约，避免把散文里的无关数字误当分）。
+#
+# 识别的写法（大小写不敏感，中英冒号/空格兼容）。两条互补 pattern，取更靠前的命中：
+#
+# 1) 关键词引导式（keyword → number）：允许关键词与数字间隔少量非数字字符
+#    （"我给它打 8/10 分" 的"它"、"满意度 90%" 的空格）。分子后可跟 %/分/比分。
+#      score / rating / 分数 / 得分 / 评分 / 总分 / 打分 / 打…分 / 满意度 / 准确率 / 符合度
+#      后跟  0.85 | 85% | 85分 | 8/10 | 3/100
+# 2) 独立比分式（number/number）：无关键词也能捞 "8/10"、"85/100"——业务 agent
+#    常直接写比分。分母 (2..1000) 限定，避免把日期/无关分数误当分。
+_PROSE_SCORE_RE = re.compile(
+    r"(?:score|rating|分数|得分|评分|总分|打分|打|满意度|准确率|符合度|符合率)"
+    r"[^\d]{0,4}?"
+    r"(\d+(?:\.\d+)?)\s*(%|分|/\s*(\d+(?:\.\d+)?))?",
+    re.IGNORECASE,
+)
+_PROSE_RATIO_RE = re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d{1,4}(?:\.\d+)?)")
+
+
+def _salvage_prose_score(text: str, *, score_type: str) -> tuple[float, str] | None:
+    """从自然语言里捞一个 [0,1] 归一分。命中返回 (value, matched_snippet)，
+    否则 None。仅供 agent-as-judge 兜底调用。
+
+    归一规则：
+      * ``85%`` / ``85分`` / 裸 ``85``（>1 且 <=100）→ /100
+      * ``8/10`` / ``8/100`` → 按分母归一
+      * ``0.85``（0~1）→ 原样
+    boolean 场景把归一分二值化（>=0.5→1.0，否则 0.0）。
+    """
+    if not text:
+        return None
+
+    value: float | None = None
+    snippet = ""
+    m = _PROSE_SCORE_RE.search(text)
+    if m:
+        try:
+            num = float(m.group(1))
+        except (TypeError, ValueError):
+            num = None
+        if num is not None:
+            unit = (m.group(2) or "").strip()
+            denom_group = m.group(3)
+            if denom_group:  # "8/10" / "8/100" 形式
+                try:
+                    denom = float(denom_group)
+                    value = num / denom if denom > 0 else 0.0
+                    snippet = m.group(0).strip()
+                except (TypeError, ValueError):
+                    value = None
+            elif unit == "%":
+                value = num / 100.0
+                snippet = m.group(0).strip()
+            elif unit == "分":  # "85 分" → 百分制；"0.85 分" 原样
+                value = num / 100.0 if num > 1 else num
+                snippet = m.group(0).strip()
+            elif num <= 1.0:
+                value = num
+                snippet = m.group(0).strip()
+            elif num <= 100.0:
+                value = num / 100.0  # 裸的 2..100 视作百分制
+                snippet = m.group(0).strip()
+
+    # 关键词式没捞到，退到独立比分式（"8/10" 等）。
+    if value is None:
+        rm = _PROSE_RATIO_RE.search(text)
+        if rm:
+            try:
+                a, b = float(rm.group(1)), float(rm.group(2))
+                if b > 0 and a <= b:
+                    value = a / b
+                    snippet = rm.group(0).strip()
+            except (TypeError, ValueError):
+                value = None
+
+    if value is None:
+        return None
+
+    value = max(0.0, min(1.0, value))
+    if (score_type or "numeric").lower() == "boolean":
+        value = 1.0 if value >= 0.5 else 0.0
+    return value, snippet
+
+
 def _diagnose_unparseable(invocation: Any) -> str:
     """When _extract_json returned None, give the user a useful explanation
     instead of a generic "not parseable JSON". The most common cause we see
@@ -381,6 +474,16 @@ def _diagnose_unparseable(invocation: Any) -> str:
     truncated = finish == "length" or stop_reason == "max_tokens"
     out_tok = invocation.usage.output_tokens if invocation.usage else 0
 
+    # 流被对端中途切断（SSEStreamAdapter 标记 truncated）——与 max_tokens 截断
+    # 不同，这是传输层失败（judge 大 payload 压垮 agent 或上游网关 RST 连接）。
+    # 明确报出来，别和「模型没吐 JSON」混为一谈，方便运维定位是 judge 端挂了。
+    stream_cut = isinstance(body, dict) and body.get("truncated")
+    if stream_cut:
+        return (
+            f"agent judge 的响应流被中途切断（已收 output_tokens={out_tok}，未读完）——"
+            "多为 judge 请求体过大压垮被测 agent 或触发上游网关读超时/RST。"
+            "排查网关 proxy_read_timeout 与 response buffering，或裁剪 judge 输入。"
+        )
     if truncated:
         return (
             f"judge response was truncated at max_tokens (output_tokens={out_tok}); "
@@ -633,55 +736,134 @@ async def run_configurable_judge(
     except TemplateRenderError as e:
         return ConfigurableJudgeResult(error=str(e))
 
-    try:
-        client = build_judge_client(
-            provider,
-            model=params.get("model"),
-            temperature=float(params.get("temperature", 0.0)),
-            max_tokens=int(params.get("max_tokens", 1024)),
-            timeout=float(params.get("timeout", 60.0)),
-        )
-    except JudgeClientError as e:
-        return ConfigurableJudgeResult(rendered_messages=messages, error=str(e))
+    base_timeout = float(params.get("timeout", 120.0))
+    # 有界补评循环：仅在「未出分」时重跑（成功即刻返回，绝不重复计费成功调用）。
+    # 每轮线性拉长超时（base, 1.5x, 2x...），直击 ReadTimeout 根因——多数超时
+    # 维度在给足时间后即出分；穷尽仍失败则返回最后一次 error 结果。
+    last_result: ConfigurableJudgeResult | None = None
+    for attempt in range(1, _JUDGE_COMPLETENESS_ATTEMPTS + 1):
+        attempt_timeout = base_timeout * (1 + 0.5 * (attempt - 1))
+        try:
+            client = build_judge_client(
+                provider,
+                model=params.get("model"),
+                temperature=float(params.get("temperature", 0.0)),
+                max_tokens=int(params.get("max_tokens", 1024)),
+                timeout=attempt_timeout,
+            )
+        except JudgeClientError as e:
+            # 客户端构造失败（如缺 model）是确定性错误，重试无益，直接返回。
+            return ConfigurableJudgeResult(rendered_messages=messages, error=str(e))
 
-    try:
-        async with client as judge:
-            invocation = await judge.ainvoke(messages)
-    except JudgeClientError as e:
-        return ConfigurableJudgeResult(rendered_messages=messages, error=str(e))
-    except Exception as e:
-        logger.exception("configurable_judge: unexpected failure")
-        return ConfigurableJudgeResult(
-            rendered_messages=messages,
-            error=f"unexpected error: {type(e).__name__}: {e}",
-        )
+        try:
+            async with client as judge:
+                invocation = await judge.ainvoke(messages)
+        except JudgeClientError as e:
+            last_result = ConfigurableJudgeResult(rendered_messages=messages, error=str(e))
+            if attempt < _JUDGE_COMPLETENESS_ATTEMPTS:
+                logger.warning(
+                    "configurable_judge[%s] no score (attempt %d/%d, next timeout=%.0fs): %s",
+                    evaluator_name, attempt, _JUDGE_COMPLETENESS_ATTEMPTS,
+                    base_timeout * (1 + 0.5 * attempt), e,
+                )
+                continue
+            return last_result
+        except Exception as e:
+            logger.exception("configurable_judge: unexpected failure")
+            last_result = ConfigurableJudgeResult(
+                rendered_messages=messages,
+                error=f"unexpected error: {type(e).__name__}: {e}",
+            )
+            if attempt < _JUDGE_COMPLETENESS_ATTEMPTS:
+                continue
+            return last_result
 
-    body = _extract_json(invocation.content)
-    if body is None:
-        return ConfigurableJudgeResult(
-            rendered_messages=messages,
+        # 流被中途切断（SSEStreamAdapter 标记 truncated）时，judge 根本没把结论说完，
+        # 半截散文里的任何数字都是无关数字——此时 salvage 抽分会把「基础设施失败」
+        # 伪造成一个自信的分，可能把该 error 的 case 洗成 pass。故 truncated 一律不
+        # 兜底，如实报 error，交由上层（judge_failed_dims）判 error 而非静默 skipped。
+        raw_resp = invocation.raw_response if isinstance(invocation.raw_response, dict) else {}
+        was_truncated = bool(raw_resp.get("truncated"))
+
+        body = _extract_json(invocation.content)
+        if body is None:
+            # agent-as-judge 兜底：SSE 业务 agent 常无视 JSON 契约、直接吐中文散文。
+            # numeric/boolean 场景下退而从散文里正则捞一个数值分，避免整轮评估
+            # 因"agent 不吐 JSON"而全体 skipped。仅对 agent 类型 provider 生效——
+            # 不放松 LLM judge 的严格 JSON 契约（散文里的无关数字不该被当分）。
+            # truncated 响应不兜底（见上）——半截话抽出的分不可信。
+            if (
+                provider.provider_type == "agent"
+                and score_type in ("numeric", "boolean")
+                and not was_truncated
+            ):
+                salvaged = _salvage_prose_score(invocation.content, score_type=score_type)
+                if salvaged is not None:
+                    value, snippet = salvaged
+                    return ConfigurableJudgeResult(
+                        scores=[JudgeScore(
+                            name=evaluator_name,
+                            value=value,
+                            reason=f"（从 agent 散文回复兜底解析）匹配：{snippet}",
+                            raw_value=snippet,
+                        )],
+                        usage=invocation.usage,
+                        model=invocation.model,
+                        raw_response=invocation.raw_response,
+                        raw_content=invocation.content,
+                        rendered_messages=messages,
+                    )
+            last_result = ConfigurableJudgeResult(
+                rendered_messages=messages,
+                usage=invocation.usage,
+                model=invocation.model,
+                raw_response=invocation.raw_response,
+                raw_content=invocation.content,
+                error=_diagnose_unparseable(invocation),
+            )
+            if attempt < _JUDGE_COMPLETENESS_ATTEMPTS:
+                logger.warning(
+                    "configurable_judge[%s] unparseable (attempt %d/%d), retrying",
+                    evaluator_name, attempt, _JUDGE_COMPLETENESS_ATTEMPTS,
+                )
+                continue
+            return last_result
+
+        score, parse_err = _parse_single_score(
+            body,
+            score_type=score_type,
+            score_range=score_range,
+            categories=categories,
+            evaluator_name=evaluator_name,
+        )
+        if score:
+            # 出分即成功——立刻返回，绝不因补评重复计费一次成功调用。
+            return ConfigurableJudgeResult(
+                scores=[score],
+                usage=invocation.usage,
+                model=invocation.model,
+                raw_response=invocation.raw_response,
+                raw_content=invocation.content,
+                rendered_messages=messages,
+                error=parse_err,
+            )
+        # 解析出 JSON 但无有效分数（schema 不符）——有界重试后仍无分则返回。
+        last_result = ConfigurableJudgeResult(
+            scores=[],
             usage=invocation.usage,
             model=invocation.model,
             raw_response=invocation.raw_response,
             raw_content=invocation.content,
-            error=_diagnose_unparseable(invocation),
+            rendered_messages=messages,
+            error=parse_err,
         )
+        if attempt < _JUDGE_COMPLETENESS_ATTEMPTS:
+            continue
+        return last_result
 
-    score, parse_err = _parse_single_score(
-        body,
-        score_type=score_type,
-        score_range=score_range,
-        categories=categories,
-        evaluator_name=evaluator_name,
-    )
-    return ConfigurableJudgeResult(
-        scores=[score] if score else [],
-        usage=invocation.usage,
-        model=invocation.model,
-        raw_response=invocation.raw_response,
-        raw_content=invocation.content,
-        rendered_messages=messages,
-        error=parse_err,
+    # 循环理应在最后一轮 return；兜底防御，绝不静默出空。
+    return last_result or ConfigurableJudgeResult(
+        rendered_messages=messages, error="judge produced no result",
     )
 
 

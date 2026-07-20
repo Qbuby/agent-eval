@@ -479,6 +479,28 @@ export interface StartEvalResponse {
   case_count: number
 }
 
+export interface EvalFacts {
+  total: number
+  execution_success: number
+  execution_abnormal: number
+  execution_unknown: number
+  evaluation_completed: number
+  evaluation_partial_or_error: number
+  scored: number
+  skipped: number
+}
+
+export interface EvalAcceptance {
+  configured: boolean
+  decided: number | null
+  passed: number | null
+  failed: number | null
+  undetermined: number | null
+  decision_coverage: number | null
+  pass_rate: number | null
+  run_decision: string | null
+}
+
 export interface EvalRunSummary {
   id: string
   benchmark_version_id: string | null
@@ -489,7 +511,20 @@ export interface EvalRunSummary {
   langsmith_project?: string | null
   langfuse_trace_name?: string | null
   agent_config: Record<string, unknown>
+  acceptance_policy?: Record<string, unknown> | null
+  // 顶层三层语义（后端 EvalRunSummary 直接透出，等同 summary_scores.facts/acceptance）
+  facts?: EvalFacts | null
+  acceptance?: EvalAcceptance | null
   summary_scores: {
+    // facts / acceptance：执行事实、评分事实、可选验收结论（#262 起）。
+    facts?: EvalFacts
+    acceptance?: EvalAcceptance
+    // cost_scored：评分样例成本；cost_execution_abnormal：执行异常样例成本。
+    cost_scored?: Record<string, number | null>
+    cost_execution_abnormal?: Record<string, number | null>
+    cost_accepted?: Record<string, number | null>
+    cost_not_accepted?: Record<string, number | null>
+    // 旧字段（历史 run 兼容，前端经 evalSemantics 兜底读取）。
     counts?: { total?: number; passed?: number; failed?: number; unreachable?: number }
     dimension_averages?: Record<string, number>
     score_distribution?: {
@@ -559,6 +594,12 @@ export interface EvalResultRow {
   benchmark_case_id: string | null
   test_case_id: string | null
   status: string
+  // 三层语义投影（后端 EvalResultRow 透出；旧数据默认 unknown / null）。
+  execution_status?: string
+  evaluation_status?: string
+  acceptance_decision?: string | null
+  decision_source?: string
+  criterion_results?: Array<Record<string, unknown>>
   actual_output: string | null
   question?: string | null
   latency_ms: number | null

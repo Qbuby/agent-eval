@@ -18,7 +18,8 @@ function ts() { return new Date().toISOString().slice(11, 23) }
 function log(...a) { console.log(`[${ts()}]`, ...a) }
 
 async function main() {
-  const browser = await chromium.launch({ headless: true })
+  const EXEC = process.env.PW_CHROMIUM || 'C:\\Users\\frh\\AppData\\Local\\ms-playwright\\chromium-1140\\chrome-win\\chrome.exe'
+  const browser = await chromium.launch({ headless: true, executablePath: EXEC })
   const ctx = await browser.newContext({ baseURL: BASE })
   const page = await ctx.newPage()
 

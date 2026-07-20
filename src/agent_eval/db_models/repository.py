@@ -14,6 +14,8 @@ from agent_eval.db_models.tables import (
     EvaluatorConfigRow,
     EvaluatorProviderRow,
     EvaluatorVersionRow,
+    FeishuConversationMessageRow,
+    FeishuOAuthTokenRow,
     LoopControlLogRow,
     OptimizationRow,
     RoutingLogRow,
@@ -21,6 +23,7 @@ from agent_eval.db_models.tables import (
     TestCaseRow,
     TestResultRow,
     TestRunRow,
+    UserRow,
 )
 
 
@@ -72,6 +75,7 @@ class Repository:
         langfuse_trace_name: str | None = None,
         langsmith_project: str | None = None,
         evaluator_configs: list | None = None,
+        acceptance_policy: dict | None = None,
         status: str = "running",
         eval_started_at: datetime | None = None,
     ) -> TestRunRow:
@@ -86,6 +90,7 @@ class Repository:
             langfuse_trace_name=langfuse_trace_name,
             langsmith_project=langsmith_project,
             evaluator_configs=evaluator_configs or [],
+            acceptance_policy=acceptance_policy,
             status=status,
             started_at=datetime.now(timezone.utc),
             eval_started_at=eval_started_at or datetime.now(timezone.utc),
@@ -127,9 +132,8 @@ class Repository:
         text_query searches over run_name + agent_config.model + agent_config.url +
         langsmith_project (case-insensitive ILIKE).
 
-        min_pass_rate is computed from summary_scores.counts.passed/total —
-        runs missing those keys are excluded when this filter is set
-        (pre-completion runs simply don't have a pass rate yet).
+        min_pass_rate 只读取显式验收策略产生的
+        summary_scores.acceptance.pass_rate；仅评分运行没有通过率，会被排除。
         """
         from sqlalchemy import func, or_, cast
         from sqlalchemy.dialects.postgresql import JSONB
@@ -159,16 +163,11 @@ class Repository:
                     cast(TestRunRow.agent_config["url"], Text).ilike(pattern),
                 ))
             if min_pass_rate is not None:
-                # summary_scores.counts.passed / counts.total >= min_pass_rate
-                # In SQL we approximate with a check that requires both keys
-                # to exist; rows missing them are filtered out.
-                # Postgres syntax: cast jsonb numbers via ::float.
                 q = q.where(
-                    (TestRunRow.summary_scores["counts"]["total"].astext.cast(Float) > 0)
+                    TestRunRow.acceptance_policy.is_not(None)
                     & (
-                        (TestRunRow.summary_scores["counts"]["passed"].astext.cast(Float)
-                         / TestRunRow.summary_scores["counts"]["total"].astext.cast(Float))
-                        >= min_pass_rate
+                        TestRunRow.summary_scores["acceptance"]["pass_rate"]
+                        .astext.cast(Float) >= min_pass_rate
                     )
                 )
             return q
@@ -618,3 +617,101 @@ class Repository:
         await self.session.delete(row)
         await self.session.flush()
         return True
+
+    # ── Feishu bot binding ─────────────────────────────────────────────
+    # 飞书机器人：open_id ↔ user 映射。users 表不挂 TenantMixin，这些查询
+    # 不受租户 ContextVar 过滤影响（机器人在无请求上下文的常驻进程里调用，
+    # 正需要能按 open_id 直接定位到任意租户的 user）。
+
+    async def get_user_by_feishu_open_id(self, open_id: str) -> UserRow | None:
+        """按飞书 open_id 找已绑定的 user；未绑定返回 None。"""
+        result = await self.session.execute(
+            select(UserRow).where(UserRow.feishu_open_id == open_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_user_by_id(self, user_id: uuid.UUID) -> UserRow | None:
+        result = await self.session.execute(
+            select(UserRow).where(UserRow.id == user_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def bind_feishu_open_id(
+        self, user_id: uuid.UUID, open_id: str,
+    ) -> UserRow | None:
+        """把 open_id 绑定到指定 user。调用方需先保证该 open_id 未被别的
+        user 占用（唯一索引也会兜底：重复绑定会在 flush 时 IntegrityError）。
+        user 不存在返回 None。"""
+        row = await self.get_user_by_id(user_id)
+        if row is None:
+            return None
+        row.feishu_open_id = open_id
+        row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    # ── Feishu user OAuth token（Bitable 访问用 user_access_token）─────────
+    # 同样不受租户过滤：feishu_oauth_tokens 表不挂 TenantMixin，机器人在无请求
+    # 上下文的常驻进程里按 user_id 直接取 token。加解密在 router/oauth 层做，
+    # repo 只存已加密 bytes、显式带 tenant_id（表无监听器盖章）。
+
+    async def get_feishu_oauth_token(
+        self, user_id: uuid.UUID,
+    ) -> FeishuOAuthTokenRow | None:
+        """取某 user 的飞书 OAuth token 行；无则 None。"""
+        result = await self.session.execute(
+            select(FeishuOAuthTokenRow).where(
+                FeishuOAuthTokenRow.user_id == user_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def upsert_feishu_oauth_token(
+        self, user_id: uuid.UUID, **fields: Any,
+    ) -> FeishuOAuthTokenRow:
+        """按 user_id upsert 飞书 OAuth token。首次插入须显式带 tenant_id
+        （表不挂 TenantMixin，无监听器盖章）。refresh_token 单次使用，故每次
+        调用整条替换 access/refresh/两个过期时刻。flush 不 commit。"""
+        row = await self.get_feishu_oauth_token(user_id)
+        if row is None:
+            row = FeishuOAuthTokenRow(user_id=user_id, **fields)
+            self.session.add(row)
+        else:
+            for k, v in fields.items():
+                if hasattr(row, k) and k not in ("id", "user_id"):
+                    setattr(row, k, v)
+            row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    # ── Feishu 多轮对话历史 ────────────────────────────────────────────────
+    # feishu_conversation_messages 挂 TenantMixin：写入由 before_flush 按当前
+    # 租户上下文盖 tenant_id，读取被监听器自动加 tenant_id 过滤。所以这里只按
+    # open_id 过滤，租户维度靠上下文兜底——调用方（bot_service）必须在正确的
+    # set_tenant_context 内调用，否则跨租户串话。
+
+    async def add_feishu_message(
+        self, open_id: str, role: str, content: str,
+    ) -> FeishuConversationMessageRow:
+        """追加一条对话历史（role: user|assistant）。flush 不 commit。"""
+        row = FeishuConversationMessageRow(
+            open_id=open_id, role=role, content=content,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_recent_feishu_messages(
+        self, open_id: str, limit: int = 20,
+    ) -> list[FeishuConversationMessageRow]:
+        """取某 open_id 最近 limit 条历史，按时间**正序**返回（可直接拼进
+        LLM messages）。DB 侧按 created_at 倒序取最近 N 条，再在内存翻正。"""
+        result = await self.session.execute(
+            select(FeishuConversationMessageRow)
+            .where(FeishuConversationMessageRow.open_id == open_id)
+            .order_by(FeishuConversationMessageRow.created_at.desc())
+            .limit(limit)
+        )
+        rows = list(result.scalars().all())
+        rows.reverse()
+        return rows

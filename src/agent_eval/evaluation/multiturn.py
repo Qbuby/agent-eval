@@ -232,13 +232,23 @@ async def score_conversation(
     evaluator_specs: list[dict[str, Any]],
     case_metadata: dict[str, Any] | None,
     case_id: str | None = None,
-) -> tuple[dict[str, float], dict[str, str], dict[str, list[dict[str, Any]]]]:
+    only_dims: set[str] | None = None,
+) -> tuple[
+    dict[str, float],
+    dict[str, str],
+    dict[str, list[dict[str, Any]]],
+    int,
+    str | None,
+]:
     """对回放结果做逐轮 + 会话级打分。
 
-    返回 ``(scores, reasons, checks)``：``scores`` 是扁平 ``{score_key: value}``
-    （聚合 / status 判定用，结构不变）；``reasons`` 是并行 ``{score_key: judge 理由}``；
-    ``checks`` 是并行 ``{score_key: [逐项 pass/fail/na+证据]}``（checklist 评分器才有），
-    一并落库写进 details，详情页据此展示「这一分由哪些检查项通过/未通过得来」。
+    返回 ``(scores, reasons, checks, failed_dims, last_error)``：``scores`` 是扁平
+    ``{score_key: value}``（聚合 / status 判定用，结构不变）；``reasons`` 是并行
+    ``{score_key: judge 理由}``；``checks`` 是并行
+    ``{score_key: [逐项 pass/fail/na+证据]}``（checklist 评分器才有），一并落库写进
+    details，详情页据此展示「这一分由哪些检查项通过/未通过得来」。
+    ``failed_dims`` 是本该出分却因 provider/传输错误未出分的维度数，``last_error``
+    是最后一条 judge 错误——供上层 status 判定区分「judge 端挂了」与「无评分依据」。
 
     只处理 ``configurable_judge``（LLM-judge）评估器——唯一评估方式。逐轮用
     criteria/expected_output 作依据，会话级用 conversation_goal。工具调用信息
@@ -252,6 +262,11 @@ async def score_conversation(
     scores: dict[str, float] = {}
     reasons: dict[str, str] = {}
     checks: dict[str, list[dict[str, Any]]] = {}
+    # 「本该出分却因 provider/传输错误没出分」的逐轮/会话级维度数与最后一条错误。
+    # 透出给上层 status 判定：judge 端挂了不能和「本就无评分依据」一样静默 skipped，
+    # 且不能让幸存维度独自判 pass。与单轮 _run_one_case 的处理对齐。
+    failed_dims = 0
+    last_error: str | None = None
 
     # turn_index → 该轮回放记录，便于按期望对齐。
     turn_by_index = {t["turn_index"]: t for t in turns}
@@ -290,6 +305,9 @@ async def score_conversation(
             # / expected_tool_calls 三者任一存在即可评（工具类 judge 只靠后者）。
             if not criteria and not expected and not expected_tc:
                 continue
+            # 仅补评模式：只打指定缺失维度，已出分维度不重复计费。
+            if only_dims is not None and f"{label}.turn{ti}" not in only_dims:
+                continue
             # 把该轮 criteria 注入 metadata，judge 模板可用 {{Criteria}} 取。
             # 同时把「实际工具调用」「期望工具调用」序列化进 metadata，供工具调用
             # 正确性 judge 用 {{ActualToolCalls}} / {{ExpectedToolCalls}} 读取。
@@ -317,12 +335,16 @@ async def score_conversation(
                     "multiturn turn-score[%s.turn%s] crashed on case %s: %s",
                     label, ti, case_id, e,
                 )
+                failed_dims += 1
+                last_error = f"{label}.turn{ti}: {type(e).__name__}: {e}"
                 continue
             if res.error and not res.scores:
                 logger.warning(
                     "multiturn turn-score[%s.turn%s] error on case %s: %s",
                     label, ti, case_id, res.error,
                 )
+                failed_dims += 1
+                last_error = f"{label}.turn{ti}: {res.error}"
                 continue
             for s in res.scores:
                 scores[f"{label}.turn{ti}"] = float(s.value)
@@ -332,7 +354,9 @@ async def score_conversation(
                     checks[f"{label}.turn{ti}"] = s.checks
 
         # ── 会话级打分：以 conversation_goal 为依据，整段对话作 output ──
-        if conversation_goal:
+        if conversation_goal and (
+            only_dims is None or f"{label}.conversation" in only_dims
+        ):
             conv_meta = dict(case_metadata or {})
             conv_meta["conversation_goal"] = conversation_goal
             # 整段对话的实际工具调用（合并各轮），供工具 judge 会话级用
@@ -358,12 +382,16 @@ async def score_conversation(
                 logger.warning(
                     "multiturn conv-score[%s] crashed on case %s: %s", label, case_id, e
                 )
+                failed_dims += 1
+                last_error = f"{label}.conversation: {type(e).__name__}: {e}"
                 continue
             if res.error and not res.scores:
                 logger.warning(
                     "multiturn conv-score[%s] error on case %s: %s",
                     label, case_id, res.error,
                 )
+                failed_dims += 1
+                last_error = f"{label}.conversation: {res.error}"
                 continue
             for s in res.scores:
                 scores[f"{label}.conversation"] = float(s.value)
@@ -372,4 +400,4 @@ async def score_conversation(
                 if s.checks:
                     checks[f"{label}.conversation"] = s.checks
 
-    return scores, reasons, checks
+    return scores, reasons, checks, failed_dims, last_error

@@ -9,7 +9,11 @@ from sqlalchemy import func, select
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
 from agent_eval.api.schemas import AddCasesRequest, BatchDeleteRequest, TestCaseInput
-from agent_eval.auth.dependencies import require_internal
+from agent_eval.auth.dependencies import (
+    ROLE_ADMIN,
+    require_internal,
+    require_role,
+)
 from agent_eval.data.benchmark_import import (
     iter_upload_rows,
     parse_conversations,
@@ -92,6 +96,19 @@ async def add_cases(
     return {"added": len(result.cases), "ids": ids}
 
 
+@router.get("/api/cases/{example_id}")
+async def get_case(
+    example_id: str,
+    mgr: DatasetManager = Depends(get_manager),
+):
+    """按 id 取单条样例的完整详情（读操作，内部角色即可，无需 admin）。"""
+    try:
+        case = await mgr.get_case(example_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"未找到样例 {example_id}：{e}") from e
+    return case.model_dump(mode="json", exclude_none=True)
+
+
 @router.put("/api/cases/{example_id}")
 async def update_case(
     example_id: str,
@@ -156,13 +173,34 @@ async def _parse_conversation_cases(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    return _cases_from_conversation_rows(
+        row_iter, messages_column=messages_column, goal_column=goal_column,
+        category=category, column_map=column_map, source="file_imported",
+    )
+
+
+def _cases_from_conversation_rows(
+    rows,
+    *,
+    messages_column: str | None,
+    goal_column: str | None,
+    category: str | None = None,
+    column_map: dict[str, str] | None = None,
+    source: str = "file_imported",
+) -> tuple[list[TestCase], int]:
+    """行迭代器 → (对话 TestCase 列表, 跳过行数)。
+
+    与文件格式解耦——上传文件走 iter_upload_rows 产出行，飞书多维表格走
+    records_to_rows 产出同形行（{列名: 值} 的 dict），两者共用此下游：同一套
+    parse_conversations 三布局识别 + column_map + TestCase 构造。
+    """
     try:
         conversations, skipped = parse_conversations(
-            row_iter, messages_column=messages_column, goal_column=goal_column,
+            rows, messages_column=messages_column, goal_column=goal_column,
             column_map=column_map,
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"文件解析失败：{e}") from e
+        raise HTTPException(status_code=400, detail=f"解析失败：{e}") from e
 
     cases: list[TestCase] = []
     for i, conv in enumerate(conversations):
@@ -173,7 +211,7 @@ async def _parse_conversation_cases(
             dataset_version="",  # 由调用方（import 端点）按 name 设定
             name=conv.name or f"conv-{i + 1}-{first[:30]}",
             description=conv.description,
-            source="file_imported",
+            source=source,
             input_messages=conv.input_messages,
             conversation_goal=conv.conversation_goal,
             turn_expectations=[TurnExpectation(**te) for te in conv.turn_expectations],
@@ -352,8 +390,25 @@ async def import_conversations(
             status_code=400,
             detail=f"未识别到任何多轮对话样例（文件为空或未匹配到问句/消息列；跳过 {skipped} 行）",
         )
+    return await _upsert_conversation_cases(
+        mgr, name, cases, skipped=skipped, split=split, kind="conversation",
+    )
 
-    # 按名 upsert：命中现有同名样例就把 case.id 覆盖为已有 example_id（== 更新）。
+
+async def _upsert_conversation_cases(
+    mgr: DatasetManager,
+    name: str,
+    cases: list[TestCase],
+    *,
+    skipped: int,
+    split: str | None,
+    kind: str,
+) -> dict:
+    """按名 upsert 一批对话样例并落库。文件导入与 Bitable 导入共用。
+
+    命中现有同名样例则复用其 example_id（Langfuse create_dataset_item(id=)
+    天然 upsert → 更新字段），否则新增。返回 {added, updated, skipped, ids}。
+    """
     try:
         existing = await mgr.load_cases(name)
     except Exception:
@@ -371,9 +426,112 @@ async def import_conversations(
     added = len(cases) - updated
     await log_audit(
         "example", name, "import",
-        details={"count": len(ids), "kind": "conversation", "added": added, "updated": updated},
+        details={"count": len(ids), "kind": kind, "added": added, "updated": updated},
     )
     return {"added": added, "updated": updated, "skipped": skipped, "ids": ids[:10]}
+
+
+class ImportBitableRequest(BaseModel):
+    app_token: str
+    table_id: str
+    split: str | None = None
+    category: str | None = None
+    # 语义字段 → Bitable 列名 的映射（覆盖别名自动识别）。多维表格列名即行 dict 的键。
+    column_map: dict[str, str] | None = None
+    messages_column: str | None = None
+    goal_column: str | None = None
+
+
+async def _fetch_bitable_rows(app_token: str, table_id: str, user) -> list[dict]:
+    """用当前用户 OAuth token 拉取整表记录并归一成行 dict 列表。
+
+    无有效 token → 428（引导去飞书授权）；权限/读取失败 → 由 BitableError
+    冒泡到端点转 400。返回的行是 {列名: 归一值}，可直接喂对话解析下游。
+    """
+    if user is None:
+        raise HTTPException(status_code=400, detail="需要登录用户以使用其飞书授权访问多维表格")
+    from agent_eval.feishu.bitable import BitableClient, BitableError
+    from agent_eval.feishu.bitable import records_to_rows
+    from agent_eval.feishu.oauth import get_valid_user_token
+
+    token = await get_valid_user_token(user.id)
+    if not token:
+        raise HTTPException(
+            status_code=428,
+            detail="尚未完成飞书多维表格授权或授权已过期，请在飞书里点击授权链接后重试",
+        )
+    try:
+        records = await BitableClient(token).list_all_records(app_token, table_id)
+    except BitableError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return records_to_rows(records)
+
+
+@router.post(
+    "/api/datasets/{name}/cases/import-bitable/inspect",
+    dependencies=[Depends(require_role(ROLE_ADMIN))],
+)
+async def inspect_bitable(
+    name: str,
+    req: ImportBitableRequest,
+    user=Depends(require_role(ROLE_ADMIN)),
+):
+    """拉取多维表格首若干行，返回列头 + 每列样例 + 建议映射（对齐文件 inspect 契约）。"""
+    from agent_eval.data.benchmark_import import (
+        collect_sample_values,
+        suggest_conversation_column_map,
+    )
+
+    rows = await _fetch_bitable_rows(req.app_token, req.table_id, user)
+    sample_rows = [r for r in rows[:20] if isinstance(r, dict)]
+    headers: list[str] = []
+    for r in sample_rows:
+        for k in r.keys():
+            if k != "_record_id" and k not in headers:
+                headers.append(k)
+    samples = collect_sample_values(sample_rows, headers, limit=3)
+    suggested = suggest_conversation_column_map(headers)
+    return {
+        "columns": headers,
+        "samples": samples,
+        "suggested": suggested,
+        "total_rows": len(rows),
+    }
+
+
+@router.post(
+    "/api/datasets/{name}/cases/import-bitable",
+    dependencies=[Depends(require_role(ROLE_ADMIN))],
+)
+async def import_bitable(
+    name: str,
+    req: ImportBitableRequest,
+    mgr: DatasetManager = Depends(get_manager),
+    user=Depends(require_role(ROLE_ADMIN)),
+):
+    """从飞书多维表格批量导入多轮对话样例到数据集。
+
+    行来源换成 Bitable 记录（用当前用户 OAuth token 访问其私人表），
+    下游复用与文件导入完全相同的 parse_conversations 三布局识别 +
+    column_map + TestCase 构造 + 按名 upsert。
+    """
+    rows = await _fetch_bitable_rows(req.app_token, req.table_id, user)
+    cases, skipped = _cases_from_conversation_rows(
+        rows,
+        messages_column=req.messages_column,
+        goal_column=req.goal_column,
+        category=req.category,
+        column_map=req.column_map or None,
+        source="bitable_imported",
+    )
+    if not cases:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未从多维表格识别到任何多轮对话样例（未匹配到问句/消息列；跳过 {skipped} 行）",
+        )
+    return await _upsert_conversation_cases(
+        mgr, name, cases, skipped=skipped, split=req.split, kind="conversation_bitable",
+    )
 
 
 def _ascii_slug(name: str, fallback: str = "dataset") -> str:
