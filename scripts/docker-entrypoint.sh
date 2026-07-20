@@ -50,4 +50,30 @@ else
     echo "[entrypoint] no host gateway resolved (src=$src, val='$gateway'); leaving /etc/hosts as-is"
 fi
 
+# --- Schema convergence guard --------------------------------------------
+# The one-shot `migrate` service is the primary migrator, but it can silently
+# no-op on redeploy: a compose `service_completed_successfully` dep is met by
+# the PREVIOUS exited-0 migrate container, and on K8s the migrate Job may not
+# rerun at all. When that happens the backend starts against a stale schema and
+# every query for a new column 500s (e.g. `users.feishu_union_id does not
+# exist` after the feishu migrations shipped but never ran).
+#
+# So the backend converges the schema itself at startup: idempotent
+# `alembic upgrade head` before the app binds. Only runs for the app server
+# (first arg = uvicorn) so the migrate service's own script isn't doubled, and
+# only when AUTO_MIGRATE != 0 (set 0 to opt out, e.g. read-only replicas).
+# Concurrent replicas are serialized by a Postgres advisory lock in
+# alembic/env.py, so parallel `upgrade head` calls can't race on DDL.
+if [ "$1" = "uvicorn" ] && [ "${AUTO_MIGRATE:-1}" != "0" ]; then
+    echo "[entrypoint] converging DB schema: alembic upgrade head"
+    if alembic upgrade head; then
+        echo "[entrypoint] schema is at head"
+    else
+        # Fail fast rather than serve traffic against a stale/broken schema —
+        # a crash-looping pod is a louder, safer signal than silent 500s.
+        echo "[entrypoint] alembic upgrade head FAILED — refusing to start backend" >&2
+        exit 1
+    fi
+fi
+
 exec "$@"
