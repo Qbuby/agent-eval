@@ -28,6 +28,10 @@ import {
   deriveFacts, deriveAcceptance, deriveCostScored, deriveCostAbnormal,
   acceptancePassRateText, runDecisionLabel,
 } from '@/lib/evalSemantics'
+import {
+  evaluatorDisplayName,
+  normalizeComparisonSummary,
+} from '@/lib/comparativeMetrics'
 
 type Tab = 'history' | 'new'
 
@@ -227,7 +231,7 @@ function HistoryTab({ onNewRun }: { onNewRun: () => void }) {
               <Th>智能体</Th>
               <Th>运行名</Th>
               <Th>进度 / 总数</Th>
-              <Th>验收通过率</Th>
+              <Th>验收 / 对比裁决</Th>
               <Th>平均时延</Th>
               <Th>启动时间</Th>
               <Th>操作</Th>
@@ -317,6 +321,8 @@ function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
   const completed = run.progress.completed ?? facts.total ?? 0
   // 通过率仅在配置了显式验收策略时展示；否则标「仅评分」，绝不用分数编造。
   const passRateText = acceptancePassRateText(acceptance)
+  const isComparative = run.eval_mode === 'comparative'
+  const comparisonSummaries = normalizeComparisonSummary(run.summary_scores?.comparison_summary)
   const qualityText = passRateText ?? '仅评分'
   const avgLatency = firstDefined(
     deriveCostScored(run.summary_scores)?.avg_latency_ms,
@@ -324,7 +330,10 @@ function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
   )
 
   const agent = run.agent_config as { model?: string; url?: string; type?: string }
-  const agentLabel = agent?.model || agent?.type || '—'
+  const agentB = run.agent_config_b as { model?: string; url?: string; type?: string } | null
+  const agentLabel = isComparative
+    ? `${agent?.model || agent?.type || 'A'} vs ${agentB?.model || agentB?.type || 'B'}`
+    : agent?.model || agent?.type || '—'
 
   return (
     <tr
@@ -357,11 +366,36 @@ function RunRow({ run, selected, deleting, onToggle, onClick, onDelete }: {
         {run.status === 'running' ? `${completed}/${total || '?'}` : `${total}`}
       </Td>
       <Td>
-        <span title={acceptance.configured
-          ? `运行结论：${runDecisionLabel(acceptance.run_decision)}`
-          : '未配置验收规则，仅评分'}>
-          {qualityText}
-        </span>
+        {isComparative ? (
+          comparisonSummaries.length > 0 ? (
+            <div className="space-y-0.5 text-[10px] tabular-nums">
+              {comparisonSummaries.map(summary => (
+                <div
+                  key={summary.evaluator_key}
+                  className="whitespace-nowrap"
+                  title={`${evaluatorDisplayName(summary)}：A 胜 ${summary.a_wins} · B 胜 ${summary.b_wins} · 平 ${summary.ties} · 评分失败 ${summary.evaluation_errors}`}
+                >
+                  <span className="text-text-secondary">{evaluatorDisplayName(summary)}：</span>
+                  <span className="text-accent">A {summary.a_wins}</span>
+                  <span className="text-text-tertiary"> · </span>
+                  <span className="text-info">B {summary.b_wins}</span>
+                  <span className="text-text-tertiary"> · 平 {summary.ties}</span>
+                  {summary.evaluation_errors > 0 && (
+                    <span className="text-negative"> · 失败 {summary.evaluation_errors}</span>
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <span className="text-[11px] text-text-tertiary" title="双模对比运行">双模 · 待出分</span>
+          )
+        ) : (
+          <span title={acceptance.configured
+            ? `运行结论：${runDecisionLabel(acceptance.run_decision)}`
+            : '未配置验收规则，仅评分'}>
+            {qualityText}
+          </span>
+        )}
       </Td>
       <Td>{avgLatency != null ? `${Math.round(avgLatency)}ms` : '—'}</Td>
       <Td>{fmtTime(run.started_at)}</Td>
@@ -412,6 +446,30 @@ function StatusBadge({ status }: { status: string }) {
 
 type CaseSourceTab = 'benchmark' | 'upload' | 'conversation'
 type TraceSource = 'none' | 'langsmith' | 'langfuse'
+type EvalMode = 'single' | 'comparative'
+type AgentType = 'sse' | 'openai' | 'sse_generic'
+
+type AgentDraft = {
+  type: AgentType
+  url: string
+  apiKey: string
+  model: string
+  language: string
+  headersText: string
+  payloadText: string
+  timeout: number
+}
+
+const createAgentDraft = (): AgentDraft => ({
+  type: 'sse',
+  url: '',
+  apiKey: '',
+  model: '',
+  language: '请用中文回复',
+  headersText: '',
+  payloadText: '',
+  timeout: 300,
+})
 
 function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const qc = useQueryClient()
@@ -513,15 +571,10 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     return convEffectiveCount
   }, [convSelectionMode, convPickedIds, convEffectiveCount, limit])
 
-  // ── agent ──
-  const [agentType, setAgentType] = useState<'sse' | 'openai' | 'sse_generic'>('sse')
-  const [agentUrl, setAgentUrl] = useState('')
-  const [agentApiKey, setAgentApiKey] = useState('')
-  const [agentModel, setAgentModel] = useState('')
-  const [agentLanguage, setAgentLanguage] = useState('请用中文回复')
-  const [agentHeadersText, setAgentHeadersText] = useState('')
-  const [agentPayloadText, setAgentPayloadText] = useState('')
-  const [agentTimeout, setAgentTimeout] = useState(300)
+  // ── agents ──
+  const [evalMode, setEvalMode] = useState<EvalMode>('single')
+  const [agentDraft, setAgentDraft] = useState<AgentDraft>(createAgentDraft)
+  const [agentDraftB, setAgentDraftB] = useState<AgentDraft>(createAgentDraft)
   const [concurrency, setConcurrency] = useState(3)
   const [runName, setRunName] = useState('')
   // Trace 来源：'none' = 不关联外部 trace（纯本地评分）；'langsmith' = agent
@@ -546,14 +599,12 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     if (prefilledRef.current) return
     if (endpointOpts.isLoading) return
     prefilledRef.current = true
-    if (!agentUrl) {
-      setAgentUrl(
-        endpointOpts.defaultValue
-          ? configOptionToString(endpointOpts.defaultValue)
-          : 'http://localhost:18094/api/agent/langgraph',
-      )
-    }
-  }, [endpointOpts.isLoading, endpointOpts.defaultValue, agentUrl])
+    const defaultUrl = endpointOpts.defaultValue
+      ? configOptionToString(endpointOpts.defaultValue)
+      : 'http://localhost:18094/api/agent/langgraph'
+    setAgentDraft(prev => prev.url ? prev : { ...prev, url: defaultUrl })
+    setAgentDraftB(prev => prev.url ? prev : { ...prev, url: defaultUrl })
+  }, [endpointOpts.isLoading, endpointOpts.defaultValue])
 
   // ── evaluator instances ──
   const evaluatorsQuery = useQuery({
@@ -587,29 +638,42 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     startBlockers.push('勾选至少 1 条对话样例')
   }
   if (selectedEvaluatorIds.size === 0) startBlockers.push('勾选至少 1 个评估器')
-  if (agentUrl.trim().length === 0) startBlockers.push('填写智能体 URL')
+  if (agentDraft.url.trim().length === 0) {
+    startBlockers.push(evalMode === 'comparative' ? '填写 A 模型智能体 URL' : '填写智能体 URL')
+  }
+  if (evalMode === 'comparative' && agentDraftB.url.trim().length === 0) {
+    startBlockers.push('填写 B 模型智能体 URL')
+  }
+  if (evalMode === 'comparative' && sourceTab === 'conversation' && convDataset) {
+    startBlockers.push('双模对比暂不支持多轮对话集')
+  }
   const canStart = startBlockers.length === 0 && !startMutation.isPending
 
-  const handleStart = () => {
+  const parseAgentDraft = (draft: AgentDraft, label: string): EvalAgentConfig | null => {
     let headers: Record<string, string> | undefined
     let payloadTpl: Record<string, unknown> | undefined
     try {
-      if (agentHeadersText.trim()) headers = JSON.parse(agentHeadersText)
-    } catch { toast.error('请求头必须是合法 JSON'); return }
+      if (draft.headersText.trim()) headers = JSON.parse(draft.headersText)
+    } catch { toast.error(`${label}请求头必须是合法 JSON`); return null }
     try {
-      if (agentPayloadText.trim()) payloadTpl = JSON.parse(agentPayloadText)
-    } catch { toast.error('请求体模板必须是合法 JSON'); return }
+      if (draft.payloadText.trim()) payloadTpl = JSON.parse(draft.payloadText)
+    } catch { toast.error(`${label}请求体模板必须是合法 JSON`); return null }
 
-    const agent: EvalAgentConfig = {
-      type: agentType,
-      url: agentUrl.trim(),
-      api_key: agentApiKey || undefined,
-      model: agentModel || undefined,
+    return {
+      type: draft.type,
+      url: draft.url.trim(),
+      api_key: draft.apiKey || undefined,
+      model: draft.model || undefined,
       headers,
       payload_template: payloadTpl,
-      timeout: agentTimeout,
-      language: agentLanguage,
+      timeout: draft.timeout,
+      language: draft.language,
     }
+  }
+
+  const handleStart = () => {
+    const agent = parseAgentDraft(agentDraft, evalMode === 'comparative' ? 'A 模型' : '')
+    if (!agent) return
 
     const body: StartEvalRequest = {
       agent,
@@ -618,6 +682,13 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       run_name: runName.trim() || null,
       langsmith_project: traceSource === 'langsmith' ? (langsmithProject.trim() || null) : null,
       langfuse_trace_name: traceSource === 'langfuse' ? (langfuseTraceName.trim() || null) : null,
+    }
+
+    if (evalMode === 'comparative') {
+      const agentB = parseAgentDraft(agentDraftB, 'B 模型')
+      if (!agentB) return
+      body.eval_mode = 'comparative'
+      body.agent_b = agentB
     }
 
     if (sourceTab === 'upload' && uploadedSource) {
@@ -998,62 +1069,59 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
         )}
       </Section>
 
-      {/* Step 2: agent */}
+      {/* Step 2: agents */}
       <Section title="2. 配置智能体">
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="类型">
-            <select value={agentType} onChange={e => setAgentType(e.target.value as typeof agentType)} className="input">
-              <option value="sse">SSE (LangGraph v2)</option>
-              <option value="openai">OpenAI 兼容</option>
-              <option value="sse_generic">SSE 通用模板</option>
-            </select>
-          </Field>
-          <Field label="模型（可选，展示用）">
-            <input type="text" value={agentModel} onChange={e => setAgentModel(e.target.value)} className="input" />
-          </Field>
-          <Field label="智能体 URL">
-            <div className="relative">
-              <input type="text" value={agentUrl} onChange={e => setAgentUrl(e.target.value)}
-                     placeholder="http://localhost:18094/api/agent/langgraph" className="input pr-9" />
-              <OptionPicker
-                options={endpointOpts.options}
-                currentValue={agentUrl}
-                onPick={v => setAgentUrl(configOptionToString(v))}
-              />
-            </div>
-          </Field>
-          <Field label="API Key（可选）">
-            <div className="relative">
-              <input type="password" value={agentApiKey} onChange={e => setAgentApiKey(e.target.value)} className="input pr-9" />
-              <OptionPicker
-                options={apiKeyOpts.options}
-                currentValue={agentApiKey}
-                onPick={v => setAgentApiKey(configOptionToString(v))}
-                maskValues
-              />
-            </div>
-          </Field>
-          <Field label="超时（秒）">
-            <div className="relative">
-              <input type="number" min={10} value={agentTimeout} onChange={e => setAgentTimeout(Number(e.target.value))} className="input pr-9" />
-              <OptionPicker
-                options={timeoutOpts.options}
-                currentValue={String(agentTimeout)}
-                onPick={v => {
-                  const n = Number(configOptionToString(v))
-                  if (!Number.isNaN(n) && n > 0) setAgentTimeout(n)
-                }}
-              />
-            </div>
-          </Field>
+        <div className="page-tabs mb-3">
+          {([
+            { id: 'single', label: '单模评估' },
+            { id: 'comparative', label: '双模对比' },
+          ] as { id: EvalMode; label: string }[]).map(mode => (
+            <button
+              key={mode.id}
+              type="button"
+              onClick={() => setEvalMode(mode.id)}
+              className={`page-tab ${evalMode === mode.id ? 'page-tab-active' : ''}`}
+            >
+              {mode.label}
+            </button>
+          ))}
+        </div>
+
+        {evalMode === 'comparative' && sourceTab === 'conversation' && convDataset && (
+          <div className="mb-3 px-3 py-2 rounded-md border border-warning/30 bg-warning/10 text-[12px] text-warning">
+            双模对比暂不支持多轮对话集
+          </div>
+        )}
+
+        <div className="flex flex-col gap-4">
+          <AgentConfigFields
+            title={evalMode === 'comparative' ? 'A 模型' : '智能体'}
+            draft={agentDraft}
+            onChange={setAgentDraft}
+            endpointOptions={endpointOpts.options}
+            apiKeyOptions={apiKeyOpts.options}
+            timeoutOptions={timeoutOpts.options}
+            headersOptions={headersOpts.options}
+            payloadOptions={payloadOpts.options}
+          />
+          {evalMode === 'comparative' && (
+            <AgentConfigFields
+              title="B 模型"
+              draft={agentDraftB}
+              onChange={setAgentDraftB}
+              endpointOptions={endpointOpts.options}
+              apiKeyOptions={apiKeyOpts.options}
+              timeoutOptions={timeoutOpts.options}
+              headersOptions={headersOpts.options}
+              payloadOptions={payloadOpts.options}
+            />
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 mt-4 pt-4 border-t border-separator">
           <Field label="并发数">
             <input type="number" min={1} max={20} value={concurrency} onChange={e => setConcurrency(Number(e.target.value))} className="input" />
           </Field>
-          {agentType === 'sse' && (
-            <Field label="language 参数">
-              <input type="text" value={agentLanguage} onChange={e => setAgentLanguage(e.target.value)} className="input" />
-            </Field>
-          )}
           <Field label="Trace 来源">
             <select value={traceSource} onChange={e => setTraceSource(e.target.value as TraceSource)} className="input">
               <option value="none">不关联（仅本地评分）</option>
@@ -1074,34 +1142,6 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
             </Field>
           )}
         </div>
-
-        <details className="mt-3">
-          <summary className="text-[11px] text-text-secondary cursor-pointer">高级：自定义 headers / payload</summary>
-          <div className="grid grid-cols-2 gap-3 mt-2">
-            <Field label="请求头 (JSON)">
-              <div className="relative">
-                <textarea value={agentHeadersText} onChange={e => setAgentHeadersText(e.target.value)}
-                          rows={3} placeholder='{"X-Custom": "value"}' className="input pr-9 font-mono text-[11px]" />
-                <OptionPicker
-                  options={headersOpts.options}
-                  currentValue={agentHeadersText}
-                  onPick={v => setAgentHeadersText(configOptionToString(v))}
-                />
-              </div>
-            </Field>
-            <Field label="请求体模板 (JSON, SSE 通用专用)">
-              <div className="relative">
-                <textarea value={agentPayloadText} onChange={e => setAgentPayloadText(e.target.value)}
-                          rows={3} placeholder='{"question": "{input}"}' className="input pr-9 font-mono text-[11px]" />
-                <OptionPicker
-                  options={payloadOpts.options}
-                  currentValue={agentPayloadText}
-                  onPick={v => setAgentPayloadText(configOptionToString(v))}
-                />
-              </div>
-            </Field>
-          </div>
-        </details>
       </Section>
 
       {/* Step 3: evaluators */}
@@ -1192,6 +1232,137 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
 
 
 // ─── Small helpers ──────────────────────────────────────────────────────────
+
+function AgentConfigFields({
+  title,
+  draft,
+  onChange,
+  endpointOptions,
+  apiKeyOptions,
+  timeoutOptions,
+  headersOptions,
+  payloadOptions,
+}: {
+  title: string
+  draft: AgentDraft
+  onChange: (draft: AgentDraft) => void
+  endpointOptions: ConfigOption[]
+  apiKeyOptions: ConfigOption[]
+  timeoutOptions: ConfigOption[]
+  headersOptions: ConfigOption[]
+  payloadOptions: ConfigOption[]
+}) {
+  const update = <K extends keyof AgentDraft>(key: K, value: AgentDraft[K]) => {
+    onChange({ ...draft, [key]: value })
+  }
+
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="page-eyebrow mb-2">{title}</div>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="类型">
+          <select value={draft.type} onChange={e => update('type', e.target.value as AgentType)} className="input">
+            <option value="sse">SSE (LangGraph v2)</option>
+            <option value="openai">OpenAI 兼容</option>
+            <option value="sse_generic">SSE 通用模板</option>
+          </select>
+        </Field>
+        <Field label="模型（可选，展示用）">
+          <input type="text" value={draft.model} onChange={e => update('model', e.target.value)} className="input" />
+        </Field>
+        <Field label="智能体 URL">
+          <div className="relative">
+            <input
+              type="text"
+              value={draft.url}
+              onChange={e => update('url', e.target.value)}
+              placeholder="http://localhost:18094/api/agent/langgraph"
+              className="input pr-9"
+            />
+            <OptionPicker
+              options={endpointOptions}
+              currentValue={draft.url}
+              onPick={v => update('url', configOptionToString(v))}
+            />
+          </div>
+        </Field>
+        <Field label="API Key（可选）">
+          <div className="relative">
+            <input type="password" value={draft.apiKey} onChange={e => update('apiKey', e.target.value)} className="input pr-9" />
+            <OptionPicker
+              options={apiKeyOptions}
+              currentValue={draft.apiKey}
+              onPick={v => update('apiKey', configOptionToString(v))}
+              maskValues
+            />
+          </div>
+        </Field>
+        <Field label="超时（秒）">
+          <div className="relative">
+            <input
+              type="number"
+              min={10}
+              value={draft.timeout}
+              onChange={e => update('timeout', Number(e.target.value))}
+              className="input pr-9"
+            />
+            <OptionPicker
+              options={timeoutOptions}
+              currentValue={String(draft.timeout)}
+              onPick={v => {
+                const n = Number(configOptionToString(v))
+                if (!Number.isNaN(n) && n > 0) update('timeout', n)
+              }}
+            />
+          </div>
+        </Field>
+        {draft.type === 'sse' && (
+          <Field label="language 参数">
+            <input type="text" value={draft.language} onChange={e => update('language', e.target.value)} className="input" />
+          </Field>
+        )}
+      </div>
+
+      <details className="mt-3">
+        <summary className="text-[11px] text-text-secondary cursor-pointer">高级：自定义 headers / payload</summary>
+        <div className="grid grid-cols-2 gap-3 mt-2">
+          <Field label="请求头 (JSON)">
+            <div className="relative">
+              <textarea
+                value={draft.headersText}
+                onChange={e => update('headersText', e.target.value)}
+                rows={3}
+                placeholder='{"X-Custom": "value"}'
+                className="input pr-9 font-mono text-[11px]"
+              />
+              <OptionPicker
+                options={headersOptions}
+                currentValue={draft.headersText}
+                onPick={v => update('headersText', configOptionToString(v))}
+              />
+            </div>
+          </Field>
+          <Field label="请求体模板 (JSON, SSE 通用专用)">
+            <div className="relative">
+              <textarea
+                value={draft.payloadText}
+                onChange={e => update('payloadText', e.target.value)}
+                rows={3}
+                placeholder='{"question": "{input}"}'
+                className="input pr-9 font-mono text-[11px]"
+              />
+              <OptionPicker
+                options={payloadOptions}
+                currentValue={draft.payloadText}
+                onPick={v => update('payloadText', configOptionToString(v))}
+              />
+            </div>
+          </Field>
+        </div>
+      </details>
+    </div>
+  )
+}
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (

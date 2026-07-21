@@ -139,6 +139,41 @@ DEFAULT_VARIABLE_MAPPING: dict[str, str] = {
 }
 
 
+# ── 双模对比评估（comparative）默认模板 ──
+# 评估器一次调用同时拿到「参考答案 + A 回复 + B 回复」，逐维度对比打分并判胜负。
+# 把「两次独立打分求差」变成「一次相对判断」，消除跨调用的 judge 方差/幻觉。
+DEFAULT_COMPARATIVE_EVALUATION_PROMPT = """请对比评估下面两个 AI 助手（A 与 B）对同一问题的回答。
+
+## 用户输入
+{{Query}}
+
+## 期望答案（如有）
+{{GroundTruth}}
+
+## 回答 A
+{{ResponseA}}
+
+## 回答 B
+{{ResponseB}}
+
+请逐维度对比 A 与 B 的优劣，各自给 0 到 1 的分数并判定该维度胜方，最后给出整体胜方。"""
+
+DEFAULT_COMPARATIVE_REASONING_PROMPT = """你是一个严谨、客观的对比评估专家。
+请就每个评估维度，同时审视 A 与 B 的回答，给出可复核的对比理由（引用两者差异），
+再分别给分并判胜负。避免位置偏好——只依据回答质量本身，不因 A/B 呈现顺序而偏袒。"""
+
+DEFAULT_COMPARATIVE_OUTPUT_PROMPT = """严格只输出以下 JSON，不要附加任何其他文字、Markdown 或代码围栏：
+
+{"dimensions": [{"name": "<维度名>", "score_a": <0到1数值>, "score_b": <0到1数值>, "winner": "A|B|tie", "reason": "<简短对比理由>"}], "overall_winner": "A|B|tie", "reasoning": "<整体对比结论>"}"""
+
+DEFAULT_COMPARATIVE_VARIABLE_MAPPING: dict[str, str] = {
+    "Query": "input",
+    "GroundTruth": "expected_output",
+    "ResponseA": "output_a",
+    "ResponseB": "output_b",
+}
+
+
 # numeric 默认范围；可被 params['score_range'] 覆盖
 DEFAULT_NUMERIC_RANGE: tuple[float, float] = (0.0, 1.0)
 
@@ -183,6 +218,34 @@ class ConfigurableJudgeResult:
     error: str | None = None
 
 
+@dataclass
+class ComparativeJudgeResult:
+    """双模对比 judge 单次调用的输出。
+
+    ``verdict`` 结构（分数已归一 [0,1]，winner ∈ {"A","B","tie"}）：
+
+        {
+          "dimensions": [
+            {"name": str, "score_a": float, "score_b": float,
+             "winner": "A|B|tie", "reason": str},
+          ],
+          "overall_winner": "A|B|tie",
+          "reasoning": str,
+        }
+
+    ``error`` 非空时 ``verdict`` 为 None。与单分数 ``ConfigurableJudgeResult``
+    完全分离，绝不复用 ``_parse_single_score``（那对多 ``*_score`` 判歧义，
+    正是对比要产出的形态）。
+    """
+    verdict: dict[str, Any] | None = None
+    usage: JudgeUsage = field(default_factory=JudgeUsage)
+    model: str = ""
+    raw_response: dict[str, Any] = field(default_factory=dict)
+    raw_content: str = ""
+    rendered_messages: list[dict[str, str]] = field(default_factory=list)
+    error: str | None = None
+
+
 # ────────────────────────────────────────────────────────────────────────
 # Template rendering
 # ────────────────────────────────────────────────────────────────────────
@@ -213,11 +276,14 @@ def _resolve_source(
     output_text: str,
     expected_output: str,
     metadata: dict[str, Any] | None,
+    output_a: str = "",
+    output_b: str = "",
 ) -> str:
     """根据 ``variable_mapping`` 的取值表达式（如 ``"input"`` /
     ``"metadata.foo.bar"``）从样本里挑出字符串。
 
     * ``input`` / ``output`` / ``expected_output`` —— 直接取
+    * ``output_a`` / ``output_b`` —— 双模对比时两侧回复（单模恒空串）
     * ``metadata`` —— 整体 JSON 序列化
     * ``metadata.<key>[.<sub>...]`` —— metadata 字典里点路径取子字段，
       最终值非字符串时 ``str(...)``；缺失返回空字符串
@@ -227,6 +293,10 @@ def _resolve_source(
         return input_text or ""
     if s == "output":
         return output_text or ""
+    if s == "output_a":
+        return output_a or ""
+    if s == "output_b":
+        return output_b or ""
     if s == "expected_output":
         return expected_output or ""
     if s == "metadata":
@@ -253,6 +323,8 @@ def _render(
     output_text: str,
     expected_output: str,
     metadata: dict[str, Any] | None,
+    output_a: str = "",
+    output_b: str = "",
 ) -> str:
     """把模板里的 ``{{Name}}`` / ``{Name}``（旧式）换成实际样本字符串。
 
@@ -283,6 +355,8 @@ def _render(
                 output_text=output_text,
                 expected_output=expected_output,
                 metadata=metadata,
+                output_a=output_a,
+                output_b=output_b,
             )
 
         return _MUSTACHE_RE.sub(_sub, template)
@@ -299,6 +373,8 @@ def _render(
             output_text=output_text,
             expected_output=expected_output,
             metadata=metadata,
+            output_a=output_a,
+            output_b=output_b,
         )
 
     return _LEGACY_RE.sub(_legacy_sub, template)
@@ -340,6 +416,50 @@ def _build_messages(
         output_text=output_text,
         expected_output=expected_output if expected_output else "（未提供）",
         metadata=metadata,
+    )
+    system = f"{reasoning_prompt}\n\n{output_prompt}"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _build_comparative_messages(
+    *,
+    params: dict[str, Any],
+    input_text: str,
+    output_a: str,
+    output_b: str,
+    expected_output: str,
+    metadata: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """对比模式的消息组装：同时渲染 ResponseA / ResponseB。
+
+    默认 prompt/mapping 用对比专用模板（含 ``{{ResponseA}}`` /
+    ``{{ResponseB}}``）；用户自定义 ``variable_mapping`` 时按其映射（可把
+    ResponseA→output_a、ResponseB→output_b）。output_prompt 缺省用对比 schema。
+    """
+    evaluation_prompt = params.get("evaluation_prompt") or DEFAULT_COMPARATIVE_EVALUATION_PROMPT
+    reasoning_prompt = params.get("reasoning_prompt") or DEFAULT_COMPARATIVE_REASONING_PROMPT
+    output_prompt = params.get("output_prompt") or DEFAULT_COMPARATIVE_OUTPUT_PROMPT
+
+    raw_mapping = params.get("variable_mapping")
+    if isinstance(raw_mapping, dict):
+        variable_mapping = {str(k): str(v) for k, v in raw_mapping.items()}
+    elif evaluation_prompt == DEFAULT_COMPARATIVE_EVALUATION_PROMPT:
+        variable_mapping = dict(DEFAULT_COMPARATIVE_VARIABLE_MAPPING)
+    else:
+        variable_mapping = {}
+
+    user = _render(
+        evaluation_prompt,
+        variable_mapping=variable_mapping,
+        input_text=input_text,
+        output_text="",
+        expected_output=expected_output if expected_output else "（未提供）",
+        metadata=metadata,
+        output_a=output_a,
+        output_b=output_b,
     )
     system = f"{reasoning_prompt}\n\n{output_prompt}"
     return [
@@ -867,15 +987,220 @@ async def run_configurable_judge(
     )
 
 
+def _norm_winner(raw: Any) -> str:
+    """把模型给的 winner 归一成 'A' | 'B' | 'tie'。识别不了按 tie。"""
+    s = str(raw or "").strip().lower()
+    if s in ("a", "响应a", "回复a", "模型a", "left", "1"):
+        return "A"
+    if s in ("b", "响应b", "回复b", "模型b", "right", "2"):
+        return "B"
+    return "tie"
+
+
+def _parse_comparison_result(
+    body: dict[str, Any],
+    *,
+    score_range: list[float] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """解析对比 judge 返回的 verdict JSON。
+
+    期望结构（dimensions 数组 + 整体结论）：
+        {"dimensions":[{"name","score_a","score_b","winner","reason"}],
+         "overall_winner":"A|B|tie","reasoning":".."}
+    单维度也兼容顶层扁平 {score_a, score_b, winner, reasoning}。
+    分数按 score_range 归一到 [0,1]。返回 (verdict | None, error | None)。
+    """
+    rng = score_range or list(DEFAULT_NUMERIC_RANGE)
+    try:
+        rmin, rmax = float(rng[0]), float(rng[1])
+    except (TypeError, ValueError, IndexError):
+        rmin, rmax = DEFAULT_NUMERIC_RANGE
+
+    def _num(v: Any) -> float | None:
+        try:
+            return _normalise_numeric(float(v), rmin, rmax)
+        except (TypeError, ValueError):
+            return None
+
+    raw_dims = body.get("dimensions")
+    dims: list[dict[str, Any]] = []
+    if isinstance(raw_dims, list) and raw_dims:
+        for i, d in enumerate(raw_dims):
+            if not isinstance(d, dict):
+                continue
+            sa = _num(d.get("score_a"))
+            sb = _num(d.get("score_b"))
+            if sa is None or sb is None:
+                continue
+            dims.append({
+                "name": str(d.get("name") or f"维度{i + 1}"),
+                "score_a": sa,
+                "score_b": sb,
+                "winner": _norm_winner(d.get("winner")),
+                "reason": str(d.get("reason") or d.get("reasoning") or ""),
+            })
+    else:
+        # 单维度扁平兜底：顶层直接给 score_a/score_b。
+        sa = _num(body.get("score_a"))
+        sb = _num(body.get("score_b"))
+        if sa is not None and sb is not None:
+            dims.append({
+                "name": "总体",
+                "score_a": sa,
+                "score_b": sb,
+                "winner": _norm_winner(body.get("winner")),
+                "reason": str(body.get("reason") or body.get("reasoning") or ""),
+            })
+
+    if not dims:
+        return None, (
+            "comparative judge response has no parseable dimensions "
+            "(expected dimensions[].{score_a,score_b,winner} or top-level "
+            "{score_a,score_b,winner})"
+        )
+
+    overall = body.get("overall_winner") or body.get("winner")
+    if overall is not None:
+        overall_winner = _norm_winner(overall)
+    else:
+        # 未显式给整体胜负：按各维度 winner 多数投票（平票→tie）。
+        a_votes = sum(1 for d in dims if d["winner"] == "A")
+        b_votes = sum(1 for d in dims if d["winner"] == "B")
+        overall_winner = "A" if a_votes > b_votes else "B" if b_votes > a_votes else "tie"
+
+    verdict = {
+        "dimensions": dims,
+        "overall_winner": overall_winner,
+        "reasoning": str(body.get("reasoning") or body.get("reason") or ""),
+    }
+    return verdict, None
+
+
+async def run_comparative_judge(
+    *,
+    params: dict[str, Any],
+    provider: EvaluatorProviderRow,
+    input_text: str,
+    output_a: str,
+    output_b: str,
+    expected_output: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    evaluator_name: str = "comparison",
+) -> ComparativeJudgeResult:
+    """对同一样例的两份回复 (output_a, output_b) 做单次对比打分。
+
+    与 ``run_configurable_judge`` 同构（同样的有界补评循环 + client 复用），
+    但走对比 prompt + ``_parse_comparison_result``，产出 A/B 各维度分 + 每维度
+    winner + 整体 winner，装进 ``ComparativeJudgeResult.verdict``。
+
+    注意：位置偏见的随机化 / 还原由调用方（langfuse_runner）负责——本函数按传入
+    的 output_a/output_b 原样呈现和解析，不关心谁是"真 A"。
+    """
+    score_range = params.get("score_range")
+
+    try:
+        messages = _build_comparative_messages(
+            params=params,
+            input_text=input_text,
+            output_a=output_a,
+            output_b=output_b,
+            expected_output=expected_output or "",
+            metadata=metadata,
+        )
+    except TemplateRenderError as e:
+        return ComparativeJudgeResult(error=str(e))
+
+    base_timeout = float(params.get("timeout", 120.0))
+    last_result: ComparativeJudgeResult | None = None
+    for attempt in range(1, _JUDGE_COMPLETENESS_ATTEMPTS + 1):
+        attempt_timeout = base_timeout * (1 + 0.5 * (attempt - 1))
+        try:
+            client = build_judge_client(
+                provider,
+                model=params.get("model"),
+                temperature=float(params.get("temperature", 0.0)),
+                max_tokens=int(params.get("max_tokens", 2048)),
+                timeout=attempt_timeout,
+                mode="comparative",
+            )
+        except JudgeClientError as e:
+            return ComparativeJudgeResult(rendered_messages=messages, error=str(e))
+
+        try:
+            async with client as judge:
+                invocation = await judge.ainvoke(messages)
+        except JudgeClientError as e:
+            last_result = ComparativeJudgeResult(rendered_messages=messages, error=str(e))
+            if attempt < _JUDGE_COMPLETENESS_ATTEMPTS:
+                continue
+            return last_result
+        except Exception as e:
+            logger.exception("run_comparative_judge: unexpected failure")
+            last_result = ComparativeJudgeResult(
+                rendered_messages=messages,
+                error=f"unexpected error: {type(e).__name__}: {e}",
+            )
+            if attempt < _JUDGE_COMPLETENESS_ATTEMPTS:
+                continue
+            return last_result
+
+        body = _extract_json(invocation.content)
+        if body is None:
+            last_result = ComparativeJudgeResult(
+                rendered_messages=messages,
+                usage=invocation.usage,
+                model=invocation.model,
+                raw_response=invocation.raw_response,
+                raw_content=invocation.content,
+                error=_diagnose_unparseable(invocation),
+            )
+            if attempt < _JUDGE_COMPLETENESS_ATTEMPTS:
+                continue
+            return last_result
+
+        verdict, parse_err = _parse_comparison_result(body, score_range=score_range)
+        if verdict:
+            return ComparativeJudgeResult(
+                verdict=verdict,
+                usage=invocation.usage,
+                model=invocation.model,
+                raw_response=invocation.raw_response,
+                raw_content=invocation.content,
+                rendered_messages=messages,
+            )
+        last_result = ComparativeJudgeResult(
+            rendered_messages=messages,
+            usage=invocation.usage,
+            model=invocation.model,
+            raw_response=invocation.raw_response,
+            raw_content=invocation.content,
+            error=parse_err,
+        )
+        if attempt < _JUDGE_COMPLETENESS_ATTEMPTS:
+            continue
+        return last_result
+
+    return last_result or ComparativeJudgeResult(
+        rendered_messages=messages, error="comparative judge produced no result",
+    )
+
+
 __all__ = [
     "ConfigurableJudgeResult",
+    "ComparativeJudgeResult",
     "JudgeScore",
     "DEFAULT_EVALUATION_PROMPT",
     "DEFAULT_REASONING_PROMPT",
     "DEFAULT_OUTPUT_PROMPT",
+    "DEFAULT_COMPARATIVE_EVALUATION_PROMPT",
+    "DEFAULT_COMPARATIVE_REASONING_PROMPT",
+    "DEFAULT_COMPARATIVE_OUTPUT_PROMPT",
+    "DEFAULT_COMPARATIVE_VARIABLE_MAPPING",
     "CHECKLIST_REASONING_PROMPT",
     "CHECKLIST_OUTPUT_PROMPT",
     "DEFAULT_VARIABLE_MAPPING",
     "TemplateRenderError",
     "run_configurable_judge",
+    "run_comparative_judge",
+    "_parse_comparison_result",
 ]

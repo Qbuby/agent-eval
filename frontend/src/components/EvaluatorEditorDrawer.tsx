@@ -40,6 +40,7 @@ import type {
 } from '@/types'
 
 type EditorMode = 'tag' | 'configurable_judge'
+type EvaluationMode = 'single' | 'comparative'
 type ScoreType = 'numeric' | 'boolean' | 'categorical'
 
 interface Category {
@@ -48,6 +49,7 @@ interface Category {
 }
 
 interface JudgeParams {
+  mode?: EvaluationMode
   provider_id?: string
   model?: string
   temperature?: number
@@ -84,10 +86,40 @@ const DEFAULT_OUTPUT_PROMPT = `严格只输出以下 JSON，不要附加任何�
 
 {"score": <数值或布尔或类别字符串>, "reasoning": "<简短理由>"}`
 
+const DEFAULT_COMPARATIVE_EVALUATION_PROMPT = `请对比评估下面两个 AI 回复。
+
+## 用户输入
+{{Query}}
+
+## 期望答案（如有）
+{{GroundTruth}}
+
+## 回复 A
+{{ResponseA}}
+
+## 回复 B
+{{ResponseB}}
+
+请逐维度比较两份回复的正确性、完整性和表达质量，并判断每个维度及整体的胜负。`
+
+const DEFAULT_COMPARATIVE_REASONING_PROMPT = `你是一个严谨、客观的对比评估专家。
+请基于相同标准独立评价回复 A 和回复 B，逐维度说明分数与胜负理由，避免位置偏见。`
+
+const DEFAULT_COMPARATIVE_OUTPUT_PROMPT = `严格只输出以下 JSON，不要附加任何其他文字、Markdown 或代码围栏：
+
+{"dimensions":[{"name":"<维度>","score_a":<数值>,"score_b":<数值>,"winner":"A|B|tie","reason":"<理由>"}],"overall_winner":"A|B|tie","reasoning":"<整体理由>"}`
+
 const DEFAULT_VARIABLE_MAPPING: Record<string, string> = {
   Query: 'input',
   Generation: 'output',
   GroundTruth: 'expected_output',
+}
+
+const DEFAULT_COMPARATIVE_VARIABLE_MAPPING: Record<string, string> = {
+  Query: 'input',
+  GroundTruth: 'expected_output',
+  ResponseA: 'output_a',
+  ResponseB: 'output_b',
 }
 
 const DEFAULT_CATEGORIES: Category[] = [
@@ -98,9 +130,13 @@ const DEFAULT_CATEGORIES: Category[] = [
 
 // 数据源选项 —— 与后端 _resolve_source 识别的表达式 1:1 对齐。
 // metadata.<key> 由用户手填（自由形式），不在下拉里枚举。
+// 变量映射数据源选项。单模用 output；对比模式用 output_a/output_b（两份回复）。
+// 合并成一张表：对比专用的 output_a/output_b 在单模场景多列两项无害，避免维护两份。
 const VARIABLE_SOURCE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'input', label: 'input（用户输入）' },
   { value: 'output', label: 'output（AI 回答）' },
+  { value: 'output_a', label: 'output_a（对比·回复 A）' },
+  { value: 'output_b', label: 'output_b（对比·回复 B）' },
   { value: 'expected_output', label: 'expected_output（期望答案）' },
   { value: 'metadata', label: 'metadata（整体 JSON）' },
 ]
@@ -160,6 +196,7 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
   // ── judge 参数 ──
   const initialJudge: JudgeParams = useMemo(() => {
     const p = (editing?.params || {}) as Record<string, unknown>
+    const evaluationMode: EvaluationMode = p.mode === 'comparative' ? 'comparative' : 'single'
     // 兼容旧 schema（system_prompt/user_template）：迁移为新字段
     let evalP = (p.evaluation_prompt as string) || (p.user_template as string) || ''
     const sysP = p.system_prompt as string | undefined
@@ -208,6 +245,7 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
     if (!evalP) evalP = ''
 
     return {
+      mode: evaluationMode,
       provider_id: p.provider_id as string | undefined,
       model: p.model as string | undefined,
       temperature: typeof p.temperature === 'number' ? p.temperature : 0,
@@ -227,6 +265,8 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
   // ── 试跑状态（必须在 useEffect 之前声明，因为 useEffect 里要 set 它们）──
   const [dryInput, setDryInput] = useState('')
   const [dryOutput, setDryOutput] = useState('')
+  const [dryOutputA, setDryOutputA] = useState('')
+  const [dryOutputB, setDryOutputB] = useState('')
   const [dryExpected, setDryExpected] = useState('')
   const [dryRunResult, setDryRunResult] = useState<DryRunResponse | null>(null)
   const [dryRunError, setDryRunError] = useState<NormalizedError | null>(null)
@@ -240,6 +280,11 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
     setDescription(editing?.description || '')
     setIsActive(editing ? editing.is_active : true)
     setJudge(initialJudge)
+    setDryInput('')
+    setDryOutput('')
+    setDryOutputA('')
+    setDryOutputB('')
+    setDryExpected('')
     setDryRunResult(null)
     setDryRunError(null)
   }, [editing, initialMode, initialJudge])
@@ -261,6 +306,75 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
 
   const selectedProvider = providersQuery.data?.find(p => p.id === judge.provider_id)
   const fallbackModel = selectedProvider?.default_model || ''
+  const evaluationMode: EvaluationMode = judge.mode || 'single'
+
+  const changeEvaluationMode = (nextMode: EvaluationMode) => {
+    if (nextMode === evaluationMode) return
+    const currentDefaults = evaluationMode === 'comparative'
+      ? {
+          evaluation: DEFAULT_COMPARATIVE_EVALUATION_PROMPT,
+          reasoning: DEFAULT_COMPARATIVE_REASONING_PROMPT,
+          output: DEFAULT_COMPARATIVE_OUTPUT_PROMPT,
+        }
+      : {
+          evaluation: DEFAULT_EVALUATION_PROMPT,
+          reasoning: DEFAULT_REASONING_PROMPT,
+          output: DEFAULT_OUTPUT_PROMPT,
+        }
+    const nextDefaults = nextMode === 'comparative'
+      ? {
+          evaluation: DEFAULT_COMPARATIVE_EVALUATION_PROMPT,
+          reasoning: DEFAULT_COMPARATIVE_REASONING_PROMPT,
+          output: DEFAULT_COMPARATIVE_OUTPUT_PROMPT,
+          mapping: DEFAULT_COMPARATIVE_VARIABLE_MAPPING,
+        }
+      : {
+          evaluation: DEFAULT_EVALUATION_PROMPT,
+          reasoning: DEFAULT_REASONING_PROMPT,
+          output: DEFAULT_OUTPUT_PROMPT,
+          mapping: DEFAULT_VARIABLE_MAPPING,
+        }
+    const usesDefaultEvaluation = judge.evaluation_prompt === currentDefaults.evaluation
+    setJudge({
+      ...judge,
+      mode: nextMode,
+      evaluation_prompt: usesDefaultEvaluation ? nextDefaults.evaluation : judge.evaluation_prompt,
+      reasoning_prompt: judge.reasoning_prompt === currentDefaults.reasoning
+        ? nextDefaults.reasoning
+        : judge.reasoning_prompt,
+      output_prompt: judge.output_prompt === currentDefaults.output
+        ? nextDefaults.output
+        : judge.output_prompt,
+      variable_mapping: usesDefaultEvaluation
+        ? { ...nextDefaults.mapping }
+        : judge.variable_mapping,
+    })
+    setDryRunResult(null)
+    setDryRunError(null)
+  }
+
+  const restoreDefaultPrompts = () => {
+    const defaults = evaluationMode === 'comparative'
+      ? {
+          evaluation: DEFAULT_COMPARATIVE_EVALUATION_PROMPT,
+          reasoning: DEFAULT_COMPARATIVE_REASONING_PROMPT,
+          output: DEFAULT_COMPARATIVE_OUTPUT_PROMPT,
+          mapping: DEFAULT_COMPARATIVE_VARIABLE_MAPPING,
+        }
+      : {
+          evaluation: DEFAULT_EVALUATION_PROMPT,
+          reasoning: DEFAULT_REASONING_PROMPT,
+          output: DEFAULT_OUTPUT_PROMPT,
+          mapping: DEFAULT_VARIABLE_MAPPING,
+        }
+    setJudge({
+      ...judge,
+      evaluation_prompt: defaults.evaluation,
+      reasoning_prompt: defaults.reasoning,
+      output_prompt: defaults.output,
+      variable_mapping: { ...defaults.mapping },
+    })
+  }
 
   const dryRunMutation = useMutation({
     mutationFn: async () => {
@@ -268,6 +382,17 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
         throw new Error('请先保存评估器再试跑')
       }
       const params = buildParams(judge)
+      if (evaluationMode === 'comparative') {
+        return evaluationApi.dryRunEvaluator(editing.id, {
+          provider_id: judge.provider_id,
+          params,
+          mode: 'comparative',
+          input: dryInput,
+          output_a: dryOutputA,
+          output_b: dryOutputB,
+          expected_output: dryExpected || null,
+        }).then(r => r.data)
+      }
       return evaluationApi.dryRunEvaluator(editing.id, {
         provider_id: judge.provider_id,
         params,
@@ -542,6 +667,48 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
               </div>
             </section>
 
+            {/* 评估模式：单模打分 / 双模对比。切换时按需替换默认 prompt。 */}
+            <section className="space-y-2">
+              <div className="page-eyebrow">评估模式</div>
+              <div className="inline-flex rounded-md border border-border overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => changeEvaluationMode('single')}
+                  className={`px-3 h-8 text-[12px] transition-colors ${
+                    evaluationMode === 'single'
+                      ? 'bg-accent text-accent-fg'
+                      : 'bg-surface text-text-secondary hover:bg-surface-hover'
+                  }`}
+                >
+                  单模打分
+                </button>
+                <button
+                  type="button"
+                  onClick={() => changeEvaluationMode('comparative')}
+                  className={`px-3 h-8 text-[12px] border-l border-border transition-colors ${
+                    evaluationMode === 'comparative'
+                      ? 'bg-accent text-accent-fg'
+                      : 'bg-surface text-text-secondary hover:bg-surface-hover'
+                  }`}
+                >
+                  双模对比
+                </button>
+                <button
+                  type="button"
+                  onClick={restoreDefaultPrompts}
+                  className="px-3 h-8 text-[12px] border-l border-border bg-surface text-text-tertiary hover:bg-surface-hover transition-colors"
+                  title="用当前模式的默认 prompt / 变量映射覆盖三段 prompt"
+                >
+                  恢复默认 Prompt
+                </button>
+              </div>
+              <div className="text-[10px] text-text-tertiary">
+                {evaluationMode === 'comparative'
+                  ? '对比模式：评估器单次同时拿到参考答案 + A/B 两份回复，逐维度对比打分并判胜负。用 {{ResponseA}} / {{ResponseB}} 占位；输出对比 JSON（dimensions[].{score_a,score_b,winner} + overall_winner）。'
+                  : '单模模式：评估器对单份回复打一个分。'}
+              </div>
+            </section>
+
             {/* Prompt 三段式 —— 1:1 复刻 Langfuse */}
             <section className="space-y-4">
               <div className="page-eyebrow">Prompt</div>
@@ -598,7 +765,8 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
             {/* 变量映射 —— 跟 Langfuse 一致：模板里写 {{Name}}，这里给每个 Name 选数据源 */}
             <VariableMappingPanel judge={judge} setJudge={setJudge} idPrefix={reactId} />
 
-            {/* 分数类型 */}
+            {/* 分数类型（对比模式固定 A/B numeric，不展示类型选择） */}
+            {evaluationMode !== 'comparative' && (
             <section className="space-y-3">
               <div className="page-eyebrow">分数</div>
               <div>
@@ -692,6 +860,7 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
                 </div>
               )}
             </section>
+            )}
 
             {/* 试跑 */}
             <section className="space-y-3 border-t border-separator pt-5">
@@ -710,14 +879,35 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
                     placeholder="用户问题 / agent 输入"
                   />
                 </div>
-                <div>
-                  <label htmlFor={ids.dryOut} className="field-label">AI 输出</label>
-                  <textarea
-                    id={ids.dryOut} className="input font-mono text-[12px]" rows={3}
-                    value={dryOutput} onChange={e => setDryOutput(e.target.value)}
-                    placeholder="agent 给出的回答"
-                  />
-                </div>
+                {evaluationMode === 'comparative' ? (
+                  <>
+                    <div>
+                      <label className="field-label">回答 A</label>
+                      <textarea
+                        className="input font-mono text-[12px]" rows={3}
+                        value={dryOutputA} onChange={e => setDryOutputA(e.target.value)}
+                        placeholder="Agent A 的回答"
+                      />
+                    </div>
+                    <div>
+                      <label className="field-label">回答 B</label>
+                      <textarea
+                        className="input font-mono text-[12px]" rows={3}
+                        value={dryOutputB} onChange={e => setDryOutputB(e.target.value)}
+                        placeholder="Agent B 的回答"
+                      />
+                    </div>
+                  </>
+                ) : (
+                  <div>
+                    <label htmlFor={ids.dryOut} className="field-label">AI 输出</label>
+                    <textarea
+                      id={ids.dryOut} className="input font-mono text-[12px]" rows={3}
+                      value={dryOutput} onChange={e => setDryOutput(e.target.value)}
+                      placeholder="agent 给出的回答"
+                    />
+                  </div>
+                )}
                 <div>
                   <label htmlFor={ids.dryExp} className="field-label">期望答案（可选）</label>
                   <textarea
@@ -809,6 +999,31 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
                     </pre>
                   )}
                 </details>
+              )}
+              {dryRunResult?.verdict && (
+                <div className="rounded-md bg-fill/5 border border-separator p-3 space-y-2">
+                  <div className="flex items-center gap-2">
+                    <span className="page-eyebrow">对比结论</span>
+                    <span className="badge badge-info">整体胜方：{dryRunResult.verdict.overall_winner}</span>
+                  </div>
+                  {(dryRunResult.verdict.dimensions || []).map((d, i) => (
+                    <div key={i} className="text-[11px] border-t border-separator pt-1.5">
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-text-secondary">{d.name}</span>
+                        <span className="font-mono">
+                          A {(d.score_a * 100).toFixed(0)}% · B {(d.score_b * 100).toFixed(0)}%
+                          <span className="badge badge-neutral ml-2">胜：{d.winner}</span>
+                        </span>
+                      </div>
+                      {d.reason && <p className="mt-1 text-text-tertiary leading-relaxed">{d.reason}</p>}
+                    </div>
+                  ))}
+                  {dryRunResult.verdict.reasoning && (
+                    <p className="text-[11px] text-text-secondary leading-relaxed border-t border-separator pt-1.5">
+                      {dryRunResult.verdict.reasoning}
+                    </p>
+                  )}
+                </div>
               )}
             </section>
           </>

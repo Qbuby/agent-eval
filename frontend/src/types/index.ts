@@ -471,6 +471,47 @@ export interface StartEvalRequest {
   // Langfuse trace 名：对称于 langsmith_project。设置后 run 结束按 (name, 时间窗)
   // 回拉 Langfuse trace，按 question 文本匹配贴回 langfuse_trace_id。
   langfuse_trace_name?: string | null
+  // 双模对比：'single'（默认，单 agent）| 'comparative'（A/B 两 agent 并发跑同一
+  // 样例，评估器单次对比打分）。comparative 时 agent_b 必填、仅支持单轮数据集。
+  eval_mode?: 'single' | 'comparative'
+  agent_b?: EvalAgentConfig | null
+}
+
+// run 级对比汇总（落在 summary_scores.comparison_summary）。新数据按 evaluator
+// 独立分组；旧顶层字段仅在单 evaluator / 历史 payload 中存在。
+export interface ComparisonDimensionSummary {
+  a_wins: number
+  b_wins: number
+  ties: number
+  mean_a: number | null
+  mean_b: number | null
+  n: number
+}
+
+export interface ComparisonEvaluatorSummary {
+  evaluator_key: string
+  evaluator_id?: string | null
+  evaluator_version_id?: string | null
+  label: string
+  tag?: string | null
+  legacy?: boolean
+  total: number
+  scored: number
+  evaluation_errors: number
+  a_wins: number
+  b_wins: number
+  ties: number
+  per_dimension: Record<string, ComparisonDimensionSummary>
+}
+
+export interface ComparisonSummary {
+  evaluators?: ComparisonEvaluatorSummary[]
+  // Deprecated 单 evaluator 汇总；保留用于读取旧 run。
+  total?: number
+  a_wins?: number
+  b_wins?: number
+  ties?: number
+  per_dimension?: Record<string, ComparisonDimensionSummary>
 }
 
 export interface StartEvalResponse {
@@ -511,6 +552,9 @@ export interface EvalRunSummary {
   langsmith_project?: string | null
   langfuse_trace_name?: string | null
   agent_config: Record<string, unknown>
+  // 双模对比：模式 + B 侧 agent 配置快照。single 时 eval_mode='single'、agent_config_b=null。
+  eval_mode?: 'single' | 'comparative'
+  agent_config_b?: Record<string, unknown> | null
   acceptance_policy?: Record<string, unknown> | null
   // 顶层三层语义（后端 EvalRunSummary 直接透出，等同 summary_scores.facts/acceptance）
   facts?: EvalFacts | null
@@ -547,6 +591,8 @@ export interface EvalRunSummary {
     error?: string
     runtime_error?: string
     stopped_early?: boolean
+    // 双模对比汇总：A/B 胜负计数 + 逐维度胜率/均分。仅 comparative run。
+    comparison_summary?: ComparisonSummary
   } | null
   progress: { total?: number; completed?: number; failed?: number }
   created_at: string | null
@@ -589,11 +635,65 @@ export interface ConversationTrace {
   turn_expectations?: TurnExpectation[]
 }
 
+// 双模对比：单维度对比结论（真实 A/B 视角，后端已还原位置随机化）。
+export interface ComparisonDimension {
+  name: string
+  score_a: number
+  score_b: number
+  winner: 'A' | 'B' | 'tie' | string
+  reason?: string
+}
+
+// 一次对比 judge 的完整结论。
+export interface ComparisonVerdict {
+  dimensions: ComparisonDimension[]
+  overall_winner: 'A' | 'B' | 'tie' | string
+  reasoning?: string
+}
+
+// 单个 evaluator 对一条 A/B 样例的独立评分。status=evaluation_error 时 verdict
+// 可为空，error 保存该 evaluator 自己的失败原因。
+export interface ComparisonEvaluatorVerdict {
+  evaluator_id?: string | null
+  evaluator_version_id?: string | null
+  label: string
+  tag?: string | null
+  status: 'scored' | 'evaluation_error' | string
+  verdict: ComparisonVerdict | null
+  error?: string | null
+}
+
+// test_results.comparison：B 侧回复快照 + 每 evaluator verdict + 位置随机化审计标记。
+export interface Comparison {
+  agent_b: {
+    output: string | null
+    tool_calls?: Array<Record<string, unknown>> | null
+    cot_steps?: CotStep[] | null
+    latency_ms?: number | null
+    first_thinking_token_ms?: number | null
+    first_answer_token_ms?: number | null
+    prompt_tokens?: number | null
+    completion_tokens?: number | null
+    total_tokens?: number | null
+    cache_creation_tokens?: number | null
+    cache_read_tokens?: number | null
+    error_message?: string | null
+    error_type?: string | null
+    attempts_made?: number | null
+  }
+  evaluator_verdicts?: ComparisonEvaluatorVerdict[]
+  // Deprecated 单 verdict 别名；仅在 evaluator_verdicts 字段不存在时回退读取。
+  verdict?: ComparisonVerdict | null
+  position_swapped?: boolean
+}
+
 export interface EvalResultRow {
   id: string
   benchmark_case_id: string | null
   test_case_id: string | null
   status: string
+  // 双模对比结果（对比 run 才有；单模为 null）。A 侧数据仍在本行主字段。
+  comparison?: Comparison | null
   // 三层语义投影（后端 EvalResultRow 透出；旧数据默认 unknown / null）。
   execution_status?: string
   evaluation_status?: string
@@ -721,9 +821,14 @@ export interface DryRunRequest {
   provider_id?: string | null
   params: Record<string, unknown>
   input: string
-  output: string
+  // 单模必填；对比模式（mode='comparative'）改用 output_a/output_b，此项可省。
+  output?: string
   expected_output?: string | null
   metadata?: Record<string, unknown> | null
+  // 对比 dry-run：mode='comparative' 时用 output_a/output_b 两份回复，返回 verdict。
+  mode?: 'single' | 'comparative'
+  output_a?: string
+  output_b?: string
 }
 
 export interface DryRunScoreItem {
@@ -737,6 +842,8 @@ export interface DryRunScoreItem {
 export interface DryRunResponse {
   // 单分数范式：scores 至多一个元素
   scores: DryRunScoreItem[]
+  // 对比模式：verdict 携带 A/B 各维度分 + winner；单模为 null。
+  verdict?: ComparisonVerdict | null
   model: string
   usage: Record<string, number>
   raw_content: string

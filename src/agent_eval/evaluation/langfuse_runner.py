@@ -46,7 +46,15 @@ from agent_eval.evaluation.acceptance import (
     project_case,
     validate_acceptance_policy,
 )
-from agent_eval.evaluation.configurable_judge import run_configurable_judge
+from agent_eval.evaluation.configurable_judge import (
+    run_comparative_judge,
+    run_configurable_judge,
+)
+from agent_eval.evaluation.comparative import (
+    build_comparison_summary,
+    pick_swap,
+    restore_verdict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -266,15 +274,49 @@ def _make_adapter(
     raise ValueError(f"unknown agent type: {t!r}")
 
 
-async def _resolve_judge_providers(specs: list[dict[str, Any]]) -> None:
-    """Mutate ``specs`` in place: for any ``configurable_judge`` evaluator
-    whose params reference a provider_id, fetch the EvaluatorProviderRow
-    once and stash it under ``_provider``. Subsequent per-case scoring then
-    reuses the row instead of round-tripping the DB on every sample.
+async def _validate_comparative_evaluator_specs(
+    specs: list[dict[str, Any]], repo: Repository,
+) -> None:
+    """Reject comparative configurations that cannot produce an A/B verdict.
 
-    Resolution failures are logged but non-fatal — the case-level loop
-    will detect ``_provider is None`` and skip the dimension instead of
-    crashing the whole run.
+    This runs before a test_run row/background task is created. Runtime judge failures
+    remain case-level ``evaluation_error`` entries, but deterministic configuration
+    errors must not spend two agent calls per sample before becoming visible.
+    """
+    for spec in specs:
+        label = spec.get("label") or spec.get("tag") or spec.get("id") or "evaluator"
+        if spec.get("evaluator_type") != "configurable_judge":
+            raise ValueError(
+                f"comparative evaluator '{label}' must use configurable_judge"
+            )
+        provider_id = (spec.get("params") or {}).get("provider_id")
+        if not provider_id:
+            raise ValueError(
+                f"comparative evaluator '{label}' is missing provider_id"
+            )
+        try:
+            provider_uuid = uuid.UUID(str(provider_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"comparative evaluator '{label}' has invalid provider_id: {provider_id}"
+            ) from exc
+        provider = await repo.get_evaluator_provider(provider_uuid)
+        if provider is None:
+            raise ValueError(
+                f"comparative evaluator '{label}' provider not found: {provider_id}"
+            )
+        if not provider.is_active:
+            raise ValueError(
+                f"comparative evaluator '{label}' provider is inactive: {provider_id}"
+            )
+
+
+async def _resolve_judge_providers(specs: list[dict[str, Any]]) -> None:
+    """Mutate ``specs`` in place: resolve each active judge provider once.
+
+    Resolution remains non-fatal here because a provider may be disabled or deleted
+    after run creation. Comparative execution records that runtime condition in the
+    evaluator's ``evaluation_error`` entry instead of silently dropping it.
     """
     needed: dict[str, list[dict[str, Any]]] = {}
     for spec in specs:
@@ -295,10 +337,17 @@ async def _resolve_judge_providers(specs: list[dict[str, Any]]) -> None:
                 row = await repo.get_evaluator_provider(uuid.UUID(pid))
             except (TypeError, ValueError):
                 row = None
-            if row is None:
+            if row is not None and not row.is_active:
+                logger.warning(
+                    "configurable_judge: provider %s inactive — affected evaluators "
+                    "(%s) will fail at score time",
+                    pid, ", ".join(s.get("label", "?") for s in specs_for_pid),
+                )
+                row = None
+            elif row is None:
                 logger.warning(
                     "configurable_judge: provider %s not found — affected evaluators "
-                    "(%s) will be skipped at score time",
+                    "(%s) will fail at score time",
                     pid, ", ".join(s.get("label", "?") for s in specs_for_pid),
                 )
             for s in specs_for_pid:
@@ -743,6 +792,249 @@ async def _run_multiturn_case(
     }
 
 
+async def _invoke_one_agent(
+    *,
+    agent_cfg: dict,
+    question: str,
+    case_name: str,
+    cancel_event: asyncio.Event | None,
+    retry_policy: _RetryPolicy | None,
+    http_client: httpx.AsyncClient | None,
+) -> dict[str, Any]:
+    """跑一个 agent 拿一份回复。返回 {output_text, tool_calls, cot_steps, latency_ms,
+    first_thinking_token_ms, first_answer_token_ms, usage, error_message, error_type,
+    attempts_made, thread_id}。对比模式下 A/B 各调一次，供并发使用。"""
+    thread_id = f"eval-{case_name}-{uuid.uuid4().hex[:8]}"
+    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    messages = [{"role": "user", "content": question}]
+    policy = retry_policy or _retry_policy_from_cfg(agent_cfg)
+
+    out: dict[str, Any] = {
+        "output_text": "", "tool_calls": [], "cot_steps": [],
+        "latency_ms": None, "first_thinking_token_ms": None,
+        "first_answer_token_ms": None,
+        "usage": {
+            "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+            "cache_creation_tokens": None, "cache_read_tokens": None,
+        },
+        "error_message": None, "error_type": None, "attempts_made": 0,
+        "thread_id": thread_id,
+    }
+    try:
+        try:
+            resp, attempts = await _invoke_with_retry(
+                adapter, messages, policy=policy, cancel_event=cancel_event,
+            )
+            out["attempts_made"] = attempts
+            out["output_text"] = resp.content
+            out["latency_ms"] = int(resp.latency_ms)
+            out["usage"] = _extract_usage(resp)
+            raw = getattr(resp, "raw_response", None)
+            if isinstance(raw, dict):
+                tcs = raw.get("tool_calls")
+                if isinstance(tcs, list):
+                    out["tool_calls"] = tcs
+                steps_raw = raw.get("steps")
+                if isinstance(steps_raw, list):
+                    out["cot_steps"] = steps_raw
+            if not out["tool_calls"]:
+                out["tool_calls"] = _extract_tool_calls_from_response(resp)
+            for s in out["cot_steps"]:
+                if not isinstance(s, dict):
+                    continue
+                t = s.get("first_token_ms")
+                if t is None:
+                    continue
+                if s.get("type") in ("thought", "answer") and out["first_thinking_token_ms"] is None:
+                    out["first_thinking_token_ms"] = int(t)
+                if s.get("type") == "answer":
+                    out["first_answer_token_ms"] = int(t)
+        except Exception as e:
+            attempts = getattr(e, "_eval_attempts_made", out["attempts_made"] or 1)
+            out["attempts_made"] = attempts
+            msg = str(e)
+            if attempts > 1:
+                msg = f"{msg} (after {attempts} attempts)"
+            out["error_message"] = msg
+            out["error_type"] = _classify_agent_error(e)
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
+    return out
+
+
+async def _run_comparative_case(
+    *,
+    case: dict[str, Any],
+    agent_cfg: dict,
+    agent_cfg_b: dict,
+    evaluator_specs: list[dict[str, Any]],
+    cancel_event: asyncio.Event | None = None,
+    retry_policy: _RetryPolicy | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """双模对比：并发跑 A、B 两 agent，评估器单次对比打分（含位置随机化 + 还原）。
+
+    A 侧结果填主字段（与单模契约同构，单模消费方读 A 侧零改动）；B 侧回复 +
+    对比 verdict 填 ``comparison``。位置随机化消除 judge 的 A/B 位置偏见：以随机
+    slot 顺序喂 judge，拿回后按 swap 标记把 verdict 还原到真实 A/B。
+    """
+    question = case["question"]
+    expected = case.get("expected_output") or ""
+    invoked_at = datetime.now(timezone.utc)
+
+    # 1) 并发跑 A、B。
+    a_res, b_res = await asyncio.gather(
+        _invoke_one_agent(
+            agent_cfg=agent_cfg, question=question, case_name=case.get("name", "case") + "-A",
+            cancel_event=cancel_event, retry_policy=retry_policy, http_client=http_client,
+        ),
+        _invoke_one_agent(
+            agent_cfg=agent_cfg_b, question=question, case_name=case.get("name", "case") + "-B",
+            cancel_event=cancel_event, retry_policy=retry_policy, http_client=http_client,
+        ),
+    )
+
+    comparison: dict[str, Any] = {
+        "agent_b": {
+            "output": b_res["output_text"],
+            "tool_calls": b_res["tool_calls"],
+            "cot_steps": b_res["cot_steps"],
+            "latency_ms": b_res["latency_ms"],
+            "first_thinking_token_ms": b_res["first_thinking_token_ms"],
+            "first_answer_token_ms": b_res["first_answer_token_ms"],
+            "prompt_tokens": b_res["usage"].get("prompt_tokens"),
+            "completion_tokens": b_res["usage"].get("completion_tokens"),
+            "total_tokens": b_res["usage"].get("total_tokens"),
+            "cache_creation_tokens": b_res["usage"].get("cache_creation_tokens"),
+            "cache_read_tokens": b_res["usage"].get("cache_read_tokens"),
+            "error_message": b_res["error_message"],
+            "error_type": b_res["error_type"],
+            "attempts_made": b_res["attempts_made"],
+        },
+        "evaluator_verdicts": [],
+        # Deprecated 单 verdict 别名：保留最后一个成功 verdict，兼容旧消费方。
+        "verdict": None,
+        "position_swapped": False,
+    }
+
+    def _entry(spec: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "evaluator_id": spec.get("evaluator_id") or spec.get("id"),
+            "evaluator_version_id": spec.get("evaluator_version_id"),
+            "label": spec.get("label") or "comparison",
+            "tag": spec.get("tag") or spec.get("label") or "comparison",
+            "status": "evaluation_error",
+            "verdict": None,
+            "error": None,
+        }
+
+    # 2) 执行状态：A、B 任一失败 → execution_error（记在对应侧），同时为每个
+    # evaluator 留下未执行条目，确保选择项不会从 payload 静默消失。
+    status = "scored"
+    error_msg: str | None = None
+    error_type: str | None = None
+    if a_res["error_message"] or b_res["error_message"]:
+        status = "execution_error"
+        error_type = "agent_error"
+        parts = []
+        if a_res["error_message"]:
+            parts.append(f"A: {a_res['error_message']}")
+        if b_res["error_message"]:
+            parts.append(f"B: {b_res['error_message']}")
+        error_msg = "；".join(parts)
+        for spec in evaluator_specs:
+            entry = _entry(spec)
+            entry["error"] = f"未执行对比评分：{error_msg}"
+            comparison["evaluator_verdicts"].append(entry)
+    else:
+        # 3) 位置随机化：随机决定 prompt 中 slot1/slot2 是否交换 A/B。
+        swap = pick_swap()
+        comparison["position_swapped"] = swap
+        slot_a = b_res["output_text"] if swap else a_res["output_text"]
+        slot_b = a_res["output_text"] if swap else b_res["output_text"]
+
+        # 4) 每个 evaluator 独立评分、独立还原并独立保存。运行期配置/传输失败也
+        # 写入失败条目，部分失败时保留已经成功的 verdict。
+        judge_errors: list[str] = []
+        for spec in evaluator_specs:
+            entry = _entry(spec)
+            label = entry["label"]
+            if spec.get("evaluator_type") != "configurable_judge":
+                entry["error"] = f"{label}: comparative 仅支持 configurable_judge"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+            provider_row = spec.get("_provider")
+            if provider_row is None:
+                entry["error"] = f"{label}: provider 未解析或不可用"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+            try:
+                cmp_result = await run_comparative_judge(
+                    params=spec.get("params") or {},
+                    provider=provider_row,
+                    input_text=question,
+                    output_a=slot_a,
+                    output_b=slot_b,
+                    expected_output=expected,
+                    metadata=case.get("metadata"),
+                    evaluator_name=label,
+                )
+            except Exception as exc:
+                entry["error"] = f"{label}: {type(exc).__name__}: {exc}"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+            if not cmp_result.verdict:
+                entry["error"] = f"{label}: {cmp_result.error or '未返回 verdict'}"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+
+            restored = restore_verdict(cmp_result.verdict, swapped=swap)
+            entry.update({"status": "scored", "verdict": restored, "error": None})
+            comparison["evaluator_verdicts"].append(entry)
+            comparison["verdict"] = restored
+
+        if judge_errors:
+            status = "evaluation_error"
+            error_type = "judge_error"
+            error_msg = (
+                f"{len(judge_errors)} 个对比评估器未出结论："
+                + "；".join(judge_errors)
+            )
+
+    return {
+        "case_id": case.get("id"),
+        "case_name": case.get("name"),
+        "case_source": case.get("source"),
+        "thread_id": a_res["thread_id"],
+        "question": question,
+        "expected_output": expected,
+        "expected_tool_calls": case.get("expected_tool_calls") or [],
+        "invoked_at": invoked_at,
+        "status": status,
+        "actual_output": a_res["output_text"],
+        "actual_tool_calls": a_res["tool_calls"],
+        "cot_steps": a_res["cot_steps"],
+        "latency_ms": a_res["latency_ms"],
+        "first_thinking_token_ms": a_res["first_thinking_token_ms"],
+        "first_answer_token_ms": a_res["first_answer_token_ms"],
+        "error_message": error_msg,
+        "error_type": error_type,
+        "attempts_made": a_res["attempts_made"],
+        "tool_call_count": len(a_res["tool_calls"]),
+        "message_count": 1,
+        "scores": {},  # 对比模式不写 EvaluationScoreRow；verdict 自带分数
+        "comparison": comparison,
+        **a_res["usage"],
+    }
+
+
 async def _run_one_case(
     *,
     case: dict[str, Any],
@@ -751,6 +1043,7 @@ async def _run_one_case(
     cancel_event: asyncio.Event | None = None,
     retry_policy: _RetryPolicy | None = None,
     http_client: httpx.AsyncClient | None = None,
+    agent_cfg_b: dict | None = None,
 ) -> dict[str, Any]:
     """Execute one case end-to-end. ``case`` is the normalized dict from
     ``_normalize_cases_for_runner``: {id, name, question, expected_output,
@@ -760,7 +1053,21 @@ async def _run_one_case(
     ``_resolve_retry_policy``) and threaded through; passing ``None`` falls
     back to per-call resolution from ``agent_cfg`` only (no DB lookup) for
     callers/tests that don't go through ``_execute_run``.
-    Returns one row's worth of data ready to persist."""
+    Returns one row's worth of data ready to persist.
+
+    ``agent_cfg_b`` 非空 → 双模对比：并发跑 A、B 两 agent，评估器单次对比打分。
+    为 None（默认）时走现有单模路径，零改动。"""
+    # 双模对比（agent_cfg_b 非空）：并发跑两 agent + 评估器单次对比。v1 仅单轮。
+    if agent_cfg_b is not None and not case.get("multi_turn"):
+        return await _run_comparative_case(
+            case=case,
+            agent_cfg=agent_cfg,
+            agent_cfg_b=agent_cfg_b,
+            evaluator_specs=evaluator_specs,
+            cancel_event=cancel_event,
+            retry_policy=retry_policy,
+            http_client=http_client,
+        )
     # 多轮对话样例（source='conversation'）：走 multiturn 回放+逐轮/会话级打分。
     # 返回 dict 与单轮契约一致，落库/聚合无需区分。
     if case.get("multi_turn"):
@@ -990,6 +1297,7 @@ async def _execute_run(
     acceptance_policy: dict[str, Any] | None = None,
     langfuse_trace_name: str | None = None,
     notify_open_ids: list[str] | None = None,
+    agent_cfg_b: dict | None = None,
 ) -> None:
     """Background task body. Invokes agent for each case, runs evaluators,
     persists results. After all cases settle, optionally kicks off the
@@ -1045,18 +1353,32 @@ async def _execute_run(
                     cancel_event=cancel_event,
                     retry_policy=retry_policy,
                     http_client=http_client,
+                    agent_cfg_b=agent_cfg_b,
                 )
             except Exception as e:
                 logger.exception("case %s crashed during run: %s", case.get("id"), e)
                 handle.progress["failed"] += 1
                 handle.progress["completed"] += 1
                 return
-            projection = project_case(
-                stored_status=res.get("status"),
-                error_type=res.get("error_type"),
-                scores=res.get("scores") or {},
-                acceptance_policy=acceptance_policy,
-            )
+            # 对比模式不走 acceptance/scores 投影（相对胜负，非通过/失败）——直接按
+            # 行 status 映射执行/评分事实：scored=评分完成，execution_error=执行异常，
+            # 其余（judge 未出结论）计为评分错误。
+            if agent_cfg_b is not None:
+                st = res.get("status")
+                projection = {
+                    "execution_status": "abnormal" if st == "execution_error" else "success",
+                    "evaluation_status": "completed" if st == "scored" else (
+                        "error" if st == "evaluation_error" else "unknown"
+                    ),
+                    "acceptance_decision": None,
+                }
+            else:
+                projection = project_case(
+                    stored_status=res.get("status"),
+                    error_type=res.get("error_type"),
+                    scores=res.get("scores") or {},
+                    acceptance_policy=acceptance_policy,
+                )
             res.update(projection)
             per_case_results.append(res)
             if projection["execution_status"] == "abnormal" or projection[
@@ -1109,6 +1431,7 @@ async def _execute_run(
                         error_type=res["error_type"],
                         status=res["status"],
                         attempts_made=res.get("attempts_made", 1),
+                        comparison=res.get("comparison"),
                     )
                     # 多轮 judge 理由（#137）：score_reasons 仅多轮 case 带，单轮无此键
                     # → .get 兜底空 dict，details 退回 {}，单轮零回归。
@@ -1247,6 +1570,10 @@ async def _execute_run(
         if acceptance_policy is not None:
             summary["cost_accepted"] = _aggregate_cost(accepted_cases)
             summary["cost_not_accepted"] = _aggregate_cost(not_accepted_cases)
+        # 对比模式：附加独立对比汇总（A胜/B胜/平 + 逐维度胜率与均分）。不复用
+        # dimension_averages（那是单模按维度聚合），对比统计走独立渲染路径。
+        if agent_cfg_b is not None:
+            summary["comparison_summary"] = build_comparison_summary(per_case_results)
         # 如果多数样例执行异常，在详情页集中提示，而不是让用户逐行扫描。
         if per_case_results:
             abnormal_ratio = facts["execution_abnormal"] / len(per_case_results)
@@ -1868,6 +2195,8 @@ async def start_run(
     eval_case_source_id: str | None = None,
     acceptance_policy: dict[str, Any] | None = None,
     notify_open_ids: list[str] | None = None,
+    eval_mode: str = "single",
+    agent_cfg_b: dict | None = None,
 ) -> str:
     """Create a test_runs row, register an asyncio task, return run_id.
 
@@ -1887,6 +2216,10 @@ async def start_run(
 
     async with async_session_factory() as session:
         repo = Repository(session)
+        if eval_mode == "comparative" or agent_cfg_b is not None:
+            if agent_cfg_b is None:
+                raise ValueError("comparative run requires agent_cfg_b")
+            await _validate_comparative_evaluator_specs(evaluator_specs, repo)
         row = await repo.create_test_run(
             benchmark_version_id=uuid.UUID(benchmark_version_id) if benchmark_version_id else None,
             eval_case_source_id=uuid.UUID(eval_case_source_id) if eval_case_source_id else None,
@@ -1896,6 +2229,8 @@ async def start_run(
             langfuse_trace_name=langfuse_trace_name,
             evaluator_configs=evaluator_specs,
             acceptance_policy=acceptance_policy,
+            eval_mode=eval_mode,
+            agent_config_b=agent_cfg_b,
             status="running",
         )
         await session.commit()
@@ -1916,6 +2251,7 @@ async def start_run(
         cancel_event=cancel_event,
         handle=handle,
         notify_open_ids=notify_open_ids,
+        agent_cfg_b=agent_cfg_b,
     ))
     _RUN_REGISTRY[run_id] = handle
     return run_id

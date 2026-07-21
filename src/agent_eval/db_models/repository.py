@@ -76,6 +76,8 @@ class Repository:
         langsmith_project: str | None = None,
         evaluator_configs: list | None = None,
         acceptance_policy: dict | None = None,
+        eval_mode: str = "single",
+        agent_config_b: dict | None = None,
         status: str = "running",
         eval_started_at: datetime | None = None,
     ) -> TestRunRow:
@@ -91,6 +93,8 @@ class Repository:
             langsmith_project=langsmith_project,
             evaluator_configs=evaluator_configs or [],
             acceptance_policy=acceptance_policy,
+            eval_mode=eval_mode,
+            agent_config_b=agent_config_b,
             status=status,
             started_at=datetime.now(timezone.utc),
             eval_started_at=eval_started_at or datetime.now(timezone.utc),

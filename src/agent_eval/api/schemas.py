@@ -297,6 +297,11 @@ class StartEvalRequest(BaseModel):
     limit: int | None = None
 
     agent: EvalAgentConfig
+    # 评估模式：single（缺省，单模）| comparative（双模对比）。comparative 时
+    # agent_b 必填，两 agent 并发跑同一样例，评估器单次对比打分。
+    eval_mode: str = "single"
+    # 双模对比的 B 侧 agent 配置；single 模式忽略。
+    agent_b: EvalAgentConfig | None = None
     # Evaluator instances by id (evaluator_configs table). Empty list is not allowed.
     evaluator_ids: list[str] = Field(default_factory=list)
     # 缺省为 None：仅评分，不产生隐式通过/失败结论。
@@ -328,6 +333,10 @@ class EvalRunSummary(BaseModel):
     langfuse_trace_name: str | None = None
     langsmith_project: str | None = None
     agent_config: dict[str, Any] = {}
+    # 双模对比：模式标记 + B 侧 agent 配置快照。single 模式下 eval_mode='single'、
+    # agent_config_b=None。前端据 eval_mode 切换对比渲染。
+    eval_mode: str = "single"
+    agent_config_b: dict[str, Any] | None = None
     acceptance_policy: dict[str, Any] | None = None
     summary_scores: dict[str, Any] | None = None
     facts: dict[str, Any] = {}
@@ -382,6 +391,9 @@ class EvalResultRow(BaseModel):
     # checklist 评估器的逐条判定 [{id,desc,verdict,evidence}]，支撑可溯源打分链路。
     # 详情页据此逐条渲染 ✓/✗/— + 证据。无明细的分数项此处缺省。
     score_details: dict[str, dict[str, Any]] = {}
+    # 双模对比结果（agent_b 回复 + 逐维度 A/B 分 + winner + 整体 winner）。
+    # 单模为 None。结构见 comparison JSONB（langfuse_runner._run_comparative_case）。
+    comparison: dict[str, Any] | None = None
 
 
 class EvalResultsPage(BaseModel):
@@ -550,6 +562,11 @@ class DryRunRequest(BaseModel):
     output: str = ""
     expected_output: str | None = None
     metadata: dict[str, Any] | None = None
+    # 对比模式 dry-run：mode='comparative' 时用 output_a/output_b 两份回复，
+    # 走对比 judge 产出 verdict（见 DryRunResponse.verdict）。缺省单模不受影响。
+    mode: str = "single"
+    output_a: str = ""
+    output_b: str = ""
 
 
 class DryRunScoreItem(BaseModel):
@@ -565,6 +582,10 @@ class DryRunResponse(BaseModel):
     # 单分数范式：``scores`` 至多一个元素，UI 直接展示首项即可。
     # 旧的 ``aggregate`` 字段（多维度加权平均）已不复存在。
     scores: list[DryRunScoreItem] = []
+    # 对比模式（mode='comparative'）dry-run 的 verdict：
+    #   {dimensions:[{name,score_a,score_b,winner,reason}], overall_winner, reasoning}
+    # 单分数模式为 None。
+    verdict: dict[str, Any] | None = None
     model: str = ""
     usage: dict[str, int] = {}
     raw_content: str = ""

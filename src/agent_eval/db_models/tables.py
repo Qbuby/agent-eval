@@ -121,6 +121,10 @@ class TestRunRow(Base, TenantMixin):
     summary_scores: Mapped[dict | None] = mapped_column(JSONB)
     # 发起运行时显式配置的验收策略不可变快照；NULL 表示仅评分。
     acceptance_policy: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # 评估模式：'single'（默认，单模）| 'comparative'（双模对比）。
+    eval_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="single")
+    # 双模对比的 B agent 配置快照；单模为 NULL。A agent 仍存在 agent_config。
+    agent_config_b: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     langfuse_run_name: Mapped[str | None] = mapped_column(Text)
     langsmith_project: Mapped[str | None] = mapped_column(Text)
     # Per-run Langfuse trace name: the回拉键 used to fetch traces by name+time
@@ -224,6 +228,10 @@ class TestResultRow(Base, TenantMixin):
     actual_tool_calls: Mapped[list | None] = mapped_column(JSONB)
     full_trace: Mapped[dict | None] = mapped_column(JSONB)
     langfuse_trace_id: Mapped[str | None] = mapped_column(Text)
+    # 双模对比评估结果（eval_mode='comparative'）：B 侧回复 + verdict（逐维度
+    # A/B 分与 winner + 整体 winner）+ position_swapped 审计。单模恒 NULL。
+    # A 侧回复/指标仍存本行原有列（主侧），单模消费方零改动。见迁移 0033。
+    comparison: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     total_tokens: Mapped[int | None] = mapped_column(Integer)
