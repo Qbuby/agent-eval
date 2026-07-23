@@ -284,18 +284,13 @@ async def resolve_eval_start_args(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # ── 3. 双模对比校验 ──
-    # comparative 模式：需第二个 agent、样例须单轮、且对比不套 acceptance_policy。
+    # comparative 模式：需第二个 agent，且对比不套 acceptance_policy；单轮/多轮均由 runner 逐样例分派。
     eval_mode = (req.eval_mode or "single").lower()
     agent_cfg_b = None
     if eval_mode == "comparative":
         if req.agent_b is None:
             raise HTTPException(
                 status_code=400, detail="双模对比评估需要提供第二个待测 agent（agent_b）",
-            )
-        if any(c.get("multi_turn") for c in cases):
-            raise HTTPException(
-                status_code=400,
-                detail="双模对比评估暂不支持多轮对话集，请选择单轮数据集",
             )
         if policy is not None:
             raise HTTPException(

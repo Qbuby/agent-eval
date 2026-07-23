@@ -498,14 +498,30 @@ export interface ComparisonEvaluatorSummary {
   total: number
   scored: number
   evaluation_errors: number
+  // 空白轮跳过：既非有效评分也非评分失败，单独计数。
+  skipped?: number
   a_wins: number
   b_wins: number
   ties: number
   per_dimension: Record<string, ComparisonDimensionSummary>
 }
 
+// A/B 各自有效/空白回答计数（run 级，跨样例累加）。空白 = 该轮回复 strip 后为空。
+export interface ComparisonAnswerCounts {
+  a_valid: number
+  a_blank: number
+  b_valid: number
+  b_blank: number
+  // run 级聚合只产 valid/blank；per-row 另有 a_total/b_total，展示未用，故可选。
+  total_turns?: number
+  a_total?: number
+  b_total?: number
+}
+
 export interface ComparisonSummary {
   evaluators?: ComparisonEvaluatorSummary[]
+  // A/B 有效回答计数（run 级汇总）；仅多轮对比 run 有。
+  answer_counts?: ComparisonAnswerCounts
   // Deprecated 单 evaluator 汇总；保留用于读取旧 run。
   total?: number
   a_wins?: number
@@ -651,6 +667,16 @@ export interface ComparisonVerdict {
   reasoning?: string
 }
 
+// 多轮对比：单个 scope（某一轮 or 会话级）的对比结论。verdict 已由后端还原真实 A/B。
+export interface ScopedComparisonVerdict {
+  scope: 'turn' | 'conversation'
+  turn_index: number | null
+  verdict: ComparisonVerdict | null
+  // skipped：该轮 A/B 任一侧回复空白，跳过对比、不计胜负（error 说明哪侧空白）。
+  status: 'scored' | 'evaluation_error' | 'skipped' | string
+  error?: string | null
+}
+
 // 单个 evaluator 对一条 A/B 样例的独立评分。status=evaluation_error 时 verdict
 // 可为空，error 保存该 evaluator 自己的失败原因。
 export interface ComparisonEvaluatorVerdict {
@@ -661,6 +687,8 @@ export interface ComparisonEvaluatorVerdict {
   status: 'scored' | 'evaluation_error' | string
   verdict: ComparisonVerdict | null
   error?: string | null
+  // 多轮对比样例才有：逐轮 + 会话级各自的对比结论；顶层 verdict 取会话级。
+  scoped_verdicts?: ScopedComparisonVerdict[]
 }
 
 // test_results.comparison：B 侧回复快照 + 每 evaluator verdict + 位置随机化审计标记。
@@ -680,11 +708,23 @@ export interface Comparison {
     error_message?: string | null
     error_type?: string | null
     attempts_made?: number | null
+    // 多轮对比才有：B 侧逐轮回放记录，供详情页逐轮渲染 B 侧回复。
+    conversation?: { turns: ConversationTurn[] } | null
   }
   evaluator_verdicts?: ComparisonEvaluatorVerdict[]
   // Deprecated 单 verdict 别名；仅在 evaluator_verdicts 字段不存在时回退读取。
   verdict?: ComparisonVerdict | null
   position_swapped?: boolean
+  // 多轮对比标记：前端据此切换到「逐轮对比 + 会话级对比」渲染。单轮对比无此键/为 false。
+  multi_turn?: boolean
+  // 多轮对比才有：A/B 各自有效/空白回答轮数（执行事实，空白轮不进评分聚合）。
+  answer_counts?: {
+    a_valid: number
+    a_blank: number
+    b_valid: number
+    b_blank: number
+    total_turns: number
+  } | null
 }
 
 export interface EvalResultRow {

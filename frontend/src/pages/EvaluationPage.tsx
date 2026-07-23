@@ -644,9 +644,6 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   if (evalMode === 'comparative' && agentDraftB.url.trim().length === 0) {
     startBlockers.push('填写 B 模型智能体 URL')
   }
-  if (evalMode === 'comparative' && sourceTab === 'conversation' && convDataset) {
-    startBlockers.push('双模对比暂不支持多轮对话集')
-  }
   const canStart = startBlockers.length === 0 && !startMutation.isPending
 
   const parseAgentDraft = (draft: AgentDraft, label: string): EvalAgentConfig | null => {
@@ -1086,12 +1083,6 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
             </button>
           ))}
         </div>
-
-        {evalMode === 'comparative' && sourceTab === 'conversation' && convDataset && (
-          <div className="mb-3 px-3 py-2 rounded-md border border-warning/30 bg-warning/10 text-[12px] text-warning">
-            双模对比暂不支持多轮对话集
-          </div>
-        )}
 
         <div className="flex flex-col gap-4">
           <AgentConfigFields

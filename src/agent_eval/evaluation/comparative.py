@@ -90,6 +90,7 @@ def _summary_entry(entry: dict[str, Any], *, legacy: bool = False) -> dict[str, 
         "total": 0,
         "scored": 0,
         "evaluation_errors": 0,
+        "skipped": 0,
         "a_wins": 0,
         "b_wins": 0,
         "ties": 0,
@@ -102,7 +103,9 @@ def build_comparison_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """按 evaluator 独立汇总逐样例 comparative 结果。
 
     新 payload 优先读取 ``comparison.evaluator_verdicts``；只有该字段不存在时才
-    回退 deprecated ``comparison.verdict``，并将其归入 ``legacy`` 组。跨 evaluator
+    回退 deprecated ``comparison.verdict``，并将其归入 ``legacy`` 组。多轮 evaluator
+    条目若有非空 ``scoped_verdicts``，则以每个 scope 为统计单位，并为维度名增加
+    ``轮{turn_index}·`` / ``会话·`` 前缀；否则沿用单轮顶层 verdict。跨 evaluator
     的同名 dimension 永不合并。为兼容旧消费方，只有最终恰好一个 evaluator 组时，
     才把该组的胜负与维度统计映射到旧顶层字段。
     """
@@ -130,46 +133,68 @@ def build_comparison_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for entry, legacy in entries:
             key = _evaluator_key(entry)
             group = groups.setdefault(key, _summary_entry(entry, legacy=legacy))
-            group["total"] += 1
 
-            verdict = entry.get("verdict")
-            if entry.get("status") != "scored" or not isinstance(verdict, dict):
-                group["evaluation_errors"] += 1
-                continue
-
-            group["scored"] += 1
-            overall = str(verdict.get("overall_winner") or "tie")
-            if overall == "A":
-                group["a_wins"] += 1
-            elif overall == "B":
-                group["b_wins"] += 1
+            scoped_verdicts = entry.get("scoped_verdicts")
+            verdict_items: list[tuple[str, Any, Any]] = []
+            if isinstance(scoped_verdicts, list) and scoped_verdicts:
+                # 多轮按逐轮/会话 scope 分别计数；失败 scope 不以顶层 verdict 兜底，避免重复或掩盖失败。
+                for scoped in scoped_verdicts:
+                    if not isinstance(scoped, dict):
+                        verdict_items.append(("evaluation_error", None, ""))
+                        continue
+                    if scoped.get("scope") == "turn":
+                        prefix = f"轮{scoped.get('turn_index')}·"
+                    else:
+                        prefix = "会话·"
+                    verdict_items.append((scoped.get("status"), scoped.get("verdict"), prefix))
             else:
-                group["ties"] += 1
+                # 单轮结构完全沿用原有顶层 verdict 路径，不改变既有统计语义。
+                verdict_items.append((entry.get("status"), entry.get("verdict"), ""))
 
-            dimensions = verdict.get("dimensions")
-            if not isinstance(dimensions, list):
-                continue
-            for dimension in dimensions:
-                if not isinstance(dimension, dict):
+            for status, verdict, dimension_prefix in verdict_items:
+                group["total"] += 1
+                # 空白轮跳过（用户决策）：不计入胜负、不计错误、不进维度均值，
+                # 单列 skipped 计数。仅对 scoped 的 skipped 生效。
+                if status == "skipped":
+                    group["skipped"] += 1
                     continue
-                name = str(dimension.get("name") or "总体")
-                slot = group["_per_dimension"].setdefault(name, {
-                    "a_wins": 0, "b_wins": 0, "ties": 0,
-                    "sum_a": 0.0, "sum_b": 0.0, "n": 0,
-                })
-                winner = str(dimension.get("winner") or "tie")
-                if winner == "A":
-                    slot["a_wins"] += 1
-                elif winner == "B":
-                    slot["b_wins"] += 1
+                if status != "scored" or not isinstance(verdict, dict):
+                    group["evaluation_errors"] += 1
+                    continue
+
+                group["scored"] += 1
+                overall = str(verdict.get("overall_winner") or "tie")
+                if overall == "A":
+                    group["a_wins"] += 1
+                elif overall == "B":
+                    group["b_wins"] += 1
                 else:
-                    slot["ties"] += 1
-                try:
-                    slot["sum_a"] += float(dimension.get("score_a"))
-                    slot["sum_b"] += float(dimension.get("score_b"))
-                    slot["n"] += 1
-                except (TypeError, ValueError):
-                    pass
+                    group["ties"] += 1
+
+                dimensions = verdict.get("dimensions")
+                if not isinstance(dimensions, list):
+                    continue
+                for dimension in dimensions:
+                    if not isinstance(dimension, dict):
+                        continue
+                    name = dimension_prefix + str(dimension.get("name") or "总体")
+                    slot = group["_per_dimension"].setdefault(name, {
+                        "a_wins": 0, "b_wins": 0, "ties": 0,
+                        "sum_a": 0.0, "sum_b": 0.0, "n": 0,
+                    })
+                    winner = str(dimension.get("winner") or "tie")
+                    if winner == "A":
+                        slot["a_wins"] += 1
+                    elif winner == "B":
+                        slot["b_wins"] += 1
+                    else:
+                        slot["ties"] += 1
+                    try:
+                        slot["sum_a"] += float(dimension.get("score_a"))
+                        slot["sum_b"] += float(dimension.get("score_b"))
+                        slot["n"] += 1
+                    except (TypeError, ValueError):
+                        pass
 
     evaluators: list[dict[str, Any]] = []
     for group in groups.values():
@@ -187,7 +212,27 @@ def build_comparison_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         group["per_dimension"] = per_dimension
         evaluators.append(group)
 
+    # run 级 A/B 有效回答计数汇总（跨样例累加逐行 comparison.answer_counts）。
+    # 空白轮跳过评估是执行事实，独立于 evaluator 裁决，供前端顶部概览展示。
+    ac_total = {"a_valid": 0, "a_blank": 0, "b_valid": 0, "b_blank": 0}
+    ac_seen = False
+    for row in rows:
+        comp = row.get("comparison") if isinstance(row, dict) else None
+        if not isinstance(comp, dict):
+            continue
+        ac = comp.get("answer_counts")
+        if not isinstance(ac, dict):
+            continue
+        ac_seen = True
+        for k in ac_total:
+            try:
+                ac_total[k] += int(ac.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+
     summary: dict[str, Any] = {"evaluators": evaluators}
+    if ac_seen:
+        summary["answer_counts"] = ac_total
     if len(evaluators) == 1:
         only = evaluators[0]
         summary.update({

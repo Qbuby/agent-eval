@@ -5,6 +5,7 @@ import type {
   ComparisonSummary,
   ComparisonVerdict,
   EvalResultRow,
+  ScopedComparisonVerdict,
 } from '@/types'
 
 export interface NormalizedComparisonVerdict extends ComparisonEvaluatorVerdict {
@@ -266,4 +267,41 @@ export function firstScoredVerdict(
 ): ComparisonVerdict | null {
   return normalizeComparisonVerdicts(comparison)
     .find(entry => entry.status === 'scored' && entry.verdict)?.verdict ?? null
+}
+
+/** 多轮对比样例：comparison.multi_turn 为真且至少一个 evaluator 带 scoped_verdicts。 */
+export function isMultiTurnComparison(
+  comparison: Comparison | null | undefined,
+): boolean {
+  if (!comparison) return false
+  if (comparison.multi_turn) return true
+  return (comparison.evaluator_verdicts ?? []).some(
+    entry => Array.isArray(entry.scoped_verdicts) && entry.scoped_verdicts.length > 0,
+  )
+}
+
+export interface ScopedVerdictGroup {
+  /** 逐轮块（按 turn_index 升序），每块一个 scope 的对比结论。 */
+  turns: ScopedComparisonVerdict[]
+  /** 会话级块（scope==='conversation'），无则 null。 */
+  conversation: ScopedComparisonVerdict | null
+}
+
+/**
+ * 把一个 evaluator 条目的 scoped_verdicts 拆成有序的逐轮 + 会话级块，供多轮详情页渲染。
+ * 逐轮按 turn_index 升序；会话级单独取出。无 scoped_verdicts 返回空组。
+ */
+export function groupScopedVerdicts(
+  entry: ComparisonEvaluatorVerdict | null | undefined,
+): ScopedVerdictGroup {
+  const scoped = entry?.scoped_verdicts
+  if (!Array.isArray(scoped) || scoped.length === 0) {
+    return { turns: [], conversation: null }
+  }
+  const turns = scoped
+    .filter(sv => sv.scope === 'turn')
+    .slice()
+    .sort((a, b) => (a.turn_index ?? 0) - (b.turn_index ?? 0))
+  const conversation = scoped.find(sv => sv.scope === 'conversation') ?? null
+  return { turns, conversation }
 }
