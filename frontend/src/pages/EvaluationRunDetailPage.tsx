@@ -6,7 +6,7 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
 } from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail, RunDetail, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail } from '@/types'
+import type { EvalResultRow, EvalRunDetail, RunDetail, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail, Comparison, ComparisonVerdict, ComparisonAnswerCounts } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
 import { CotTimeline, ToolCallsTable } from '@/components/TraceTimeline'
 import MarkdownView from '@/components/MarkdownView'
@@ -23,6 +23,719 @@ import {
   deriveFacts, deriveAcceptance, deriveCostScored, deriveCostAbnormal,
   acceptancePassRateText, runDecisionLabel, type EvalFacts, type EvalAcceptance,
 } from '@/lib/evalSemantics'
+import {
+  aggregateComparativeResources,
+  comparativePerformanceMetricLabels,
+  comparativeResourceMetricLabels,
+  evaluatorDisplayName,
+  normalizeComparisonSummary,
+  normalizeComparisonVerdicts,
+  isMultiTurnComparison,
+  groupScopedVerdicts,
+  type ComparativePerformanceMetricKey,
+  type ComparativeResourceMetricKey,
+  type NormalizedComparisonSummary,
+} from '@/lib/comparativeMetrics'
+
+// ── 双模对比：胜负标记 + 汇总 + 逐样例 A/B 展示 ──
+
+
+// winner 徽章：A 绿 / B 蓝 / tie 灰。用于逐维度、整体、汇总。
+// labelA/labelB 传入时用真实模型名替代「A 胜」「B 胜」。
+function WinnerBadge({ winner, size = 'sm', labelA, labelB }: {
+  winner: string; size?: 'sm' | 'md'; labelA?: string; labelB?: string
+}) {
+  const cls = winner === 'A'
+    ? 'bg-accent/15 text-accent'
+    : winner === 'B'
+      ? 'bg-info/15 text-info'
+      : 'bg-fill/15 text-text-tertiary'
+  const label = winner === 'A'
+    ? (labelA ? `${labelA} 胜` : 'A 胜')
+    : winner === 'B'
+      ? (labelB ? `${labelB} 胜` : 'B 胜')
+      : '平'
+  const pad = size === 'md' ? 'px-2 py-0.5 text-[12px]' : 'px-1.5 py-0.5 text-[10px]'
+  return <span className={`inline-block rounded font-medium ${pad} ${cls}`}>{label}</span>
+}
+
+// A/B 侧统一取名：优先 model，退 type，再退字面 A/B。返回展示名 + URL（悬浮全文）。
+function modelInfo(cfg: unknown, side: 'A' | 'B'): { name: string; url: string } {
+  const c = (cfg ?? {}) as { model?: string; type?: string; url?: string }
+  return { name: c.model || c.type || side, url: c.url || '' }
+}
+
+// A/B 模型徽标：side 字母 + 真实模型名，A=accent 绿 / B=info 蓝。
+function ModelBadge({ side, name, size = 'sm' }: { side: 'A' | 'B'; name: string; size?: 'sm' | 'md' }) {
+  const cls = side === 'A' ? 'bg-accent/15 text-accent' : 'bg-info/15 text-info'
+  const pad = size === 'md' ? 'px-2 py-1 text-[12px]' : 'px-1.5 py-0.5 text-[10px]'
+  return (
+    <span className={`inline-flex items-center gap-1 rounded font-medium ${pad} ${cls}`}>
+      <span className="opacity-70">{side}</span>
+      <span className="font-mono">{name}</span>
+    </span>
+  )
+}
+
+// 每个 comparative evaluator 独立展示，绝不跨 evaluator 合并同名维度。
+function ComparativeHeader({ run, summaries, answerCounts }: {
+  run: EvalRunDetail
+  summaries: NormalizedComparisonSummary[]
+  answerCounts?: ComparisonAnswerCounts
+}) {
+  const a = modelInfo(run.agent_config, 'A')
+  const b = modelInfo(run.agent_config_b, 'B')
+  return (
+    <section className="card p-4 mb-5">
+      {answerCounts && (answerCounts.a_valid + answerCounts.a_blank + answerCounts.b_valid + answerCounts.b_blank) > 0 && (
+        <div className="grid grid-cols-4 gap-2 text-center mb-4">
+          <MetaCard label={`A · ${a.name} 有效回答`} value={answerCounts.a_valid} />
+          <MetaCard label="A 空白轮（跳过）" value={answerCounts.a_blank} />
+          <MetaCard label={`B · ${b.name} 有效回答`} value={answerCounts.b_valid} />
+          <MetaCard label="B 空白轮（跳过）" value={answerCounts.b_blank} />
+        </div>
+      )}
+      <div className="flex items-start justify-between gap-4 mb-4">
+        <div>
+          <div className="page-eyebrow mb-1">对比裁决（按评估器）</div>
+          <div className="text-[11px] text-text-tertiary">
+            {summaries.length} 个评估器 · 启动 → 完成 {fmtDuration(run.started_at, run.finished_at)}
+          </div>
+        </div>
+        <div className="flex flex-col gap-1.5 min-w-[240px]">
+          <div className="flex items-center gap-2">
+            <ModelBadge side="A" name={a.name} size="md" />
+            {a.url && <span className="font-mono text-[10px] text-text-tertiary truncate max-w-[160px]" title={a.url}>{a.url}</span>}
+          </div>
+          <div className="flex items-center gap-2">
+            <ModelBadge side="B" name={b.name} size="md" />
+            {b.url && <span className="font-mono text-[10px] text-text-tertiary truncate max-w-[160px]" title={b.url}>{b.url}</span>}
+          </div>
+        </div>
+      </div>
+      {summaries.length === 0 ? (
+        <div className="text-[12px] text-text-tertiary">暂无对比汇总数据。</div>
+      ) : (
+        <div className="space-y-4">
+          {summaries.map(summary => {
+            const total = summary.scored || 0
+            const pct = (n: number) => total > 0 ? `${((n / total) * 100).toFixed(0)}%` : '—'
+            const perDim = Object.entries(summary.per_dimension || {})
+            const verdict = summary.a_wins === summary.b_wins
+              ? { tone: 'text-text-secondary', text: `${a.name} 与 ${b.name} 打平` }
+              : summary.a_wins > summary.b_wins
+                ? { tone: 'text-accent', text: `${a.name} 胜出` }
+                : { tone: 'text-info', text: `${b.name} 胜出` }
+            return (
+              <div key={summary.evaluator_key} className="rounded-lg border border-border p-3">
+                <div className="flex items-start justify-between gap-3 mb-3">
+                  <div>
+                    <div className="font-medium text-[13px]">{evaluatorDisplayName(summary)}</div>
+                    {!summary.legacy && summary.tag && summary.tag !== summary.label && (
+                      <div className="font-mono text-[10px] text-text-tertiary mt-0.5">{summary.tag}</div>
+                    )}
+                    {summary.legacy && (
+                      <div className="text-[10px] text-warning mt-1">旧数据只保留单份裁决，原评估器归属无法恢复。</div>
+                    )}
+                  </div>
+                  <div className={`text-[15px] font-semibold ${verdict.tone}`}>{verdict.text}</div>
+                </div>
+                <WinRateStackBar
+                  aWins={summary.a_wins} bWins={summary.b_wins} ties={summary.ties}
+                  aName={a.name} bName={b.name}
+                />
+                <div className="grid grid-cols-5 gap-2 mb-3">
+                  <MetaCard label="有效样例" value={summary.scored} />
+                  <MetaCard label="评分失败" value={summary.evaluation_errors} />
+                  <MetaCard label={`A · ${a.name} 胜`} value={summary.a_wins} hint={pct(summary.a_wins)} />
+                  <MetaCard label={`B · ${b.name} 胜`} value={summary.b_wins} hint={pct(summary.b_wins)} />
+                  <MetaCard label="平" value={summary.ties} hint={pct(summary.ties)} />
+                </div>
+                {perDim.length > 0 && (
+                  <div className="mb-3">
+                    <div className="page-eyebrow mb-2">各维度 A / B 均分（跨轮合并）</div>
+                    <MergedDimensionChart perDim={perDim} aName={a.name} bName={b.name} />
+                  </div>
+                )}
+                {perDim.length > 0 && (
+                  <div className="table-card">
+                    <table className="table-base">
+                      <thead><tr>
+                        <th>维度</th><th className="text-right text-accent">A 均分</th>
+                        <th className="text-right text-info">B 均分</th><th className="text-right">A / B / 平</th>
+                        <th className="text-right">覆盖 n</th>
+                      </tr></thead>
+                      <tbody>{mergeDimsByBase(perDim).map((m) => (
+                        <tr key={m.dim}>
+                          <td className="font-medium">{m.dim}</td>
+                          <td className="text-right tabular-nums text-accent">{m.mean_a == null ? '—' : m.mean_a.toFixed(2)}</td>
+                          <td className="text-right tabular-nums text-info">{m.mean_b == null ? '—' : m.mean_b.toFixed(2)}</td>
+                          <td className="text-right tabular-nums">{m.a_wins} / {m.b_wins} / {m.ties}</td>
+                          <td className="text-right tabular-nums">{m.n}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </section>
+  )
+}
+
+// 双模 Agent 配置：A/B 两侧并列展示，避免沿用单模卡片造成配置归属歧义。
+function ComparativeAgentConfig({ run }: { run: EvalRunDetail }) {
+  const a = modelInfo(run.agent_config, 'A')
+  const b = modelInfo(run.agent_config_b, 'B')
+  const configs = [
+    { side: 'A' as const, info: a, data: run.agent_config, tone: 'border-accent/25 bg-accent/5' },
+    { side: 'B' as const, info: b, data: run.agent_config_b, tone: 'border-info/25 bg-info/5' },
+  ]
+
+  return (
+    <section className="card p-4 mb-5">
+      <h3 className="page-eyebrow mb-3">Agent 配置（A / B 对照）</h3>
+      <div className="grid grid-cols-2 gap-3">
+        {configs.map(({ side, info, data, tone }) => {
+          const cfg = (data ?? {}) as { type?: string; model?: string; url?: string }
+          return (
+            <div key={side} className={`rounded-lg border p-3 ${tone}`}>
+              <div className="mb-3"><ModelBadge side={side} name={info.name} size="md" /></div>
+              <div className="grid grid-cols-3 gap-3 text-[12px]">
+                <KV k="Type" v={cfg.type ?? '—'} />
+                <KV k="Model" v={cfg.model ?? '—'} />
+                <KV k="URL" v={cfg.url ?? '—'} mono />
+              </div>
+            </div>
+          )
+        })}
+      </div>
+      <details className="mt-3">
+        <summary className="text-[11px] text-text-secondary cursor-pointer">原始 A/B 配置 / evaluators</summary>
+        <div className="grid grid-cols-3 gap-3 mt-2">
+          <JsonBlock label="agent_config_a" data={run.agent_config} />
+          <JsonBlock label="agent_config_b" data={run.agent_config_b} />
+          <JsonBlock label="evaluator_configs" data={run.evaluator_configs} />
+        </div>
+      </details>
+    </section>
+  )
+}
+
+function fmtMetric(value: number | null, unit = ''): string {
+  if (value == null) return '—'
+  const text = Number.isInteger(value) ? String(value) : value.toFixed(2)
+  return `${text}${unit}`
+}
+
+function fmtDelta(value: number | null, percent: number | null, unit = ''): string {
+  if (value == null) return '—'
+  const signed = `${value > 0 ? '+' : ''}${fmtMetric(value, unit)}`
+  return percent == null ? signed : `${signed} (${percent > 0 ? '+' : ''}${(percent * 100).toFixed(1)}%)`
+}
+
+// A=accent（绿）/ B=info（蓝）：与全站 A/B 语义色一致，图表复用同一 entity 色——颜色跟实体走，
+// 切勿按名次/大小重新着色。tie 用中性灰，网格走一档淡的分隔线（实线，非虚线）。
+const A_FILL = 'rgb(var(--accent))'
+const B_FILL = 'rgb(var(--info))'
+const TIE_FILL = 'rgb(var(--text-tertiary))'
+const GRID_STROKE = 'rgb(var(--separator) / 0.4)'
+
+// 胜负占比：单条水平堆叠（A 胜 / 平 / B 胜）——part-to-whole 三类的正解，一眼见谁赢。
+// 相邻段留 2px 表面缝隙分隔（非描边），段够宽时段内直接标数，下方图例给全量。空数据不渲染。
+function WinRateStackBar({ aWins, bWins, ties, aName, bName }: {
+  aWins: number; bWins: number; ties: number; aName: string; bName: string
+}) {
+  const total = aWins + bWins + ties
+  if (total <= 0) return null
+  const pctLabel = (n: number) => `${((n / total) * 100).toFixed(0)}%`
+  const segments = [
+    { key: 'A', n: aWins, fill: A_FILL, label: `${aName} 胜`, ink: true },
+    { key: 'tie', n: ties, fill: TIE_FILL, label: '平', ink: false },
+    { key: 'B', n: bWins, fill: B_FILL, label: `${bName} 胜`, ink: true },
+  ]
+  return (
+    <div className="mb-3">
+      <div
+        className="flex h-7 w-full overflow-hidden rounded-md"
+        role="img"
+        aria-label={`胜负占比：${aName} 胜 ${aWins}，平 ${ties}，${bName} 胜 ${bWins}`}
+      >
+        {segments.map((s, i) => s.n > 0 && (
+          <div
+            key={s.key}
+            className="flex items-center justify-center text-[11px] font-medium text-white"
+            style={{
+              width: `${(s.n / total) * 100}%`,
+              backgroundColor: s.fill,
+              marginLeft: i > 0 ? 2 : 0,
+            }}
+            title={`${s.label}：${s.n}（${pctLabel(s.n)}）`}
+          >
+            {s.ink && s.n / total >= 0.12 ? s.n : ''}
+          </div>
+        ))}
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-text-secondary">
+        {segments.map(s => (
+          <span key={s.key} className="inline-flex items-center gap-1">
+            <span className="inline-block h-2 w-2 rounded-sm" style={{ backgroundColor: s.fill }} />
+            {s.label} {s.n}（{pctLabel(s.n)}）
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// 逐轮维度名前缀：后端聚合器给多轮 scoped 维度加了「轮N·」「会话·」前缀。
+// 展示层按基础维度名（去前缀）跨轮合并，避免把每轮每维平铺成几十条。
+const _DIM_PREFIX_RE = /^(轮\d+·|会话·)/
+
+interface DimStat {
+  a_wins: number; b_wins: number; ties: number
+  mean_a: number | null; mean_b: number | null; n: number
+}
+interface MergedDim {
+  dim: string                       // 基础维度名
+  mean_a: number | null; mean_b: number | null
+  a_wins: number; b_wins: number; ties: number; n: number
+  turns: Array<[string, DimStat]>   // 该维度的逐轮/会话原始明细（含前缀），供下钻
+}
+
+// 按基础维度名跨轮合并：mean 以 n 加权，胜负/覆盖数累加。turns 保留原始逐轮条目。
+function mergeDimsByBase(perDim: Array<[string, DimStat]>): MergedDim[] {
+  const groups = new Map<string, MergedDim>()
+  const order: string[] = []
+  for (const [key, s] of perDim) {
+    const base = key.replace(_DIM_PREFIX_RE, '')
+    let g = groups.get(base)
+    if (!g) {
+      g = { dim: base, mean_a: null, mean_b: null, a_wins: 0, b_wins: 0, ties: 0, n: 0, turns: [] }
+      groups.set(base, g)
+      order.push(base)
+    }
+    g.turns.push([key, s])
+    g.a_wins += s.a_wins; g.b_wins += s.b_wins; g.ties += s.ties
+    const n = s.n || 0
+    if (n > 0) {
+      if (s.mean_a != null) g.mean_a = (g.mean_a ?? 0) + s.mean_a * n
+      if (s.mean_b != null) g.mean_b = (g.mean_b ?? 0) + s.mean_b * n
+      g.n += n
+    }
+  }
+  // 把加权和除以总 n 还原为均值。
+  for (const g of groups.values()) {
+    if (g.n > 0) {
+      if (g.mean_a != null) g.mean_a = g.mean_a / g.n
+      if (g.mean_b != null) g.mean_b = g.mean_b / g.n
+    }
+  }
+  return order.map(k => groups.get(k)!)
+}
+
+// 合并维度 + 可展开逐轮明细：默认每维一条（跨轮加权均分）；点开看该维度逐轮拆解。
+function MergedDimensionChart({ perDim, aName, bName }: {
+  perDim: Array<[string, DimStat]>; aName: string; bName: string
+}) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const merged = mergeDimsByBase(perDim)
+  if (merged.length === 0) return null
+  const chartData = merged
+    .filter(m => m.mean_a != null || m.mean_b != null)
+    .map(m => ({ dim: m.dim, A: m.mean_a, B: m.mean_b }))
+  const toggle = (dim: string) => setExpanded(prev => {
+    const next = new Set(prev)
+    if (next.has(dim)) next.delete(dim); else next.add(dim)
+    return next
+  })
+  return (
+    <div>
+      {chartData.length > 0 && (
+        <ResponsiveContainer width="100%" height={chartData.length * 46 + 40}>
+          <BarChart data={chartData} layout="vertical" margin={{ top: 4, right: 16, left: 8, bottom: 4 }} barGap={2}>
+            <CartesianGrid horizontal={false} stroke={GRID_STROKE} />
+            <XAxis type="number" tick={{ fontSize: 10 }} />
+            <YAxis type="category" dataKey="dim" width={110} tick={{ fontSize: 10 }} />
+            <Tooltip contentStyle={{ fontSize: 11, borderRadius: 6 }} />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            <Bar dataKey="A" name={aName} fill={A_FILL} radius={[0, 3, 3, 0]} maxBarSize={16} />
+            <Bar dataKey="B" name={bName} fill={B_FILL} radius={[0, 3, 3, 0]} maxBarSize={16} />
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+      {/* 逐轮下钻：仅当某维度含多个逐轮条目时才提供展开。 */}
+      <div className="mt-2 space-y-1">
+        {merged.filter(m => m.turns.length > 1).map(m => (
+          <div key={m.dim} className="text-[11px]">
+            <button
+              type="button"
+              onClick={() => toggle(m.dim)}
+              className="text-text-tertiary hover:text-text-secondary"
+            >
+              {expanded.has(m.dim) ? '▾' : '▸'} {m.dim} 逐轮明细（{m.turns.length}）
+            </button>
+            {expanded.has(m.dim) && (
+              <table className="table-base mt-1">
+                <thead><tr>
+                  <th>轮次</th><th className="text-right text-accent">A</th>
+                  <th className="text-right text-info">B</th><th className="text-right">A/B/平</th>
+                </tr></thead>
+                <tbody>{m.turns.map(([key, s]) => (
+                  <tr key={key}>
+                    <td className="font-medium">{key.match(_DIM_PREFIX_RE)?.[0]?.replace('·', '') ?? '总体'}</td>
+                    <td className="text-right tabular-nums text-accent">{s.mean_a == null ? '—' : s.mean_a.toFixed(2)}</td>
+                    <td className="text-right tabular-nums text-info">{s.mean_b == null ? '—' : s.mean_b.toFixed(2)}</td>
+                    <td className="text-right tabular-nums">{s.a_wins}/{s.b_wins}/{s.ties}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// 成本/性能相对差异：以 A 均值为基线，画 B 相对 A 的均值偏移 %。用相对 % 把量纲天差地别的指标
+// （万级 token vs 个位工具调用）收进同一根轴，避免双轴虚构相关性。越低越省 → positive 绿，越高 → negative 红。
+// 仅纳入「越低越好」的资源/性能指标；缓存命中率语义相反，仍只在表格呈现。
+function CostDeltaChart({ rows }: { rows: Array<{ label: string; pct: number }> }) {
+  if (rows.length === 0) return null
+  return (
+    <ResponsiveContainer width="100%" height={rows.length * 34 + 44}>
+      <BarChart data={rows} layout="vertical" margin={{ top: 4, right: 44, left: 8, bottom: 4 }}>
+        <CartesianGrid horizontal={false} stroke={GRID_STROKE} />
+        <XAxis type="number" tick={{ fontSize: 10 }} tickFormatter={(v: number) => `${v > 0 ? '+' : ''}${v}%`} />
+        <YAxis type="category" dataKey="label" width={140} tick={{ fontSize: 10 }} />
+        <Tooltip
+          contentStyle={{ fontSize: 11, borderRadius: 6 }}
+          formatter={(v) => {
+            const n = typeof v === 'number' ? v : Number(v)
+            return [`${n > 0 ? '+' : ''}${n.toFixed(1)}%`, 'B 相对 A 均值']
+          }}
+        />
+        <Bar dataKey="pct" radius={[0, 3, 3, 0]} maxBarSize={16}>
+          {rows.map((r, i) => (
+            <Cell key={i} fill={r.pct > 0 ? 'rgb(var(--negative))' : 'rgb(var(--positive))'} />
+          ))}
+        </Bar>
+      </BarChart>
+    </ResponsiveContainer>
+  )
+}
+
+// 双模资源对照按各指标独立统计覆盖数；缺失字段保持缺失，不按 0 填充。
+function ComparativeCostCards({ items, modelA, modelB }: {
+  items: EvalResultRow[]
+  modelA: string
+  modelB: string
+}) {
+  const aggregate = aggregateComparativeResources(items)
+  const resourceKeys = Object.keys(comparativeResourceMetricLabels) as ComparativeResourceMetricKey[]
+  const performanceKeys = Object.keys(comparativePerformanceMetricLabels) as ComparativePerformanceMetricKey[]
+
+  // 差异图取「均值」维度的相对偏移%（B 相对 A）：资源与性能均属「越低越省」，同轴可比。
+  // 缓存命中率语义相反（越高越好）故排除，仍只在表格呈现。两侧均值缺失或 A=0 无法算百分比的跳过。
+  const deltaRows = [
+    ...resourceKeys.map(key => ({ label: comparativeResourceMetricLabels[key], pct: aggregate.resources[key].meanDelta.percent })),
+    ...performanceKeys.map(key => ({ label: comparativePerformanceMetricLabels[key], pct: aggregate.performance[key].meanDelta.percent })),
+  ]
+    .filter((r): r is { label: string; pct: number } => r.pct != null)
+    .map(r => ({ label: r.label, pct: r.pct * 100 }))
+
+  return (
+    <section className="card p-4 mb-5">
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <h3 className="page-eyebrow">资源成本 / 性能对照（A / B · 全部执行样例）</h3>
+        <span className="text-[10px] text-text-tertiary">共 {aggregate.totalRows} 条；n 为该指标实际有值的样例数</span>
+      </div>
+      {deltaRows.length > 0 && (
+        <div className="mb-4">
+          <div className="page-eyebrow mb-2">
+            B 相对 A 的均值差异（以 A 为基线；<span className="text-positive">绿=更省</span> / <span className="text-negative">红=更耗</span>）
+          </div>
+          <CostDeltaChart rows={deltaRows} />
+        </div>
+      )}
+      <div className="table-card overflow-x-auto">
+        <table className="table-base min-w-[980px]">
+          <thead>
+            <tr>
+              <th>指标</th>
+              <th className="text-right text-accent">A · {modelA} 总量</th>
+              <th className="text-right text-accent">A 均值</th>
+              <th className="text-right text-info">B · {modelB} 总量</th>
+              <th className="text-right text-info">B 均值</th>
+              <th className="text-right">Δ 总量（B-A）</th>
+              <th className="text-right">Δ 均值（B-A）</th>
+              <th className="text-right">覆盖 n（A/B）</th>
+            </tr>
+          </thead>
+          <tbody>
+            {resourceKeys.map(key => {
+              const metric = aggregate.resources[key]
+              return (
+                <tr key={key}>
+                  <td className="text-text-secondary">{comparativeResourceMetricLabels[key]}</td>
+                  <td className="text-right font-mono tabular-nums text-accent">{fmtMetric(metric.a.sum)}</td>
+                  <td className="text-right font-mono tabular-nums text-accent">{fmtMetric(metric.a.mean)}</td>
+                  <td className="text-right font-mono tabular-nums text-info">{fmtMetric(metric.b.sum)}</td>
+                  <td className="text-right font-mono tabular-nums text-info">{fmtMetric(metric.b.mean)}</td>
+                  <td className="text-right font-mono tabular-nums">{fmtDelta(metric.sumDelta.value, metric.sumDelta.percent)}</td>
+                  <td className="text-right font-mono tabular-nums">{fmtDelta(metric.meanDelta.value, metric.meanDelta.percent)}</td>
+                  <td className="text-right font-mono tabular-nums">{metric.a.n} / {metric.b.n}</td>
+                </tr>
+              )
+            })}
+            {performanceKeys.map(key => {
+              const metric = aggregate.performance[key]
+              return (
+                <tr key={key}>
+                  <td className="text-text-secondary">{comparativePerformanceMetricLabels[key]}</td>
+                  <td className="text-right text-text-tertiary">—</td>
+                  <td className="text-right font-mono tabular-nums text-accent">{fmtMetric(metric.a.mean, 'ms')}</td>
+                  <td className="text-right text-text-tertiary">—</td>
+                  <td className="text-right font-mono tabular-nums text-info">{fmtMetric(metric.b.mean, 'ms')}</td>
+                  <td className="text-right text-text-tertiary">—</td>
+                  <td className="text-right font-mono tabular-nums">{fmtDelta(metric.meanDelta.value, metric.meanDelta.percent, 'ms')}</td>
+                  <td className="text-right font-mono tabular-nums">{metric.a.n} / {metric.b.n}</td>
+                </tr>
+              )
+            })}
+            <tr>
+              <td className="text-text-secondary">缓存命中率（缓存命中 token / 输入 token）</td>
+              <td className="text-right text-text-tertiary">—</td>
+              <td className="text-right font-mono tabular-nums text-accent">{aggregate.cacheHitRate.a.value == null ? '—' : `${(aggregate.cacheHitRate.a.value * 100).toFixed(1)}%`}</td>
+              <td className="text-right text-text-tertiary">—</td>
+              <td className="text-right font-mono tabular-nums text-info">{aggregate.cacheHitRate.b.value == null ? '—' : `${(aggregate.cacheHitRate.b.value * 100).toFixed(1)}%`}</td>
+              <td className="text-right text-text-tertiary">—</td>
+              <td className="text-right font-mono tabular-nums">{aggregate.cacheHitRate.delta.value == null ? '—' : `${aggregate.cacheHitRate.delta.value > 0 ? '+' : ''}${(aggregate.cacheHitRate.delta.value * 100).toFixed(1)} 个百分点`}</td>
+              <td className="text-right font-mono tabular-nums">{aggregate.cacheHitRate.a.promptN}/{aggregate.cacheHitRate.a.cacheReadN} · {aggregate.cacheHitRate.b.promptN}/{aggregate.cacheHitRate.b.cacheReadN}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  )
+}
+
+// 逐样例对比明细：A/B 回复只展示一次，各 evaluator 的裁决彼此隔离。
+function VerdictDimensionsTable({ verdict }: { verdict: ComparisonVerdict }) {
+  if (!verdict.dimensions || verdict.dimensions.length === 0) return null
+  return (
+    <div className="table-card">
+      <table className="table-base">
+        <thead><tr>
+          <th>维度</th><th className="w-20 text-right text-accent">A 分</th>
+          <th className="w-20 text-right text-info">B 分</th><th className="w-16 text-center">胜方</th><th>理由</th>
+        </tr></thead>
+        <tbody>{verdict.dimensions.map((d, i) => (
+          <tr key={`${d.name}-${i}`}>
+            <td className="font-medium">{d.name}</td>
+            <td className="text-right tabular-nums text-accent">{d.score_a.toFixed(2)}</td>
+            <td className="text-right tabular-nums text-info">{d.score_b.toFixed(2)}</td>
+            <td className="text-center"><WinnerBadge winner={d.winner} /></td>
+            <td className="text-[11px] text-text-secondary">{d.reason || '—'}</td>
+          </tr>
+        ))}</tbody>
+      </table>
+    </div>
+  )
+}
+
+// 渲染单个 scope（某一轮 or 会话级）的对比结论：失败提示 + 维度表 + 综述。
+function ScopedVerdictBody({ verdict, status, error }: {
+  verdict: ComparisonVerdict | null; status: string; error?: string | null
+}) {
+  return (
+    <>
+      {status === 'skipped' && (
+        <div className="text-[11px] text-text-tertiary mb-2">{error || '该轮回复空白，已跳过评估'}</div>
+      )}
+      {status !== 'scored' && status !== 'skipped' && (
+        <div className="text-[11px] text-negative mb-2">评分失败：{error || status}</div>
+      )}
+      {verdict && <VerdictDimensionsTable verdict={verdict} />}
+      {verdict?.reasoning && (
+        <p className="text-[12px] text-text-secondary leading-relaxed mt-2">{verdict.reasoning}</p>
+      )}
+      {!verdict && status === 'scored' && (
+        <div className="text-[11px] text-text-tertiary">本 scope 无维度结论。</div>
+      )}
+    </>
+  )
+}
+
+function ComparisonMessageBubble({ role, side, text }: {
+  role: 'user' | 'assistant'; side?: 'A' | 'B'; text: string
+}) {
+  const isUser = role === 'user'
+  const labelTone = side === 'A' ? 'text-accent' : side === 'B' ? 'text-info' : 'text-text-tertiary'
+  return (
+    <div className={isUser ? 'flex flex-col items-end' : 'flex flex-col items-start'}>
+      <div className={`max-w-[85%] rounded-lg px-3 py-2 ${
+        isUser ? 'bg-accent/10 border border-accent/20' : 'bg-fill/5 border border-border'
+      }`}>
+        <div className={`text-[10px] uppercase tracking-wide mb-1 ${labelTone}`}>
+          {isUser ? '用户' : `助手 ${side}`}
+        </div>
+        <div className="text-[12px] text-text-primary">
+          <MarkdownView text={text} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 多轮对比的逐轮回答区：A/B 按 turn_index 的有序并集对齐，缺侧显示占位。
+function MultiTurnAnswers({ row, comparison }: { row: EvalResultRow; comparison: Comparison }) {
+  const aTurns = row.full_trace?.conversation?.turns ?? []
+  const bTurns = comparison.agent_b?.conversation?.turns ?? []
+  const aByIndex = new Map(aTurns.map(turn => [turn.turn_index, turn] as const))
+  const bByIndex = new Map(bTurns.map(turn => [turn.turn_index, turn] as const))
+  const turnIndexes = Array.from(new Set([...aByIndex.keys(), ...bByIndex.keys()]))
+    .sort((a, b) => a - b)
+
+  if (turnIndexes.length === 0) {
+    return (
+      <div className="grid grid-cols-2 gap-3">
+        <ComparisonMessageBubble role="assistant" side="A" text={row.actual_output || '（无输出）'} />
+        <ComparisonMessageBubble role="assistant" side="B" text={comparison.agent_b?.output || '（无输出）'} />
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-3">
+      {turnIndexes.map(turnIndex => {
+        const aTurn = aByIndex.get(turnIndex)
+        const bTurn = bByIndex.get(turnIndex)
+        const user = aTurn?.user ?? bTurn?.user ?? ''
+        return (
+          <div key={turnIndex} className="rounded-lg border border-border p-3 space-y-3">
+            <div className="text-[11px] font-medium text-text-secondary">第 {turnIndex + 1} 轮</div>
+            {user && <ComparisonMessageBubble role="user" text={user} />}
+            <div className="grid grid-cols-2 gap-3">
+              <ComparisonMessageBubble
+                role="assistant"
+                side="A"
+                text={aTurn ? (aTurn.assistant || '（无输出）') : '（该侧无此轮）'}
+              />
+              <ComparisonMessageBubble
+                role="assistant"
+                side="B"
+                text={bTurn ? (bTurn.assistant || '（无输出）') : '（该侧无此轮）'}
+              />
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function ComparisonDetail({ row, comparison }: { row: EvalResultRow; comparison: Comparison }) {
+  const b = comparison.agent_b
+  const verdicts = normalizeComparisonVerdicts(comparison)
+  const multiTurn = isMultiTurnComparison(comparison)
+  return (
+    <div className="space-y-4">
+      {comparison.position_swapped && (
+        <div className="text-[10px] text-text-tertiary" title="本样例在送评时随机交换了 A/B 呈现顺序，结论已还原到真实 A/B">
+          已消除位置偏见：送评顺序曾随机交换，以下结论均已还原到真实 A/B。
+        </div>
+      )}
+
+      {multiTurn ? (
+        <MultiTurnAnswers row={row} comparison={comparison} />
+      ) : (
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <div className="field-label text-accent">回答 A</div>
+            <pre className="font-mono text-[11px] bg-accent/5 border border-accent/20 rounded-md p-2.5 max-h-[240px] overflow-y-auto whitespace-pre-wrap">
+              {row.actual_output || '（无输出）'}
+            </pre>
+          </div>
+          <div>
+            <div className="field-label text-info">回答 B</div>
+            <pre className="font-mono text-[11px] bg-info/5 border border-info/20 rounded-md p-2.5 max-h-[240px] overflow-y-auto whitespace-pre-wrap">
+              {b?.output || '（无输出）'}
+            </pre>
+          </div>
+        </div>
+      )}
+
+      {verdicts.length === 0 && (
+        <div className="text-[12px] text-text-tertiary">本样例暂无 evaluator 裁决。</div>
+      )}
+      {verdicts.map(entry => {
+        const group = multiTurn ? groupScopedVerdicts(entry) : null
+        const scoped = group && (group.turns.length > 0 || group.conversation)
+        return (
+          <section key={entry.evaluatorKey} className="rounded-lg border border-border p-3">
+            <div className="flex items-start justify-between gap-3 mb-3">
+              <div>
+                <div className="font-medium text-[12px]">{evaluatorDisplayName(entry)}</div>
+                {!entry.legacy && entry.tag && entry.tag !== entry.label && (
+                  <div className="font-mono text-[10px] text-text-tertiary mt-0.5">{entry.tag}</div>
+                )}
+                {entry.legacy && (
+                  <div className="text-[10px] text-warning mt-1">旧数据未保留 evaluator 身份，无法恢复归属。</div>
+                )}
+              </div>
+              {!multiTurn && entry.verdict && <WinnerBadge winner={entry.verdict.overall_winner} size="md" />}
+            </div>
+            {entry.status !== 'scored' && (
+              <div className="text-[11px] text-negative mb-2">评分失败：{entry.error || entry.status}</div>
+            )}
+
+            {scoped ? (
+              <div className="space-y-3">
+                {group!.turns.map((sv, ti) => (
+                  <div key={`turn-${sv.turn_index ?? ti}`} className="rounded-md border border-border/60 p-2.5">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-[11px] font-medium text-text-secondary">第 {(sv.turn_index ?? ti) + 1} 轮</div>
+                      {sv.verdict && <WinnerBadge winner={sv.verdict.overall_winner} />}
+                    </div>
+                    <ScopedVerdictBody verdict={sv.verdict} status={sv.status} error={sv.error} />
+                  </div>
+                ))}
+                {group!.conversation && (
+                  <div className="rounded-md border border-accent/30 bg-accent/5 p-2.5">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="text-[11px] font-medium text-accent">会话级综合</div>
+                      {group!.conversation.verdict && <WinnerBadge winner={group!.conversation.verdict.overall_winner} size="md" />}
+                    </div>
+                    <ScopedVerdictBody verdict={group!.conversation.verdict} status={group!.conversation.status} error={group!.conversation.error} />
+                  </div>
+                )}
+              </div>
+            ) : (
+              <>
+                {entry.verdict && <VerdictDimensionsTable verdict={entry.verdict} />}
+                {entry.verdict?.reasoning && (
+                  <p className="text-[12px] text-text-secondary leading-relaxed mt-3">{entry.verdict.reasoning}</p>
+                )}
+              </>
+            )}
+          </section>
+        )
+      })}
+
+      {Array.isArray(b?.cot_steps) && b.cot_steps.length > 0 && (
+        <div>
+          <div className="field-label text-info">B 思维链（{b.cot_steps.length} 步）</div>
+          <CotTimeline steps={b.cot_steps as never} />
+        </div>
+      )}
+    </div>
+  )
+}
 
 export default function EvaluationRunDetailPage() {
   const { runId } = useParams<{ runId: string }>()
@@ -119,7 +832,8 @@ export default function EvaluationRunDetailPage() {
       </div>
     )
   }
-
+  const isComparative = run.eval_mode === 'comparative'
+  const comparisonSummaries = normalizeComparisonSummary(run.summary_scores?.comparison_summary)
   const facts = deriveFacts(run.summary_scores ?? run)
   const acceptance = deriveAcceptance(run.summary_scores ?? run)
   // 按评估器聚合（折叠 .turnN / .conversation）。后端新 run 已折叠，这里再折一次
@@ -249,7 +963,7 @@ export default function EvaluationRunDetailPage() {
             size="sm"
             loading={rescoreMutation.isPending}
             onClick={() => rescoreMutation.mutate()}
-            title="对评分未出全的样例（evaluation_error）复用已存回答，只补缺失维度的 judge 打分"
+            title="对评分未出全的样例（evaluation_error）复用已存回答，只补缺失维度的 judge 打分（含对比模式）"
           >
             补评缺分维度
           </Button>
@@ -288,12 +1002,22 @@ export default function EvaluationRunDetailPage() {
         </div>
       )}
 
-      {rescoreMutation.data && (
+      {rescoreStatusQuery.data?.status === 'running' && (
         <div className="mb-3 text-[12px] text-text-secondary border border-border bg-fill/5 rounded-md px-3 py-2">
-          已补评：扫描 {rescoreMutation.data.results_scanned} 条缺分样例，
-          补回维度 {rescoreMutation.data.dimensions_recovered} 个，
-          恢复完整 {rescoreMutation.data.results_completed} 条
-          {rescoreMutation.data.results_still_missing > 0 ? `，仍缺 ${rescoreMutation.data.results_still_missing} 条（上游 judge 仍未出分，可稍后再点）` : ''}
+          补评进行中…逐个失败样例串行重打 judge，大批量可能需几分钟，完成后自动刷新。
+        </div>
+      )}
+      {rescoreStatusQuery.data?.status === 'completed' && (
+        <div className="mb-3 text-[12px] text-positive border border-border bg-fill/5 rounded-md px-3 py-2">
+          已补评：扫描 {rescoreStatusQuery.data.results_scanned ?? 0} 条缺分样例，
+          补回维度 {rescoreStatusQuery.data.dimensions_recovered ?? 0} 个，
+          恢复完整 {rescoreStatusQuery.data.results_completed ?? 0} 条
+          {(rescoreStatusQuery.data.results_still_missing ?? 0) > 0 ? `，仍缺 ${rescoreStatusQuery.data.results_still_missing} 条（上游 judge 仍未出分，可稍后再点）` : ''}
+        </div>
+      )}
+      {rescoreStatusQuery.data?.status === 'error' && (
+        <div className="mb-3 text-[12px] text-negative border border-border bg-fill/5 rounded-md px-3 py-2">
+          补评失败：{rescoreStatusQuery.data.error}
         </div>
       )}
       {rescoreMutation.isError && (
@@ -319,36 +1043,49 @@ export default function EvaluationRunDetailPage() {
         </section>
       )}
 
-      <section className="grid grid-cols-4 gap-3 mb-5">
-        <MetaCard label="总数" value={facts.total || run.progress.total || '—'} />
-        <MetaCard
-          label="Agent 执行"
-          value={facts.execution_success}
-          hint={`成功 · 异常 ${facts.execution_abnormal}`}
-        />
-        <MetaCard
-          label="Judge 评分"
-          value={facts.evaluation_completed}
-          hint={`完成 · 跳过 ${facts.skipped}`}
-        />
-        <MetaCard label="启动 → 完成" value={fmtDuration(run.started_at, run.finished_at)} />
-      </section>
 
-      <section className="card p-4 mb-5">
-        <h3 className="page-eyebrow mb-2">Agent 配置</h3>
-        <div className="grid grid-cols-3 gap-3 text-[12px]">
-          <KV k="Type" v={(run.agent_config as { type?: string }).type ?? '—'} />
-          <KV k="Model" v={(run.agent_config as { model?: string }).model ?? '—'} />
-          <KV k="URL" v={(run.agent_config as { url?: string }).url ?? '—'} mono />
-        </div>
-        <details className="mt-3">
-          <summary className="text-[11px] text-text-secondary cursor-pointer">原始配置 / evaluators</summary>
-          <div className="grid grid-cols-2 gap-3 mt-2">
-            <JsonBlock label="agent_config" data={run.agent_config} />
-            <JsonBlock label="evaluator_configs" data={run.evaluator_configs} />
+      {isComparative ? (
+        <ComparativeHeader
+          run={run}
+          summaries={comparisonSummaries}
+          answerCounts={run.summary_scores?.comparison_summary?.answer_counts ?? undefined}
+        />
+      ) : (
+        <section className="grid grid-cols-4 gap-3 mb-5">
+          <MetaCard label="总数" value={facts.total || run.progress.total || '—'} />
+          <MetaCard
+            label="Agent 执行"
+            value={facts.execution_success}
+            hint={`成功 · 异常 ${facts.execution_abnormal}`}
+          />
+          <MetaCard
+            label="Judge 评分"
+            value={facts.evaluation_completed}
+            hint={`完成 · 跳过 ${facts.skipped}`}
+          />
+          <MetaCard label="启动 → 完成" value={fmtDuration(run.started_at, run.finished_at)} />
+        </section>
+      )}
+
+      {isComparative ? (
+        <ComparativeAgentConfig run={run} />
+      ) : (
+        <section className="card p-4 mb-5">
+          <h3 className="page-eyebrow mb-2">Agent 配置</h3>
+          <div className="grid grid-cols-3 gap-3 text-[12px]">
+            <KV k="Type" v={(run.agent_config as { type?: string }).type ?? '—'} />
+            <KV k="Model" v={(run.agent_config as { model?: string }).model ?? '—'} />
+            <KV k="URL" v={(run.agent_config as { url?: string }).url ?? '—'} mono />
           </div>
-        </details>
-      </section>
+          <details className="mt-3">
+            <summary className="text-[11px] text-text-secondary cursor-pointer">原始配置 / evaluators</summary>
+            <div className="grid grid-cols-2 gap-3 mt-2">
+              <JsonBlock label="agent_config" data={run.agent_config} />
+              <JsonBlock label="evaluator_configs" data={run.evaluator_configs} />
+            </div>
+          </details>
+        </section>
+      )}
 
       <section className="card p-4 mb-5">
         <h3 className="page-eyebrow mb-2">调用轨迹（LangSmith Project）</h3>
@@ -422,7 +1159,8 @@ export default function EvaluationRunDetailPage() {
         )}
       </section>
 
-      {Object.keys(dimAvg).length > 0 && (
+      {/* 单模维度平均分：对比 run 无 dimension_averages，隐藏避免误导。 */}
+      {!isComparative && Object.keys(dimAvg).length > 0 && (
         <section className="card p-4 mb-5">
           <h3 className="page-eyebrow mb-3">维度平均分（0-1）</h3>
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
@@ -471,7 +1209,8 @@ export default function EvaluationRunDetailPage() {
         </section>
       )}
 
-      {latencyBars.length > 0 && (
+      {/* 单模延迟分布：对比 run 的 A/B 延迟拆分放入逐样例表与抽屉，这里隐藏。 */}
+      {!isComparative && latencyBars.length > 0 && (
         <section className="card p-4 mb-5">
           <h3 className="page-eyebrow mb-3">延迟分布（按样例 · ms）</h3>
           <ResponsiveContainer width="100%" height={220}>
@@ -498,19 +1237,30 @@ export default function EvaluationRunDetailPage() {
         </section>
       )}
 
-      <ReportSection
-        dimAvg={dimAvg}
-        radarData={radarData}
-        scoreDistribution={scoreDistribution}
-        toolUsage={toolUsage}
-        facts={facts}
-        acceptance={acceptance}
-      />
+      {/* 单模维度得分/雷达：对比 run 无 dimension_averages，隐藏避免误导。 */}
+      {!isComparative && (
+        <ReportSection
+          dimAvg={dimAvg}
+          radarData={radarData}
+          scoreDistribution={scoreDistribution}
+          toolUsage={toolUsage}
+          facts={facts}
+          acceptance={acceptance}
+        />
+      )}
 
-      <section className="grid grid-cols-2 gap-3 mb-5">
-        <CostCard title="评分样例的成本" data={costScored} />
-        <CostCard title="执行异常样例的成本" data={costAbnormal} />
-      </section>
+      {isComparative ? (
+        <ComparativeCostCards
+          items={allItems}
+          modelA={modelInfo(run.agent_config, 'A').name}
+          modelB={modelInfo(run.agent_config_b, 'B').name}
+        />
+      ) : (
+        <section className="grid grid-cols-2 gap-3 mb-5">
+          <CostCard title="评分样例的成本" data={costScored} />
+          <CostCard title="执行异常样例的成本" data={costAbnormal} />
+        </section>
+      )}
 
       <RetryStatsCard stats={run.summary_scores?.retry_stats} />
 
@@ -597,35 +1347,49 @@ export default function EvaluationRunDetailPage() {
         <div className="table-card">
           <table className="table-base">
             <thead>
-              <tr>
-                <th>样例</th>
-                <th>问题</th>
-                <th className="w-28">状态</th>
-                <th className="w-20">时延</th>
-                <th className="w-24">输入 token</th>
-                <th className="w-24">输出 token</th>
-                <th className="w-24">缓存命中</th>
-                <th className="w-16">工具</th>
-                <th className="w-16">重试</th>
-                <th>分数</th>
-                <th className="w-24">追踪</th>
-              </tr>
+              {isComparative ? (
+                <tr>
+                  <th>样例</th>
+                  <th>问题</th>
+                  <th className="w-28">状态</th>
+                  <th className="w-20 text-center">胜方</th>
+                  <th className="w-20 text-right text-accent">A 时延</th>
+                  <th className="w-20 text-right text-info">B 时延</th>
+                  <th className="w-28">维度分 (A / B)</th>
+                  <th className="w-24">追踪</th>
+                </tr>
+              ) : (
+                <tr>
+                  <th>样例</th>
+                  <th>问题</th>
+                  <th className="w-28">状态</th>
+                  <th className="w-20">时延</th>
+                  <th className="w-24">输入 token</th>
+                  <th className="w-24">输出 token</th>
+                  <th className="w-24">缓存命中</th>
+                  <th className="w-16">工具</th>
+                  <th className="w-16">重试</th>
+                  <th>分数</th>
+                  <th className="w-24">追踪</th>
+                </tr>
+              )}
             </thead>
             <tbody>
               {resultsQuery.isLoading && (
-                <tr><td colSpan={11} className="empty-state">加载中…</td></tr>
+                <tr><td colSpan={isComparative ? 8 : 11} className="empty-state">加载中…</td></tr>
               )}
               {items.map((r: EvalResultRow) => (
                 <ResultRow
                   key={r.id}
                   row={r}
                   langfuseHost={langfuseHost}
+                  comparative={isComparative}
                   selected={r.id === selectedRowId}
                   onSelect={() => setSelectedRowId(r.id)}
                 />
               ))}
               {items.length === 0 && !resultsQuery.isLoading && (
-                <tr><td colSpan={11} className="empty-state">
+                <tr><td colSpan={isComparative ? 8 : 11} className="empty-state">
                   {filterActive
                     ? '没有符合筛选条件的样例。'
                     : run.status === 'running' ? '还没产出样例结果…' : '没有样例结果'}
@@ -742,12 +1506,77 @@ function ScoreCell({ scores }: { scores: Record<string, number> }) {
 }
 
 
-function ResultRow({ row, langfuseHost, selected, onSelect }: {
+function ResultRow({ row, langfuseHost, selected, onSelect, comparative }: {
   row: EvalResultRow
   langfuseHost: string | null
   selected: boolean
   onSelect: () => void
+  comparative?: boolean
 }) {
+  const trace = row.langsmith_run_id ? (
+    <span className="text-[11px] font-mono text-accent">{row.langsmith_run_id.slice(0, 8)}</span>
+  ) : row.langfuse_trace_id && langfuseHost ? (
+    <a
+      href={`${langfuseHost}/trace/${row.langfuse_trace_id}`}
+      target="_blank" rel="noreferrer"
+      onClick={e => e.stopPropagation()}
+      className="text-[11px] text-accent hover:text-accent-hover font-mono transition-colors"
+    >
+      {row.langfuse_trace_id.slice(0, 8)} ↗
+    </a>
+  ) : '—'
+
+  if (comparative) {
+    const verdicts = normalizeComparisonVerdicts(row.comparison)
+    const b = row.comparison?.agent_b
+    return (
+      <tr onClick={onSelect} className={`cursor-pointer ${selected ? 'bg-accent/5' : ''}`}>
+        <td className="font-mono text-[11px]">{row.benchmark_case_id?.slice(0, 8) ?? row.id.slice(0, 8)}</td>
+        <td>
+          <div className="max-w-[240px] truncate" title={row.question || ''}>
+            {row.question || '—'}
+          </div>
+        </td>
+        <td><RunStatusBadge status={row.status} /></td>
+        <td>
+          {verdicts.length > 0 ? (
+            <div className="flex flex-col items-start gap-1">
+              {verdicts.map(entry => (
+                <div key={entry.evaluatorKey} className="flex items-center gap-1 max-w-[180px]" title={evaluatorDisplayName(entry)}>
+                  <span className="truncate text-[10px] text-text-tertiary">{evaluatorDisplayName(entry)}</span>
+                  {entry.verdict
+                    ? <WinnerBadge winner={entry.verdict.overall_winner} />
+                    : <span className="text-[10px] text-negative">评分失败</span>}
+                </div>
+              ))}
+            </div>
+          ) : <span className="text-text-tertiary text-[11px]">—</span>}
+        </td>
+        <td className="tabular-nums text-right text-accent">{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</td>
+        <td className="tabular-nums text-right text-info">{b?.latency_ms != null ? `${b.latency_ms}ms` : '—'}</td>
+        <td className="text-[11px] tabular-nums">
+          {verdicts.some(entry => entry.verdict) ? (
+            <div className="flex flex-col gap-1">
+              {verdicts.filter(entry => entry.verdict).map(entry => {
+                const dims = entry.verdict?.dimensions ?? []
+                const first = dims[0]
+                return first ? (
+                  <span key={entry.evaluatorKey} title={`${evaluatorDisplayName(entry)}\n${dims.map(d => `${d.name}: A ${d.score_a.toFixed(2)} / B ${d.score_b.toFixed(2)}`).join('\n')}`}>
+                    <span className="text-accent">{first.score_a.toFixed(2)}</span>
+                    <span className="text-text-tertiary"> / </span>
+                    <span className="text-info">{first.score_b.toFixed(2)}</span>
+                    {dims.length > 1 && <span className="text-text-tertiary"> +{dims.length - 1}</span>}
+                  </span>
+                ) : null
+              })}
+            </div>
+          ) : <span className="text-text-tertiary">—</span>}
+        </td>
+        <td>{trace}</td>
+      </tr>
+    )
+  }
+
   return (
     <tr
       onClick={onSelect}
@@ -784,20 +1613,7 @@ function ResultRow({ row, langfuseHost, selected, onSelect }: {
       <td>
         <ScoreCell scores={row.scores} />
       </td>
-      <td>
-        {row.langsmith_run_id ? (
-          <span className="text-[11px] font-mono text-accent">{row.langsmith_run_id.slice(0, 8)}</span>
-        ) : row.langfuse_trace_id && langfuseHost ? (
-          <a
-            href={`${langfuseHost}/trace/${row.langfuse_trace_id}`}
-            target="_blank" rel="noreferrer"
-            onClick={e => e.stopPropagation()}
-            className="text-[11px] text-accent hover:text-accent-hover font-mono transition-colors"
-          >
-            {row.langfuse_trace_id.slice(0, 8)} ↗
-          </a>
-        ) : '—'}
-      </td>
+      <td>{trace}</td>
     </tr>
   )
 }
@@ -869,7 +1685,7 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
         </div>
       </div>
 
-      {scoreEntries.length > 0 && (
+      {!row.comparison && scoreEntries.length > 0 && (
         <div className="mb-4">
           <div className="field-label">评分</div>
           <div className="flex flex-wrap gap-1">
@@ -891,7 +1707,10 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
         </div>
       )}
 
-      {row.full_trace?.conversation ? (
+      {/* 双模对比：A/B 并排回复 + 逐维度对比。对比 run 走此分支，替代单份输出。 */}
+      {row.comparison ? (
+        <ComparisonDetail row={row} comparison={row.comparison} />
+      ) : row.full_trace?.conversation ? (
         <div className="mb-3">
           <div className="field-label">多轮对话回放</div>
           <ConversationResultView
@@ -918,14 +1737,14 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
         </div>
       )}
 
-      {Array.isArray(row.full_trace?.steps) && row.full_trace!.steps!.length > 0 && (
+      {!row.comparison && Array.isArray(row.full_trace?.steps) && row.full_trace!.steps!.length > 0 && (
         <div className="mb-3">
           <div className="field-label">思维链 ({row.full_trace!.steps!.length} 步)</div>
           <CotTimeline steps={row.full_trace!.steps!} />
         </div>
       )}
 
-      {Array.isArray(row.actual_tool_calls) && row.actual_tool_calls.length > 0 && (
+      {!row.comparison && Array.isArray(row.actual_tool_calls) && row.actual_tool_calls.length > 0 && (
         <div className="mb-3">
           <div className="field-label">工具调用 ({row.actual_tool_calls.length})</div>
           <ToolCallsTable calls={row.actual_tool_calls as Array<Record<string, unknown>>} />

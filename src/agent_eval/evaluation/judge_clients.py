@@ -395,6 +395,22 @@ class AgentSSEJudgeClient(_BaseJudgeClient):
         "不要输出任何额外文字、解释或 Markdown 代码围栏。"
     )
 
+    # 对比模式契约：judge 要同时对 A/B 两份回复逐维度打分并判胜负，输出结构与
+    # 单分数契约不同——附加此契约才不会与 comparative output_prompt 冲突。
+    _COMPARATIVE_JSON_CONTRACT = (
+        "\n\n---\n"
+        "【输出要求（务必遵守）】你现在是对比评分器，不是问答助手。"
+        "不要解答上面的问题本身，只需对「回答 A」和「回答 B」逐维度对比打分并判胜负。"
+        "最终必须只输出一个 JSON 对象，形如 "
+        '{"dimensions": [{"name": "<维度名>", "score_a": <0到1数值>, '
+        '"score_b": <0到1数值>, "winner": "A|B|tie", "reason": "<简短理由>"}], '
+        '"overall_winner": "A|B|tie", "reasoning": "<整体结论>"}，'
+        "不要输出任何额外文字、解释或 Markdown 代码围栏。"
+    )
+
+    # 评分模式，由 build_judge_client 注入：'single'（默认）| 'comparative'。
+    mode: str = "single"
+
     def _flatten_question(self, messages: list[dict[str, Any]]) -> str:
         system_parts: list[str] = []
         user_parts: list[str] = []
@@ -413,7 +429,12 @@ class AgentSSEJudgeClient(_BaseJudgeClient):
             combined = f"{system}\n\n{user}"
         else:
             combined = system or user
-        return f"{combined}{self._JSON_CONTRACT}"
+        contract = (
+            self._COMPARATIVE_JSON_CONTRACT
+            if self.mode == "comparative"
+            else self._JSON_CONTRACT
+        )
+        return f"{combined}{contract}"
 
     async def ainvoke(self, messages: list[dict[str, Any]]) -> JudgeInvocation:
         # Import here to avoid a module-level cycle (agent_adapter is a
@@ -506,6 +527,7 @@ def build_judge_client(
     temperature: float = 0.0,
     max_tokens: int = 1024,
     timeout: float = 60.0,
+    mode: str = "single",
 ) -> _BaseJudgeClient:
     """Construct an async judge client from a saved provider record.
 
@@ -537,7 +559,7 @@ def build_judge_client(
 
     api_key = decrypt_secret(provider.api_key_encrypted) if provider.api_key_encrypted else None
 
-    return cls(
+    client = cls(
         base_url=provider.base_url,
         api_key=api_key,
         model=resolved_model,
@@ -546,3 +568,7 @@ def build_judge_client(
         timeout=timeout,
         extra_config=provider.extra_config or {},
     )
+    # 评分模式仅 AgentSSE client 用来选择追加的输出契约（single/comparative）；
+    # 其它 dialect 只透传消息文本，忽略该属性。
+    client.mode = mode
+    return client

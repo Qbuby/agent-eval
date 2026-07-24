@@ -1,8 +1,10 @@
 """HTTP API for the evaluation workbench."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -48,9 +50,11 @@ from agent_eval.evaluation.acceptance import (
     project_stored_summary,
     validate_acceptance_policy,
 )
+from agent_eval.evaluation.comparative import build_comparison_summary
 from agent_eval.evaluation.langfuse_runner import (
     BUILTIN_EVALUATORS,
     _aggregate_cost,
+    _validate_comparative_evaluator_specs,
     get_run_progress,
     request_stop,
     rerun_backfill,
@@ -281,10 +285,43 @@ async def resolve_eval_start_args(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # ── 3. 双模对比校验 ──
+    # comparative 模式：需第二个 agent，且对比不套 acceptance_policy；单轮/多轮均由 runner 逐样例分派。
+    eval_mode = (req.eval_mode or "single").lower()
+    agent_cfg_b = None
+    if eval_mode == "comparative":
+        if req.agent_b is None:
+            raise HTTPException(
+                status_code=400, detail="双模对比评估需要提供第二个待测 agent（agent_b）",
+            )
+        if policy is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="双模对比评估基于相对胜负，不使用验收策略（acceptance_policy）",
+            )
+        provider_rows: dict[str, Any] = {}
+        for spec in evaluator_specs:
+            provider_id = (spec.get("params") or {}).get("provider_id")
+            if not provider_id or provider_id in provider_rows:
+                continue
+            try:
+                provider_rows[provider_id] = await repo.get_evaluator_provider(
+                    uuid.UUID(str(provider_id))
+                )
+            except (TypeError, ValueError):
+                provider_rows[provider_id] = None
+        try:
+            _validate_comparative_evaluator_specs(evaluator_specs, provider_rows)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        agent_cfg_b = req.agent_b.model_dump()
+
     # start_run 的 kwargs（notify_open_ids 由调用方按触发来源另行注入）。
     return {
         "cases": cases,
         "agent_cfg": req.agent.model_dump(),
+        "agent_cfg_b": agent_cfg_b,
+        "eval_mode": eval_mode,
         "evaluator_specs": evaluator_specs,
         "acceptance_policy": policy,
         "concurrency": req.concurrency,
@@ -329,6 +366,8 @@ def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRun
         summary_scores=summary,
         facts=summary.get("facts") or {},
         acceptance=summary.get("acceptance") or {},
+        eval_mode=getattr(row, "eval_mode", None) or "single",
+        agent_config_b=getattr(row, "agent_config_b", None),
         progress=progress or {},
         created_at=row.created_at,
     )
@@ -441,12 +480,26 @@ async def get_run_results(
     items: list[EvalResultRow] = []
     for r in rows:
         scores = score_index.get(r.id, {})
-        projection = project_case(
-            stored_status=r.status,
-            error_type=r.error_type,
-            scores=scores,
-            acceptance_policy=acceptance_policy,
-        )
+        comparison = getattr(r, "comparison", None)
+        if comparison is not None:
+            # 对比样例不走 scores/acceptance 投影（相对胜负，非通过/失败）——
+            # 直接按行 status 映射执行/评分事实，acceptance_decision 恒 None。
+            projection = {
+                "execution_status": "abnormal" if r.status == "execution_error" else "success",
+                "evaluation_status": "completed" if r.status == "scored" else (
+                    "error" if r.status == "evaluation_error" else "unknown"
+                ),
+                "acceptance_decision": None,
+                "decision_source": "current",
+                "criterion_results": [],
+            }
+        else:
+            projection = project_case(
+                stored_status=r.status,
+                error_type=r.error_type,
+                scores=scores,
+                acceptance_policy=acceptance_policy,
+            )
         items.append(EvalResultRow(
             id=str(r.id),
             benchmark_case_id=str(r.benchmark_case_id) if r.benchmark_case_id else None,
@@ -457,6 +510,7 @@ async def get_run_results(
             acceptance_decision=projection["acceptance_decision"],
             decision_source=projection["decision_source"],
             criterion_results=projection["criterion_results"],
+            comparison=comparison,
             actual_output=r.actual_output,
             question=r.question,
             latency_ms=r.latency_ms,
@@ -988,6 +1042,47 @@ async def get_run_report(run_id: str):
         )
         run_name = run_row.langfuse_run_name or run_id[:8]
 
+        # 对比模式：逐行聚合 A/B 执行成本（token/时延/工具调用/尝试），塞进
+        # comparison_summary.perf 供报告层解读。A 侧=result 行本身，B 侧=
+        # comparison.agent_b——与前端 aggregateComparativeResources 同口径。
+        cmp_summary = (summary or {}).get("comparison_summary")
+        if isinstance(cmp_summary, dict) and cmp_summary.get("evaluators"):
+            from agent_eval.evaluation.comparative import aggregate_comparison_perf
+
+            rows = (await session.execute(
+                select(TestResultRow).where(TestResultRow.run_id == run_uuid)
+            )).scalars().all()
+            pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for r in rows:
+                cmp = r.comparison if isinstance(r.comparison, dict) else None
+                if cmp is None:
+                    continue
+                agent_b = cmp.get("agent_b") if isinstance(cmp.get("agent_b"), dict) else {}
+                a_side = {
+                    "total_tokens": r.total_tokens,
+                    "prompt_tokens": r.prompt_tokens,
+                    "completion_tokens": r.completion_tokens,
+                    "cache_read_tokens": r.cache_read_tokens,
+                    "latency_ms": r.latency_ms,
+                    "tool_call_count": r.tool_call_count,
+                    "attempts_made": r.attempts_made,
+                }
+                b_tc = agent_b.get("tool_calls")
+                b_side = {
+                    "total_tokens": agent_b.get("total_tokens"),
+                    "prompt_tokens": agent_b.get("prompt_tokens"),
+                    "completion_tokens": agent_b.get("completion_tokens"),
+                    "cache_read_tokens": agent_b.get("cache_read_tokens"),
+                    "latency_ms": agent_b.get("latency_ms"),
+                    "tool_call_count": len(b_tc) if isinstance(b_tc, list) else None,
+                    "attempts_made": agent_b.get("attempts_made"),
+                }
+                pairs.append((a_side, b_side))
+            if pairs:
+                perf = aggregate_comparison_perf(pairs)
+                if perf:
+                    cmp_summary["perf"] = perf
+
     report = await generate_run_report(summary, run_name=run_name)
     return {"run_id": run_id, "run_name": run_name, "report": report}
 
@@ -1084,26 +1179,77 @@ async def stop_run(run_id: str):
     return {"run_id": run_id, "status": "stopping"}
 
 
-@router.post("/runs/{run_id}/rescore")
-async def rescore_run(run_id: str):
-    """对已完成 run 里「缺分维度」补评。
+# ── 补评异步作业：内存态 job registry ──
+# 补评对失败样例逐个串行调真实 judge，大 run（数十个失败 scope）总耗时会超过
+# 网关/前端的同步请求超时（曾出现 68 个失败 scope → HTTP 504）。故改为后台任务：
+# POST /rescore 起 asyncio task 立即返回，前端轮询 GET /rescore-status。
+# 与 _RUN_REGISTRY 同为进程内单实例态（本项目单副本部署，够用）。
+_RESCORE_JOBS: dict[str, dict[str, Any]] = {}
 
-    复用已存的 agent 回答（不重跑 agent），只对评分缺失的维度
-    重打 judge；维度齐全的样例从 evaluation_error 恢复为 scored。
-    补评完成后复用 reaggregate 刷新汇总。
-    """
+
+async def _run_rescore_job(run_id: str) -> None:
+    """后台执行补评 + reaggregate，把进度/结果写进 _RESCORE_JOBS[run_id]。"""
+    job = _RESCORE_JOBS[run_id]
     try:
         stats = await rescore_missing_dimensions(run_id)
+        job.update(stats)
+        # 补评改了逐样例分数/状态，立即重算汇总使列表/详情页一致。
+        try:
+            await reaggregate_run(run_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("rescore: reaggregate after rescore failed for %s: %s", run_id, e)
+        job["status"] = "completed"
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        job["status"] = "error"
+        job["error"] = str(e)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"rescore failed: {e}") from e
-    # 补评改了逐样例分数/状态，立即重算汇总使列表/详情页一致。
+        logger.exception("rescore job crashed for %s", run_id)
+        job["status"] = "error"
+        job["error"] = f"rescore failed: {e}"
+    finally:
+        job["finished_at"] = time.time()
+
+
+@router.post("/runs/{run_id}/rescore")
+async def rescore_run(run_id: str):
+    """发起对已完成 run 的「缺分维度」补评（异步后台任务）。
+
+    复用已存的 agent 回答（不重跑 agent），只对评分缺失的维度重打 judge；
+    维度齐全的样例从 evaluation_error 恢复为 scored，完成后复用 reaggregate
+    刷新汇总。因逐个失败样例串行调真实 judge，大 run 耗时长，故起后台任务
+    立即返回 ``{status: "running"}``，前端轮询 ``/rescore-status`` 取结果。
+    """
     try:
-        await reaggregate_run(run_id)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("rescore: reaggregate after rescore failed for %s: %s", run_id, e)
-    return {"run_id": run_id, **stats}
+        run_uuid = uuid.UUID(run_id)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail="invalid run_id") from e
+    async with async_session_factory() as session:
+        exists = (await session.execute(
+            select(TestRunRow.id).where(TestRunRow.id == run_uuid)
+        )).scalar_one_or_none()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="run not found")
+
+    existing = _RESCORE_JOBS.get(run_id)
+    if existing and existing.get("status") == "running":
+        return {"run_id": run_id, "status": "running"}
+
+    _RESCORE_JOBS[run_id] = {
+        "run_id": run_id, "status": "running", "started_at": time.time(),
+        "results_scanned": 0, "dimensions_recovered": 0,
+        "results_completed": 0, "results_still_missing": 0,
+    }
+    asyncio.create_task(_run_rescore_job(run_id))
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.get("/runs/{run_id}/rescore-status")
+async def rescore_status(run_id: str):
+    """查询补评后台任务状态：running / completed / error / idle。"""
+    job = _RESCORE_JOBS.get(run_id)
+    if job is None:
+        return {"run_id": run_id, "status": "idle"}
+    return dict(job)
 
 
 @router.post("/runs/{run_id}/reaggregate")
@@ -1246,6 +1392,19 @@ async def reaggregate_run(run_id: str):
         else:
             merged.pop("cost_accepted", None)
             merged.pop("cost_not_accepted", None)
+
+        # Comparative runs do not write EvaluationScoreRow records. Rebuild their
+        # dedicated summary directly from the persisted comparison JSON payloads,
+        # supporting both evaluator_verdicts[] and the deprecated single verdict.
+        is_comparative = (
+            (getattr(run_row, "eval_mode", None) or "single") == "comparative"
+            or any(getattr(result, "comparison", None) is not None for result in results)
+        )
+        if is_comparative:
+            merged["comparison_summary"] = build_comparison_summary([
+                {"comparison": getattr(result, "comparison", None)}
+                for result in results
+            ])
 
         run_row.summary_scores = merged
         await session.commit()
@@ -1674,7 +1833,10 @@ async def dry_run_evaluator(evaluator_id: str, req: DryRunRequest):
     is in ``params['provider_id']``. This lets the user try an unsaved
     prompt against a different provider in one click.
     """
-    from agent_eval.evaluation.configurable_judge import run_configurable_judge
+    from agent_eval.evaluation.configurable_judge import (
+        run_comparative_judge,
+        run_configurable_judge,
+    )
 
     async with async_session_factory() as session:
         repo = Repository(session)
@@ -1697,6 +1859,31 @@ async def dry_run_evaluator(evaluator_id: str, req: DryRunRequest):
         provider_row = await repo.get_evaluator_provider(provider_uuid)
         if provider_row is None:
             raise HTTPException(status_code=404, detail="provider not found")
+
+    # 对比模式 dry-run：拿 output_a/output_b 走对比 judge，返回 verdict。
+    if (req.mode or "single") == "comparative":
+        cmp_result = await run_comparative_judge(
+            params=params,
+            provider=provider_row,
+            input_text=req.input,
+            output_a=req.output_a,
+            output_b=req.output_b,
+            expected_output=req.expected_output,
+            metadata=req.metadata,
+            evaluator_name=evaluator_row.name or "comparison",
+        )
+        return DryRunResponse(
+            verdict=cmp_result.verdict,
+            model=cmp_result.model,
+            usage={
+                "input_tokens": cmp_result.usage.input_tokens,
+                "output_tokens": cmp_result.usage.output_tokens,
+                "total_tokens": cmp_result.usage.total_tokens,
+            },
+            raw_content=cmp_result.raw_content,
+            rendered_messages=cmp_result.rendered_messages,
+            error=cmp_result.error,
+        )
 
     result = await run_configurable_judge(
         params=params,

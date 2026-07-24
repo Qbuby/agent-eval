@@ -190,3 +190,64 @@ def test_run_rule_bounds_are_validated():
     with pytest.raises(ValueError):
         validate_acceptance_policy(bad)
     assert math.isfinite(0.5)  # sanity
+
+
+def test_project_case_comparison_scored_is_completed():
+    """对比样例分数在 comparison JSONB、scores 为空——不应误判 skipped。"""
+    cmp = {
+        "evaluator_verdicts": [
+            {
+                "label": "幻觉率对比",
+                "status": "scored",
+                "scoped_verdicts": [
+                    {"scope": "turn", "turn_index": 0, "status": "scored",
+                     "verdict": {"overall_winner": "A"}},
+                ],
+            }
+        ]
+    }
+    out = project_case(
+        stored_status="scored", error_type=None, scores={}, comparison=cmp,
+    )
+    assert out["execution_status"] == "success"
+    assert out["evaluation_status"] == "completed"
+
+
+def test_project_case_comparison_all_error_is_error():
+    """对比样例全部 scoped verdict 失败——评分状态应为 error，而非 skipped。"""
+    cmp = {
+        "evaluator_verdicts": [
+            {
+                "label": "幻觉率对比",
+                "status": "evaluation_error",
+                "scoped_verdicts": [
+                    {"scope": "turn", "turn_index": 0, "status": "evaluation_error",
+                     "verdict": None, "error": "provider down"},
+                ],
+            }
+        ]
+    }
+    out = project_case(
+        stored_status="evaluation_error", error_type=None, scores={}, comparison=cmp,
+    )
+    assert out["evaluation_status"] == "error"
+
+
+def test_project_case_comparison_scoped_only_verdict_recognized():
+    """顶层 status 未标 scored，但存在 scoped scored verdict——仍应视为 completed。"""
+    cmp = {
+        "evaluator_verdicts": [
+            {
+                "label": "x",
+                "status": "scored",
+                "scoped_verdicts": [
+                    {"scope": "conversation", "turn_index": None, "status": "scored",
+                     "verdict": {"overall_winner": "tie"}},
+                ],
+            }
+        ]
+    }
+    out = project_case(
+        stored_status="scored", error_type=None, scores={}, comparison=cmp,
+    )
+    assert out["evaluation_status"] == "completed"

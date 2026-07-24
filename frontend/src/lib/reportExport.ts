@@ -9,48 +9,24 @@
 // - 图表用手写 SVG（雷达）/ div 宽度条（柱状），不引第三方库。
 // - 所有动态文本走 esc() 转义，杜绝注入。
 
+import type { EvalResultRow, EvalRunSummary } from '@/types'
 import { downloadBlob } from './download'
 import { collapseDimAvg, collapseScoreKey } from './dimensionCollapse'
 import {
   deriveFacts, deriveAcceptance, deriveCostScored,
   acceptancePassRateText, runDecisionLabel,
-  type EvalFacts, type EvalAcceptance,
 } from './evalSemantics'
+import {
+  aggregateComparativeResources,
+  comparativePerformanceMetricLabels,
+  comparativeResourceMetricLabels,
+  evaluatorDisplayName,
+  normalizeComparisonSummary,
+} from './comparativeMetrics'
 
-// ─────────────────────────────────────────────────────────────────────
-// 数据形态（与页面聚合结果对齐；只取报告需要的字段，容忍缺失）
-// ─────────────────────────────────────────────────────────────────────
-
-export interface ReportRun {
-  id: string
-  status: string
-  started_at?: string | null
-  finished_at?: string | null
-  langfuse_run_name?: string | null
-  langsmith_project?: string | null
-  summary_scores?: {
-    facts?: Partial<EvalFacts>
-    acceptance?: Partial<EvalAcceptance>
-    cost_scored?: Record<string, number | null>
-    cost_execution_abnormal?: Record<string, number | null>
-    counts?: { total?: number; passed?: number; failed?: number; unreachable?: number }
-    dimension_averages?: Record<string, number>
-    tool_usage?: Array<{ name: string; calls: number; errors: number; cases: number }>
-    cost_success?: Record<string, number | null>
-    cost_failure?: Record<string, number | null>
-  } | null
-}
-
-export interface ReportResultRow {
-  id: string
-  question?: string | null
-  status: string
-  latency_ms?: number | null
-  total_tokens?: number | null
-  tool_call_count?: number | null
-  error_message?: string | null
-  scores?: Record<string, number>
-}
+// 报告直接复用 API 正式类型，避免双模结构演进后出现第二套过期 DTO。
+export type ReportRun = EvalRunSummary
+export type ReportResultRow = EvalResultRow
 
 // 维度 key → 展示标签（调用方可传入 scoreSemantics 的 label；缺省用 key 本身）。
 export type DimLabel = (key: string) => string
@@ -395,6 +371,104 @@ export function buildRunReportHtml(
       <tbody>${rowsHtml}</tbody>
     </table>
   </section>` : ''
+
+  // 双模对比 run：每个 evaluator 独立展示，绝不把同名维度或胜负数跨 evaluator
+  // 相加。成本/性能直接从 A/B 执行快照聚合，judge 失败不影响资源统计。
+  if (run.eval_mode === 'comparative') {
+    const summaries = normalizeComparisonSummary(run.summary_scores?.comparison_summary)
+    const agentName = (cfg: unknown, fallback: string) => {
+      const c = (cfg ?? {}) as { model?: string; type?: string }
+      return c.model || c.type || fallback
+    }
+    const modelA = agentName(run.agent_config, 'A')
+    const modelB = agentName(run.agent_config_b, 'B')
+    const evaluatorBlocks = summaries.map(summary => {
+      const total = summary.scored || 0
+      const pct = (n: number) => total > 0 ? `${((n / total) * 100).toFixed(0)}%` : '—'
+      const winnerText = summary.a_wins === summary.b_wins
+        ? `${modelA} 与 ${modelB} 持平`
+        : summary.a_wins > summary.b_wins ? `${modelA} 胜出` : `${modelB} 胜出`
+      const perDimRows = Object.entries(summary.per_dimension ?? {})
+        .map(([dim, s]) => `<tr>
+          <td>${esc(dimLabel(dim))}</td>
+          <td class="num">${s.a_wins}</td>
+          <td class="num">${s.b_wins}</td>
+          <td class="num">${s.ties}</td>
+          <td class="num">${fmtNum(s.mean_a, 3)}</td>
+          <td class="num">${fmtNum(s.mean_b, 3)}</td>
+          <td class="num">${s.n}</td>
+        </tr>`)
+        .join('')
+      return `
+      <div style="border:1px solid var(--line);border-radius:8px;padding:14px;margin-top:12px">
+        <div class="kpis">
+          <div>
+            <strong>${esc(evaluatorDisplayName(summary))}</strong>
+            ${summary.legacy ? '<div class="muted">旧数据未保留 evaluator 身份，无法恢复归属。</div>' : ''}
+            <div class="muted">${esc(winnerText)} · 有效 ${summary.scored} · 评分失败 ${summary.evaluation_errors}</div>
+          </div>
+          <div class="kpi-grid" style="margin-left:auto">
+            <div class="kpi"><div class="v pos">${summary.a_wins}</div><div class="l">A 胜 · ${pct(summary.a_wins)}</div></div>
+            <div class="kpi"><div class="v">${summary.b_wins}</div><div class="l">B 胜 · ${pct(summary.b_wins)}</div></div>
+            <div class="kpi"><div class="v">${summary.ties}</div><div class="l">平 · ${pct(summary.ties)}</div></div>
+          </div>
+        </div>
+        ${perDimRows ? `<table style="margin-top:12px">
+          <thead><tr><th>评估维度</th><th class="num">A 胜</th><th class="num">B 胜</th><th class="num">平</th><th class="num">A 均分</th><th class="num">B 均分</th><th class="num">覆盖 n</th></tr></thead>
+          <tbody>${perDimRows}</tbody>
+        </table>` : ''}
+      </div>`
+    }).join('')
+    const cmpSection = `
+  <section class="card">
+    <h2>对比裁决（按评估器）</h2>
+    <div class="muted">A · ${esc(modelA)} / B · ${esc(modelB)} · ${summaries.length} 个评估器</div>
+    ${evaluatorBlocks || '<div class="muted" style="margin-top:12px">本次对比运行暂无汇总数据。</div>'}
+  </section>`
+
+    const aggregate = aggregateComparativeResources(items)
+    const fmtDelta = (value: number | null, percent: number | null, unit = '') => {
+      if (value == null) return '—'
+      const signed = `${value > 0 ? '+' : ''}${fmtNum(value)}${unit}`
+      return percent == null ? signed : `${signed} (${percent > 0 ? '+' : ''}${fmtPct(percent)})`
+    }
+    const resourceRows = (Object.keys(comparativeResourceMetricLabels) as Array<keyof typeof comparativeResourceMetricLabels>)
+      .map(key => {
+        const metric = aggregate.resources[key]
+        return `<tr><td>${esc(comparativeResourceMetricLabels[key])}</td>
+          <td class="num">${fmtNum(metric.a.sum)}</td><td class="num">${fmtNum(metric.a.mean)}</td>
+          <td class="num">${fmtNum(metric.b.sum)}</td><td class="num">${fmtNum(metric.b.mean)}</td>
+          <td class="num">${fmtDelta(metric.sumDelta.value, metric.sumDelta.percent)}</td>
+          <td class="num">${fmtDelta(metric.meanDelta.value, metric.meanDelta.percent)}</td>
+          <td class="num">${metric.a.n} / ${metric.b.n}</td></tr>`
+      }).join('')
+    const performanceRows = (Object.keys(comparativePerformanceMetricLabels) as Array<keyof typeof comparativePerformanceMetricLabels>)
+      .map(key => {
+        const metric = aggregate.performance[key]
+        return `<tr><td>${esc(comparativePerformanceMetricLabels[key])}</td>
+          <td class="num">—</td><td class="num">${fmtNum(metric.a.mean)}ms</td>
+          <td class="num">—</td><td class="num">${fmtNum(metric.b.mean)}ms</td>
+          <td class="num">—</td><td class="num">${fmtDelta(metric.meanDelta.value, metric.meanDelta.percent, 'ms')}</td>
+          <td class="num">${metric.a.n} / ${metric.b.n}</td></tr>`
+      }).join('')
+    const cache = aggregate.cacheHitRate
+    const cacheRow = `<tr><td>缓存命中率（命中 token / 输入 token）</td>
+      <td class="num">—</td><td class="num">${cache.a.value == null ? '—' : fmtPct(cache.a.value)}</td>
+      <td class="num">—</td><td class="num">${cache.b.value == null ? '—' : fmtPct(cache.b.value)}</td>
+      <td class="num">—</td><td class="num">${cache.delta.value == null ? '—' : `${cache.delta.value > 0 ? '+' : ''}${(cache.delta.value * 100).toFixed(1)} 个百分点`}</td>
+      <td class="num">${cache.a.promptN}/${cache.a.cacheReadN} · ${cache.b.promptN}/${cache.b.cacheReadN}</td></tr>`
+    const resourceSection = `
+  <section class="card">
+    <h2>资源成本 / 性能对照（全部执行样例）</h2>
+    <div class="muted">共 ${aggregate.totalRows} 条；缺失值不按 0 补齐，n 为各指标实际覆盖数。</div>
+    <table style="margin-top:12px">
+      <thead><tr><th>指标</th><th class="num">A 总量</th><th class="num">A 均值</th><th class="num">B 总量</th><th class="num">B 均值</th><th class="num">Δ 总量（B-A）</th><th class="num">Δ 均值（B-A）</th><th class="num">覆盖 n（A/B）</th></tr></thead>
+      <tbody>${resourceRows}${performanceRows}${cacheRow}</tbody>
+    </table>
+  </section>`
+
+    return htmlShell(title, header + overview + analysisSection(analysis) + cmpSection + resourceSection)
+  }
 
   return htmlShell(title, header + overview + analysisSection(analysis) + dimSection + toolSection + costSection + detailSection)
 }

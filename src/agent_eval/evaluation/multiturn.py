@@ -298,6 +298,10 @@ async def score_conversation(
             turn = turn_by_index.get(ti)
             if turn is None:
                 continue
+            # 空白轮跳过（用户决策，与双模对比路径一致）：该轮 assistant 回复
+            # strip 后为空 → 不送 judge、不产 score（自然不进聚合与平均）。
+            if not (turn.get("assistant") or "").strip():
+                continue
             criteria = te.get("criteria") or []
             expected = te.get("expected_output") or ""
             expected_tc = te.get("expected_tool_calls") or []

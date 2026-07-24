@@ -20,6 +20,7 @@ path below never calls dataset / score_trace unless that flag is set.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -31,6 +32,7 @@ from typing import Any
 import httpx
 from langfuse import Langfuse  # kept for optional remote write; unused otherwise
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from agent_eval.config import settings
 from agent_eval.db import async_session_factory
@@ -46,7 +48,16 @@ from agent_eval.evaluation.acceptance import (
     project_case,
     validate_acceptance_policy,
 )
-from agent_eval.evaluation.configurable_judge import run_configurable_judge
+from agent_eval.evaluation.configurable_judge import (
+    _MUSTACHE_RE,
+    run_comparative_judge,
+    run_configurable_judge,
+)
+from agent_eval.evaluation.comparative import (
+    build_comparison_summary,
+    pick_swap,
+    restore_verdict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -266,15 +277,79 @@ def _make_adapter(
     raise ValueError(f"unknown agent type: {t!r}")
 
 
-async def _resolve_judge_providers(specs: list[dict[str, Any]]) -> None:
-    """Mutate ``specs`` in place: for any ``configurable_judge`` evaluator
-    whose params reference a provider_id, fetch the EvaluatorProviderRow
-    once and stash it under ``_provider``. Subsequent per-case scoring then
-    reuses the row instead of round-tripping the DB on every sample.
+async def _validate_comparative_evaluator_specs(
+    specs: list[dict[str, Any]], repo: Repository,
+) -> None:
+    """Reject comparative configurations that cannot produce an A/B verdict.
 
-    Resolution failures are logged but non-fatal — the case-level loop
-    will detect ``_provider is None`` and skip the dimension instead of
-    crashing the whole run.
+    This runs before a test_run row/background task is created. Runtime judge failures
+    remain case-level ``evaluation_error`` entries, but deterministic configuration
+    errors must not spend two agent calls per sample before becoming visible.
+    """
+    for spec in specs:
+        label = spec.get("label") or spec.get("tag") or spec.get("id") or "evaluator"
+        if spec.get("evaluator_type") != "configurable_judge":
+            raise ValueError(
+                f"comparative evaluator '{label}' must use configurable_judge"
+            )
+        provider_id = (spec.get("params") or {}).get("provider_id")
+        if not provider_id:
+            raise ValueError(
+                f"comparative evaluator '{label}' is missing provider_id"
+            )
+        try:
+            provider_uuid = uuid.UUID(str(provider_id))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"comparative evaluator '{label}' has invalid provider_id: {provider_id}"
+            ) from exc
+        provider = await repo.get_evaluator_provider(provider_uuid)
+        if provider is None:
+            raise ValueError(
+                f"comparative evaluator '{label}' provider not found: {provider_id}"
+            )
+        if not provider.is_active:
+            raise ValueError(
+                f"comparative evaluator '{label}' provider is inactive: {provider_id}"
+            )
+        # 对比路径把真实 A/B 回复分别塞进 output_a / output_b（configurable_judge
+        # ._build_comparative_messages 硬编码 output_text=""）。若 evaluator 用的是
+        # 单模写法（variable_mapping 里没有指向 output_a/output_b 的项，或 prompt 不
+        # 引用它们所映射的占位符），judge 收到的 A/B 恒为空串——会静默跑出「AI 回答
+        # 空白 / 非 A/B 对比」的假分。这是确定性配置错误，必须在建 run 前拦截，
+        # 而不是每样例烧两次 agent 调用后才在 verdict 里暴露。
+        params = spec.get("params") or {}
+        mapping = params.get("variable_mapping")
+        eval_prompt = params.get("evaluation_prompt") or ""
+        # 用户自定义了 mapping（dict）时才校验：未给 mapping 会走
+        # DEFAULT_COMPARATIVE_VARIABLE_MAPPING（已含 output_a/output_b），无需拦。
+        if isinstance(mapping, dict):
+            ab_vars = {
+                name for name, source in mapping.items()
+                if str(source).strip() in ("output_a", "output_b")
+            }
+            if not ab_vars:
+                raise ValueError(
+                    f"comparative evaluator '{label}' 的 variable_mapping 未映射到 "
+                    "output_a / output_b，无法接收对比的 A/B 两侧回复"
+                    "（这是单模逐轮评估器，请改用对比专用评估器）"
+                )
+            # mapping 指向了 A/B，但 prompt 里要真的引用这些占位符才有效。
+            referenced = set(_MUSTACHE_RE.findall(eval_prompt))
+            if not (ab_vars & referenced):
+                raise ValueError(
+                    f"comparative evaluator '{label}' 的 evaluation_prompt 未引用任何 "
+                    f"指向 output_a/output_b 的占位符（{sorted(ab_vars)}）"
+                    "——judge 将收不到 A/B 回复内容"
+                )
+
+
+async def _resolve_judge_providers(specs: list[dict[str, Any]]) -> None:
+    """Mutate ``specs`` in place: resolve each active judge provider once.
+
+    Resolution remains non-fatal here because a provider may be disabled or deleted
+    after run creation. Comparative execution records that runtime condition in the
+    evaluator's ``evaluation_error`` entry instead of silently dropping it.
     """
     needed: dict[str, list[dict[str, Any]]] = {}
     for spec in specs:
@@ -295,10 +370,17 @@ async def _resolve_judge_providers(specs: list[dict[str, Any]]) -> None:
                 row = await repo.get_evaluator_provider(uuid.UUID(pid))
             except (TypeError, ValueError):
                 row = None
-            if row is None:
+            if row is not None and not row.is_active:
+                logger.warning(
+                    "configurable_judge: provider %s inactive — affected evaluators "
+                    "(%s) will fail at score time",
+                    pid, ", ".join(s.get("label", "?") for s in specs_for_pid),
+                )
+                row = None
+            elif row is None:
                 logger.warning(
                     "configurable_judge: provider %s not found — affected evaluators "
-                    "(%s) will be skipped at score time",
+                    "(%s) will fail at score time",
                     pid, ", ".join(s.get("label", "?") for s in specs_for_pid),
                 )
             for s in specs_for_pid:
@@ -718,10 +800,17 @@ async def _run_multiturn_case(
         "actual_tool_calls": actual_tool_calls,
         "cot_steps": cot_steps,
         # 多轮专属：完整逐轮记录 + 会话级上下文，落库进 full_trace.conversation。
+        # answer_counts：分侧统计有效/空白回答数（单模只有一侧，记在 valid/blank）。
+        # 与双模路径的 comparison.answer_counts 对称，供前端展示 agent 有效回答计数。
         "conversation": {
             "turns": turns,
             "goal": conversation_goal,
             "turn_expectations": turn_expectations,
+            "answer_counts": {
+                "valid": sum(1 for t in turns if (t.get("assistant") or "").strip()),
+                "blank": sum(1 for t in turns if not (t.get("assistant") or "").strip()),
+                "total_turns": len(turns),
+            },
         },
         "latency_ms": replay.get("latency_ms"),
         "first_thinking_token_ms": None,
@@ -743,6 +832,686 @@ async def _run_multiturn_case(
     }
 
 
+async def _invoke_one_agent(
+    *,
+    agent_cfg: dict,
+    question: str,
+    case_name: str,
+    cancel_event: asyncio.Event | None,
+    retry_policy: _RetryPolicy | None,
+    http_client: httpx.AsyncClient | None,
+) -> dict[str, Any]:
+    """跑一个 agent 拿一份回复。返回 {output_text, tool_calls, cot_steps, latency_ms,
+    first_thinking_token_ms, first_answer_token_ms, usage, error_message, error_type,
+    attempts_made, thread_id}。对比模式下 A/B 各调一次，供并发使用。"""
+    thread_id = f"eval-{case_name}-{uuid.uuid4().hex[:8]}"
+    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    messages = [{"role": "user", "content": question}]
+    policy = retry_policy or _retry_policy_from_cfg(agent_cfg)
+
+    out: dict[str, Any] = {
+        "output_text": "", "tool_calls": [], "cot_steps": [],
+        "latency_ms": None, "first_thinking_token_ms": None,
+        "first_answer_token_ms": None,
+        "usage": {
+            "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+            "cache_creation_tokens": None, "cache_read_tokens": None,
+        },
+        "error_message": None, "error_type": None, "attempts_made": 0,
+        "thread_id": thread_id,
+    }
+    try:
+        try:
+            resp, attempts = await _invoke_with_retry(
+                adapter, messages, policy=policy, cancel_event=cancel_event,
+            )
+            out["attempts_made"] = attempts
+            out["output_text"] = resp.content
+            out["latency_ms"] = int(resp.latency_ms)
+            out["usage"] = _extract_usage(resp)
+            raw = getattr(resp, "raw_response", None)
+            if isinstance(raw, dict):
+                tcs = raw.get("tool_calls")
+                if isinstance(tcs, list):
+                    out["tool_calls"] = tcs
+                steps_raw = raw.get("steps")
+                if isinstance(steps_raw, list):
+                    out["cot_steps"] = steps_raw
+            if not out["tool_calls"]:
+                out["tool_calls"] = _extract_tool_calls_from_response(resp)
+            for s in out["cot_steps"]:
+                if not isinstance(s, dict):
+                    continue
+                t = s.get("first_token_ms")
+                if t is None:
+                    continue
+                if s.get("type") in ("thought", "answer") and out["first_thinking_token_ms"] is None:
+                    out["first_thinking_token_ms"] = int(t)
+                if s.get("type") == "answer":
+                    out["first_answer_token_ms"] = int(t)
+        except Exception as e:
+            attempts = getattr(e, "_eval_attempts_made", out["attempts_made"] or 1)
+            out["attempts_made"] = attempts
+            msg = str(e)
+            if attempts > 1:
+                msg = f"{msg} (after {attempts} attempts)"
+            out["error_message"] = msg
+            out["error_type"] = _classify_agent_error(e)
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
+    return out
+
+
+async def _run_comparative_case(
+    *,
+    case: dict[str, Any],
+    agent_cfg: dict,
+    agent_cfg_b: dict,
+    evaluator_specs: list[dict[str, Any]],
+    cancel_event: asyncio.Event | None = None,
+    retry_policy: _RetryPolicy | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """双模对比：并发跑 A、B 两 agent，评估器单次对比打分（含位置随机化 + 还原）。
+
+    A 侧结果填主字段（与单模契约同构，单模消费方读 A 侧零改动）；B 侧回复 +
+    对比 verdict 填 ``comparison``。位置随机化消除 judge 的 A/B 位置偏见：以随机
+    slot 顺序喂 judge，拿回后按 swap 标记把 verdict 还原到真实 A/B。
+    """
+    question = case["question"]
+    expected = case.get("expected_output") or ""
+    invoked_at = datetime.now(timezone.utc)
+
+    # 1) 并发跑 A、B。
+    a_res, b_res = await asyncio.gather(
+        _invoke_one_agent(
+            agent_cfg=agent_cfg, question=question, case_name=case.get("name", "case") + "-A",
+            cancel_event=cancel_event, retry_policy=retry_policy, http_client=http_client,
+        ),
+        _invoke_one_agent(
+            agent_cfg=agent_cfg_b, question=question, case_name=case.get("name", "case") + "-B",
+            cancel_event=cancel_event, retry_policy=retry_policy, http_client=http_client,
+        ),
+    )
+
+    comparison: dict[str, Any] = {
+        "agent_b": {
+            "output": b_res["output_text"],
+            "tool_calls": b_res["tool_calls"],
+            "cot_steps": b_res["cot_steps"],
+            "latency_ms": b_res["latency_ms"],
+            "first_thinking_token_ms": b_res["first_thinking_token_ms"],
+            "first_answer_token_ms": b_res["first_answer_token_ms"],
+            "prompt_tokens": b_res["usage"].get("prompt_tokens"),
+            "completion_tokens": b_res["usage"].get("completion_tokens"),
+            "total_tokens": b_res["usage"].get("total_tokens"),
+            "cache_creation_tokens": b_res["usage"].get("cache_creation_tokens"),
+            "cache_read_tokens": b_res["usage"].get("cache_read_tokens"),
+            "error_message": b_res["error_message"],
+            "error_type": b_res["error_type"],
+            "attempts_made": b_res["attempts_made"],
+        },
+        "evaluator_verdicts": [],
+        # Deprecated 单 verdict 别名：保留最后一个成功 verdict，兼容旧消费方。
+        "verdict": None,
+        "position_swapped": False,
+    }
+
+    def _entry(spec: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "evaluator_id": spec.get("evaluator_id") or spec.get("id"),
+            "evaluator_version_id": spec.get("evaluator_version_id"),
+            "label": spec.get("label") or "comparison",
+            "tag": spec.get("tag") or spec.get("label") or "comparison",
+            "status": "evaluation_error",
+            "verdict": None,
+            "error": None,
+        }
+
+    # 2) 执行状态：A、B 任一失败 → execution_error（记在对应侧），同时为每个
+    # evaluator 留下未执行条目，确保选择项不会从 payload 静默消失。
+    status = "scored"
+    error_msg: str | None = None
+    error_type: str | None = None
+    if a_res["error_message"] or b_res["error_message"]:
+        status = "execution_error"
+        error_type = "agent_error"
+        parts = []
+        if a_res["error_message"]:
+            parts.append(f"A: {a_res['error_message']}")
+        if b_res["error_message"]:
+            parts.append(f"B: {b_res['error_message']}")
+        error_msg = "；".join(parts)
+        for spec in evaluator_specs:
+            entry = _entry(spec)
+            entry["error"] = f"未执行对比评分：{error_msg}"
+            comparison["evaluator_verdicts"].append(entry)
+    else:
+        # 3) 位置随机化：随机决定 prompt 中 slot1/slot2 是否交换 A/B。
+        swap = pick_swap()
+        comparison["position_swapped"] = swap
+        slot_a = b_res["output_text"] if swap else a_res["output_text"]
+        slot_b = a_res["output_text"] if swap else b_res["output_text"]
+
+        # 4) 每个 evaluator 独立评分、独立还原并独立保存。运行期配置/传输失败也
+        # 写入失败条目，部分失败时保留已经成功的 verdict。
+        judge_errors: list[str] = []
+        for spec in evaluator_specs:
+            entry = _entry(spec)
+            label = entry["label"]
+            if spec.get("evaluator_type") != "configurable_judge":
+                entry["error"] = f"{label}: comparative 仅支持 configurable_judge"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+            provider_row = spec.get("_provider")
+            if provider_row is None:
+                entry["error"] = f"{label}: provider 未解析或不可用"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+            try:
+                cmp_result = await run_comparative_judge(
+                    params=spec.get("params") or {},
+                    provider=provider_row,
+                    input_text=question,
+                    output_a=slot_a,
+                    output_b=slot_b,
+                    expected_output=expected,
+                    metadata=case.get("metadata"),
+                    evaluator_name=label,
+                )
+            except Exception as exc:
+                entry["error"] = f"{label}: {type(exc).__name__}: {exc}"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+            if not cmp_result.verdict:
+                entry["error"] = f"{label}: {cmp_result.error or '未返回 verdict'}"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+
+            restored = restore_verdict(cmp_result.verdict, swapped=swap)
+            entry.update({"status": "scored", "verdict": restored, "error": None})
+            comparison["evaluator_verdicts"].append(entry)
+            comparison["verdict"] = restored
+
+        if judge_errors:
+            status = "evaluation_error"
+            error_type = "judge_error"
+            error_msg = (
+                f"{len(judge_errors)} 个对比评估器未出结论："
+                + "；".join(judge_errors)
+            )
+
+    return {
+        "case_id": case.get("id"),
+        "case_name": case.get("name"),
+        "case_source": case.get("source"),
+        "thread_id": a_res["thread_id"],
+        "question": question,
+        "expected_output": expected,
+        "expected_tool_calls": case.get("expected_tool_calls") or [],
+        "invoked_at": invoked_at,
+        "status": status,
+        "actual_output": a_res["output_text"],
+        "actual_tool_calls": a_res["tool_calls"],
+        "cot_steps": a_res["cot_steps"],
+        "latency_ms": a_res["latency_ms"],
+        "first_thinking_token_ms": a_res["first_thinking_token_ms"],
+        "first_answer_token_ms": a_res["first_answer_token_ms"],
+        "error_message": error_msg,
+        "error_type": error_type,
+        "attempts_made": a_res["attempts_made"],
+        "tool_call_count": len(a_res["tool_calls"]),
+        "message_count": 1,
+        "scores": {},  # 对比模式不写 EvaluationScoreRow；verdict 自带分数
+        "comparison": comparison,
+        **a_res["usage"],
+    }
+
+
+async def _replay_one_side(
+    *,
+    agent_cfg: dict,
+    case_name: str,
+    input_messages: list[dict[str, Any]],
+    cancel_event: asyncio.Event | None,
+    retry_policy: _RetryPolicy | None,
+    http_client: httpx.AsyncClient | None,
+) -> dict[str, Any]:
+    """回放一侧（A 或 B）整段多轮对话，返回 multiturn.replay_conversation 的结果
+    dict（含 turns / tool_calls / steps / usage / latency_ms / attempts / error…）。
+
+    与 _run_multiturn_case 的回放段同构：独立 adapter + 独立 thread_id，用完即关。
+    错误经 replay 的 error 字段或抛异常上交调用方，本函数不做 status 判定。"""
+    from agent_eval.evaluation import multiturn
+
+    agent_type = agent_cfg.get("type", "sse")
+    thread_id = f"eval-{case_name}-{uuid.uuid4().hex[:8]}"
+    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    policy = retry_policy or _retry_policy_from_cfg(agent_cfg)
+
+    async def _invoke(adp: Any, msgs: list[dict[str, Any]]):
+        return await _invoke_with_retry(
+            adp, msgs, policy=policy, cancel_event=cancel_event,
+        )
+
+    replay: dict[str, Any] = {}
+    error_msg: str | None = None
+    error_exc: BaseException | None = None
+    try:
+        try:
+            replay = await multiturn.replay_conversation(
+                adapter=adapter,
+                agent_type=agent_type,
+                input_messages=input_messages,
+                invoke=_invoke,
+            )
+        except Exception as e:
+            attempts = getattr(e, "_eval_attempts_made", 1)
+            error_msg = str(e)
+            if attempts > 1:
+                error_msg = f"{error_msg} (after {attempts} attempts)"
+            error_exc = e
+    finally:
+        try:
+            await adapter.close()
+        except Exception:
+            pass
+
+    # 逐轮容错：replay 正常返回但某轮失败时，error 字段非空、已完成轮仍在 turns。
+    if not error_msg and replay.get("error"):
+        error_msg = replay.get("error")
+        error_exc = replay.get("error_exc")
+
+    replay["thread_id"] = thread_id
+    replay["error"] = error_msg
+    replay["error_exc"] = error_exc
+    return replay
+
+
+async def _run_multiturn_comparative_case(
+    *,
+    case: dict[str, Any],
+    agent_cfg: dict,
+    agent_cfg_b: dict,
+    evaluator_specs: list[dict[str, Any]],
+    cancel_event: asyncio.Event | None = None,
+    retry_policy: _RetryPolicy | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """多轮 + 双模对比：A、B 各自独立回放整段对话，逐轮 + 会话级对比打分。
+
+    对比粒度（用户决策）：
+      * 逐轮：仅对定义了 turn_expectations[turn_index] 的轮，取 A、B 该轮回复做一次
+        对比 verdict；A、B 任一侧缺该轮 → 该 scope 记 evaluation_error。
+      * 会话级：conversation_goal 非空时，A 整段 transcript vs B 整段 transcript
+        做一次对比 verdict。
+    位置随机化：逐样例一个 swap 决策（整段统一），喂 judge 前按 swap 定 slot，
+    拿回后 restore_verdict 还原真实 A/B。返回 dict 与 _run_comparative_case 同契约
+    （主字段 = A 侧，B 侧 + verdict 填 comparison），落库/聚合无需区分。"""
+    from agent_eval.evaluation import multiturn
+
+    input_messages = case.get("input_messages") or []
+    conversation_goal = case.get("conversation_goal")
+    turn_expectations = case.get("turn_expectations") or []
+    question = case.get("question") or ""
+    expected = case.get("expected_output") or ""
+    case_metadata = case.get("metadata")
+    invoked_at = datetime.now(timezone.utc)
+
+    # 1) 并发回放 A、B 两侧整段对话（各维持独立 thread 上下文）。
+    a_replay, b_replay = await asyncio.gather(
+        _replay_one_side(
+            agent_cfg=agent_cfg, case_name=case.get("name", "conv") + "-A",
+            input_messages=input_messages, cancel_event=cancel_event,
+            retry_policy=retry_policy, http_client=http_client,
+        ),
+        _replay_one_side(
+            agent_cfg=agent_cfg_b, case_name=case.get("name", "conv") + "-B",
+            input_messages=input_messages, cancel_event=cancel_event,
+            retry_policy=retry_policy, http_client=http_client,
+        ),
+    )
+
+    a_turns = a_replay.get("turns") or []
+    b_turns = b_replay.get("turns") or []
+    transcript_a = multiturn.build_transcript(a_turns)
+    transcript_b = multiturn.build_transcript(b_turns)
+    a_usage = a_replay.get("usage") or {
+        "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
+        "cache_creation_tokens": None, "cache_read_tokens": None,
+    }
+    b_usage = b_replay.get("usage") or {}
+    a_tool_calls = a_replay.get("tool_calls") or []
+    b_tool_calls = b_replay.get("tool_calls") or []
+
+    a_err = a_replay.get("error")
+    b_err = b_replay.get("error")
+
+    # A/B 各自「有效回答」计数（执行事实，覆盖全部回放轮）：assistant 文本 strip 后
+    # 非空即有效，空白（""/None/纯空白）计为 blank。空白轮不作为有效评估内容（用户决策），
+    # 逐轮对比会跳过、不计入胜负与分数聚合；此处的计数供前端顶部展示 A/B 实际作答情况。
+    def _blank(text: Any) -> bool:
+        return not (text or "").strip()
+
+    answer_counts = {
+        "a_valid": sum(1 for t in a_turns if not _blank(t.get("assistant"))),
+        "a_blank": sum(1 for t in a_turns if _blank(t.get("assistant"))),
+        "b_valid": sum(1 for t in b_turns if not _blank(t.get("assistant"))),
+        "b_blank": sum(1 for t in b_turns if _blank(t.get("assistant"))),
+        "a_turns": len(a_turns),
+        "b_turns": len(b_turns),
+    }
+
+    comparison: dict[str, Any] = {
+        "multi_turn": True,
+        "answer_counts": answer_counts,
+        "agent_b": {
+            "output": transcript_b,
+            "conversation": {"turns": b_turns},
+            "tool_calls": b_tool_calls,
+            "cot_steps": b_replay.get("steps") or [],
+            "latency_ms": b_replay.get("latency_ms"),
+            "first_thinking_token_ms": None,
+            "first_answer_token_ms": None,
+            "prompt_tokens": b_usage.get("prompt_tokens"),
+            "completion_tokens": b_usage.get("completion_tokens"),
+            "total_tokens": b_usage.get("total_tokens"),
+            "cache_creation_tokens": b_usage.get("cache_creation_tokens"),
+            "cache_read_tokens": b_usage.get("cache_read_tokens"),
+            "error_message": b_err,
+            "error_type": _classify_agent_error(b_replay.get("error_exc")) if b_err else None,
+            "attempts_made": b_replay.get("attempts", 1),
+        },
+        "evaluator_verdicts": [],
+        "verdict": None,
+        "position_swapped": False,
+    }
+
+    def _entry(spec: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "evaluator_id": spec.get("evaluator_id") or spec.get("id"),
+            "evaluator_version_id": spec.get("evaluator_version_id"),
+            "label": spec.get("label") or "comparison",
+            "tag": spec.get("tag") or spec.get("label") or "comparison",
+            "status": "evaluation_error",
+            "verdict": None,
+            "error": None,
+            "scoped_verdicts": [],
+        }
+
+    status = "scored"
+    error_msg: str | None = None
+    error_type: str | None = None
+
+    # 2) 执行错误：A、B 任一侧回放失败 → execution_error（保留已完成轮），
+    #    为每个 evaluator 留未执行条目，确保选择项不从 payload 静默消失。
+    if a_err or b_err:
+        status = "execution_error"
+        error_type = "agent_error"
+        parts = []
+        if a_err:
+            parts.append(f"A: {a_err}")
+        if b_err:
+            parts.append(f"B: {b_err}")
+        error_msg = "；".join(parts)
+        for spec in evaluator_specs:
+            entry = _entry(spec)
+            entry["error"] = f"未执行对比评分：{error_msg}"
+            comparison["evaluator_verdicts"].append(entry)
+    else:
+        # 3) 位置随机化：逐样例一个 swap，整段统一。
+        swap = pick_swap()
+        comparison["position_swapped"] = swap
+
+        a_turn_by_idx = {t["turn_index"]: t for t in a_turns}
+        b_turn_by_idx = {t["turn_index"]: t for t in b_turns}
+        # turn_index → 期望，按 input_messages 里 user 下标对齐。
+        exp_by_index: dict[int, dict[str, Any]] = {}
+        for te in turn_expectations:
+            ti = te.get("turn_index")
+            if isinstance(ti, int):
+                exp_by_index[ti] = te
+
+        judge_errors: list[str] = []
+
+        # 空白轮跳过（用户决策）：某轮任一侧 assistant 回复 strip 后为空 → 该轮不送 judge、
+        # 不产 verdict、不计胜负（scoped status="skipped"）；但分侧统计有效/空白回答数，
+        # 作为 A/B 执行事实展示。计数覆盖全部回放轮次（不限有期望的轮）。
+        def _is_blank(text: Any) -> bool:
+            return not (text or "").strip()
+
+        a_valid = sum(1 for t in a_turns if not _is_blank(t.get("assistant")))
+        a_blank = len(a_turns) - a_valid
+        b_valid = sum(1 for t in b_turns if not _is_blank(t.get("assistant")))
+        b_blank = len(b_turns) - b_valid
+        comparison["answer_counts"] = {
+            "a_valid": a_valid, "a_blank": a_blank, "a_total": len(a_turns),
+            "b_valid": b_valid, "b_blank": b_blank, "b_total": len(b_turns),
+        }
+
+        async def _compare_once(
+            *, spec: dict[str, Any], input_text: str, real_a: str, real_b: str,
+            expected_output: str, metadata: dict[str, Any] | None, evaluator_name: str,
+            tools_a: str | None = None, tools_b: str | None = None,
+        ) -> tuple[dict[str, Any] | None, str | None]:
+            """按 swap 喂 judge 并还原，返回 (restored_verdict, error)。
+
+            tools_a/tools_b（该轮 A/B 侧实际工具调用的 JSON 串）必须与 real_a/real_b
+            走**同一个 swap 决策**入槽——否则位置随机化后 judge 看到的「回答 A」是一侧、
+            「工具调用 A」却是另一侧，判定就建立在错配的组合上。故按 swap 把工具调用注入
+            metadata 副本的 actual_tool_calls_a/_b（不改传入 metadata，避免污染下一次调用）。
+            """
+            provider_row = spec.get("_provider")
+            if provider_row is None:
+                return None, f"{evaluator_name}: provider 未解析或不可用"
+            slot_a = real_b if swap else real_a
+            slot_b = real_a if swap else real_b
+            call_metadata = metadata
+            if tools_a is not None or tools_b is not None:
+                call_metadata = dict(metadata or {})
+                call_metadata["actual_tool_calls_a"] = (tools_b if swap else tools_a) or "[]"
+                call_metadata["actual_tool_calls_b"] = (tools_a if swap else tools_b) or "[]"
+            try:
+                cmp_result = await run_comparative_judge(
+                    params=spec.get("params") or {},
+                    provider=provider_row,
+                    input_text=input_text,
+                    output_a=slot_a,
+                    output_b=slot_b,
+                    expected_output=expected_output,
+                    metadata=call_metadata,
+                    evaluator_name=evaluator_name,
+                )
+            except Exception as exc:
+                return None, f"{evaluator_name}: {type(exc).__name__}: {exc}"
+            if not cmp_result.verdict:
+                return None, f"{evaluator_name}: {cmp_result.error or '未返回 verdict'}"
+            return restore_verdict(cmp_result.verdict, swapped=swap), None
+
+        for spec in evaluator_specs:
+            entry = _entry(spec)
+            label = entry["label"]
+            if spec.get("evaluator_type") != "configurable_judge":
+                entry["error"] = f"{label}: comparative 仅支持 configurable_judge"
+                judge_errors.append(entry["error"])
+                comparison["evaluator_verdicts"].append(entry)
+                continue
+
+            scoped: list[dict[str, Any]] = []
+            conv_verdict: dict[str, Any] | None = None
+
+            # ── 逐轮对比：仅对有期望的轮 ──
+            for ti in sorted(exp_by_index):
+                te = exp_by_index[ti]
+                criteria = te.get("criteria") or []
+                turn_expected = te.get("expected_output") or ""
+                expected_tc = te.get("expected_tool_calls") or []
+                if not criteria and not turn_expected and not expected_tc:
+                    continue
+                a_turn = a_turn_by_idx.get(ti)
+                b_turn = b_turn_by_idx.get(ti)
+                if a_turn is None or b_turn is None:
+                    miss = "A" if a_turn is None else "B"
+                    scoped.append({
+                        "scope": "turn", "turn_index": ti, "verdict": None,
+                        "status": "evaluation_error",
+                        "error": f"{label}.turn{ti}: {miss} 侧缺该轮回复",
+                    })
+                    judge_errors.append(f"{label}.turn{ti}: {miss} 侧缺该轮回复")
+                    continue
+                # 空白轮跳过：任一侧回复空白 → 不送 judge，标 skipped，不计胜负。
+                # 对比 judge 输入是 A/B 两份回答，缺一侧无从比对，单侧打分会退化成
+                # 单模评估、语义不清；故整轮跳过（有效回答计数仍分侧记录）。
+                a_blank_turn = _is_blank(a_turn.get("assistant"))
+                b_blank_turn = _is_blank(b_turn.get("assistant"))
+                if a_blank_turn or b_blank_turn:
+                    if a_blank_turn and b_blank_turn:
+                        which = "A、B 两侧"
+                    elif a_blank_turn:
+                        which = "A 侧"
+                    else:
+                        which = "B 侧"
+                    scoped.append({
+                        "scope": "turn", "turn_index": ti, "verdict": None,
+                        "status": "skipped",
+                        "error": f"{which}该轮回复空白，跳过对比",
+                    })
+                    continue
+                turn_meta = dict(case_metadata or {})
+                turn_meta["turn_criteria"] = "\n".join(criteria) if criteria else ""
+                turn_meta["turn_index"] = ti
+                turn_meta["expected_tool_calls"] = json.dumps(expected_tc, ensure_ascii=False)
+                verdict, err = await _compare_once(
+                    spec=spec, input_text=a_turn.get("user", ""),
+                    real_a=a_turn.get("assistant", ""), real_b=b_turn.get("assistant", ""),
+                    expected_output=turn_expected, metadata=turn_meta,
+                    evaluator_name=f"{label}.turn{ti}",
+                    tools_a=json.dumps(a_turn.get("tool_calls") or [], ensure_ascii=False),
+                    tools_b=json.dumps(b_turn.get("tool_calls") or [], ensure_ascii=False),
+                )
+                if err:
+                    scoped.append({
+                        "scope": "turn", "turn_index": ti, "verdict": None,
+                        "status": "evaluation_error", "error": err,
+                    })
+                    judge_errors.append(err)
+                else:
+                    scoped.append({
+                        "scope": "turn", "turn_index": ti, "verdict": verdict,
+                        "status": "scored", "error": None,
+                    })
+
+            # ── 会话级对比：conversation_goal 非空才做 ──
+            if conversation_goal:
+                conv_meta = dict(case_metadata or {})
+                conv_meta["conversation_goal"] = conversation_goal
+                verdict, err = await _compare_once(
+                    spec=spec, input_text=conversation_goal,
+                    real_a=transcript_a, real_b=transcript_b,
+                    expected_output=conversation_goal, metadata=conv_meta,
+                    evaluator_name=f"{label}.conversation",
+                    tools_a=json.dumps(a_tool_calls, ensure_ascii=False),
+                    tools_b=json.dumps(b_tool_calls, ensure_ascii=False),
+                )
+                if err:
+                    scoped.append({
+                        "scope": "conversation", "turn_index": None, "verdict": None,
+                        "status": "evaluation_error", "error": err,
+                    })
+                    judge_errors.append(err)
+                else:
+                    conv_verdict = verdict
+                    scoped.append({
+                        "scope": "conversation", "turn_index": None, "verdict": verdict,
+                        "status": "scored", "error": None,
+                    })
+
+            entry["scoped_verdicts"] = scoped
+            # 顶层 verdict 取会话级；无会话级则取最后一个成功的逐轮 verdict。
+            if conv_verdict is None:
+                for sv in reversed(scoped):
+                    if sv.get("status") == "scored" and sv.get("verdict"):
+                        conv_verdict = sv["verdict"]
+                        break
+            has_scored = any(sv.get("status") == "scored" for sv in scoped)
+            has_error = any(sv.get("status") == "evaluation_error" for sv in scoped)
+            if has_scored:
+                entry["status"] = "scored"
+                entry["verdict"] = conv_verdict
+                entry["error"] = None
+                comparison["verdict"] = conv_verdict
+            elif scoped and not has_error:
+                # scoped 非空但无 scored、无 error → 全是 skipped（空白轮）。
+                # 按用户决策：空白不算评分失败，evaluator 整体记 skipped，不进 error 桶。
+                entry["status"] = "skipped"
+                entry["verdict"] = None
+                entry["error"] = None
+            else:
+                entry["status"] = "evaluation_error"
+                entry["verdict"] = None
+                if not scoped:
+                    entry["error"] = f"{label}: 无可对比的轮次或会话目标"
+                    judge_errors.append(entry["error"])
+            comparison["evaluator_verdicts"].append(entry)
+
+        # 全部 evaluator 都没出任何成功 verdict → 按原因分级：
+        #   有 ≥1 scored → scored（默认）；
+        #   无 scored 但全是 skipped（空白轮）→ skipped，不算失败（用户决策）；
+        #   否则（有真错误/无可比）→ evaluation_error。
+        ev_statuses = [e.get("status") for e in comparison["evaluator_verdicts"]]
+        any_scored = any(s == "scored" for s in ev_statuses)
+        if not any_scored:
+            if ev_statuses and all(s == "skipped" for s in ev_statuses):
+                status = "skipped"
+                error_msg = "全部对比轮次因回复空白被跳过"
+            else:
+                status = "evaluation_error"
+                error_type = "judge_error"
+                error_msg = (
+                    f"对比评估未出结论："
+                    + "；".join(judge_errors[:5])
+                ) if judge_errors else "对比评估未产出任何 verdict"
+
+    return {
+        "case_id": case.get("id"),
+        "case_name": case.get("name"),
+        "case_source": case.get("source"),
+        "thread_id": a_replay.get("thread_id"),
+        "question": question,
+        "expected_output": expected,
+        "expected_tool_calls": [],
+        "invoked_at": invoked_at,
+        "status": status,
+        "actual_output": transcript_a,
+        "actual_tool_calls": a_tool_calls,
+        "cot_steps": a_replay.get("steps") or [],
+        # A 侧多轮上下文，复用单模多轮的 conversation 落库键。
+        "conversation": {
+            "turns": a_turns,
+            "goal": conversation_goal,
+            "turn_expectations": turn_expectations,
+        },
+        "latency_ms": a_replay.get("latency_ms"),
+        "first_thinking_token_ms": None,
+        "first_answer_token_ms": None,
+        "error_message": error_msg,
+        "error_type": error_type,
+        "attempts_made": a_replay.get("attempts", 1),
+        "tool_call_count": len(a_tool_calls),
+        "message_count": len(a_turns),
+        "scores": {},  # 对比模式不写 EvaluationScoreRow；verdict 自带分数
+        "comparison": comparison,
+        **a_usage,
+    }
+
+
 async def _run_one_case(
     *,
     case: dict[str, Any],
@@ -751,6 +1520,7 @@ async def _run_one_case(
     cancel_event: asyncio.Event | None = None,
     retry_policy: _RetryPolicy | None = None,
     http_client: httpx.AsyncClient | None = None,
+    agent_cfg_b: dict | None = None,
 ) -> dict[str, Any]:
     """Execute one case end-to-end. ``case`` is the normalized dict from
     ``_normalize_cases_for_runner``: {id, name, question, expected_output,
@@ -760,7 +1530,32 @@ async def _run_one_case(
     ``_resolve_retry_policy``) and threaded through; passing ``None`` falls
     back to per-call resolution from ``agent_cfg`` only (no DB lookup) for
     callers/tests that don't go through ``_execute_run``.
-    Returns one row's worth of data ready to persist."""
+    Returns one row's worth of data ready to persist.
+
+    ``agent_cfg_b`` 非空 → 双模对比：并发跑 A、B 两 agent，评估器单次对比打分。
+    为 None（默认）时走现有单模路径，零改动。"""
+    # 多轮 + 双模对比：A、B 各自回放整段对话，逐轮 + 会话级对比打分。
+    if agent_cfg_b is not None and case.get("multi_turn"):
+        return await _run_multiturn_comparative_case(
+            case=case,
+            agent_cfg=agent_cfg,
+            agent_cfg_b=agent_cfg_b,
+            evaluator_specs=evaluator_specs,
+            cancel_event=cancel_event,
+            retry_policy=retry_policy,
+            http_client=http_client,
+        )
+    # 双模对比（agent_cfg_b 非空）：并发跑两 agent + 评估器单次对比。仅单轮。
+    if agent_cfg_b is not None and not case.get("multi_turn"):
+        return await _run_comparative_case(
+            case=case,
+            agent_cfg=agent_cfg,
+            agent_cfg_b=agent_cfg_b,
+            evaluator_specs=evaluator_specs,
+            cancel_event=cancel_event,
+            retry_policy=retry_policy,
+            http_client=http_client,
+        )
     # 多轮对话样例（source='conversation'）：走 multiturn 回放+逐轮/会话级打分。
     # 返回 dict 与单轮契约一致，落库/聚合无需区分。
     if case.get("multi_turn"):
@@ -990,6 +1785,7 @@ async def _execute_run(
     acceptance_policy: dict[str, Any] | None = None,
     langfuse_trace_name: str | None = None,
     notify_open_ids: list[str] | None = None,
+    agent_cfg_b: dict | None = None,
 ) -> None:
     """Background task body. Invokes agent for each case, runs evaluators,
     persists results. After all cases settle, optionally kicks off the
@@ -1045,18 +1841,32 @@ async def _execute_run(
                     cancel_event=cancel_event,
                     retry_policy=retry_policy,
                     http_client=http_client,
+                    agent_cfg_b=agent_cfg_b,
                 )
             except Exception as e:
                 logger.exception("case %s crashed during run: %s", case.get("id"), e)
                 handle.progress["failed"] += 1
                 handle.progress["completed"] += 1
                 return
-            projection = project_case(
-                stored_status=res.get("status"),
-                error_type=res.get("error_type"),
-                scores=res.get("scores") or {},
-                acceptance_policy=acceptance_policy,
-            )
+            # 对比模式不走 acceptance/scores 投影（相对胜负，非通过/失败）——直接按
+            # 行 status 映射执行/评分事实：scored=评分完成，execution_error=执行异常，
+            # 其余（judge 未出结论）计为评分错误。
+            if agent_cfg_b is not None:
+                st = res.get("status")
+                projection = {
+                    "execution_status": "abnormal" if st == "execution_error" else "success",
+                    "evaluation_status": "completed" if st == "scored" else (
+                        "error" if st == "evaluation_error" else "unknown"
+                    ),
+                    "acceptance_decision": None,
+                }
+            else:
+                projection = project_case(
+                    stored_status=res.get("status"),
+                    error_type=res.get("error_type"),
+                    scores=res.get("scores") or {},
+                    acceptance_policy=acceptance_policy,
+                )
             res.update(projection)
             per_case_results.append(res)
             if projection["execution_status"] == "abnormal" or projection[
@@ -1109,6 +1919,7 @@ async def _execute_run(
                         error_type=res["error_type"],
                         status=res["status"],
                         attempts_made=res.get("attempts_made", 1),
+                        comparison=res.get("comparison"),
                     )
                     # 多轮 judge 理由（#137）：score_reasons 仅多轮 case 带，单轮无此键
                     # → .get 兜底空 dict，details 退回 {}，单轮零回归。
@@ -1247,6 +2058,10 @@ async def _execute_run(
         if acceptance_policy is not None:
             summary["cost_accepted"] = _aggregate_cost(accepted_cases)
             summary["cost_not_accepted"] = _aggregate_cost(not_accepted_cases)
+        # 对比模式：附加独立对比汇总（A胜/B胜/平 + 逐维度胜率与均分）。不复用
+        # dimension_averages（那是单模按维度聚合），对比统计走独立渲染路径。
+        if agent_cfg_b is not None:
+            summary["comparison_summary"] = build_comparison_summary(per_case_results)
         # 如果多数样例执行异常，在详情页集中提示，而不是让用户逐行扫描。
         if per_case_results:
             abnormal_ratio = facts["execution_abnormal"] / len(per_case_results)
@@ -1868,6 +2683,8 @@ async def start_run(
     eval_case_source_id: str | None = None,
     acceptance_policy: dict[str, Any] | None = None,
     notify_open_ids: list[str] | None = None,
+    eval_mode: str = "single",
+    agent_cfg_b: dict | None = None,
 ) -> str:
     """Create a test_runs row, register an asyncio task, return run_id.
 
@@ -1887,6 +2704,10 @@ async def start_run(
 
     async with async_session_factory() as session:
         repo = Repository(session)
+        if eval_mode == "comparative" or agent_cfg_b is not None:
+            if agent_cfg_b is None:
+                raise ValueError("comparative run requires agent_cfg_b")
+            await _validate_comparative_evaluator_specs(evaluator_specs, repo)
         row = await repo.create_test_run(
             benchmark_version_id=uuid.UUID(benchmark_version_id) if benchmark_version_id else None,
             eval_case_source_id=uuid.UUID(eval_case_source_id) if eval_case_source_id else None,
@@ -1896,6 +2717,8 @@ async def start_run(
             langfuse_trace_name=langfuse_trace_name,
             evaluator_configs=evaluator_specs,
             acceptance_policy=acceptance_policy,
+            eval_mode=eval_mode,
+            agent_config_b=agent_cfg_b,
             status="running",
         )
         await session.commit()
@@ -1916,6 +2739,7 @@ async def start_run(
         cancel_event=cancel_event,
         handle=handle,
         notify_open_ids=notify_open_ids,
+        agent_cfg_b=agent_cfg_b,
     ))
     _RUN_REGISTRY[run_id] = handle
     return run_id
@@ -1988,6 +2812,201 @@ def _expected_judge_dims(
     return dims
 
 
+async def _rescore_comparison_result(
+    *,
+    comparison: dict[str, Any],
+    judge_specs: list[dict[str, Any]],
+    full_trace: dict[str, Any],
+    result_id: str,
+) -> tuple[int, bool]:
+    """对一条对比 result 的 comparison 补评——复用已存 A/B 回答，不重跑 agent。
+
+    对比模式的分数存在 ``comparison`` JSONB（evaluator_verdicts[].scoped_verdicts[]），
+    不落 EvaluationScoreRow。故补评针对每个 evaluator 里 status 非 "scored" 也非
+    "skipped"（即 evaluation_error）的 scoped verdict，用已存的 A/B 该轮/整段回答
+    重打对比 judge，成功则原地把该 scope 改回 scored + 写入 verdict。空白轮
+    （skipped）不补——那是执行事实，非评分失败。
+
+    位置随机化：与首评一致，逐 result 一个 swap 决策，喂 judge 前按 swap 定 slot，
+    ``restore_verdict`` 还原真实 A/B。judge_specs 需已解析 ``_provider``。
+
+    原地修改传入的 ``comparison``（调用方负责 flag_modified + commit）。
+    返回 ``(recovered_scope_count, still_has_unscored)``：
+      * recovered = 本次成功补回的 scope 数；
+      * still_has_unscored = 补评后是否仍有 evaluation_error 的 scope（决定 result
+        能否回到 completed）。
+    """
+    conv = full_trace.get("conversation") if isinstance(full_trace, dict) else None
+    a_turns = (conv.get("turns") or []) if isinstance(conv, dict) else []
+    goal = conv.get("goal") if isinstance(conv, dict) else None
+    turn_exps = (conv.get("turn_expectations") or []) if isinstance(conv, dict) else []
+    a_turn_by_idx = {t.get("turn_index"): t for t in a_turns if isinstance(t, dict)}
+    exp_by_index: dict[int, dict[str, Any]] = {}
+    for te in turn_exps:
+        ti = te.get("turn_index")
+        if isinstance(ti, int):
+            exp_by_index[ti] = te
+
+    agent_b = comparison.get("agent_b") if isinstance(comparison, dict) else None
+    b_conv = agent_b.get("conversation") if isinstance(agent_b, dict) else None
+    b_turns = (b_conv.get("turns") or []) if isinstance(b_conv, dict) else []
+    b_turn_by_idx = {t.get("turn_index"): t for t in b_turns if isinstance(t, dict)}
+
+    from agent_eval.evaluation import multiturn
+
+    transcript_a = multiturn.build_transcript(a_turns) if a_turns else ""
+    transcript_b = multiturn.build_transcript(b_turns) if b_turns else ""
+
+    spec_by_label = {(s.get("label") or s.get("tag") or "comparison"): s for s in judge_specs}
+
+    def _is_blank(text: Any) -> bool:
+        return not (text or "").strip()
+
+    swap = pick_swap()
+
+    async def _compare_once(
+        *, spec: dict[str, Any], input_text: str, real_a: str, real_b: str,
+        expected_output: str, metadata: dict[str, Any] | None, evaluator_name: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        provider_row = spec.get("_provider")
+        if provider_row is None:
+            return None, f"{evaluator_name}: provider 未解析或不可用"
+        slot_a = real_b if swap else real_a
+        slot_b = real_a if swap else real_b
+        try:
+            cmp_result = await run_comparative_judge(
+                params=spec.get("params") or {},
+                provider=provider_row,
+                input_text=input_text,
+                output_a=slot_a,
+                output_b=slot_b,
+                expected_output=expected_output,
+                metadata=metadata,
+                evaluator_name=evaluator_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{evaluator_name}: {type(exc).__name__}: {exc}"
+        if not cmp_result.verdict:
+            return None, f"{evaluator_name}: {cmp_result.error or '未返回 verdict'}"
+        return restore_verdict(cmp_result.verdict, swapped=swap), None
+
+    recovered = 0
+    entries = comparison.get("evaluator_verdicts") if isinstance(comparison, dict) else None
+    if not isinstance(entries, list):
+        return 0, False
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("label") or entry.get("tag") or "comparison"
+        spec = spec_by_label.get(label)
+        scoped = entry.get("scoped_verdicts")
+        if not isinstance(scoped, list) or not scoped:
+            continue
+
+        for sv in scoped:
+            if not isinstance(sv, dict):
+                continue
+            # 只补 evaluation_error 的 scope；scored/skipped 不动。
+            if sv.get("status") != "evaluation_error":
+                continue
+            if spec is None:
+                continue
+
+            scope = sv.get("scope")
+            if scope == "turn":
+                ti = sv.get("turn_index")
+                te = exp_by_index.get(ti) or {}
+                a_turn = a_turn_by_idx.get(ti)
+                b_turn = b_turn_by_idx.get(ti)
+                if a_turn is None or b_turn is None:
+                    continue  # 缺回放数据，无从补
+                if _is_blank(a_turn.get("assistant")) or _is_blank(b_turn.get("assistant")):
+                    # 空白轮：改判 skipped（首评本应如此，历史 error 数据一并纠正）。
+                    sv["status"] = "skipped"
+                    sv["verdict"] = None
+                    sv["error"] = "该轮回复空白，跳过对比"
+                    continue
+                criteria = te.get("criteria") or []
+                turn_meta = {
+                    "turn_criteria": "\n".join(criteria) if criteria else "",
+                    "turn_index": ti,
+                    "expected_tool_calls": json.dumps(
+                        te.get("expected_tool_calls") or [], ensure_ascii=False),
+                    "actual_tool_calls_a": json.dumps(
+                        a_turn.get("tool_calls") or [], ensure_ascii=False),
+                    "actual_tool_calls_b": json.dumps(
+                        b_turn.get("tool_calls") or [], ensure_ascii=False),
+                }
+                verdict, err = await _compare_once(
+                    spec=spec, input_text=a_turn.get("user", ""),
+                    real_a=a_turn.get("assistant", ""), real_b=b_turn.get("assistant", ""),
+                    expected_output=te.get("expected_output") or "",
+                    metadata=turn_meta,
+                    evaluator_name=f"{label}.turn{ti}",
+                )
+            elif scope == "conversation":
+                if not goal:
+                    continue
+                conv_meta = {"conversation_goal": goal}
+                verdict, err = await _compare_once(
+                    spec=spec, input_text=goal,
+                    real_a=transcript_a, real_b=transcript_b,
+                    expected_output=goal, metadata=conv_meta,
+                    evaluator_name=f"{label}.conversation",
+                )
+            else:
+                continue
+
+            if err:
+                logger.warning("rescore comparison[%s] result %s scope %s failed: %s",
+                               label, result_id, scope, err)
+                continue
+            sv["status"] = "scored"
+            sv["verdict"] = verdict
+            sv["error"] = None
+            recovered += 1
+
+        # ── 重算该 evaluator 顶层 status（对齐首评收尾语义）──
+        has_scored = any(s.get("status") == "scored" for s in scoped if isinstance(s, dict))
+        has_error = any(s.get("status") == "evaluation_error" for s in scoped if isinstance(s, dict))
+        conv_verdict: dict[str, Any] | None = None
+        for s in reversed(scoped):
+            if isinstance(s, dict) and s.get("scope") == "conversation" and s.get("status") == "scored":
+                conv_verdict = s.get("verdict")
+                break
+        if conv_verdict is None:
+            for s in reversed(scoped):
+                if isinstance(s, dict) and s.get("status") == "scored" and s.get("verdict"):
+                    conv_verdict = s.get("verdict")
+                    break
+        if has_scored:
+            entry["status"] = "scored"
+            entry["verdict"] = conv_verdict
+            entry["error"] = None
+        elif not has_error:
+            # 无 scored、无 error → 全 skipped。
+            entry["status"] = "skipped"
+            entry["verdict"] = None
+            entry["error"] = None
+        else:
+            entry["status"] = "evaluation_error"
+            entry["verdict"] = None
+
+    # 顶层 comparison.verdict 兼容旧消费方：取任一 scored evaluator 的顶层 verdict。
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("status") == "scored" and entry.get("verdict"):
+            comparison["verdict"] = entry["verdict"]
+            break
+
+    still_unscored = any(
+        isinstance(sv, dict) and sv.get("status") == "evaluation_error"
+        for entry in entries if isinstance(entry, dict)
+        for sv in (entry.get("scoped_verdicts") or [])
+    )
+    return recovered, still_unscored
+
+
 async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
     """对一个已完成 run 里「缺分维度」补评——复用已存 agent 回答，不重跑 agent。
 
@@ -2040,6 +3059,35 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
             # 只补「评分不全」的样例；execution_error（agent 没答）不补。
             if r.status not in ("evaluation_error", "scored", "skipped"):
                 continue
+
+            # ── 对比模式：分数在 comparison JSONB（非 EvaluationScoreRow），单独走
+            #    _rescore_comparison_result 复用已存 A/B 回答重打失败 scoped verdict。──
+            cmp_json = r.comparison if isinstance(r.comparison, dict) else None
+            if cmp_json is not None:
+                full_trace = r.full_trace if isinstance(r.full_trace, dict) else {}
+                recovered, still_missing = await _rescore_comparison_result(
+                    comparison=cmp_json,
+                    judge_specs=judge_specs,
+                    full_trace=full_trace,
+                    result_id=str(r.id),
+                )
+                if recovered <= 0 and not still_missing:
+                    # 无失败 scoped、无恢复 → 该条对比结果本就齐全，跳过。
+                    continue
+                results_scanned += 1
+                dims_recovered += recovered
+                if still_missing:
+                    results_still_missing += 1
+                else:
+                    if r.status in ("evaluation_error", "skipped"):
+                        r.status = "scored"
+                        r.error_type = None
+                        r.error_message = None
+                    results_completed += 1
+                if recovered > 0:
+                    flag_modified(r, "comparison")
+                continue
+
             existing_rows = scores_by_result.get(r.id, [])
             existing_dims = {row.dimension for row in existing_rows}
 

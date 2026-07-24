@@ -163,6 +163,121 @@ def _compact_summary(summary: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _has_comparison_summary(summary: dict[str, Any] | None) -> bool:
+    """summary_scores 是否含对比数据（双模 A/B）。"""
+    if not isinstance(summary, dict):
+        return False
+    cs = summary.get("comparison_summary")
+    return isinstance(cs, dict) and bool(cs.get("evaluators"))
+
+
+def _collapse_cmp_dims(per_dimension: dict[str, Any] | None) -> dict[str, Any]:
+    """把逐轮维度键（轮N·X / 会话·X）按基础维度名合并，会话·单列保留。"""
+    if not isinstance(per_dimension, dict):
+        return {}
+    import re as _re
+    merged: dict[str, dict[str, Any]] = {}
+    for name, slot in per_dimension.items():
+        if not isinstance(slot, dict):
+            continue
+        base = _re.sub(r"^轮\d+·", "", str(name))
+        m = merged.setdefault(base, {"a_wins": 0, "b_wins": 0, "ties": 0, "_sa": 0.0, "_sb": 0.0, "_n": 0})
+        m["a_wins"] += int(slot.get("a_wins") or 0)
+        m["b_wins"] += int(slot.get("b_wins") or 0)
+        m["ties"] += int(slot.get("ties") or 0)
+        n = int(slot.get("n") or 0)
+        if n and slot.get("mean_a") is not None and slot.get("mean_b") is not None:
+            m["_sa"] += float(slot["mean_a"]) * n
+            m["_sb"] += float(slot["mean_b"]) * n
+            m["_n"] += n
+    out: dict[str, Any] = {}
+    for base, m in merged.items():
+        n = m.pop("_n"); sa = m.pop("_sa"); sb = m.pop("_sb")
+        m["mean_a"] = round(sa / n, 4) if n else None
+        m["mean_b"] = round(sb / n, 4) if n else None
+        out[base] = m
+    return out
+
+
+def _compact_comparison(summary: dict[str, Any]) -> dict[str, Any]:
+    """精简对比 summary 喂 LLM：每评估器 胜负计数 + 合并维度 + A/B 有效回答计数。"""
+    cs = summary.get("comparison_summary") or {}
+    evs = []
+    for e in (cs.get("evaluators") or []):
+        if not isinstance(e, dict):
+            continue
+        evs.append({
+            "label": e.get("label"),
+            "scored": e.get("scored"),
+            "skipped": e.get("skipped"),
+            "evaluation_errors": e.get("evaluation_errors"),
+            "a_wins": e.get("a_wins"), "b_wins": e.get("b_wins"), "ties": e.get("ties"),
+            "per_dimension": _collapse_cmp_dims(e.get("per_dimension")),
+        })
+    out: dict[str, Any] = {"evaluators": evs}
+    if isinstance(cs.get("answer_counts"), dict):
+        out["answer_counts"] = cs["answer_counts"]
+    if isinstance(cs.get("perf"), dict) and cs["perf"]:
+        out["perf"] = cs["perf"]
+    if isinstance(summary.get("facts"), dict):
+        out["facts"] = summary["facts"]
+    return out
+
+
+def _rule_based_comparison_run(summary: dict[str, Any], run_name: str) -> str:
+    """对比模式无 LLM 时的规则兜底报告。"""
+    cs = summary.get("comparison_summary") or {}
+    lines = [f"# 双模对比分析 · {run_name or '（未命名）'}", ""]
+    ac = cs.get("answer_counts") if isinstance(cs.get("answer_counts"), dict) else None
+    if ac:
+        lines.append(f"A/B 有效回答：A {ac.get('a_valid', 0)} 有效 / {ac.get('a_blank', 0)} 空白；"
+                     f"B {ac.get('b_valid', 0)} 有效 / {ac.get('b_blank', 0)} 空白")
+        lines.append("")
+    for e in (cs.get("evaluators") or []):
+        if not isinstance(e, dict):
+            continue
+        lines.append(f"## {e.get('label') or '对比评估器'}")
+        aw = int(e.get("a_wins") or 0); bw = int(e.get("b_wins") or 0); ti = int(e.get("ties") or 0)
+        sk = int(e.get("skipped") or 0); er = int(e.get("evaluation_errors") or 0)
+        lines.append(f"- 胜负：A 胜 {aw} / B 胜 {bw} / 平 {ti}（跳过 {sk}，评分失败 {er}）")
+        for base, m in _collapse_cmp_dims(e.get("per_dimension")).items():
+            ma = m.get("mean_a"); mb = m.get("mean_b")
+            seg = f"  · {base}：A 胜 {m.get('a_wins', 0)} / B 胜 {m.get('b_wins', 0)} / 平 {m.get('ties', 0)}"
+            if ma is not None and mb is not None:
+                seg += f"，均分 A {ma} / B {mb}"
+            lines.append(seg)
+        lines.append("")
+    perf = cs.get("perf") if isinstance(cs.get("perf"), dict) else None
+    if perf:
+        _perf_labels = {
+            "total_tokens": "总 token", "prompt_tokens": "输入 token",
+            "completion_tokens": "输出 token", "cache_read_tokens": "缓存命中 token",
+            "latency_ms": "时延(ms)", "tool_call_count": "工具调用数",
+            "attempts_made": "尝试次数",
+        }
+        lines.append("## 性能成本对比（A vs B）")
+        for _k, _lab in _perf_labels.items():
+            m = perf.get(_k)
+            if not isinstance(m, dict):
+                continue
+            a = m.get("a") or {}; b = m.get("b") or {}; d = m.get("delta") or {}
+            am = a.get("mean"); bm = b.get("mean")
+            if am is None and bm is None:
+                continue
+            seg = f"  · {_lab}：A 均 {am} / B 均 {bm}"
+            dp = d.get("percent")
+            if dp is not None:
+                seg += f"（B 相对 A {'+' if dp >= 0 else ''}{round(dp * 100, 1)}%）"
+            lines.append(seg)
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+_COMPARISON_RUN_SYSTEM_PROMPT = """你是资深的 AI 智能体评估分析师。用户会给你一次「双模对比（A/B）」评估运行的聚合数据（JSON），请写简洁、专业、可执行的中文分析报告。
+数据是相对判断：每个评估器给出 A 胜/B 胜/平局计数，以及各维度 A/B 均分与胜负。answer_counts 是 A/B 各自的有效/空白回答数（空白轮已跳过、不计入胜负）。perf 是 A/B 执行性能成本对比（total_tokens/prompt_tokens/completion_tokens/cache_read_tokens/latency_ms/tool_call_count/attempts_made，各含 A/B 的 sum/mean/n 与 delta=B-A 的 value/percent）。
+请聚焦：(1) 总体哪侧更优、优势是否稳定；(2) 分维度差异与短板；(3) 性能成本对比（若 perf 存在：token 消耗/时延/工具调用哪侧更省更快及幅度）；(4) 空白回答对结论的影响；(5) 结合质量与成本的可执行建议。不要臆造数据里没有的数字。"""
+
+
 async def generate_run_report(
     summary: dict[str, Any] | None, *, run_name: str = "",
 ) -> str:
@@ -176,6 +291,8 @@ async def generate_run_report(
     """
     if not summary:
         return "本次运行暂无聚合数据，无法生成分析报告（可能尚未完成或无评分）。"
+
+    _is_cmp = _has_comparison_summary(summary)
 
     import json
 
@@ -199,15 +316,15 @@ async def generate_run_report(
                 "report_llm: provider «%s» missing, using rule-based summary",
                 settings.feishu.judge_provider,
             )
-            return _rule_based_summary(summary, run_name)
+            return _rule_based_comparison_run(summary, run_name) if _is_cmp else _rule_based_summary(summary, run_name)
 
-        payload = _compact_summary(summary)
+        payload = _compact_comparison(summary) if _is_cmp else _compact_summary(summary)
         user_msg = (
             f"评估运行名：{run_name or '（未命名）'}\n"
             f"聚合指标 JSON：\n{json.dumps(payload, ensure_ascii=False)}"
         )
         messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": _COMPARISON_RUN_SYSTEM_PROMPT if _is_cmp else _SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ]
         override_model = (settings.feishu.judge_model or "").strip() or None
@@ -216,13 +333,13 @@ async def generate_run_report(
             invocation = await judge.ainvoke(messages)
         text = (invocation.content or "").strip()
         if not text:
-            return _rule_based_summary(summary, run_name)
+            return _rule_based_comparison_run(summary, run_name) if _is_cmp else _rule_based_summary(summary, run_name)
         return text
     except JudgeClientError as e:
         logger.warning("report_llm LLM call failed: %s", e)
     except Exception:  # noqa: BLE001
         logger.exception("report_llm crashed, falling back to rules")
-    return _rule_based_summary(summary, run_name)
+    return _rule_based_comparison_run(summary, run_name) if _is_cmp else _rule_based_summary(summary, run_name)
 
 
 # ─────────────────────────────────────────────────────────────────────
