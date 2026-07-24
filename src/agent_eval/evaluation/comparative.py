@@ -245,4 +245,61 @@ def build_comparison_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
-__all__ = ["pick_swap", "restore_verdict", "build_comparison_summary"]
+def aggregate_comparison_perf(
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[str, Any]:
+    """把逐样例 (A 侧指标, B 侧指标) 聚合成 A/B 各指标的 sum/mean + (B-A) delta。
+
+    ``pairs`` 每对是一条对比样例的 A、B 侧执行指标（token / 时延 / 工具调用 /
+    尝试次数）。A 侧取 result 行本身，B 侧取 ``comparison.agent_b``——与前端
+    ``aggregateComparativeResources`` 同口径。缺失值跳过，各指标独立计数 n；
+    仅返回至少一侧有数据的指标。供报告层解读 A/B 资源成本差异。
+    """
+    metrics = [
+        "total_tokens", "prompt_tokens", "completion_tokens",
+        "cache_read_tokens", "latency_ms", "tool_call_count", "attempts_made",
+    ]
+    out: dict[str, Any] = {}
+    for key in metrics:
+        a_vals: list[float] = []
+        b_vals: list[float] = []
+        for a, b in pairs:
+            av = a.get(key) if isinstance(a, dict) else None
+            bv = b.get(key) if isinstance(b, dict) else None
+            if isinstance(av, (int, float)):
+                a_vals.append(float(av))
+            if isinstance(bv, (int, float)):
+                b_vals.append(float(bv))
+        if not a_vals and not b_vals:
+            continue
+        a_sum = sum(a_vals) if a_vals else None
+        b_sum = sum(b_vals) if b_vals else None
+        a_mean = a_sum / len(a_vals) if a_vals else None
+        b_mean = b_sum / len(b_vals) if b_vals else None
+        dv = (b_mean - a_mean) if (a_mean is not None and b_mean is not None) else None
+        dp = (dv / a_mean) if (dv is not None and a_mean not in (None, 0)) else None
+        out[key] = {
+            "a": {
+                "sum": round(a_sum, 2) if a_sum is not None else None,
+                "mean": round(a_mean, 2) if a_mean is not None else None,
+                "n": len(a_vals),
+            },
+            "b": {
+                "sum": round(b_sum, 2) if b_sum is not None else None,
+                "mean": round(b_mean, 2) if b_mean is not None else None,
+                "n": len(b_vals),
+            },
+            "delta": {
+                "value": round(dv, 2) if dv is not None else None,
+                "percent": round(dp, 4) if dp is not None else None,
+            },
+        }
+    return out
+
+
+__all__ = [
+    "pick_swap",
+    "restore_verdict",
+    "build_comparison_summary",
+    "aggregate_comparison_perf",
+]

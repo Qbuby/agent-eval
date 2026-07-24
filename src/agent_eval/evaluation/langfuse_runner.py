@@ -32,6 +32,7 @@ from typing import Any
 import httpx
 from langfuse import Langfuse  # kept for optional remote write; unused otherwise
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from agent_eval.config import settings
 from agent_eval.db import async_session_factory
@@ -2811,6 +2812,201 @@ def _expected_judge_dims(
     return dims
 
 
+async def _rescore_comparison_result(
+    *,
+    comparison: dict[str, Any],
+    judge_specs: list[dict[str, Any]],
+    full_trace: dict[str, Any],
+    result_id: str,
+) -> tuple[int, bool]:
+    """对一条对比 result 的 comparison 补评——复用已存 A/B 回答，不重跑 agent。
+
+    对比模式的分数存在 ``comparison`` JSONB（evaluator_verdicts[].scoped_verdicts[]），
+    不落 EvaluationScoreRow。故补评针对每个 evaluator 里 status 非 "scored" 也非
+    "skipped"（即 evaluation_error）的 scoped verdict，用已存的 A/B 该轮/整段回答
+    重打对比 judge，成功则原地把该 scope 改回 scored + 写入 verdict。空白轮
+    （skipped）不补——那是执行事实，非评分失败。
+
+    位置随机化：与首评一致，逐 result 一个 swap 决策，喂 judge 前按 swap 定 slot，
+    ``restore_verdict`` 还原真实 A/B。judge_specs 需已解析 ``_provider``。
+
+    原地修改传入的 ``comparison``（调用方负责 flag_modified + commit）。
+    返回 ``(recovered_scope_count, still_has_unscored)``：
+      * recovered = 本次成功补回的 scope 数；
+      * still_has_unscored = 补评后是否仍有 evaluation_error 的 scope（决定 result
+        能否回到 completed）。
+    """
+    conv = full_trace.get("conversation") if isinstance(full_trace, dict) else None
+    a_turns = (conv.get("turns") or []) if isinstance(conv, dict) else []
+    goal = conv.get("goal") if isinstance(conv, dict) else None
+    turn_exps = (conv.get("turn_expectations") or []) if isinstance(conv, dict) else []
+    a_turn_by_idx = {t.get("turn_index"): t for t in a_turns if isinstance(t, dict)}
+    exp_by_index: dict[int, dict[str, Any]] = {}
+    for te in turn_exps:
+        ti = te.get("turn_index")
+        if isinstance(ti, int):
+            exp_by_index[ti] = te
+
+    agent_b = comparison.get("agent_b") if isinstance(comparison, dict) else None
+    b_conv = agent_b.get("conversation") if isinstance(agent_b, dict) else None
+    b_turns = (b_conv.get("turns") or []) if isinstance(b_conv, dict) else []
+    b_turn_by_idx = {t.get("turn_index"): t for t in b_turns if isinstance(t, dict)}
+
+    from agent_eval.evaluation import multiturn
+
+    transcript_a = multiturn.build_transcript(a_turns) if a_turns else ""
+    transcript_b = multiturn.build_transcript(b_turns) if b_turns else ""
+
+    spec_by_label = {(s.get("label") or s.get("tag") or "comparison"): s for s in judge_specs}
+
+    def _is_blank(text: Any) -> bool:
+        return not (text or "").strip()
+
+    swap = pick_swap()
+
+    async def _compare_once(
+        *, spec: dict[str, Any], input_text: str, real_a: str, real_b: str,
+        expected_output: str, metadata: dict[str, Any] | None, evaluator_name: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        provider_row = spec.get("_provider")
+        if provider_row is None:
+            return None, f"{evaluator_name}: provider 未解析或不可用"
+        slot_a = real_b if swap else real_a
+        slot_b = real_a if swap else real_b
+        try:
+            cmp_result = await run_comparative_judge(
+                params=spec.get("params") or {},
+                provider=provider_row,
+                input_text=input_text,
+                output_a=slot_a,
+                output_b=slot_b,
+                expected_output=expected_output,
+                metadata=metadata,
+                evaluator_name=evaluator_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{evaluator_name}: {type(exc).__name__}: {exc}"
+        if not cmp_result.verdict:
+            return None, f"{evaluator_name}: {cmp_result.error or '未返回 verdict'}"
+        return restore_verdict(cmp_result.verdict, swapped=swap), None
+
+    recovered = 0
+    entries = comparison.get("evaluator_verdicts") if isinstance(comparison, dict) else None
+    if not isinstance(entries, list):
+        return 0, False
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("label") or entry.get("tag") or "comparison"
+        spec = spec_by_label.get(label)
+        scoped = entry.get("scoped_verdicts")
+        if not isinstance(scoped, list) or not scoped:
+            continue
+
+        for sv in scoped:
+            if not isinstance(sv, dict):
+                continue
+            # 只补 evaluation_error 的 scope；scored/skipped 不动。
+            if sv.get("status") != "evaluation_error":
+                continue
+            if spec is None:
+                continue
+
+            scope = sv.get("scope")
+            if scope == "turn":
+                ti = sv.get("turn_index")
+                te = exp_by_index.get(ti) or {}
+                a_turn = a_turn_by_idx.get(ti)
+                b_turn = b_turn_by_idx.get(ti)
+                if a_turn is None or b_turn is None:
+                    continue  # 缺回放数据，无从补
+                if _is_blank(a_turn.get("assistant")) or _is_blank(b_turn.get("assistant")):
+                    # 空白轮：改判 skipped（首评本应如此，历史 error 数据一并纠正）。
+                    sv["status"] = "skipped"
+                    sv["verdict"] = None
+                    sv["error"] = "该轮回复空白，跳过对比"
+                    continue
+                criteria = te.get("criteria") or []
+                turn_meta = {
+                    "turn_criteria": "\n".join(criteria) if criteria else "",
+                    "turn_index": ti,
+                    "expected_tool_calls": json.dumps(
+                        te.get("expected_tool_calls") or [], ensure_ascii=False),
+                    "actual_tool_calls_a": json.dumps(
+                        a_turn.get("tool_calls") or [], ensure_ascii=False),
+                    "actual_tool_calls_b": json.dumps(
+                        b_turn.get("tool_calls") or [], ensure_ascii=False),
+                }
+                verdict, err = await _compare_once(
+                    spec=spec, input_text=a_turn.get("user", ""),
+                    real_a=a_turn.get("assistant", ""), real_b=b_turn.get("assistant", ""),
+                    expected_output=te.get("expected_output") or "",
+                    metadata=turn_meta,
+                    evaluator_name=f"{label}.turn{ti}",
+                )
+            elif scope == "conversation":
+                if not goal:
+                    continue
+                conv_meta = {"conversation_goal": goal}
+                verdict, err = await _compare_once(
+                    spec=spec, input_text=goal,
+                    real_a=transcript_a, real_b=transcript_b,
+                    expected_output=goal, metadata=conv_meta,
+                    evaluator_name=f"{label}.conversation",
+                )
+            else:
+                continue
+
+            if err:
+                logger.warning("rescore comparison[%s] result %s scope %s failed: %s",
+                               label, result_id, scope, err)
+                continue
+            sv["status"] = "scored"
+            sv["verdict"] = verdict
+            sv["error"] = None
+            recovered += 1
+
+        # ── 重算该 evaluator 顶层 status（对齐首评收尾语义）──
+        has_scored = any(s.get("status") == "scored" for s in scoped if isinstance(s, dict))
+        has_error = any(s.get("status") == "evaluation_error" for s in scoped if isinstance(s, dict))
+        conv_verdict: dict[str, Any] | None = None
+        for s in reversed(scoped):
+            if isinstance(s, dict) and s.get("scope") == "conversation" and s.get("status") == "scored":
+                conv_verdict = s.get("verdict")
+                break
+        if conv_verdict is None:
+            for s in reversed(scoped):
+                if isinstance(s, dict) and s.get("status") == "scored" and s.get("verdict"):
+                    conv_verdict = s.get("verdict")
+                    break
+        if has_scored:
+            entry["status"] = "scored"
+            entry["verdict"] = conv_verdict
+            entry["error"] = None
+        elif not has_error:
+            # 无 scored、无 error → 全 skipped。
+            entry["status"] = "skipped"
+            entry["verdict"] = None
+            entry["error"] = None
+        else:
+            entry["status"] = "evaluation_error"
+            entry["verdict"] = None
+
+    # 顶层 comparison.verdict 兼容旧消费方：取任一 scored evaluator 的顶层 verdict。
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("status") == "scored" and entry.get("verdict"):
+            comparison["verdict"] = entry["verdict"]
+            break
+
+    still_unscored = any(
+        isinstance(sv, dict) and sv.get("status") == "evaluation_error"
+        for entry in entries if isinstance(entry, dict)
+        for sv in (entry.get("scoped_verdicts") or [])
+    )
+    return recovered, still_unscored
+
+
 async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
     """对一个已完成 run 里「缺分维度」补评——复用已存 agent 回答，不重跑 agent。
 
@@ -2863,6 +3059,35 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
             # 只补「评分不全」的样例；execution_error（agent 没答）不补。
             if r.status not in ("evaluation_error", "scored", "skipped"):
                 continue
+
+            # ── 对比模式：分数在 comparison JSONB（非 EvaluationScoreRow），单独走
+            #    _rescore_comparison_result 复用已存 A/B 回答重打失败 scoped verdict。──
+            cmp_json = r.comparison if isinstance(r.comparison, dict) else None
+            if cmp_json is not None:
+                full_trace = r.full_trace if isinstance(r.full_trace, dict) else {}
+                recovered, still_missing = await _rescore_comparison_result(
+                    comparison=cmp_json,
+                    judge_specs=judge_specs,
+                    full_trace=full_trace,
+                    result_id=str(r.id),
+                )
+                if recovered <= 0 and not still_missing:
+                    # 无失败 scoped、无恢复 → 该条对比结果本就齐全，跳过。
+                    continue
+                results_scanned += 1
+                dims_recovered += recovered
+                if still_missing:
+                    results_still_missing += 1
+                else:
+                    if r.status in ("evaluation_error", "skipped"):
+                        r.status = "scored"
+                        r.error_type = None
+                        r.error_message = None
+                    results_completed += 1
+                if recovered > 0:
+                    flag_modified(r, "comparison")
+                continue
+
             existing_rows = scores_by_result.get(r.id, [])
             existing_dims = {row.dimension for row in existing_rows}
 

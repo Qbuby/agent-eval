@@ -958,17 +958,15 @@ export default function EvaluationRunDetailPage() {
           >
             重算汇总
           </Button>
-          {!isComparative && (
-            <Button
-              variant="secondary"
-              size="sm"
-              loading={rescoreMutation.isPending}
-              onClick={() => rescoreMutation.mutate()}
-              title="对评分未出全的样例（evaluation_error）复用已存回答，只补缺失维度的 judge 打分"
-            >
-              补评缺分维度
-            </Button>
-          )}
+          <Button
+            variant="secondary"
+            size="sm"
+            loading={rescoreMutation.isPending}
+            onClick={() => rescoreMutation.mutate()}
+            title="对评分未出全的样例（evaluation_error）复用已存回答，只补缺失维度的 judge 打分（含对比模式）"
+          >
+            补评缺分维度
+          </Button>
         </div>
       </header>
 

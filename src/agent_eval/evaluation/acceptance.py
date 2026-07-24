@@ -130,6 +130,35 @@ def reduce_dimension_score(
     return sum(turn_values) / len(turn_values)
 
 
+def _comparison_has_scored_verdict(comparison: Mapping[str, Any] | None) -> bool:
+    """对比模式的分数不落 score_map，而在 ``comparison`` JSONB 里。
+
+    判定该 comparison 是否含至少一个「已出分」裁决：
+      * 任一 ``evaluator_verdicts[].status == "scored"``；或
+      * 任一 ``evaluator_verdicts[].scoped_verdicts[].status == "scored"``（多轮）；或
+      * legacy 顶层 ``verdict`` 为 dict（旧单轮 payload）。
+    仅用于把「有对比结论但 score_map 为空」的样例投影为评分完成，不造假分数。
+    """
+    if not isinstance(comparison, Mapping):
+        return False
+    entries = comparison.get("evaluator_verdicts")
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            if entry.get("status") == "scored":
+                return True
+            scoped = entry.get("scoped_verdicts")
+            if isinstance(scoped, list):
+                for sv in scoped:
+                    if isinstance(sv, Mapping) and sv.get("status") == "scored":
+                        return True
+    # legacy 顶层 verdict（无 evaluator_verdicts 的旧 payload）。
+    if isinstance(comparison.get("verdict"), Mapping):
+        return True
+    return False
+
+
 def project_case(
     *,
     stored_status: str | None,
@@ -137,10 +166,17 @@ def project_case(
     scores: Mapping[str, float] | None,
     acceptance_policy: Mapping[str, Any] | None = None,
     decision_source: str | None = None,
+    comparison: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """把持久化结果保守投影为执行、评分和可选验收三层语义。"""
+    """把持久化结果保守投影为执行、评分和可选验收三层语义。
+
+    ``comparison`` 为对比模式的 comparison JSONB（可为 None）。对比样例的分数不在
+    ``scores`` 里而在此，故据它把「有对比结论、score_map 为空」的样例投影为评分完成，
+    避免误判为 skipped。
+    """
     status = (stored_status or "").strip()
     score_map = dict(scores or {})
+    has_cmp_verdict = _comparison_has_scored_verdict(comparison)
     source = decision_source or (
         "legacy_derived" if status in {"pass", "fail", "error"} else "current"
     )
@@ -151,7 +187,7 @@ def project_case(
         execution_status = "abnormal"
     elif status in {
         "scored", "skipped", "evaluation_error", "pass", "fail"
-    } or score_map:
+    } or score_map or has_cmp_verdict:
         execution_status = "success"
     else:
         execution_status = "unknown"
@@ -163,6 +199,10 @@ def project_case(
     elif status == "skipped":
         evaluation_status = "skipped"
     elif score_map and status in {"scored", "pass", "fail"}:
+        evaluation_status = "completed"
+    # 对比模式：分数在 comparison JSONB 而非 score_map。有 scored 裁决且执行成功
+    # → 评分完成（不造假分数，仅纠正三层投影，避免误判 skipped）。
+    elif has_cmp_verdict and status in {"scored", "pass", "fail"}:
         evaluation_status = "completed"
     elif score_map:
         evaluation_status = "unknown"

@@ -1040,6 +1040,47 @@ async def get_run_report(run_id: str):
         )
         run_name = run_row.langfuse_run_name or run_id[:8]
 
+        # 对比模式：逐行聚合 A/B 执行成本（token/时延/工具调用/尝试），塞进
+        # comparison_summary.perf 供报告层解读。A 侧=result 行本身，B 侧=
+        # comparison.agent_b——与前端 aggregateComparativeResources 同口径。
+        cmp_summary = (summary or {}).get("comparison_summary")
+        if isinstance(cmp_summary, dict) and cmp_summary.get("evaluators"):
+            from agent_eval.evaluation.comparative import aggregate_comparison_perf
+
+            rows = (await session.execute(
+                select(TestResultRow).where(TestResultRow.run_id == run_uuid)
+            )).scalars().all()
+            pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for r in rows:
+                cmp = r.comparison if isinstance(r.comparison, dict) else None
+                if cmp is None:
+                    continue
+                agent_b = cmp.get("agent_b") if isinstance(cmp.get("agent_b"), dict) else {}
+                a_side = {
+                    "total_tokens": r.total_tokens,
+                    "prompt_tokens": r.prompt_tokens,
+                    "completion_tokens": r.completion_tokens,
+                    "cache_read_tokens": r.cache_read_tokens,
+                    "latency_ms": r.latency_ms,
+                    "tool_call_count": r.tool_call_count,
+                    "attempts_made": r.attempts_made,
+                }
+                b_tc = agent_b.get("tool_calls")
+                b_side = {
+                    "total_tokens": agent_b.get("total_tokens"),
+                    "prompt_tokens": agent_b.get("prompt_tokens"),
+                    "completion_tokens": agent_b.get("completion_tokens"),
+                    "cache_read_tokens": agent_b.get("cache_read_tokens"),
+                    "latency_ms": agent_b.get("latency_ms"),
+                    "tool_call_count": len(b_tc) if isinstance(b_tc, list) else None,
+                    "attempts_made": agent_b.get("attempts_made"),
+                }
+                pairs.append((a_side, b_side))
+            if pairs:
+                perf = aggregate_comparison_perf(pairs)
+                if perf:
+                    cmp_summary["perf"] = perf
+
     report = await generate_run_report(summary, run_name=run_name)
     return {"run_id": run_id, "run_name": run_name, "report": report}
 
