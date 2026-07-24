@@ -1,8 +1,10 @@
 """HTTP API for the evaluation workbench."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -1177,26 +1179,77 @@ async def stop_run(run_id: str):
     return {"run_id": run_id, "status": "stopping"}
 
 
-@router.post("/runs/{run_id}/rescore")
-async def rescore_run(run_id: str):
-    """对已完成 run 里「缺分维度」补评。
+# ── 补评异步作业：内存态 job registry ──
+# 补评对失败样例逐个串行调真实 judge，大 run（数十个失败 scope）总耗时会超过
+# 网关/前端的同步请求超时（曾出现 68 个失败 scope → HTTP 504）。故改为后台任务：
+# POST /rescore 起 asyncio task 立即返回，前端轮询 GET /rescore-status。
+# 与 _RUN_REGISTRY 同为进程内单实例态（本项目单副本部署，够用）。
+_RESCORE_JOBS: dict[str, dict[str, Any]] = {}
 
-    复用已存的 agent 回答（不重跑 agent），只对评分缺失的维度
-    重打 judge；维度齐全的样例从 evaluation_error 恢复为 scored。
-    补评完成后复用 reaggregate 刷新汇总。
-    """
+
+async def _run_rescore_job(run_id: str) -> None:
+    """后台执行补评 + reaggregate，把进度/结果写进 _RESCORE_JOBS[run_id]。"""
+    job = _RESCORE_JOBS[run_id]
     try:
         stats = await rescore_missing_dimensions(run_id)
+        job.update(stats)
+        # 补评改了逐样例分数/状态，立即重算汇总使列表/详情页一致。
+        try:
+            await reaggregate_run(run_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("rescore: reaggregate after rescore failed for %s: %s", run_id, e)
+        job["status"] = "completed"
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        job["status"] = "error"
+        job["error"] = str(e)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"rescore failed: {e}") from e
-    # 补评改了逐样例分数/状态，立即重算汇总使列表/详情页一致。
+        logger.exception("rescore job crashed for %s", run_id)
+        job["status"] = "error"
+        job["error"] = f"rescore failed: {e}"
+    finally:
+        job["finished_at"] = time.time()
+
+
+@router.post("/runs/{run_id}/rescore")
+async def rescore_run(run_id: str):
+    """发起对已完成 run 的「缺分维度」补评（异步后台任务）。
+
+    复用已存的 agent 回答（不重跑 agent），只对评分缺失的维度重打 judge；
+    维度齐全的样例从 evaluation_error 恢复为 scored，完成后复用 reaggregate
+    刷新汇总。因逐个失败样例串行调真实 judge，大 run 耗时长，故起后台任务
+    立即返回 ``{status: "running"}``，前端轮询 ``/rescore-status`` 取结果。
+    """
     try:
-        await reaggregate_run(run_id)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("rescore: reaggregate after rescore failed for %s: %s", run_id, e)
-    return {"run_id": run_id, **stats}
+        run_uuid = uuid.UUID(run_id)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail="invalid run_id") from e
+    async with async_session_factory() as session:
+        exists = (await session.execute(
+            select(TestRunRow.id).where(TestRunRow.id == run_uuid)
+        )).scalar_one_or_none()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="run not found")
+
+    existing = _RESCORE_JOBS.get(run_id)
+    if existing and existing.get("status") == "running":
+        return {"run_id": run_id, "status": "running"}
+
+    _RESCORE_JOBS[run_id] = {
+        "run_id": run_id, "status": "running", "started_at": time.time(),
+        "results_scanned": 0, "dimensions_recovered": 0,
+        "results_completed": 0, "results_still_missing": 0,
+    }
+    asyncio.create_task(_run_rescore_job(run_id))
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.get("/runs/{run_id}/rescore-status")
+async def rescore_status(run_id: str):
+    """查询补评后台任务状态：running / completed / error / idle。"""
+    job = _RESCORE_JOBS.get(run_id)
+    if job is None:
+        return {"run_id": run_id, "status": "idle"}
+    return dict(job)
 
 
 @router.post("/runs/{run_id}/reaggregate")

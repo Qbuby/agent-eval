@@ -1002,12 +1002,22 @@ export default function EvaluationRunDetailPage() {
         </div>
       )}
 
-      {rescoreMutation.data && (
+      {rescoreStatusQuery.data?.status === 'running' && (
         <div className="mb-3 text-[12px] text-text-secondary border border-border bg-fill/5 rounded-md px-3 py-2">
-          已补评：扫描 {rescoreMutation.data.results_scanned} 条缺分样例，
-          补回维度 {rescoreMutation.data.dimensions_recovered} 个，
-          恢复完整 {rescoreMutation.data.results_completed} 条
-          {rescoreMutation.data.results_still_missing > 0 ? `，仍缺 ${rescoreMutation.data.results_still_missing} 条（上游 judge 仍未出分，可稍后再点）` : ''}
+          补评进行中…逐个失败样例串行重打 judge，大批量可能需几分钟，完成后自动刷新。
+        </div>
+      )}
+      {rescoreStatusQuery.data?.status === 'completed' && (
+        <div className="mb-3 text-[12px] text-positive border border-border bg-fill/5 rounded-md px-3 py-2">
+          已补评：扫描 {rescoreStatusQuery.data.results_scanned ?? 0} 条缺分样例，
+          补回维度 {rescoreStatusQuery.data.dimensions_recovered ?? 0} 个，
+          恢复完整 {rescoreStatusQuery.data.results_completed ?? 0} 条
+          {(rescoreStatusQuery.data.results_still_missing ?? 0) > 0 ? `，仍缺 ${rescoreStatusQuery.data.results_still_missing} 条（上游 judge 仍未出分，可稍后再点）` : ''}
+        </div>
+      )}
+      {rescoreStatusQuery.data?.status === 'error' && (
+        <div className="mb-3 text-[12px] text-negative border border-border bg-fill/5 rounded-md px-3 py-2">
+          补评失败：{rescoreStatusQuery.data.error}
         </div>
       )}
       {rescoreMutation.isError && (

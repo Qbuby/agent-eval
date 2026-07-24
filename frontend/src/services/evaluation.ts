@@ -240,11 +240,19 @@ export const evaluationApi = {
   rescoreRun(runId: string) {
     return api.post<{
       run_id: string
-      results_scanned: number
-      dimensions_recovered: number
-      results_completed: number
-      results_still_missing: number
-      note?: string
+      status: string
     }>(`/eval/runs/${runId}/rescore`)
+  },
+  rescoreStatus(runId: string) {
+    return api.get<{
+      run_id: string
+      status: 'idle' | 'running' | 'completed' | 'error'
+      results_scanned?: number
+      dimensions_recovered?: number
+      results_completed?: number
+      results_still_missing?: number
+      error?: string
+      note?: string
+    }>(`/eval/runs/${runId}/rescore-status`)
   },
 }
