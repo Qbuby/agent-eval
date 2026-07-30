@@ -373,6 +373,9 @@ class EvalResultRow(BaseModel):
     criterion_results: list[dict[str, Any]] = []
     actual_output: str | None = None
     question: str | None = None
+    expected_output: str | None = None
+    # 评估启动时冻结的答案关键点；首评与补评均以此为准。
+    expected_output_criteria: list[str] = []
     latency_ms: int | None = None
     total_tokens: int | None = None
     prompt_tokens: int | None = None

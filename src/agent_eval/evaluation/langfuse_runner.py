@@ -70,6 +70,24 @@ logger = logging.getLogger(__name__)
 _TURN_SUFFIX_RE = re.compile(r"^(turn\d+|conversation)$")
 
 
+def _case_reference_criteria(case: dict[str, Any]) -> list[str]:
+    """本次运行冻结的答案关键点：优先取样例显式字段，回退到 metadata.reference_criteria。
+
+    resolve_eval_start_args 已把三类来源（对话集 / 上传文件 / 基准集）的关键点归一
+    进 ``case['expected_output_criteria']`` 与 ``metadata['reference_criteria']``。这里
+    返回的列表会随 test_results 一起落库，补评时按快照复用，不跟随源样例后续修改漂移。
+    """
+    value = case.get("expected_output_criteria")
+    if not value:
+        meta = case.get("metadata")
+        value = meta.get("reference_criteria") if isinstance(meta, dict) else None
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 def _collapse_score_key(key: str) -> str:
     idx = key.rfind(".")
     if idx <= 0:
@@ -1952,6 +1970,8 @@ async def _execute_run(
                         benchmark_case_id=bench_id,
                         question=res["question"],
                         expected_output=res.get("expected_output") or None,
+                        # 冻结本次运行的答案关键点快照，补评复用不漂移。
+                        expected_output_criteria=_case_reference_criteria(case),
                         thread_id=res["thread_id"],
                         actual_output=res["actual_output"],
                         actual_tool_calls=res["actual_tool_calls"] or None,
@@ -3193,6 +3213,13 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                     only_dims=missing,
                 )
             else:
+                # 回喂本次运行冻结的答案关键点（落库快照，非源样例）——与首评
+                # 走 metadata.reference_criteria 同一注入路径，保证补评的 judge
+                # 看到相同参考标准，不因源数据后续修改而漂移。
+                snap_criteria = list(r.expected_output_criteria or [])
+                rescore_metadata: dict[str, Any] | None = (
+                    {"reference_criteria": snap_criteria} if snap_criteria else None
+                )
                 for spec in judge_specs:
                     label = spec.get("label") or "judge"
                     if label not in missing:
@@ -3207,7 +3234,7 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                             input_text=r.question or "",
                             output_text=r.actual_output or "",
                             expected_output=r.expected_output or "",
-                            metadata=None,
+                            metadata=rescore_metadata,
                             evaluator_name=label,
                         )
                     except Exception as e:  # noqa: BLE001

@@ -226,6 +226,11 @@ class TestResultRow(Base, TenantMixin):
     # so the export/detail view always has it, independent of whether the
     # originating case still exists. NULL on rows created before 0016.
     expected_output: Mapped[str | None] = mapped_column(Text)
+    # 本次运行启动时冻结的答案关键点，独立于源样例保存。
+    # 后续补评只复用这份快照，不跟随源数据修改而漂移。
+    expected_output_criteria: Mapped[list] = mapped_column(
+        JSONB, default=list,
+    )
     thread_id: Mapped[str | None] = mapped_column(Text)
     langsmith_run_id: Mapped[str | None] = mapped_column(Text)
 

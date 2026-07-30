@@ -380,6 +380,58 @@ def _render(
     return _LEGACY_RE.sub(_legacy_sub, template)
 
 
+def _reference_criteria_text(metadata: dict[str, Any] | None) -> str:
+    """读取本次评估固化的参考要点；逐轮要点优先于样例级要点。"""
+    data = metadata or {}
+    value = data.get("turn_criteria") or data.get("reference_criteria")
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(
+            f"{index}. {str(item).strip()}"
+            for index, item in enumerate(value, 1)
+            if str(item).strip()
+        )
+    return ""
+
+
+def _append_required_reference_criteria(
+    user_prompt: str,
+    *,
+    evaluation_prompt: str,
+    variable_mapping: dict[str, str],
+    metadata: dict[str, Any] | None,
+) -> str:
+    """确保固化要点一定进入 judge 上下文，同时避免模板已引用时重复。"""
+    criteria = _reference_criteria_text(metadata)
+    if not criteria:
+        return user_prompt
+
+    referenced_names = set(_MUSTACHE_RE.findall(evaluation_prompt))
+    data = metadata or {}
+    consumed = any(
+        (
+            variable_mapping.get(name) == "metadata.turn_criteria"
+            and bool(str(data.get("turn_criteria") or "").strip())
+        )
+        or (
+            variable_mapping.get(name) == "metadata.reference_criteria"
+            and bool(data.get("reference_criteria"))
+        )
+        for name in referenced_names
+    )
+    if consumed:
+        return user_prompt
+
+    return (
+        f"{user_prompt}\n\n"
+        "## 固化参考要点（必须逐条核对）\n"
+        f"{criteria}\n\n"
+        "以上要点来自样例在本次评估启动时冻结的参考依据。评分时必须逐条核对，"
+        "不得因自定义模板未声明对应变量而忽略。"
+    )
+
+
 def _build_messages(
     *,
     params: dict[str, Any],
@@ -415,6 +467,12 @@ def _build_messages(
         input_text=input_text,
         output_text=output_text,
         expected_output=expected_output if expected_output else "（未提供）",
+        metadata=metadata,
+    )
+    user = _append_required_reference_criteria(
+        user,
+        evaluation_prompt=evaluation_prompt,
+        variable_mapping=variable_mapping,
         metadata=metadata,
     )
     system = f"{reasoning_prompt}\n\n{output_prompt}"
@@ -460,6 +518,12 @@ def _build_comparative_messages(
         metadata=metadata,
         output_a=output_a,
         output_b=output_b,
+    )
+    user = _append_required_reference_criteria(
+        user,
+        evaluation_prompt=evaluation_prompt,
+        variable_mapping=variable_mapping,
+        metadata=metadata,
     )
     system = f"{reasoning_prompt}\n\n{output_prompt}"
     return [

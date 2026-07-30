@@ -11,6 +11,7 @@ import pytest
 from agent_eval.evaluation.langfuse_runner import (
     _aggregate_cost,
     _bench_case_to_dataset_input,
+    _case_reference_criteria,
     _classify_langsmith_error,
     _evaluator_exact_match,
     _evaluator_tool_sequence,
@@ -20,6 +21,19 @@ from agent_eval.evaluation.langfuse_runner import (
     BUILTIN_EVALUATORS,
 )
 from agent_eval.evaluation.agent_adapter import AgentResponse
+
+
+def test_case_reference_criteria_prefers_explicit_snapshot():
+    case = {
+        "expected_output_criteria": [" 显式要点 ", ""],
+        "metadata": {"reference_criteria": ["旧元数据要点"]},
+    }
+    assert _case_reference_criteria(case) == ["显式要点"]
+
+
+def test_case_reference_criteria_falls_back_to_metadata():
+    case = {"metadata": {"reference_criteria": " 元数据要点 "}}
+    assert _case_reference_criteria(case) == ["元数据要点"]
 
 
 def test_exact_match_case_insensitive_default():

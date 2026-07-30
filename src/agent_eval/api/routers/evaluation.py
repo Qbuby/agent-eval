@@ -113,6 +113,22 @@ async def resolve_eval_start_args(
 
     cases: list[dict[str, Any]] = []
 
+    def _criteria(value: Any) -> list[str]:
+        """把各数据源的 key_points / criteria / keywords 统一成非空文本列表。"""
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _metadata_with_criteria(
+        metadata: dict[str, Any] | None, criteria: list[str],
+    ) -> dict[str, Any]:
+        """将冻结关键点同步进 judge metadata，同时保留来源自带元数据。"""
+        result = dict(metadata or {})
+        result["reference_criteria"] = list(criteria)
+        return result
+
     if req.conversation_dataset:
         # ── 多轮对话数据集（直读 LangSmith dataset，保留多轮字段）──
         # 与 benchmark/file 不同：这条路径不降维成单 question，而是整段
@@ -168,13 +184,17 @@ async def resolve_eval_start_args(
             first_user = next(
                 (m.get("content", "") for m in msgs if m.get("role") == "user"), ""
             )
+            reference_criteria = _criteria(c.expected_output_criteria)
             cases.append({
                 "id": c.id,
                 "name": c.name or c.id,
                 "question": first_user,
                 "expected_output": c.expected_output or "",
+                "expected_output_criteria": reference_criteria,
                 "expected_tool_calls": [],
-                "metadata": {"tags": list(c.tags or [])},
+                "metadata": _metadata_with_criteria(
+                    {"tags": list(c.tags or [])}, reference_criteria,
+                ),
                 "source": "conversation",
                 # 多轮标记 + 完整回放/打分输入：runner 据此走 multiturn 分支。
                 "multi_turn": True,
@@ -196,13 +216,21 @@ async def resolve_eval_start_args(
         if req.limit:
             raw_cases = raw_cases[: req.limit]
         for c in raw_cases:
+            reference_criteria = _criteria(
+                c.get("expected_output_criteria")
+                or c.get("key_points")
+                or c.get("expected_keywords")
+            )
             cases.append({
                 "id": c.get("name") or f"case-{len(cases)+1}",
                 "name": c.get("name") or f"case-{len(cases)+1}",
                 "question": c.get("question") or "",
                 "expected_output": c.get("expected_output") or "",
+                "expected_output_criteria": reference_criteria,
                 "expected_tool_calls": [],
-                "metadata": c.get("metadata") or {},
+                "metadata": _metadata_with_criteria(
+                    c.get("metadata"), reference_criteria,
+                ),
                 "source": "file",
             })
     else:
@@ -228,13 +256,17 @@ async def resolve_eval_start_args(
                     nm = t.get("tool_name") or t.get("name") if isinstance(t, dict) else None
                     if nm:
                         expected_tool_calls.append({"tool_name": nm})
+            reference_criteria = _criteria(b.key_points)
             cases.append({
                 "id": str(b.id),
                 "name": str(b.id)[:8],
                 "question": b.question,
                 "expected_output": b.reference_answer or "",
+                "expected_output_criteria": reference_criteria,
                 "expected_tool_calls": expected_tool_calls,
-                "metadata": {"tags": list(b.tags or [])},
+                "metadata": _metadata_with_criteria(
+                    {"tags": list(b.tags or [])}, reference_criteria,
+                ),
                 "source": "benchmark",
             })
 
@@ -577,6 +609,8 @@ async def get_run_results(
             comparison=comparison,
             actual_output=r.actual_output,
             question=r.question,
+            expected_output=r.expected_output,
+            expected_output_criteria=list(r.expected_output_criteria or []),
             latency_ms=r.latency_ms,
             total_tokens=r.total_tokens,
             prompt_tokens=r.prompt_tokens,
@@ -2105,7 +2139,7 @@ def _parse_cases_payload(raw: bytes, filename: str) -> tuple[list[dict[str, Any]
 
 
 def _normalize_cases(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Coerce each entry into {name, question, expected_keywords} shape."""
+    """Coerce uploaded entries into the canonical evaluation-case shape."""
     out = []
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
@@ -2125,9 +2159,22 @@ def _normalize_cases(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     break
         if not question:
             continue
+        criteria = (
+            item.get("expected_output_criteria")
+            or item.get("key_points")
+            or item.get("expected_keywords")
+            or []
+        )
+        if isinstance(criteria, str):
+            criteria = [criteria]
+        if not isinstance(criteria, list):
+            criteria = []
+        criteria = [str(value).strip() for value in criteria if str(value).strip()]
         out.append({
             "name": str(item.get("name") or item.get("id") or f"case-{i+1}"),
             "question": question,
+            # canonical 字段供评估冻结快照；旧字段保留，兼容历史上传消费方。
+            "expected_output_criteria": criteria,
             "expected_keywords": item.get("expected_keywords") or [],
             "expected_output": item.get("expected_output") or item.get("reference_answer") or "",
             "metadata": item.get("metadata") or {},
