@@ -48,3 +48,30 @@ deploy/seed/*.sql
 # Local experiments — prompt tuning harness, dimension alignment drafts
 _prompt_tuning/
 scripts/_aligned/
+
+# Probe / verify scratch (task #119/#120)
+# Local probe scratch: auth material and one-off dumps. Never commit.
+# _tok.txt holds a live JWT; probe-user.json / auth.json hold a plaintext
+# probe password. Keep the files on disk for reruns, keep them out of git.
+e2e/_tok.txt
+e2e/probe-user.json
+probe-user.json
+e2e/auth.json
+auth.json
+# One-off verify dumps and extracted xlsx parts
+e2e/export-out/
+e2e/export-out-*/
+e2e/xlsx-dump/
+e2e/_*.txt
+e2e/_diag_*.mjs
+# Repo-root scratch from interactive debugging
+_*.cjs
+_*.diff
+_*.txt
+_*.tsx
+_split/
+_mock_agent.py
+_verify*.py
+_*.sh
+_*.tar
+_headcheck/

@@ -1,0 +1,13 @@
+{
+  "test_cases": [
+    {
+      "name": "criteria-ui-1785404466271",
+      "question": "MOCKTOOL 关键点快照验收 criteria-ui-1785404466271",
+      "expected_output": "期望答案-criteria-ui-1785404466271",
+      "expected_output_criteria": [
+        "必须包含冻结关键点甲-criteria-ui-1785404466271",
+        "必须包含冻结关键点乙-criteria-ui-1785404466271"
+      ]
+    }
+  ]
+}
