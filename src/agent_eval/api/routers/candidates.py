@@ -9,13 +9,19 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from agent_eval.governance.helpers import log_audit
-from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.api.exporters import (
+    ExportColumn,
+    attach_agent_replies,
+    build_export_response,
+    validate_format,
+)
 from agent_eval.auth.dependencies import (
     ROLE_ADMIN,
     require_internal,
     require_role,
 )
 from agent_eval.db import async_session_factory
+from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import BenchmarkCaseRow, CandidateCaseRow, CategoryRow
 from agent_eval.data.benchmark_import import (
     auto_detect_field_mapping,
@@ -178,11 +184,17 @@ async def export_candidates(
         result = await session.execute(stmt)
         cases = result.scalars().all()
 
-    rows = [_candidate_to_dict(c) for c in cases]
+        rows = [_candidate_to_dict(c) for c in cases]
+        replies = await Repository(session).get_current_agent_replies(
+            "candidate", [r["id"] for r in rows],
+        )
+        attach_agent_replies(rows, replies)
     columns = [
         ExportColumn("id", "ID"),
         ExportColumn("question", "问题"),
         ExportColumn("answer", "答案"),
+        ExportColumn("agent_reply", "Agent 回复"),
+        ExportColumn("agent_reply_version", "Agent 回复版本"),
         ExportColumn("key_points", "关键点"),
         ExportColumn("negative_points", "负向点"),
         ExportColumn("tags", "标签"),

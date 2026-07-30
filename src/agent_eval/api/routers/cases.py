@@ -7,7 +7,12 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from agent_eval.api.dependencies import get_manager
-from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.api.exporters import (
+    ExportColumn,
+    attach_agent_replies,
+    build_export_response,
+    validate_format,
+)
 from agent_eval.api.schemas import AddCasesRequest, BatchDeleteRequest, TestCaseInput
 from agent_eval.auth.dependencies import (
     ROLE_ADMIN,
@@ -21,6 +26,7 @@ from agent_eval.data.benchmark_import import (
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.data.schemas import validate_and_parse
 from agent_eval.db import async_session_factory
+from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import ConversationCategoryRow
 from agent_eval.governance.helpers import log_audit
 from agent_eval.models.test_case import TestCase, TurnExpectation
@@ -606,6 +612,14 @@ async def export_conversations(
             "source": c.source,
         })
 
+    # 多轮对话样例的 agent 回复以 case_ref = Langfuse item id 存储（= c.id）。
+    # content 是 build_transcript(turns) 的整段文本，直接落进「Agent 回复」列。
+    async with async_session_factory() as session:
+        replies = await Repository(session).get_current_agent_replies(
+            "conversation", [r["id"] for r in rows],
+        )
+    attach_agent_replies(rows, replies)
+
     columns = [
         ExportColumn("id", "ID"),
         ExportColumn("name", "名称"),
@@ -614,6 +628,8 @@ async def export_conversations(
         ExportColumn("conversation_goal", "会话目标"),
         ExportColumn("input_messages", "对话消息"),
         ExportColumn("turn_expectations", "逐轮期望"),
+        ExportColumn("agent_reply", "Agent 回复"),
+        ExportColumn("agent_reply_version", "Agent 回复版本"),
         ExportColumn("source", "来源"),
     ]
     return build_export_response(

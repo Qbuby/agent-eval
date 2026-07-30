@@ -924,6 +924,29 @@ class Repository:
         )).all()
         return {r[0]: int(r[1]) for r in rows}
 
+    async def get_current_agent_replies(
+        self, dataset_type: str, case_refs: list[str],
+    ) -> dict[str, AgentReplyVersionRow]:
+        """批量取一批样例「当前生效」的回复版本行（导出用），按 case_ref 索引。
+
+        只返回 case_state 指针命中的当前版本；指针悬空 / 未生成过回复的样例不
+        出现在结果里，由调用方按缺失处理（导出留空）。一次 join 查询，避免逐样
+        例往返。
+        """
+        if not case_refs:
+            return {}
+        state = AgentReplyCaseStateRow
+        ver = AgentReplyVersionRow
+        rows = (await self.session.execute(
+            select(state.case_ref, ver)
+            .join(ver, state.current_version_id == ver.id)
+            .where(
+                state.dataset_type == dataset_type,
+                state.case_ref.in_(case_refs),
+            )
+        )).all()
+        return {r[0]: r[1] for r in rows}
+
     # ---- 生成任务 ----
 
     async def create_agent_reply_job(
