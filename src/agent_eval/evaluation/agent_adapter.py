@@ -17,6 +17,40 @@ class AgentResponse:
     raw_response: Any = None
 
 
+class AgentHTTPStatusError(httpx.HTTPStatusError):
+    """HTTP 状态错误，同时保留流式响应正文供上层展示。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request: httpx.Request,
+        response: httpx.Response,
+        response_body: str,
+    ) -> None:
+        super().__init__(message, request=request, response=response)
+        self.response_body = response_body
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        if not self.response_body:
+            return base
+        return f"{base}\nResponse body: {self.response_body}"
+
+
+def _render_payload_value(value: Any, question: str) -> Any:
+    """递归展开 payload 模板中的运行时占位符。"""
+    if isinstance(value, str):
+        return value.replace("{input}", question).replace(
+            "{uuid}", uuid.uuid4().hex[:12]
+        )
+    if isinstance(value, dict):
+        return {key: _render_payload_value(item, question) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_render_payload_value(item, question) for item in value]
+    return value
+
+
 class OpenAICompatibleAdapter:
     """Calls an OpenAI-compatible /v1/chat/completions endpoint."""
 
@@ -87,8 +121,12 @@ class SSEStreamAdapter:
       shape:
 
           {"question": <text>,
-           "configurable": {"thread_id": <id>, "language": <text>},
-           "stream": True}
+           "configurable": {"thread_id": <id>, "language": <text>}}
+
+      服务端请求体是 ``extra="forbid"`` 的严格 schema，只接受这两个字段，
+      流式由 ``Accept: text/event-stream`` 协商、用户身份由 ``X-User-Id``
+      header 传递，因此运行时不再注入 ``stream`` 等协议外字段；个别服务确需
+      额外字段时通过 ``payload_template`` 显式声明。
 
       and events follow LangChain's ``astream_events v2`` format, so we read
       ``data.chunk.kwargs.content`` text items from ``on_chat_model_stream``
@@ -129,26 +167,42 @@ class SSEStreamAdapter:
             self._owns_client = True
 
     def _build_payload(self, question: str) -> dict[str, Any]:
+        rendered = _render_payload_value(self.payload_template, question)
+        if not isinstance(rendered, dict):
+            rendered = {}
+
         if self.mode == "langgraph_v2":
-            return {
-                "question": question,
-                "configurable": {
-                    "thread_id": self.thread_id or f"eval_{uuid.uuid4().hex[:12]}",
-                    "language": self.language,
-                },
-                "stream": True,
+            # LangGraph 服务端的请求体是 extra="forbid" 的严格 schema，只接受
+            # question 与 configurable。任何多余顶层字段都会被判 422
+            # （extra_forbidden），历史上运行时硬注入的 stream=True 正是如此。
+            # 因此这里不再自行添加协议外字段：流式由 Accept: text/event-stream
+            # 协商，用户身份由 X-User-Id header 传递；确有服务需要 stream 等
+            # 额外字段时，通过 payload_template 显式声明。
+            payload = {
+                key: value
+                for key, value in rendered.items()
+                if key not in {"question", "configurable"}
             }
+            configurable: dict[str, Any] = {
+                "thread_id": self.thread_id or f"eval_{uuid.uuid4().hex[:12]}",
+                "language": self.language,
+            }
+            template_configurable = rendered.get("configurable")
+            if isinstance(template_configurable, dict):
+                configurable.update({
+                    key: value
+                    for key, value in template_configurable.items()
+                    if key != "thread_id"
+                })
+
+            payload.update({
+                "question": question,
+                "configurable": configurable,
+            })
+            return payload
 
         # generic mode (legacy)
-        payload = {}
-        for key, value in self.payload_template.items():
-            if isinstance(value, str) and "{input}" in value:
-                payload[key] = value.replace("{input}", question)
-            elif isinstance(value, str) and "{uuid}" in value:
-                payload[key] = value.replace("{uuid}", uuid.uuid4().hex[:12])
-            else:
-                payload[key] = value
-
+        payload = rendered
         if "question" not in payload and "messages" not in payload:
             payload["question"] = question
 
@@ -203,7 +257,22 @@ class SSEStreamAdapter:
         truncated = False
         try:
             async with self._client.stream("POST", self.url, json=payload, headers=self._headers) as resp:
-                resp.raise_for_status()
+                try:
+                    resp.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    # 流式响应默认尚未读取，直接访问 response.text 会抛
+                    # ResponseNotRead。趁上下文仍打开读取并限制正文长度，使
+                    # FastAPI 的 422 detail 能进入结果错误，同时避免无界放大。
+                    raw_body = await resp.aread()
+                    response_body = raw_body.decode(
+                        resp.encoding or "utf-8", errors="replace"
+                    )[:2000]
+                    raise AgentHTTPStatusError(
+                        str(exc),
+                        request=exc.request,
+                        response=exc.response,
+                        response_body=response_body,
+                    ) from exc
                 async for line in resp.aiter_lines():
                     if not line or not line.startswith("data:"):
                         continue

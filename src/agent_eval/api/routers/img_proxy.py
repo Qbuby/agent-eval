@@ -45,6 +45,7 @@ _ALLOWED_HOST_SUFFIXES: tuple[str, ...] = (
     "aiservice.ep-ep.com",
     "epcare.ep-ep.com",
     "ep-care.com",
+    "oss.imowfms.com",
 )
 
 # 允许回流的内容类型前缀（只代理图片，杜绝把代理当通用 fetch 用）。
@@ -58,6 +59,29 @@ _TIMEOUT = httpx.Timeout(15.0, connect=8.0)
 # 容器 DNS 对阿里云 OSS 间歇性失败时的有限重试：尝试次数 + 退避基数（秒，线性递增）。
 _FETCH_ATTEMPTS = 4
 _FETCH_BACKOFF = 0.4
+
+
+def _sniff_image_type(body: bytes) -> str | None:
+    """按魔数字节判断是否图片，返回对应 content-type，否则 None。
+
+    真凶：``aiservice.ep-ep.com`` 短链图床对真图片也返回
+    ``binary/octet-stream``（不设 content-type），被下方严格的 ``image/`` 前缀
+    检查 415 误杀。故当上游声明的类型不是 image/* 时，用魔数兜底嗅探——真图片
+    （PNG/JPEG/GIF/WebP/BMP）放行并按嗅探类型回流，PDF 等非图片仍拒。
+    """
+    if len(body) < 12:
+        return None
+    if body[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if body[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if body[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return "image/webp"
+    if body[:2] == b"BM":
+        return "image/bmp"
+    return None
 
 
 def _host_allowed(host: str) -> bool:
@@ -121,13 +145,18 @@ async def proxy_image(url: str = Query(..., max_length=2000)):
             detail=f"upstream image fetch failed after {_FETCH_ATTEMPTS} attempts",
         ) from (last_err if isinstance(last_err, BaseException) else None)
 
-    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-    if not content_type.startswith(_ALLOWED_CONTENT_TYPE):
-        raise HTTPException(status_code=415, detail="upstream is not an image")
-
     body = resp.content
     if len(body) > _MAX_BYTES:
         raise HTTPException(status_code=413, detail="image too large")
+
+    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if not content_type.startswith(_ALLOWED_CONTENT_TYPE):
+        # 上游没如实声明 image/*（如短链图床恒返回 binary/octet-stream）：用魔数
+        # 嗅探兜底。真图片按嗅探类型回流，非图片（PDF 等）仍拒。
+        sniffed = _sniff_image_type(body)
+        if sniffed is None:
+            raise HTTPException(status_code=415, detail="upstream is not an image")
+        content_type = sniffed
 
     return Response(
         content=body,

@@ -250,6 +250,7 @@ class EvalAgentConfig(BaseModel):
     model: str = "default"
     headers: dict[str, str] = {}
     payload_template: dict[str, Any] = {}
+    language: str = "请用中文回复"
     timeout: float = 120.0
 
 

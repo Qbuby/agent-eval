@@ -151,10 +151,11 @@ def test_handler_compat_without_usage_acc():
 def test_build_payload_langgraph_shape():
     ad = SSEStreamAdapter(url="http://x", mode="langgraph_v2", thread_id="TC-1", language="en")
     payload = ad._build_payload("hello?")
+    # 真实 LangGraph 服务端 body schema 是 extra="forbid"，只接受 question +
+    # configurable。多传 stream / user_id 会被判 extra_forbidden 返回 422。
     assert payload == {
         "question": "hello?",
         "configurable": {"thread_id": "TC-1", "language": "en"},
-        "stream": True,
     }
 
 
@@ -168,6 +169,83 @@ def test_build_payload_generic_preserves_template():
     assert payload["model"] == "gpt-4"
     assert payload["seed"] == 7
     assert "conversation_id" in payload  # auto-added
+
+
+def test_build_payload_langgraph_merges_template_without_overriding_runtime_fields():
+    ad = SSEStreamAdapter(
+        url="http://x",
+        mode="langgraph_v2",
+        thread_id="runtime-thread",
+        language="zh",
+        payload_template={
+            "user_id": "user-{input}",
+            "question": "must-not-win",
+            "stream": True,
+            "configurable": {
+                "thread_id": "must-not-win",
+                "language": "template-language",
+                "tenant": "tenant-{uuid}",
+            },
+        },
+    )
+
+    payload = ad._build_payload("hello")
+
+    # 模板可以补充顶层字段（给需要 stream/user_id 的服务端用），
+    # 但改不动本次问题和会话 thread_id。
+    assert payload["user_id"] == "user-hello"
+    assert payload["question"] == "hello"
+    assert payload["stream"] is True
+    assert payload["configurable"]["thread_id"] == "runtime-thread"
+    assert payload["configurable"]["language"] == "template-language"
+    assert payload["configurable"]["tenant"].startswith("tenant-")
+
+
+def test_build_payload_langgraph_omits_stream_and_user_id_by_default():
+    """默认 body 必须最小化：X-User-Id 走 header，不复制进 body。"""
+    ad = SSEStreamAdapter(
+        url="http://x",
+        mode="langgraph_v2",
+        thread_id="TC-1",
+        headers={"x-user-id": "agent-eval", "Authorization": "secret"},
+    )
+
+    payload = ad._build_payload("hello")
+
+    assert "user_id" not in payload
+    assert "stream" not in payload
+    assert "Authorization" not in payload
+    assert payload["question"] == "hello"
+
+
+def test_stream_http_error_preserves_response_detail():
+    async def _run():
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                422,
+                json={"detail": [{"loc": ["body", "user_id"], "msg": "Field required"}]},
+                request=request,
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            ad = SSEStreamAdapter(
+                url="http://agent.test/api/agent/langgraph",
+                mode="langgraph_v2",
+                client=client,
+            )
+            try:
+                await ad.invoke([{"role": "user", "content": "hello"}])
+                raise AssertionError("expected HTTPStatusError")
+            except httpx.HTTPStatusError as exc:
+                assert exc.response.status_code == 422
+                assert "user_id" in str(exc)
+                assert "Field required" in str(exc)
+                assert getattr(exc, "response_body", "")
+        finally:
+            await client.aclose()
+
+    asyncio.run(_run())
 
 
 # ─── shared-client ownership (high-concurrency connection pooling) ──────────
