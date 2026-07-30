@@ -259,6 +259,7 @@ def _make_adapter(
         return SSEStreamAdapter(
             url=agent_cfg["url"],
             headers=agent_cfg.get("headers"),
+            payload_template=agent_cfg.get("payload_template"),
             timeout=float(agent_cfg.get("timeout", 120.0)),
             mode="langgraph_v2",
             thread_id=thread_id,
@@ -507,6 +508,17 @@ _TRANSIENT_HINTS = (
 
 def _classify_agent_error(err: Exception) -> str:
     """Map a raised agent error to a stable category surfaced to the UI."""
+    if isinstance(err, httpx.HTTPStatusError):
+        status_code = err.response.status_code
+        if 400 <= status_code < 500:
+            return "agent_bad_request"
+        if status_code in (502, 503):
+            return "agent_unreachable"
+        if status_code == 504:
+            return "agent_timeout"
+        if 500 <= status_code < 600:
+            return "agent_5xx"
+
     s = str(err).lower()
     if "502" in s or "bad gateway" in s or "503" in s or "service unavailable" in s:
         return "agent_unreachable"
@@ -532,6 +544,12 @@ def _classify_agent_error(err: Exception) -> str:
 
 
 def _is_transient(err: Exception) -> bool:
+    if isinstance(err, httpx.HTTPStatusError):
+        status_code = err.response.status_code
+        if 400 <= status_code < 500:
+            return False
+        if status_code in (502, 503, 504):
+            return True
     s = str(err).lower()
     return any(hint in s for hint in _TRANSIENT_HINTS)
 

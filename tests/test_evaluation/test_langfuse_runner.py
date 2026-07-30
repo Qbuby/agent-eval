@@ -5,6 +5,7 @@ Actual Langfuse roundtrips are covered by the e2e smoke script, not here.
 """
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from agent_eval.evaluation.langfuse_runner import (
@@ -280,6 +281,21 @@ def test_classify_agent_timeout():
 def test_classify_parse_error():
     from agent_eval.evaluation.langfuse_runner import _classify_agent_error
     assert _classify_agent_error(Exception("JSON decode error at line 1")) == "parse_error"
+
+
+def test_classify_http_422_as_bad_request_even_when_detail_mentions_transient_terms():
+    from agent_eval.evaluation.langfuse_runner import _classify_agent_error, _is_transient
+
+    request = httpx.Request("POST", "http://agent.test/api/agent/langgraph")
+    response = httpx.Response(422, request=request)
+    err = httpx.HTTPStatusError(
+        "422 detail mentions timeout and 502",
+        request=request,
+        response=response,
+    )
+
+    assert _classify_agent_error(err) == "agent_bad_request"
+    assert not _is_transient(err)
 
 
 def test_is_transient_known_signals():
