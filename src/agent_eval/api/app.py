@@ -8,10 +8,10 @@ from fastapi.responses import JSONResponse
 
 from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
-    admin, admin_entry_codes, admin_tenants, auth, benchmark, candidates, cases, config,
-    datasets, evaluation, evaluator_providers, feedback_review, feishu_oauth, generate,
-    governance, img_proxy, langfuse_metrics, portal, projects, routing, scheduled_tasks,
-    scheduler, traces,
+    admin, admin_entry_codes, admin_tenants, agent_replies, auth, benchmark, candidates,
+    cases, config, datasets, evaluation, evaluator_providers, feedback_review, feishu_oauth,
+    generate, governance, img_proxy, langfuse_metrics, portal, projects, routing,
+    scheduled_tasks, scheduler, traces,
 )
 from agent_eval.config import settings
 from agent_eval.logging_config import setup_logging
@@ -38,6 +38,15 @@ async def lifespan(app: FastAPI):
             logger.info("swept %d orphaned eval runs to 'interrupted'", n)
     except Exception as e:
         logger.warning("orphaned eval run sweep failed: %s", e)
+
+    # 同理收尾上个进程残留的 agent 回复生成任务（running -> interrupted）。
+    try:
+        from agent_eval.evaluation.reply_generator import sweep_orphaned_jobs
+        n = await sweep_orphaned_jobs()
+        if n:
+            logger.info("swept %d orphaned agent reply jobs to 'interrupted'", n)
+    except Exception as e:
+        logger.warning("orphaned agent reply job sweep failed: %s", e)
 
     svc = SchedulerService()
     scheduler.set_scheduler(svc)
@@ -141,6 +150,9 @@ def create_app() -> FastAPI:
     app.include_router(scheduled_tasks.router)
     app.include_router(evaluation.router)
     app.include_router(evaluator_providers.router)
+    # 持久化 agent 回复：数据集页面预生成答案 + 版本回溯 + 作为评估数据来源。
+    # router 自带 prefix(/api/agent-replies) 与 require_internal 门禁。见迁移 0035。
+    app.include_router(agent_replies.router)
     app.include_router(admin.router)
     # 多租户 + 外部客户 Portal 三个新模块：admin 后台开户、客户 portal、内部反馈展示。
     # 各 router 已自带 prefix 与角色门禁（admin_tenants/feedback_review 挂 require_role(ROLE_ADMIN)，

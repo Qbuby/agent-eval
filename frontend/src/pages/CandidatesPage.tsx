@@ -1,7 +1,10 @@
-import { useId, useState } from 'react'
+import { useId, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useToast, useConfirm, ExportMenu } from '@/components/ui'
 import { candidatesApi, projectsApi, type CandidateCase } from '@/services/benchmark'
+import { agentRepliesApi } from '@/services'
+import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 
 const STATUS_BADGE: Record<string, string> = {
@@ -41,6 +44,10 @@ export default function CandidatesPage() {
   const [promoteProjectId, setPromoteProjectId] = useState('')
   const [promoteCategoryId, _setPromoteCategoryId] = useState('')
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  // agent 生成答案：勾选样例后开弹窗；null = 用当前勾选集，非空 = 只重跑这一条。
+  const [genOpen, setGenOpen] = useState(false)
+  const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
 
   const pageSize = 20
 
@@ -107,6 +114,19 @@ export default function CandidatesPage() {
   const cases = casesData?.items ?? []
   const total = casesData?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
+
+  // 当前页样例的「agent 生成答案」状态，一次批量查，给每行打标记。
+  const caseIdsOnPage = useMemo(() => cases.map(c => c.id), [cases])
+  const { data: replyStates } = useQuery({
+    queryKey: ['agent-reply-states', 'candidate', caseIdsOnPage],
+    queryFn: () => agentRepliesApi.listStates('candidate', caseIdsOnPage).then(r => r.data),
+    enabled: caseIdsOnPage.length > 0,
+  })
+  const replyStateMap = new Map((replyStates ?? []).map(s => [s.case_ref, s]))
+
+  function refreshReplyStates() {
+    queryClient.invalidateQueries({ queryKey: ['agent-reply-states'] })
+  }
 
   function startEdit(c: CandidateCase) {
     setEditingId(c.id)
@@ -178,6 +198,16 @@ export default function CandidatesPage() {
         <Button onClick={() => setShowLangSmithImport(true)} variant="secondary" size="md">
           从 LangSmith 导入
         </Button>
+        {/* 勾选样例后先让 agent 跑出答案存成版本，评估时可直接消费、不再实时连 agent。 */}
+        <Button
+          onClick={() => { setGenSingleId(null); setGenOpen(true) }}
+          variant="secondary"
+          size="md"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : undefined}
+        >
+          agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
         {selectedIds.size > 0 && statusFilter === 'ready' && (
           <Button onClick={() => setShowPromote(true)} variant="primary" size="md">
             导入基准测试集 ({selectedIds.size})
@@ -221,7 +251,8 @@ export default function CandidatesPage() {
               <th>问题</th>
               <th className="w-24">来源</th>
               <th className="w-24">状态</th>
-              <th className="w-28 text-right">操作</th>
+              <th className="w-28">agent回复</th>
+              <th className="w-40 text-right">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -248,6 +279,25 @@ export default function CandidatesPage() {
                   <span className={STATUS_BADGE[c.status] || 'badge badge-neutral'}>
                     {STATUS_LABEL[c.status] || c.status}
                   </span>
+                </td>
+                <td>
+                  {/* 点开版本抽屉：可切换当前版本 / 手工修订 / 删除 / 重新生成 */}
+                  {(() => {
+                    const st = replyStateMap.get(c.id)
+                    if (!st?.has_reply) {
+                      return <span className="text-[11px] text-text-tertiary">未生成</span>
+                    }
+                    return (
+                      <button
+                        onClick={() => setVersionsCaseRef(c.id)}
+                        className="text-action text-[11px]"
+                        title="查看 / 回溯 agent 生成的回复版本"
+                      >
+                        v{st.current_version_number ?? '—'}
+                        {st.version_count > 1 ? ` · 共${st.version_count}版` : ''}
+                      </button>
+                    )
+                  })()}
                 </td>
                 <td className="text-right">
                   <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
@@ -459,6 +509,25 @@ export default function CandidatesPage() {
           </div>
         </div>
       </Dialog>
+
+      {/* agent 生成答案：genSingleId 非空 = 只重跑这一条，否则用当前勾选集 */}
+      <AgentReplyGenerateDialog
+        open={genOpen}
+        onClose={() => { setGenOpen(false); setGenSingleId(null) }}
+        datasetType="candidate"
+        caseIds={genSingleId ? [genSingleId] : Array.from(selectedIds)}
+        onFinished={refreshReplyStates}
+      />
+
+      <AgentReplyVersionsDrawer
+        open={!!versionsCaseRef}
+        onClose={() => setVersionsCaseRef(null)}
+        datasetType="candidate"
+        caseRef={versionsCaseRef}
+        caseTitle={cases.find(c => c.id === versionsCaseRef)?.question?.slice(0, 60) ?? null}
+        onRetryCase={ref => { setVersionsCaseRef(null); setGenSingleId(ref); setGenOpen(true) }}
+        onChanged={refreshReplyStates}
+      />
     </div>
   )
 }

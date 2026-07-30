@@ -230,8 +230,14 @@ def _make_adapter(
     *,
     thread_id: str | None = None,
     client: httpx.AsyncClient | None = None,
+    reply_version: Any | None = None,
 ) -> Any:
     """Build the HTTP adapter for one case.
+
+    ``reply_version`` 非空 → 该样例消费**预生成回复**（reply_source='persisted'）：
+    返回一个同接口的假 adapter，把已存回复按 invoke 逐次交还，全程不建 SSE、不
+    调 agent。放在这里短路是为了让单轮 / 多轮 / 双模三条评估路径共用同一入口，
+    打分、聚合、落库逻辑一行不改。见 reply_generator.PersistedReplyAdapter。
 
     - ``type='sse'`` defaults to LangGraph v2 payload/event shape (the production
       agent used in D:/files/EPtestcases/agent_chat_sse_*.py). The caller passes
@@ -245,6 +251,11 @@ def _make_adapter(
     keepalive connections (and one DNS lookup) instead of each opening a
     fresh client — the dominant cause of burst DNS failures / agent_unreachable.
     """
+    if reply_version is not None:
+        from agent_eval.evaluation.reply_generator import adapter_from_version
+
+        return adapter_from_version(reply_version)
+
     t = agent_cfg.get("type", "sse")
     if t == "openai":
         return OpenAICompatibleAdapter(
@@ -704,7 +715,12 @@ async def _run_multiturn_case(
 
     # 整段对话共用一个 thread_id（agent 端按它维持上下文）。
     thread_id = f"eval-{case.get('name','conv')}-{uuid.uuid4().hex[:8]}"
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    adapter = _make_adapter(
+        agent_cfg,
+        thread_id=thread_id,
+        client=http_client,
+        reply_version=case.get("_reply_version"),
+    )
     if retry_policy is None:
         retry_policy = _retry_policy_from_cfg(agent_cfg)
 
@@ -858,12 +874,15 @@ async def _invoke_one_agent(
     cancel_event: asyncio.Event | None,
     retry_policy: _RetryPolicy | None,
     http_client: httpx.AsyncClient | None,
+    reply_version: Any | None = None,
 ) -> dict[str, Any]:
     """跑一个 agent 拿一份回复。返回 {output_text, tool_calls, cot_steps, latency_ms,
     first_thinking_token_ms, first_answer_token_ms, usage, error_message, error_type,
     attempts_made, thread_id}。对比模式下 A/B 各调一次，供并发使用。"""
     thread_id = f"eval-{case_name}-{uuid.uuid4().hex[:8]}"
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    adapter = _make_adapter(
+        agent_cfg, thread_id=thread_id, client=http_client, reply_version=reply_version,
+    )
     messages = [{"role": "user", "content": question}]
     policy = retry_policy or _retry_policy_from_cfg(agent_cfg)
 
@@ -943,15 +962,17 @@ async def _run_comparative_case(
     expected = case.get("expected_output") or ""
     invoked_at = datetime.now(timezone.utc)
 
-    # 1) 并发跑 A、B。
+    # 1) 并发跑 A、B。任一侧带 _reply_version 即该侧消费预生成回复（A/B 可独立选）。
     a_res, b_res = await asyncio.gather(
         _invoke_one_agent(
             agent_cfg=agent_cfg, question=question, case_name=case.get("name", "case") + "-A",
             cancel_event=cancel_event, retry_policy=retry_policy, http_client=http_client,
+            reply_version=case.get("_reply_version"),
         ),
         _invoke_one_agent(
             agent_cfg=agent_cfg_b, question=question, case_name=case.get("name", "case") + "-B",
             cancel_event=cancel_event, retry_policy=retry_policy, http_client=http_client,
+            reply_version=case.get("_reply_version_b"),
         ),
     )
 
@@ -1101,6 +1122,7 @@ async def _replay_one_side(
     cancel_event: asyncio.Event | None,
     retry_policy: _RetryPolicy | None,
     http_client: httpx.AsyncClient | None,
+    reply_version: Any | None = None,
 ) -> dict[str, Any]:
     """回放一侧（A 或 B）整段多轮对话，返回 multiturn.replay_conversation 的结果
     dict（含 turns / tool_calls / steps / usage / latency_ms / attempts / error…）。
@@ -1111,7 +1133,9 @@ async def _replay_one_side(
 
     agent_type = agent_cfg.get("type", "sse")
     thread_id = f"eval-{case_name}-{uuid.uuid4().hex[:8]}"
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    adapter = _make_adapter(
+        agent_cfg, thread_id=thread_id, client=http_client, reply_version=reply_version,
+    )
     policy = retry_policy or _retry_policy_from_cfg(agent_cfg)
 
     async def _invoke(adp: Any, msgs: list[dict[str, Any]]):
@@ -1184,16 +1208,19 @@ async def _run_multiturn_comparative_case(
     invoked_at = datetime.now(timezone.utc)
 
     # 1) 并发回放 A、B 两侧整段对话（各维持独立 thread 上下文）。
+    #    任一侧带 _reply_version 即该侧逐轮消费预生成回复，不连 agent。
     a_replay, b_replay = await asyncio.gather(
         _replay_one_side(
             agent_cfg=agent_cfg, case_name=case.get("name", "conv") + "-A",
             input_messages=input_messages, cancel_event=cancel_event,
             retry_policy=retry_policy, http_client=http_client,
+            reply_version=case.get("_reply_version"),
         ),
         _replay_one_side(
             agent_cfg=agent_cfg_b, case_name=case.get("name", "conv") + "-B",
             input_messages=input_messages, cancel_event=cancel_event,
             retry_policy=retry_policy, http_client=http_client,
+            reply_version=case.get("_reply_version_b"),
         ),
     )
 
@@ -1595,7 +1622,12 @@ async def _run_one_case(
     # (start_time, question text) instead.
     thread_id = f"eval-{case.get('name','case')}-{uuid.uuid4().hex[:8]}"
 
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    adapter = _make_adapter(
+        agent_cfg,
+        thread_id=thread_id,
+        client=http_client,
+        reply_version=case.get("_reply_version"),
+    )
     messages = [{"role": "user", "content": question}]
     if retry_policy is None:
         retry_policy = _retry_policy_from_cfg(agent_cfg)
@@ -1938,6 +1970,11 @@ async def _execute_run(
                         status=res["status"],
                         attempts_made=res.get("attempts_made", 1),
                         comparison=res.get("comparison"),
+                        # 消费预生成回复时固定记录实际用的版本（A 侧为准），
+                        # 供详情页溯源「这条结果是哪个版本的回复打出来的」。
+                        reply_version_id=(
+                            getattr(case.get("_reply_version"), "id", None)
+                        ),
                     )
                     # 多轮 judge 理由（#137）：score_reasons 仅多轮 case 带，单轮无此键
                     # → .get 兜底空 dict，details 退回 {}，单轮零回归。
@@ -2703,6 +2740,7 @@ async def start_run(
     notify_open_ids: list[str] | None = None,
     eval_mode: str = "single",
     agent_cfg_b: dict | None = None,
+    reply_source: str = "live",
 ) -> str:
     """Create a test_runs row, register an asyncio task, return run_id.
 
@@ -2737,6 +2775,7 @@ async def start_run(
             acceptance_policy=acceptance_policy,
             eval_mode=eval_mode,
             agent_config_b=agent_cfg_b,
+            reply_source=reply_source,
             status="running",
         )
         await session.commit()

@@ -475,6 +475,12 @@ export interface StartEvalRequest {
   // 样例，评估器单次对比打分）。comparative 时 agent_b 必填、仅支持单轮数据集。
   eval_mode?: 'single' | 'comparative'
   agent_b?: EvalAgentConfig | null
+  // A / B 两侧可独立选择实时调用或消费预生成回复。版本映射未覆盖的样例
+  // 自动使用该样例的当前版本。
+  reply_source?: 'live' | 'persisted'
+  reply_version_ids?: Record<string, string>
+  reply_source_b?: 'live' | 'persisted'
+  reply_version_ids_b?: Record<string, string>
 }
 
 // run 级对比汇总（落在 summary_scores.comparison_summary）。新数据按 evaluator

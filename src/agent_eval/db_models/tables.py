@@ -133,6 +133,11 @@ class TestRunRow(Base, TenantMixin):
     # role for LangSmith. Distinct from langfuse_run_name (display/search only).
     langfuse_trace_name: Mapped[str | None] = mapped_column(Text)
     evaluator_configs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # 回复数据来源：'live'（实时调用 agent，历史默认）| 'persisted'（消费预生成的
+    # AgentReplyVersionRow，全程不建 SSE、不调 agent）。见迁移 0035。
+    reply_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="live", server_default="live"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     # Soft-delete: list endpoints filter out non-null deleted_at by default;
     # the row stays in DB so historical reports / langfuse links still work.
@@ -232,6 +237,14 @@ class TestResultRow(Base, TenantMixin):
     # A/B 分与 winner + 整体 winner）+ position_swapped 审计。单模恒 NULL。
     # A 侧回复/指标仍存本行原有列（主侧），单模消费方零改动。见迁移 0033。
     comparison: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # 本行实际消费的预生成回复版本（reply_source='persisted' 时非空）。固定记录
+    # 而非"当前版本"，以便当前版本切走后历史结果仍可复现。见迁移 0035。
+    reply_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_reply_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     total_tokens: Mapped[int | None] = mapped_column(Integer)
@@ -1046,6 +1059,175 @@ class LangfuseMetricsCursorRow(Base, TenantMixin):
     consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="idle")
     last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+# ---------------------------------------------------------------------------
+# 持久化 agent 回复（预生成 + 版本回溯 + 作为评估数据来源）。见迁移 0035。
+#
+# 样例引用是 (dataset_type, case_ref) 多态键，不建外键：
+#   candidate    -> candidate_cases.id 的字符串形式
+#   benchmark    -> benchmark_cases.id 的字符串形式
+#   conversation -> Langfuse dataset item id（样例真身不在 PG）
+# ---------------------------------------------------------------------------
+
+REPLY_DATASET_TYPES = ("candidate", "benchmark", "conversation")
+
+
+class AgentReplyJobRow(Base, TenantMixin):
+    """批量「agent 生成答案」任务。
+
+    状态落库（而非只留内存）是刻意的：进程重启 / 页面刷新后仍要能看到进度，
+    并支持取消剩余、重试失败项。启动时由 sweep 把残留 running 改 interrupted。
+    """
+
+    __tablename__ = "agent_reply_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    dataset_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    dataset_name: Mapped[str | None] = mapped_column(String(256))
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    # 完整 EvalAgentConfig 快照——本仓库没有 agent 配置表，只能整体快照。
+    agent_config: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # agent_config 归一化后的 sha256，用于「同样例 + 同配置已有在途任务」去重。
+    config_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # 用户自定义版本号；agent 配置差异由它体现，不额外建按配置划分的版本链。
+    version_label: Mapped[str | None] = mapped_column(String(64))
+    # running | completed | failed | cancelled | interrupted
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", index=True)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    succeeded_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    running_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class AgentReplyVersionRow(Base, TenantMixin):
+    """样例的一条 agent 回复版本（append-only）。
+
+    ``version_number`` 是 per-(dataset_type, case_ref) 的单调计数，从 1 开始，
+    靠唯一约束容错并发——与 ``evaluator_versions`` 同一范式。
+
+    多轮对话集的 ``turns`` 与 ``multiturn.replay_conversation`` 返回的 turns
+    同构，这样评估侧复用已生成回复时可以无改动喂给 ``score_conversation`` /
+    ``build_transcript``。
+    """
+
+    __tablename__ = "agent_reply_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_type", "case_ref", "version_number",
+            name="uq_agent_reply_versions_case_version",
+        ),
+        Index("ix_agent_reply_versions_case", "dataset_type", "case_ref"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    dataset_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    case_ref: Mapped[str] = mapped_column(String(256), nullable=False)
+    dataset_name: Mapped[str | None] = mapped_column(String(256))
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    version_label: Mapped[str | None] = mapped_column(String(64))
+    # 单轮：回复正文。多轮：build_transcript(turns) 的整段文本。
+    content: Mapped[str | None] = mapped_column(Text)
+    turns: Mapped[list | None] = mapped_column(JSONB)
+    raw_trace: Mapped[dict | None] = mapped_column(JSONB)
+    agent_config: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    config_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    # pending | running | succeeded | failed
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="succeeded")
+    error_message: Mapped[str | None] = mapped_column(Text)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    # 人工编辑过的版本；用于 UI 区分「agent 原始产出」与「人工修订」。
+    edited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_reply_jobs.id", ondelete="SET NULL"),
+        index=True,
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class AgentReplyCaseStateRow(Base, TenantMixin):
+    """每个样例一行，指向该样例「当前生效」的回复版本。
+
+    单独成表而非在样例表上加列：三类数据集落地不对称，多轮对话集的样例真身在
+    Langfuse，PG 里根本没有 case 表可加列。
+    """
+
+    __tablename__ = "agent_reply_case_states"
+    __table_args__ = (
+        UniqueConstraint("dataset_type", "case_ref", name="uq_agent_reply_case_states_case"),
+        Index("ix_agent_reply_case_states_dataset", "dataset_type", "dataset_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    dataset_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    case_ref: Mapped[str] = mapped_column(String(256), nullable=False)
+    dataset_name: Mapped[str | None] = mapped_column(String(256))
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    current_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_reply_versions.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class AgentReplyJobItemRow(Base, TenantMixin):
+    """生成任务的逐样例项：进度统计、单条重试、在途去重都靠它。"""
+
+    __tablename__ = "agent_reply_job_items"
+    __table_args__ = (
+        UniqueConstraint("job_id", "case_ref", name="uq_agent_reply_job_items_job_case"),
+        Index("ix_agent_reply_job_items_case_status", "case_ref", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_reply_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    case_ref: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    question: Mapped[str | None] = mapped_column(Text)
+    # pending | running | succeeded | failed | cancelled
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_reply_versions.id", ondelete="SET NULL")
+    )
+    error_message: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

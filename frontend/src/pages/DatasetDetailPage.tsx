@@ -1,8 +1,10 @@
-import { useId, useState, useRef } from 'react'
+import { useId, useMemo, useState, useRef } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/ui'
-import { datasetsApi, candidatesApi, projectsApi } from '@/services'
+import { datasetsApi, candidatesApi, projectsApi, agentRepliesApi } from '@/services'
+import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import type { CandidateCase, ImportPreview } from '@/services/benchmark'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 
@@ -44,6 +46,10 @@ export default function DatasetDetailPage() {
   const [addCategory, setAddCategory] = useState('')
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [importCategory, setImportCategory] = useState('')
+  // agent 生成答案：genSingleId 非空 = 只重跑这一条，否则用当前勾选集
+  const [genOpen, setGenOpen] = useState(false)
+  const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
   // 两步式文件导入：选文件 → 预览（识别列 + 建议问题/答案列 + 样例）→ 确认导入。
   const fileRef = useRef<HTMLInputElement>(null)
   const importFileId = `${reactId}-import-file`
@@ -190,6 +196,19 @@ export default function DatasetDetailPage() {
   const total = casesData?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
+  // 当前页样例的「agent 生成答案」状态，一次批量查，给每行打标记。
+  const caseIdsOnPage = useMemo(() => cases.map(c => c.id), [cases])
+  const { data: replyStates } = useQuery({
+    queryKey: ['agent-reply-states', 'candidate', caseIdsOnPage],
+    queryFn: () => agentRepliesApi.listStates('candidate', caseIdsOnPage).then(r => r.data),
+    enabled: caseIdsOnPage.length > 0,
+  })
+  const replyStateMap = new Map((replyStates ?? []).map(s => [s.case_ref, s]))
+
+  function refreshReplyStates() {
+    queryClient.invalidateQueries({ queryKey: ['agent-reply-states'] })
+  }
+
   function openEdit(c: CandidateCase) {
     setEditingCase(c)
     setEditAnswer(c.answer || '')
@@ -301,6 +320,16 @@ export default function DatasetDetailPage() {
         >
           从 LangSmith 同步
         </Button>
+        {/* 勾选样例后先让 agent 跑出答案存成版本，评估时可直接消费、不再实时连 agent。 */}
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => { setGenSingleId(null); setGenOpen(true) }}
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : undefined}
+        >
+          agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
         {selectedIds.size > 0 && (statusFilter === '' || statusFilter === 'ready') && (
           <Button variant="primary" size="sm" onClick={() => setShowPromote(true)}>
             导入基准 ({selectedIds.size})
@@ -338,6 +367,7 @@ export default function DatasetDetailPage() {
               <th className="w-20">有答案</th>
               <th className="w-24">状态</th>
               <th className="w-24">来源</th>
+              <th className="w-28">agent回复</th>
               <th className="w-28 text-right">操作</th>
             </tr>
           </thead>
@@ -367,6 +397,25 @@ export default function DatasetDetailPage() {
                   </span>
                 </td>
                 <td className="text-text-tertiary text-[11px]">{c.source}</td>
+                <td>
+                  {/* 点开版本抽屉：可切换当前版本 / 手工修订 / 删除 / 重新生成 */}
+                  {(() => {
+                    const st = replyStateMap.get(c.id)
+                    if (!st?.has_reply) {
+                      return <span className="text-[11px] text-text-tertiary">未生成</span>
+                    }
+                    return (
+                      <button
+                        onClick={() => setVersionsCaseRef(c.id)}
+                        className="text-action text-[11px]"
+                        title="查看 / 回溯 agent 生成的回复版本"
+                      >
+                        v{st.current_version_number ?? '—'}
+                        {st.version_count > 1 ? ` · 共${st.version_count}版` : ''}
+                      </button>
+                    )
+                  })()}
+                </td>
                 <td className="text-right">
                   <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
                     <button onClick={() => openEdit(c)} className="text-action">
@@ -672,6 +721,25 @@ export default function DatasetDetailPage() {
       <datalist id="candidate-category-options">
         {(categoryOptions ?? []).map(cat => <option key={cat} value={cat} />)}
       </datalist>
+
+      {/* agent 生成答案：genSingleId 非空 = 只重跑这一条，否则用当前勾选集 */}
+      <AgentReplyGenerateDialog
+        open={genOpen}
+        onClose={() => { setGenOpen(false); setGenSingleId(null) }}
+        datasetType="candidate"
+        caseIds={genSingleId ? [genSingleId] : Array.from(selectedIds)}
+        onFinished={refreshReplyStates}
+      />
+
+      <AgentReplyVersionsDrawer
+        open={!!versionsCaseRef}
+        onClose={() => setVersionsCaseRef(null)}
+        datasetType="candidate"
+        caseRef={versionsCaseRef}
+        caseTitle={cases.find(c => c.id === versionsCaseRef)?.question?.slice(0, 60) ?? null}
+        onRetryCase={ref => { setVersionsCaseRef(null); setGenSingleId(ref); setGenOpen(true) }}
+        onChanged={refreshReplyStates}
+      />
     </div>
   )
 }

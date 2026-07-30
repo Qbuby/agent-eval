@@ -2,7 +2,10 @@ import { Fragment, useId, useState, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/ui'
+import { agentRepliesApi } from '@/services'
 import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn, type ImportPreview } from '@/services/benchmark'
+import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 
 export default function BenchmarkPage() {
@@ -47,6 +50,10 @@ export default function BenchmarkPage() {
   const [newCategoryId, setNewCategoryId] = useState('')
   const [showAddCategory, setShowAddCategory] = useState(false)
   const [newCategoryName, setNewCategoryName] = useState('')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [genOpen, setGenOpen] = useState(false)
+  const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
 
   const pageSize = 20
 
@@ -192,6 +199,26 @@ export default function BenchmarkPage() {
   const cases = casesData?.items ?? []
   const total = casesData?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const caseIdsOnPage = useMemo(() => cases.map(c => c.id), [cases])
+  const { data: replyStates } = useQuery({
+    queryKey: ['agent-reply-states', 'benchmark', caseIdsOnPage],
+    queryFn: () => agentRepliesApi.listStates('benchmark', caseIdsOnPage).then(r => r.data),
+    enabled: caseIdsOnPage.length > 0,
+  })
+  const replyStateMap = new Map((replyStates ?? []).map(s => [s.case_ref, s]))
+
+  function toggleSelect(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  function refreshReplyStates() {
+    queryClient.invalidateQueries({ queryKey: ['agent-reply-states'] })
+  }
 
   const getCategoryName = (id: string | null) => {
     if (!id) return '—'
@@ -262,6 +289,14 @@ export default function BenchmarkPage() {
           + 类别
         </button>
         <div className="flex-1" />
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          onClick={() => { setGenSingleId(null); setGenOpen(true) }}
+        >
+          agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
         <ExportMenu
           disabled={!projectId}
           onExport={async (format) => {
@@ -289,6 +324,17 @@ export default function BenchmarkPage() {
         <table className="table-base">
           <thead>
             <tr>
+              <th className="w-10 text-center">
+                <input
+                  type="checkbox"
+                  checked={cases.length > 0 && cases.every(c => selectedIds.has(c.id))}
+                  onChange={() => {
+                    const allSelected = cases.length > 0 && cases.every(c => selectedIds.has(c.id))
+                    setSelectedIds(allSelected ? new Set() : new Set(cases.map(c => c.id)))
+                  }}
+                  className="accent-accent w-3.5 h-3.5"
+                />
+              </th>
               <th>问题</th>
               {!categoryFilter && <th className="w-28">类别</th>}
               {extraColumns.map((col: SchemaColumn) => (
@@ -298,14 +344,16 @@ export default function BenchmarkPage() {
               ))}
               <th className="w-20">有答案</th>
               <th className="w-20">来源</th>
+              <th className="w-28">agent回复</th>
               <th className="w-16 text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             {cases.map(c => {
               const isOpen = expandedId === c.id
-              const colSpan = 3 + (categoryFilter ? 0 : 1) + extraColumns.length
+              const colSpan = 5 + (categoryFilter ? 0 : 1) + extraColumns.length
               const expectedTools = (c.extra_fields?.expected_tool_calls ?? []) as Array<Record<string, unknown>>
+              const replyState = replyStateMap.get(c.id)
               return (
               <Fragment key={c.id}>
               <tr
@@ -313,6 +361,14 @@ export default function BenchmarkPage() {
                 onClick={() => setExpandedId(isOpen ? null : c.id)}
                 title="点击展开/收起 参考答案与期望工具调用"
               >
+                <td className="text-center" onClick={e => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(c.id)}
+                    onChange={() => toggleSelect(c.id)}
+                    className="accent-accent w-3.5 h-3.5"
+                  />
+                </td>
                 <td className="max-w-[460px]">
                   <span className="inline-block w-3 mr-1 text-text-tertiary">{isOpen ? '▾' : '▸'}</span>
                   <span className="truncate inline-block max-w-[420px] align-middle">{c.question}</span>
@@ -329,6 +385,20 @@ export default function BenchmarkPage() {
                   </span>
                 </td>
                 <td className="text-text-tertiary text-[11px]">{c.source}</td>
+                <td onClick={e => e.stopPropagation()}>
+                  {replyState?.has_reply ? (
+                    <button
+                      onClick={() => setVersionsCaseRef(c.id)}
+                      className="text-action text-[11px]"
+                      title="查看 / 回溯 agent 生成的回复版本"
+                    >
+                      v{replyState.current_version_number ?? '—'}
+                      {replyState.version_count > 1 ? ` · 共${replyState.version_count}版` : ''}
+                    </button>
+                  ) : (
+                    <span className="text-[11px] text-text-tertiary">未生成</span>
+                  )}
+                </td>
                 <td className="text-right" onClick={e => e.stopPropagation()}>
                   <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
                     <button onClick={() => setEditCase(c)} className="text-action">编辑</button>
@@ -676,6 +746,25 @@ export default function BenchmarkPage() {
           />
         </div>
       </Dialog>
+
+      <AgentReplyGenerateDialog
+        open={genOpen}
+        onClose={() => { setGenOpen(false); setGenSingleId(null) }}
+        datasetType="benchmark"
+        projectId={projectId}
+        caseIds={genSingleId ? [genSingleId] : Array.from(selectedIds)}
+        onFinished={refreshReplyStates}
+      />
+
+      <AgentReplyVersionsDrawer
+        open={!!versionsCaseRef}
+        onClose={() => setVersionsCaseRef(null)}
+        datasetType="benchmark"
+        caseRef={versionsCaseRef}
+        caseTitle={cases.find(c => c.id === versionsCaseRef)?.question?.slice(0, 60) ?? null}
+        onRetryCase={ref => { setVersionsCaseRef(null); setGenSingleId(ref); setGenOpen(true) }}
+        onChanged={refreshReplyStates}
+      />
     </div>
   )
 }

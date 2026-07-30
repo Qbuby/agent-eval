@@ -1,8 +1,8 @@
-import { useId, useRef, useState } from 'react'
+import { useId, useMemo, useRef, useState } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, ExportMenu, useConfirm, useToast } from '@/components/ui'
-import { datasetsApi } from '@/services'
+import { agentRepliesApi, datasetsApi } from '@/services'
 import { useAuthStore } from '@/stores/auth'
 import type {
   ConversationImportPreview,
@@ -11,6 +11,8 @@ import type {
 } from '@/services/datasets'
 import ConversationView from '@/components/ConversationView'
 import ConversationEditor from '@/components/ConversationEditor'
+import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import type { TestCase } from '@/types'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 
@@ -71,8 +73,11 @@ export default function ConversationDatasetDetailPage() {
   const [viewing, setViewing] = useState<TestCase | null>(null)
   const [showImport, setShowImport] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
-  // 批量选择（example_id 集合）。
+  // 批量选择（Langfuse dataset item id 集合，也是持久化回复的 case_ref）。
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [genOpen, setGenOpen] = useState(false)
+  const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
   // 三步式导入：选文件 → 字段映射（拍平多行布局才需要）→ 解析预览 → 确认导入。
   // step 驱动弹窗内容：'file' 选文件、'map' 映射列、'preview' 看解析结果。
   const [importStep, setImportStep] = useState<'file' | 'map' | 'preview'>('file')
@@ -257,6 +262,22 @@ export default function ConversationDatasetDetailPage() {
   const total = casesData?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
+  // conversation 的 case_ref 必须使用 Langfuse dataset item id（即 TestCase.id）。
+  const caseIdsOnPage = useMemo(
+    () => cases.map(c => c.id).filter((id): id is string => !!id),
+    [cases],
+  )
+  const { data: replyStates } = useQuery({
+    queryKey: ['agent-reply-states', 'conversation', caseIdsOnPage],
+    queryFn: () => agentRepliesApi.listStates('conversation', caseIdsOnPage).then(r => r.data),
+    enabled: caseIdsOnPage.length > 0,
+  })
+  const replyStateMap = new Map((replyStates ?? []).map(s => [s.case_ref, s]))
+
+  function refreshReplyStates() {
+    queryClient.invalidateQueries({ queryKey: ['agent-reply-states'] })
+  }
+
   function openNew() {
     setIsNew(true)
     setEditing(emptyCase())
@@ -332,6 +353,16 @@ export default function ConversationDatasetDetailPage() {
           <button className="text-action text-[12px]" onClick={() => setShowAddCategory(true)}>+ 类别</button>
         )}
         <div className="flex-1" />
+        {canWrite && (
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={selectedIds.size === 0}
+            onClick={() => { setGenSingleId(null); setGenOpen(true) }}
+          >
+            agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+          </Button>
+        )}
         {canWrite && selectedIds.size > 0 && (
           <Button
             variant="danger"
@@ -411,6 +442,7 @@ export default function ConversationDatasetDetailPage() {
               <th>会话目标</th>
               {!categoryFilter && <th className="w-32">类别</th>}
               <th className="w-24 text-center">逐轮期望</th>
+              <th className="w-28">agent回复</th>
               <th className="w-28 text-right">操作</th>
             </tr>
           </thead>
@@ -450,6 +482,22 @@ export default function ConversationDatasetDetailPage() {
                   )}
                   <td className="text-center text-text-secondary">
                     {c.turn_expectations?.length || 0}
+                  </td>
+                  <td>
+                    {c.id && replyStateMap.get(c.id)?.has_reply ? (
+                      <button
+                        onClick={() => setVersionsCaseRef(c.id!)}
+                        className="text-action text-[11px]"
+                        title="查看 / 回溯 agent 生成的回复版本"
+                      >
+                        v{replyStateMap.get(c.id)?.current_version_number ?? '—'}
+                        {(replyStateMap.get(c.id)?.version_count ?? 0) > 1
+                          ? ` · 共${replyStateMap.get(c.id)?.version_count}版`
+                          : ''}
+                      </button>
+                    ) : (
+                      <span className="text-[11px] text-text-tertiary">未生成</span>
+                    )}
                   </td>
                   <td className="text-right">
                     <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
@@ -836,6 +884,30 @@ export default function ConversationDatasetDetailPage() {
           />
         </div>
       </Dialog>
+
+      <AgentReplyGenerateDialog
+        open={genOpen}
+        onClose={() => { setGenOpen(false); setGenSingleId(null) }}
+        datasetType="conversation"
+        datasetName={name}
+        caseIds={genSingleId ? [genSingleId] : Array.from(selectedIds)}
+        onFinished={refreshReplyStates}
+      />
+
+      <AgentReplyVersionsDrawer
+        open={!!versionsCaseRef}
+        onClose={() => setVersionsCaseRef(null)}
+        datasetType="conversation"
+        caseRef={versionsCaseRef}
+        caseTitle={cases.find(c => c.id === versionsCaseRef)?.name ?? null}
+        canWrite={canWrite}
+        onRetryCase={canWrite ? ref => {
+          setVersionsCaseRef(null)
+          setGenSingleId(ref)
+          setGenOpen(true)
+        } : undefined}
+        onChanged={refreshReplyStates}
+      />
     </div>
   )
 }

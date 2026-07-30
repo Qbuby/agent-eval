@@ -1,13 +1,15 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button, useConfirm, useToast, ExportMenu } from '@/components/ui'
 import {
+  agentRepliesApi,
   benchmarkApi,
   datasetsApi,
   evaluationApi,
   projectsApi,
 } from '@/services'
+import type { CaseReplyState, ReplyDatasetType } from '@/services/agentReplies'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { ExportFormat } from '@/lib/download'
 import type {
@@ -24,6 +26,7 @@ import type {
   UploadCasesResponse,
 } from '@/types'
 import { configOptionToString, useConfigOptions } from '@/hooks/useConfigOptions'
+import { OptionPicker } from '@/components/ui'
 import {
   deriveFacts, deriveAcceptance, deriveCostScored, deriveCostAbnormal,
   acceptancePassRateText, runDecisionLabel,
@@ -448,6 +451,8 @@ type CaseSourceTab = 'benchmark' | 'upload' | 'conversation'
 type TraceSource = 'none' | 'langsmith' | 'langfuse'
 type EvalMode = 'single' | 'comparative'
 type AgentType = 'sse' | 'openai' | 'sse_generic'
+type ReplySource = 'live' | 'persisted'
+type ReplyCaseOption = { id: string; label: string }
 
 type AgentDraft = {
   type: AgentType
@@ -571,12 +576,69 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     return convEffectiveCount
   }, [convSelectionMode, convPickedIds, convEffectiveCount, limit])
 
-  // ── agents ──
+  // ── agents / persisted replies ──
   const [evalMode, setEvalMode] = useState<EvalMode>('single')
   const [agentDraft, setAgentDraft] = useState<AgentDraft>(createAgentDraft)
   const [agentDraftB, setAgentDraftB] = useState<AgentDraft>(createAgentDraft)
+  const [replySource, setReplySource] = useState<ReplySource>('live')
+  const [replySourceB, setReplySourceB] = useState<ReplySource>('live')
+  const [replyVersionIds, setReplyVersionIds] = useState<Record<string, string>>({})
+  const [replyVersionIdsB, setReplyVersionIdsB] = useState<Record<string, string>>({})
   const [concurrency, setConcurrency] = useState(3)
   const [runName, setRunName] = useState('')
+
+  // 前端预检只使用本次能精确推导出的样例集合；筛选结果超过首批 100 条时，
+  // 仍展示已知范围，完整性由后端开跑前的 resolve_reply_versions 最终兜底。
+  const replyDatasetType: ReplyDatasetType | null =
+    sourceTab === 'benchmark' ? 'benchmark'
+    : sourceTab === 'conversation' ? 'conversation'
+    : null
+  const replyCaseOptions = useMemo<ReplyCaseOption[]>(() => {
+    if (sourceTab === 'benchmark') {
+      const rows = casesQuery.data?.items ?? []
+      const selected = selectionMode === 'pick'
+        ? rows.filter(c => pickedCaseIds.has(c.id))
+        : rows.slice(0, typeof limit === 'number' && limit > 0 ? limit : undefined)
+      return selected.map(c => ({ id: c.id, label: c.question }))
+    }
+    if (sourceTab === 'conversation') {
+      const rows = convCasesQuery.data?.items ?? []
+      const selected = convSelectionMode === 'pick'
+        ? rows.filter(c => !!c.id && convPickedIds.has(c.id))
+        : rows.slice(0, typeof limit === 'number' && limit > 0 ? limit : undefined)
+      return selected.flatMap(c => {
+        if (!c.id) return []
+        const firstUser = (c.input_messages ?? []).find(m => m.role === 'user')?.content
+        return [{ id: c.id, label: firstUser || c.name || c.id }]
+      })
+    }
+    return []
+  }, [sourceTab, casesQuery.data, selectionMode, pickedCaseIds, limit, convCasesQuery.data, convSelectionMode, convPickedIds])
+  const replyCaseRefs = useMemo(() => replyCaseOptions.map(c => c.id), [replyCaseOptions])
+  const replyPrecheckExact = useMemo(() => {
+    if (sourceTab === 'benchmark') {
+      if (selectionMode === 'pick') return true
+      const loaded = casesQuery.data?.items.length ?? 0
+      const wanted = typeof limit === 'number' && limit > 0 ? Math.min(casesQuery.data?.total ?? 0, limit) : (casesQuery.data?.total ?? 0)
+      return loaded >= wanted
+    }
+    if (sourceTab === 'conversation') {
+      if (convSelectionMode === 'pick') return true
+      const loaded = convCasesQuery.data?.items.length ?? 0
+      const wanted = typeof limit === 'number' && limit > 0 ? Math.min(convCasesQuery.data?.total ?? 0, limit) : (convCasesQuery.data?.total ?? 0)
+      return loaded >= wanted
+    }
+    return false
+  }, [sourceTab, selectionMode, casesQuery.data, limit, convSelectionMode, convCasesQuery.data])
+  const persistedEnabled = replySource === 'persisted' || (evalMode === 'comparative' && replySourceB === 'persisted')
+  const replyStatesQuery = useQuery({
+    queryKey: ['agent-reply-states', replyDatasetType, replyCaseRefs],
+    queryFn: () => agentRepliesApi.listStates(replyDatasetType!, replyCaseRefs).then(r => r.data),
+    enabled: persistedEnabled && !!replyDatasetType && replyCaseRefs.length > 0,
+  })
+  const replyStates = replyStatesQuery.data ?? []
+  const replyStateMap = new Map(replyStates.map(s => [s.case_ref, s]))
+  const missingReplyCases = replyCaseOptions.filter(c => !replyStateMap.get(c.id)?.has_reply)
   // Trace 来源：'none' = 不关联外部 trace（纯本地评分）；'langsmith' = agent
   // 自报 trace 到 LangSmith，运行后按 project+时间窗回查贴回 langsmith_run_id；
   // 'langfuse' = agent 自报 trace 到 Langfuse，运行后按 trace name+时间窗回查、
@@ -634,15 +696,27 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       : '上传一个样例文件',
     )
   }
+  if (sourceTab === 'benchmark' && projectId && selectionMode === 'pick' && pickedCaseIds.size === 0) {
+    startBlockers.push('勾选至少 1 条基准样例')
+  }
   if (sourceTab === 'conversation' && convDataset && convSelectionMode === 'pick' && convPickedIds.size === 0) {
     startBlockers.push('勾选至少 1 条对话样例')
   }
   if (selectedEvaluatorIds.size === 0) startBlockers.push('勾选至少 1 个评估器')
-  if (agentDraft.url.trim().length === 0) {
+  if (replySource === 'live' && agentDraft.url.trim().length === 0) {
     startBlockers.push(evalMode === 'comparative' ? '填写 A 模型智能体 URL' : '填写智能体 URL')
   }
-  if (evalMode === 'comparative' && agentDraftB.url.trim().length === 0) {
+  if (evalMode === 'comparative' && replySourceB === 'live' && agentDraftB.url.trim().length === 0) {
     startBlockers.push('填写 B 模型智能体 URL')
+  }
+  if (persistedEnabled && sourceTab === 'upload') {
+    startBlockers.push('上传文件不支持使用已有回复')
+  }
+  if (persistedEnabled && replyCaseRefs.length > 0 && replyStatesQuery.isLoading) {
+    startBlockers.push('等待已有回复预检完成')
+  }
+  if (persistedEnabled && replyPrecheckExact && !replyStatesQuery.isLoading && missingReplyCases.length > 0) {
+    startBlockers.push(`${missingReplyCases.length} 条样例没有可用的已有回复`)
   }
   const canStart = startBlockers.length === 0 && !startMutation.isPending
 
@@ -669,7 +743,16 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   }
 
   const handleStart = () => {
-    const agent = parseAgentDraft(agentDraft, evalMode === 'comparative' ? 'A 模型' : '')
+    // 后端 schema 始终要求 agent / agent_b。persisted 侧传不会被调用的占位配置，
+    // runner 会依据 _reply_version 切到 PersistedReplyAdapter，不建立任何网络连接。
+    const persistedAgent: EvalAgentConfig = {
+      type: 'sse',
+      url: 'persisted://agent-reply',
+      model: 'persisted-reply',
+    }
+    const agent = replySource === 'persisted'
+      ? persistedAgent
+      : parseAgentDraft(agentDraft, evalMode === 'comparative' ? 'A 模型' : '')
     if (!agent) return
 
     const body: StartEvalRequest = {
@@ -679,13 +762,19 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
       run_name: runName.trim() || null,
       langsmith_project: traceSource === 'langsmith' ? (langsmithProject.trim() || null) : null,
       langfuse_trace_name: traceSource === 'langfuse' ? (langfuseTraceName.trim() || null) : null,
+      reply_source: replySource,
+      reply_version_ids: replySource === 'persisted' ? replyVersionIds : {},
     }
 
     if (evalMode === 'comparative') {
-      const agentB = parseAgentDraft(agentDraftB, 'B 模型')
+      const agentB = replySourceB === 'persisted'
+        ? persistedAgent
+        : parseAgentDraft(agentDraftB, 'B 模型')
       if (!agentB) return
       body.eval_mode = 'comparative'
       body.agent_b = agentB
+      body.reply_source_b = replySourceB
+      body.reply_version_ids_b = replySourceB === 'persisted' ? replyVersionIdsB : {}
     }
 
     if (sourceTab === 'upload' && uploadedSource) {
@@ -1085,27 +1174,55 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
         </div>
 
         <div className="flex flex-col gap-4">
-          <AgentConfigFields
+          <ReplySourcePanel
             title={evalMode === 'comparative' ? 'A 模型' : '智能体'}
-            draft={agentDraft}
-            onChange={setAgentDraft}
-            endpointOptions={endpointOpts.options}
-            apiKeyOptions={apiKeyOpts.options}
-            timeoutOptions={timeoutOpts.options}
-            headersOptions={headersOpts.options}
-            payloadOptions={payloadOpts.options}
-          />
-          {evalMode === 'comparative' && (
+            source={replySource}
+            onSourceChange={setReplySource}
+            datasetType={replyDatasetType}
+            cases={replyCaseOptions}
+            states={replyStates}
+            statesLoading={replyStatesQuery.isLoading}
+            precheckExact={replyPrecheckExact}
+            versionIds={replyVersionIds}
+            onVersionIdsChange={setReplyVersionIds}
+            persistedDisabled={sourceTab === 'upload'}
+          >
             <AgentConfigFields
-              title="B 模型"
-              draft={agentDraftB}
-              onChange={setAgentDraftB}
+              title={evalMode === 'comparative' ? 'A 模型 · 实时调用配置' : '实时调用配置'}
+              draft={agentDraft}
+              onChange={setAgentDraft}
               endpointOptions={endpointOpts.options}
               apiKeyOptions={apiKeyOpts.options}
               timeoutOptions={timeoutOpts.options}
               headersOptions={headersOpts.options}
               payloadOptions={payloadOpts.options}
             />
+          </ReplySourcePanel>
+          {evalMode === 'comparative' && (
+            <ReplySourcePanel
+              title="B 模型"
+              source={replySourceB}
+              onSourceChange={setReplySourceB}
+              datasetType={replyDatasetType}
+              cases={replyCaseOptions}
+              states={replyStates}
+              statesLoading={replyStatesQuery.isLoading}
+              precheckExact={replyPrecheckExact}
+              versionIds={replyVersionIdsB}
+              onVersionIdsChange={setReplyVersionIdsB}
+              persistedDisabled={sourceTab === 'upload'}
+            >
+              <AgentConfigFields
+                title="B 模型 · 实时调用配置"
+                draft={agentDraftB}
+                onChange={setAgentDraftB}
+                endpointOptions={endpointOpts.options}
+                apiKeyOptions={apiKeyOpts.options}
+                timeoutOptions={timeoutOpts.options}
+                headersOptions={headersOpts.options}
+                payloadOptions={payloadOpts.options}
+              />
+            </ReplySourcePanel>
           )}
         </div>
 
@@ -1223,6 +1340,188 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
 
 
 // ─── Small helpers ──────────────────────────────────────────────────────────
+
+type ReplySourcePanelProps = {
+  title: string
+  source: ReplySource
+  onSourceChange: (source: ReplySource) => void
+  datasetType: ReplyDatasetType | null
+  cases: ReplyCaseOption[]
+  states: CaseReplyState[]
+  statesLoading: boolean
+  precheckExact: boolean
+  versionIds: Record<string, string>
+  onVersionIdsChange: (value: Record<string, string>) => void
+  persistedDisabled: boolean
+  children: React.ReactNode
+}
+
+/**
+ * 单模 / A/B 每一侧独立选择回复来源。默认消费各样例当前版本；只有用户选中
+ * 某条样例做覆盖时才请求该条的历史版本，避免列表较大时产生 N 个请求。
+ */
+function ReplySourcePanel({
+  title,
+  source,
+  onSourceChange,
+  datasetType,
+  cases,
+  states,
+  statesLoading,
+  precheckExact,
+  versionIds,
+  onVersionIdsChange,
+  persistedDisabled,
+  children,
+}: ReplySourcePanelProps) {
+  const [overrideCaseRef, setOverrideCaseRef] = useState('')
+  const stateMap = new Map(states.map(state => [state.case_ref, state]))
+  const missing = cases.filter(item => !stateMap.get(item.id)?.has_reply)
+  const ready = cases.length - missing.length
+
+  return (
+    <div className="rounded-md border border-border p-3">
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div className="page-eyebrow">{title}</div>
+        <div className="inline-flex rounded-md border border-border bg-fill/5 p-0.5">
+          <button
+            type="button"
+            onClick={() => onSourceChange('live')}
+            className={`px-2.5 py-1 rounded text-[11px] transition-colors ${
+              source === 'live' ? 'bg-surface text-text-primary shadow-sm' : 'text-text-tertiary hover:text-text-primary'
+            }`}
+          >
+            实时调用 agent
+          </button>
+          <button
+            type="button"
+            disabled={persistedDisabled}
+            onClick={() => !persistedDisabled && onSourceChange('persisted')}
+            title={persistedDisabled ? '上传文件没有稳定的样例 ID，不能匹配已有回复' : '不再调用 agent，直接消费已生成回复'}
+            className={`px-2.5 py-1 rounded text-[11px] transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+              source === 'persisted' ? 'bg-surface text-text-primary shadow-sm' : 'text-text-tertiary hover:text-text-primary'
+            }`}
+          >
+            使用已有回复
+          </button>
+        </div>
+      </div>
+
+      {source === 'live' ? children : (
+        <div className="space-y-3">
+          <p className="text-[11px] text-text-secondary">
+            评估将直接回放持久化回复，不建立 SSE / agent 连接。默认使用每条样例的当前版本。
+          </p>
+
+          {statesLoading ? (
+            <div className="rounded-md border border-border bg-fill/5 px-3 py-2 text-[11px] text-text-tertiary">
+              正在预检已有回复…
+            </div>
+          ) : (
+            <div className={`rounded-md border px-3 py-2 text-[11px] ${
+              missing.length > 0
+                ? 'border-warning/30 bg-warning/10 text-warning'
+                : 'border-positive/30 bg-positive/5 text-positive'
+            }`}>
+              已检查 {cases.length} 条：{ready} 条可用
+              {missing.length > 0 && `，${missing.length} 条缺少回复`}
+              {!precheckExact && (
+                <span className="text-text-tertiary ml-1">
+                  （当前仅预检已加载范围，启动时后端会校验最终样例集）
+                </span>
+              )}
+            </div>
+          )}
+
+          {missing.length > 0 && (
+            <div className="text-[11px] text-warning break-all">
+              缺失：{missing.slice(0, 5).map(item => item.label).join('；')}
+              {missing.length > 5 && ` 等 ${missing.length} 条`}
+            </div>
+          )}
+
+          {cases.length > 0 && datasetType && (
+            <div className="grid grid-cols-2 gap-3 pt-2 border-t border-separator">
+              <Field label="覆盖历史版本（可选）">
+                <select
+                  value={overrideCaseRef}
+                  onChange={e => setOverrideCaseRef(e.target.value)}
+                  className="input"
+                >
+                  <option value="">选择一条样例…</option>
+                  {cases.filter(item => stateMap.get(item.id)?.has_reply).map(item => (
+                    <option key={item.id} value={item.id}>{item.label}</option>
+                  ))}
+                </select>
+              </Field>
+              <ReplyVersionOverride
+                datasetType={datasetType}
+                caseRef={overrideCaseRef}
+                value={overrideCaseRef ? (versionIds[overrideCaseRef] ?? '') : ''}
+                onChange={versionId => {
+                  if (!overrideCaseRef) return
+                  const next = { ...versionIds }
+                  if (versionId) next[overrideCaseRef] = versionId
+                  else delete next[overrideCaseRef]
+                  onVersionIdsChange(next)
+                }}
+              />
+            </div>
+          )}
+
+          {Object.keys(versionIds).length > 0 && (
+            <div className="text-[10px] text-text-tertiary">
+              已为 {Object.keys(versionIds).length} 条样例指定历史版本；其余使用当前版本。
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ReplyVersionOverride({
+  datasetType,
+  caseRef,
+  value,
+  onChange,
+}: {
+  datasetType: ReplyDatasetType
+  caseRef: string
+  value: string
+  onChange: (versionId: string) => void
+}) {
+  const versionsQuery = useQuery({
+    queryKey: ['agent-reply-versions', datasetType, caseRef],
+    queryFn: () => agentRepliesApi.listVersions(datasetType, caseRef).then(r => r.data),
+    enabled: !!caseRef,
+  })
+  const versions = (versionsQuery.data ?? []).filter(version => version.status === 'succeeded')
+
+  return (
+    <Field label="回复版本">
+      <select
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        disabled={!caseRef || versionsQuery.isLoading}
+        className="input disabled:opacity-50"
+      >
+        <option value="">
+          {!caseRef ? '先选择样例' : versionsQuery.isLoading ? '加载版本中…' : '当前版本（默认）'}
+        </option>
+        {versions.map(version => (
+          <option key={version.id} value={version.id}>
+            v{version.version_number}{version.version_label ? ` · ${version.version_label}` : ''}
+            {version.is_current ? '（当前）' : ''}
+          </option>
+        ))}
+      </select>
+      {versionsQuery.isError && (
+        <span className="text-[10px] text-negative mt-1">版本加载失败，请重试。</span>
+      )}
+    </Field>
+  )
+}
 
 function AgentConfigFields({
   title,
@@ -1373,171 +1672,6 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   )
 }
 
-// Dropdown trigger that lists pre-configured options for a config key.
-// Renders an absolutely-positioned chevron button — its parent must be
-// `relative`, and the sibling input should reserve space with `pr-9`.
-// Returns null when no options exist so unconfigured keys stay invisible.
-//
-// Fluent-Design notes: chevron rotates on open (motion), the popover floats
-// with layered shadow + faint border (depth), the focused row has a 2px
-// accent leading bar (light/selection), and ↑↓ Enter Esc work for keyboard
-// users.
-function OptionPicker({ options, currentValue, onPick, maskValues }: {
-  options: ConfigOption[]
-  currentValue: string
-  onPick: (value: unknown) => void
-  maskValues?: boolean
-}) {
-  const [open, setOpen] = useState(false)
-  const [focusIdx, setFocusIdx] = useState<number>(-1)
-  const wrapRef = useRef<HTMLDivElement>(null)
-  const listRef = useRef<HTMLDivElement>(null)
-  const reactId = useId()
-  const listboxId = `optionpicker-list-${reactId}`
-  const optionId = (i: number) => `${listboxId}-opt-${i}`
-
-  // When opening, focus the currently-selected option (or first).
-  useEffect(() => {
-    if (!open) { setFocusIdx(-1); return }
-    const sel = options.findIndex(o => configOptionToString(o.value) === currentValue)
-    setFocusIdx(sel >= 0 ? sel : 0)
-  }, [open, options, currentValue])
-
-  useEffect(() => {
-    if (!open) return
-    const onDoc = (e: MouseEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false)
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { setOpen(false); return }
-      if (e.key === 'ArrowDown') {
-        e.preventDefault()
-        setFocusIdx(i => (i + 1) % options.length)
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault()
-        setFocusIdx(i => (i <= 0 ? options.length - 1 : i - 1))
-      } else if (e.key === 'Enter') {
-        e.preventDefault()
-        const opt = options[focusIdx]
-        if (opt) { onPick(opt.value); setOpen(false) }
-      } else if (e.key === 'Home') {
-        e.preventDefault(); setFocusIdx(0)
-      } else if (e.key === 'End') {
-        e.preventDefault(); setFocusIdx(options.length - 1)
-      }
-    }
-    document.addEventListener('mousedown', onDoc)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onDoc)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [open, options, focusIdx, onPick])
-
-  // Keep the focused row in view.
-  useEffect(() => {
-    if (!open || focusIdx < 0) return
-    const node = listRef.current?.querySelector<HTMLButtonElement>(`[data-idx="${focusIdx}"]`)
-    node?.scrollIntoView({ block: 'nearest' })
-  }, [open, focusIdx])
-
-  if (!options || options.length === 0) return null
-
-  const display = (v: unknown) => {
-    const s = configOptionToString(v)
-    if (maskValues && s) return s.length <= 6 ? '••••' : `••••${s.slice(-4)}`
-    return s.length > 60 ? s.slice(0, 60) + '…' : s
-  }
-
-  return (
-    <div ref={wrapRef} className="absolute right-1 top-1.5">
-      <button
-        type="button"
-        tabIndex={-1}
-        onClick={() => setOpen(o => !o)}
-        aria-label="选择预设值"
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        aria-controls={open ? listboxId : undefined}
-        title="选择预设值"
-        className={`inline-flex items-center justify-center w-6 h-6 rounded-md border transition-[color,background-color,border-color,box-shadow] duration-150 ease-standard ${
-          open
-            ? 'border-accent text-accent bg-accent/10 shadow-sm'
-            : 'border-transparent text-text-tertiary hover:border-border hover:bg-fill/10 hover:text-text-primary'
-        }`}
-      >
-        <svg
-          viewBox="0 0 12 12"
-          width="10"
-          height="10"
-          aria-hidden="true"
-          className={`transition-transform duration-200 ease-standard ${open ? 'rotate-180' : ''}`}
-        >
-          <path d="M2.5 4.5l3.5 3.5 3.5-3.5" stroke="currentColor" strokeWidth="1.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-      </button>
-      {open && (
-        <div
-          id={listboxId}
-          role="listbox"
-          aria-label="预设值"
-          aria-activedescendant={focusIdx >= 0 ? optionId(focusIdx) : undefined}
-          className="absolute right-0 top-[calc(100%+4px)] z-20 min-w-[260px] max-w-[380px] bg-bg-elevated border border-border rounded-lg shadow-lg overflow-hidden animate-popover-in origin-top-right"
-        >
-          <div className="px-3 py-1.5 flex items-center justify-between border-b border-separator bg-fill/5">
-            <span className="text-[10px] tracking-[0.12em] uppercase text-text-tertiary font-medium">预设值</span>
-            <span className="text-[10px] text-text-tertiary tabular-nums">{options.length}</span>
-          </div>
-          <div ref={listRef} className="max-h-64 overflow-auto py-1">
-            {options.map((opt, i) => {
-              const valueStr = configOptionToString(opt.value)
-              const active = valueStr === currentValue
-              const focused = i === focusIdx
-              return (
-                <button
-                  key={i}
-                  id={optionId(i)}
-                  type="button"
-                  data-idx={i}
-                  role="option"
-                  aria-selected={active}
-                  onMouseEnter={() => setFocusIdx(i)}
-                  onClick={() => { onPick(opt.value); setOpen(false) }}
-                  title={maskValues ? opt.label || `选项 #${i}` : valueStr}
-                  className={`relative w-full text-left pl-6 pr-3 py-1.5 text-[11px] flex flex-col gap-0.5 transition-colors duration-150 ease-standard ${
-                    focused ? 'bg-fill/10' : ''
-                  } ${active ? 'text-text-primary' : 'text-text-secondary'}`}
-                >
-                  {active && (
-                    <span className="absolute left-1 top-1 bottom-1 w-[2px] rounded-full bg-accent" aria-hidden="true" />
-                  )}
-                  {active && (
-                    <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true" className="absolute left-3 top-1/2 -translate-y-1/2 text-accent">
-                      <path d="M2.5 6.2l2.4 2.4L9.5 3.6" stroke="currentColor" strokeWidth="1.6" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  )}
-                  <span className="truncate font-medium">{opt.label ? opt.label : display(opt.value)}</span>
-                  {opt.label && (
-                    <span className="text-text-tertiary text-[10px] truncate font-mono">{display(opt.value)}</span>
-                  )}
-                </button>
-              )
-            })}
-          </div>
-          <div className="px-3 py-1 border-t border-separator bg-fill/5 text-[10px] text-text-tertiary flex items-center gap-2">
-            <kbd className="font-mono px-1 py-px rounded border border-border bg-surface">↑↓</kbd>
-            <span>导航</span>
-            <kbd className="font-mono px-1 py-px rounded border border-border bg-surface">Enter</kbd>
-            <span>选择</span>
-            <kbd className="font-mono px-1 py-px rounded border border-border bg-surface">Esc</kbd>
-            <span>关闭</span>
-          </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
 function firstDefined<T>(...vals: (T | null | undefined)[]): T | null {
   for (const v of vals) {
     if (v !== null && v !== undefined) return v
@@ -1553,3 +1687,4 @@ function fmtTime(iso: string | null): string {
 function extractError(err: unknown): string {
   return toToastMessage(formatApiError(err, { fallbackMessage: '未知错误' }))
 }
+

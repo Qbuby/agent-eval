@@ -316,6 +316,64 @@ async def resolve_eval_start_args(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         agent_cfg_b = req.agent_b.model_dump()
 
+    # ── 4. 预生成回复（reply_source='persisted'）──
+    # 选了「使用已有回复」的一侧不连 agent：把解析出的版本行挂到 case 上，
+    # runner 的 _make_adapter 见到 _reply_version 就换成假 adapter 直接回放，
+    # 打分/聚合/落库全链路零改动。A / B 两侧各自独立选（可一侧实跑一侧回放）。
+    reply_source = (req.reply_source or "live").lower()
+    reply_source_b = (req.reply_source_b or "live").lower()
+    for name, val in (("reply_source", reply_source), ("reply_source_b", reply_source_b)):
+        if val not in ("live", "persisted"):
+            raise HTTPException(
+                status_code=400, detail=f"{name} 只能是 live 或 persisted，收到 {val!r}",
+            )
+    if reply_source_b == "persisted" and eval_mode != "comparative":
+        raise HTTPException(
+            status_code=400, detail="reply_source_b 仅在双模对比评估（comparative）下有意义",
+        )
+
+    if reply_source == "persisted" or reply_source_b == "persisted":
+        from agent_eval.evaluation.reply_generator import resolve_reply_versions
+
+        # 数据集类型由来源推断：上传文件来源的样例没有稳定的 case_ref，
+        # 无法与预生成回复对应，直接拒绝而不是静默退回实跑。
+        if req.conversation_dataset:
+            reply_dataset_type = "conversation"
+        elif req.benchmark_version_id or req.project_id:
+            reply_dataset_type = "benchmark"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="上传文件来源的样例不支持「使用已有回复」，请改用基准测试集或多轮对话集",
+            )
+
+        case_refs = [str(c["id"]) for c in cases]
+        for side, src, vids in (
+            ("A", reply_source, req.reply_version_ids),
+            ("B", reply_source_b, req.reply_version_ids_b),
+        ):
+            if src != "persisted":
+                continue
+            resolved, missing = await resolve_reply_versions(
+                dataset_type=reply_dataset_type,
+                case_refs=case_refs,
+                version_ids=vids or None,
+            )
+            if missing:
+                shown = "、".join(missing[:5])
+                more = f" 等 {len(missing)} 个" if len(missing) > 5 else ""
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{side} 侧选择了「使用已有回复」，但以下样例没有可用的已生成回复"
+                        f"（未生成 / 生成失败 / 版本不匹配）：{shown}{more}。"
+                        "请先在数据集页面用「agent生成答案」生成，或改回实时调用 agent。"
+                    ),
+                )
+            key = "_reply_version" if side == "A" else "_reply_version_b"
+            for c in cases:
+                c[key] = resolved[str(c["id"])]
+
     # start_run 的 kwargs（notify_open_ids 由调用方按触发来源另行注入）。
     return {
         "cases": cases,
@@ -330,6 +388,12 @@ async def resolve_eval_start_args(
         "langfuse_trace_name": req.langfuse_trace_name,
         "benchmark_version_id": req.benchmark_version_id,
         "eval_case_source_id": req.case_source_id,
+        # 双模一侧用 persisted 也算 persisted 运行（详情页据此标注数据来源）。
+        "reply_source": (
+            "persisted"
+            if "persisted" in (reply_source, reply_source_b)
+            else "live"
+        ),
     }
 
 
