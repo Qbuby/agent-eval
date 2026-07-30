@@ -68,6 +68,24 @@ class DatasetManager:
             dataset_name, as_of=as_of, splits=splits, tags=tags, limit=limit
         )
 
+    async def load_cases_page(
+        self,
+        dataset_name: str,
+        *,
+        page: int,
+        page_size: int,
+        as_of: datetime | None = None,
+    ) -> tuple[list[TestCase], int]:
+        """分页读取。Langfuse provider 走上游真分页；旧 provider 回退全量切片。"""
+        method = getattr(self.provider, "load_cases_page", None)
+        if method is not None:
+            return await method(
+                dataset_name, page=page, page_size=page_size, as_of=as_of
+            )
+        cases = await self.load_cases(dataset_name, as_of=as_of)
+        start = (page - 1) * page_size
+        return cases[start:start + page_size], len(cases)
+
     async def get_case(self, example_id: str) -> TestCase:
         return await self.provider.get_case(example_id)
 

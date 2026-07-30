@@ -801,8 +801,25 @@ export default function EvaluationRunDetailPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['eval-run', runId] })
       qc.invalidateQueries({ queryKey: ['eval-results', runId] })
+      qc.invalidateQueries({ queryKey: ['eval-rescore-status', runId] })
     },
   })
+
+  // 补评改为异步后台任务（避免 504），这里轮询任务状态；running 时 2.5s 一次，终态停轮询。
+  const rescoreStatusQuery = useQuery({
+    queryKey: ['eval-rescore-status', runId],
+    queryFn: () => evaluationApi.rescoreStatus(runId!).then(r => r.data),
+    enabled: !!runId,
+    refetchInterval: (q) => (q.state.data?.status === 'running' ? 2500 : false),
+  })
+
+  // 补评跑完后刷新明细与汇总，让新补回的分数立刻可见。
+  const rescoreStatus = rescoreStatusQuery.data?.status
+  useEffect(() => {
+    if (rescoreStatus !== 'completed') return
+    qc.invalidateQueries({ queryKey: ['eval-run', runId] })
+    qc.invalidateQueries({ queryKey: ['eval-results', runId] })
+  }, [rescoreStatus, qc, runId])
 
   const run = runQuery.data
   const langfuseHost = deriveLangfuseHost(run)

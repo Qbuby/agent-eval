@@ -4,7 +4,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from agent_eval.api.dependencies import get_manager
 from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
@@ -43,29 +43,31 @@ async def list_cases(
 ):
     as_of_dt = datetime.fromisoformat(as_of) if as_of else None
     try:
-        cases = await mgr.load_cases(
-            name, as_of=as_of_dt, splits=[split] if split else None,
-            tags=tag,
-        )
+        # 无客户端筛选时直接使用 Langfuse dataset_items 真分页；翻页只传输当前页。
+        # search/category/tag/split 需要检查样例内容，才回退到 provider 的共享全量快照。
+        if not any((search, category, tag, split)):
+            page_items, total = await mgr.load_cases_page(
+                name, page=page, page_size=page_size, as_of=as_of_dt
+            )
+        else:
+            cases = await mgr.load_cases(
+                name, as_of=as_of_dt, splits=[split] if split else None,
+                tags=tag,
+            )
+            if search:
+                search_lower = search.lower()
+                cases = [
+                    c for c in cases
+                    if search_lower in c.name.lower()
+                    or search_lower in (c.description or "").lower()
+                ]
+            if category:
+                cases = [c for c in cases if (c.category or "") == category]
+            total = len(cases)
+            start = (page - 1) * page_size
+            page_items = cases[start:start + page_size]
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LangSmith API error: {e}") from e
-
-    if search:
-        search_lower = search.lower()
-        cases = [
-            c for c in cases
-            if search_lower in c.name.lower() or search_lower in (c.description or "").lower()
-        ]
-
-    # 受管类别过滤：与 search/tag 同构（全量 load + 内存 filter）。category 存在
-    # case.category（→ Langfuse item metadata["category"]，见 converter）。
-    if category:
-        cases = [c for c in cases if (c.category or "") == category]
-
-    total = len(cases)
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_items = cases[start:end]
+        raise HTTPException(status_code=502, detail=f"Langfuse API error: {e}") from e
 
     return {
         "items": [c.model_dump(mode="json", exclude_none=True) for c in page_items],
