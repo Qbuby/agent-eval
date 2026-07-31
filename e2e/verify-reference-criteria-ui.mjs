@@ -127,7 +127,15 @@ try {
   }
 
   await page.goto(`/evaluation/runs/${runId}`, { waitUntil: 'domcontentloaded' })
-  await page.getByText(question, { exact: false }).first().waitFor({ state: 'visible', timeout: 20_000 })
+  const resultRow = page.locator('tbody tr').filter({ hasText: question }).first()
+  await resultRow.waitFor({ state: 'visible', timeout: 20_000 })
+  await resultRow.click()
+  await page.getByText(`评估参考依据 (${criteria.length})`, { exact: true })
+    .waitFor({ state: 'visible', timeout: 20_000 })
+  for (const criterion of criteria) {
+    await page.getByText(criterion, { exact: true })
+      .waitFor({ state: 'visible', timeout: 10_000 })
+  }
   await page.screenshot({ path: screenshotPath, fullPage: true })
 
   console.log(JSON.stringify({

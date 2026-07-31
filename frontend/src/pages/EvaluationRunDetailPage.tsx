@@ -1702,6 +1702,18 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
         </div>
       </div>
 
+      {/* 评估参考依据：首评时冻结的答案关键点，对比 run 亦适用（A/B 同一套标准）。 */}
+      {(row.expected_output_criteria?.length ?? 0) > 0 && (
+        <div className="mb-4">
+          <div className="field-label" title="评估启动时冻结的样例答案关键点；源样例之后被修改也不影响本次评分依据">
+            评估参考依据 ({row.expected_output_criteria!.length})
+          </div>
+          <ul className="list-disc list-inside space-y-0.5 rounded-md border border-border bg-fill/5 px-3 py-2 text-[11px] text-text-secondary">
+            {row.expected_output_criteria!.map((c, i) => <li key={i}>{c}</li>)}
+          </ul>
+        </div>
+      )}
+
       {!row.comparison && scoreEntries.length > 0 && (
         <div className="mb-4">
           <div className="field-label">评分</div>

@@ -1173,6 +1173,18 @@ function SampleCompareDetail({ aligned, runs }: {
                   </div>
                 )}
 
+                {/* 评估参考依据：与单次详情页同源，冻结于首评时点。 */}
+                {(row.expected_output_criteria?.length ?? 0) > 0 && (
+                  <div className="mb-2">
+                    <div className="field-label" title="评估启动时冻结的样例答案关键点；源样例之后被修改也不影响本次评分依据">
+                      评估参考依据 ({row.expected_output_criteria!.length})
+                    </div>
+                    <ul className="list-disc list-inside space-y-0.5 rounded-md border border-border bg-fill/5 px-3 py-2 text-[11px] text-text-secondary">
+                      {row.expected_output_criteria!.map((c, i) => <li key={i}>{c}</li>)}
+                    </ul>
+                  </div>
+                )}
+
                 <div className="mb-2">
                   <div className="field-label">输出</div>
                   <pre className="font-mono text-[11px] bg-fill/5 border border-border rounded-md p-2.5 max-h-[180px] overflow-y-auto whitespace-pre-wrap">

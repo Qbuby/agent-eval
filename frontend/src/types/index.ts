@@ -748,6 +748,9 @@ export interface EvalResultRow {
   criterion_results?: Array<Record<string, unknown>>
   actual_output: string | null
   question?: string | null
+  // 评估启动时冻结的答案关键点（后端 0036 起持久化到 test_results）。
+  // 源样例后续被改也不影响本次评估的参考依据，详情页据此展示"按什么标准打分"。
+  expected_output_criteria?: string[]
   latency_ms: number | null
   total_tokens: number | null
   prompt_tokens: number | null
