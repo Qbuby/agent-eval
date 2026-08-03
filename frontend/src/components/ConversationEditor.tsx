@@ -1,5 +1,7 @@
 import { useState } from 'react'
-import { Button } from './ui'
+import { Button, useToast } from './ui'
+import { keyPointsApi } from '@/services'
+import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { TestCase, TurnExpectation } from '@/types'
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -28,6 +30,7 @@ export default function ConversationEditor({
   for (const te of value.turn_expectations ?? []) expByIndex.set(te.turn_index, te)
 
   const [expandedExp, setExpandedExp] = useState<Set<number>>(new Set())
+  const toast = useToast()
 
   function patch(p: Partial<TestCase>) {
     onChange({ ...value, ...p })
@@ -72,6 +75,31 @@ export default function ConversationEditor({
       if (n.has(i)) n.delete(i); else n.add(i)
       return n
     })
+  }
+
+  // 逐轮单条提炼：从该轮的期望输出提炼评判要点，只回填输入框，
+  // 用户核对（可改）后随整个样例一起保存，不单独落库。
+  const [extractingTurn, setExtractingTurn] = useState<number | null>(null)
+
+  async function extractOneCriteria(i: number) {
+    const answer = (expByIndex.get(i)?.expected_output ?? '').trim()
+    if (!answer) {
+      toast.error('请先填写该轮的期望输出')
+      return
+    }
+    setExtractingTurn(i)
+    try {
+      const res = await keyPointsApi.extractOne({
+        answer,
+        question: messages[i]?.content || undefined,
+      })
+      setExp(i, { criteria: res.data.points })
+      toast.success(`提炼出 ${res.data.points.length} 个评判要点，确认后点保存`)
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '提炼失败' })))
+    } finally {
+      setExtractingTurn(null)
+    }
   }
 
   return (
@@ -146,7 +174,19 @@ export default function ConversationEditor({
                       />
                     </div>
                     <div>
-                      <label className="field-label text-[11px]">评判要点（逗号分隔，可选）</label>
+                      <div className="flex items-center justify-between">
+                        <label className="field-label text-[11px] mb-0">评判要点（逗号分隔，可选）</label>
+                        {/* 提炼结果只回填输入框，用户核对（可改）后随样例一起保存 */}
+                        <button
+                          type="button"
+                          onClick={() => extractOneCriteria(i)}
+                          disabled={extractingTurn !== null || !exp?.expected_output?.trim()}
+                          className="text-action text-[11px] disabled:opacity-40"
+                          title={exp?.expected_output?.trim() ? '用大模型从该轮期望输出提炼评判要点' : '请先填写该轮的期望输出'}
+                        >
+                          {extractingTurn === i ? '提炼中…' : 'AI 提炼'}
+                        </button>
+                      </div>
                       <input
                         value={(exp?.criteria ?? []).join(', ')}
                         onChange={e => setExp(i, {

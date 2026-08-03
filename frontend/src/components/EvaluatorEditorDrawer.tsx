@@ -76,6 +76,9 @@ const DEFAULT_EVALUATION_PROMPT = `请评估下面 AI 助手的回答质量。
 ## 期望答案（如有）
 {{GroundTruth}}
 
+## 评判要点（如有，逐条核对回答是否满足）
+{{Criteria}}
+
 请给出一个 0 到 1 之间的总分（0=完全错误，1=完美）。`
 
 const DEFAULT_REASONING_PROMPT = `你是一个严谨、客观的评估专家。
@@ -113,6 +116,7 @@ const DEFAULT_VARIABLE_MAPPING: Record<string, string> = {
   Query: 'input',
   Generation: 'output',
   GroundTruth: 'expected_output',
+  Criteria: 'reference_criteria',
 }
 
 const DEFAULT_COMPARATIVE_VARIABLE_MAPPING: Record<string, string> = {
@@ -120,6 +124,7 @@ const DEFAULT_COMPARATIVE_VARIABLE_MAPPING: Record<string, string> = {
   GroundTruth: 'expected_output',
   ResponseA: 'output_a',
   ResponseB: 'output_b',
+  Criteria: 'reference_criteria',
 }
 
 const DEFAULT_CATEGORIES: Category[] = [
@@ -138,6 +143,7 @@ const VARIABLE_SOURCE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'output_a', label: 'output_a（对比·回复 A）' },
   { value: 'output_b', label: 'output_b（对比·回复 B）' },
   { value: 'expected_output', label: 'expected_output（期望答案）' },
+  { value: 'reference_criteria', label: 'reference_criteria（固化参考要点）' },
   { value: 'metadata', label: 'metadata（整体 JSON）' },
 ]
 
@@ -728,7 +734,10 @@ export default function EvaluatorEditorDrawer({ open, editing, onClose }: Props)
                   （大小写敏感）。在下方"变量映射"段为每个变量选数据源；
                   默认模板内置 <code className="font-mono">{`{{Query}}`}</code>{' '}
                   <code className="font-mono">{`{{Generation}}`}</code>{' '}
-                  <code className="font-mono">{`{{GroundTruth}}`}</code>。
+                  <code className="font-mono">{`{{GroundTruth}}`}</code>{' '}
+                  <code className="font-mono">{`{{Criteria}}`}</code>。
+                  其中 <code className="font-mono">{`{{Criteria}}`}</code> 取 reference_criteria
+                  （样例答案关键点，评估启动时冻结）；样例没填关键点时渲染为空。
                 </div>
               </div>
 

@@ -106,6 +106,68 @@ class CaseReplyStateOut(BaseModel):
     version_count: int = 0
 
 
+class BatchVersionSelector(BaseModel):
+    """批量切换版本的「按什么挑」。
+
+    version_id 是 per-(dataset_type, case_ref) 的，跨样例不可复用，所以批量切换
+    只能按跨样例可识别的标识来指定：
+
+    - ``latest``          每个样例各自版本链里最新的成功版本
+    - ``version_number``  精确 vN（各样例的 vN 是不同的版本行）
+    - ``label``           版本备注完全相同的那条；同一备注多条时取最新
+    """
+
+    mode: str = "latest"
+    version_number: int | None = None
+    label: str | None = None
+
+
+class BatchSetCurrentRequest(BaseModel):
+    dataset_type: str
+    case_refs: list[str] = Field(min_length=1, max_length=2000)
+    selector: BatchVersionSelector = BatchVersionSelector()
+
+
+class BatchResolveItemOut(BaseModel):
+    """单个样例的解析结果。matched=False 时 reason 说明为什么切不了。"""
+
+    case_ref: str
+    matched: bool
+    already_current: bool = False
+    version_id: str | None = None
+    version_number: int | None = None
+    version_label: str | None = None
+    status: str | None = None
+    reason: str | None = None
+
+
+class BatchOptionOut(BaseModel):
+    """可选的批量标识及命中样例数（前端下拉直接用）。"""
+
+    value: str
+    case_count: int
+
+
+class BatchResolveOut(BaseModel):
+    total: int
+    matched_count: int
+    changed_count: int
+    unchanged_count: int
+    missing_count: int
+    items: list[BatchResolveItemOut]
+    label_options: list[BatchOptionOut] = []
+    version_number_options: list[BatchOptionOut] = []
+
+
+class BatchSetCurrentOut(BaseModel):
+    total: int
+    changed_count: int
+    unchanged_count: int
+    missing_count: int
+    failed_count: int
+    items: list[BatchResolveItemOut]
+
+
 class JobItemOut(BaseModel):
     id: str
     case_ref: str
@@ -304,6 +366,198 @@ def _job_out(job: Any, items: list[Any], user_names: dict[str, str]) -> JobOut:
             for i in items
         ],
     )
+
+
+def _batch_options(
+    grouped: dict[str, list[Any]],
+) -> tuple[list[BatchOptionOut], list[BatchOptionOut]]:
+    """从一批样例的版本链里汇总出可用的批量标识及各自命中的样例数。
+
+    只统计成功版本 —— 失败版本设不了当前，出现在下拉里只会误导用户。
+    """
+    label_cases: dict[str, set[str]] = {}
+    number_cases: dict[int, set[str]] = {}
+    for ref, versions in grouped.items():
+        for v in versions:
+            if v.status != "succeeded":
+                continue
+            if v.version_label:
+                label_cases.setdefault(v.version_label, set()).add(ref)
+            number_cases.setdefault(int(v.version_number), set()).add(ref)
+    labels = [
+        BatchOptionOut(value=k, case_count=len(v))
+        for k, v in sorted(label_cases.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    ]
+    numbers = [
+        BatchOptionOut(value=f"v{k}", case_count=len(v))
+        for k, v in sorted(number_cases.items(), reverse=True)
+    ]
+    return labels, numbers
+
+
+async def _resolve_batch_versions(
+    repo: Repository,
+    *,
+    dataset_type: str,
+    case_refs: list[str],
+    selector: BatchVersionSelector,
+) -> BatchResolveOut:
+    """把一个批量意图在每个样例各自的版本链里解析成一条具体版本。
+
+    「预览」和「执行」共用这里，保证用户看到的和实际切的是同一套判定。
+    """
+    if selector.mode not in ("latest", "version_number", "label"):
+        raise HTTPException(
+            status_code=400,
+            detail="selector.mode 必须是 latest / version_number / label 之一",
+        )
+    if selector.mode == "version_number" and selector.version_number is None:
+        raise HTTPException(
+            status_code=400, detail="按版本号批量切换必须提供 version_number",
+        )
+    if selector.mode == "label" and not (selector.label or "").strip():
+        raise HTTPException(status_code=400, detail="按版本备注批量切换必须提供 label")
+
+    refs = list(dict.fromkeys(case_refs))
+    grouped = await repo.list_agent_reply_versions_by_cases(dataset_type, refs)
+    states = await repo.list_agent_reply_case_states(dataset_type, refs)
+    current_by_ref = {
+        s.case_ref: s.current_version_id for s in states if s.current_version_id
+    }
+    label = (selector.label or "").strip()
+
+    items: list[BatchResolveItemOut] = []
+    for ref in refs:
+        versions = grouped.get(ref) or []
+        if not versions:
+            items.append(BatchResolveItemOut(
+                case_ref=ref, matched=False, reason="该样例还没有生成过回复",
+            ))
+            continue
+        if selector.mode == "latest":
+            hit = next((v for v in versions if v.status == "succeeded"), None)
+            reason = None if hit is not None else "该样例的所有版本都是生成失败的"
+        elif selector.mode == "version_number":
+            same = [
+                v for v in versions
+                if int(v.version_number) == selector.version_number
+            ]
+            hit = next((v for v in same if v.status == "succeeded"), None)
+            if hit is not None:
+                reason = None
+            elif same:
+                reason = f"v{selector.version_number} 生成失败，不能设为当前版本"
+            else:
+                reason = f"该样例没有 v{selector.version_number}"
+        else:
+            same = [v for v in versions if (v.version_label or "") == label]
+            hit = next((v for v in same if v.status == "succeeded"), None)
+            if hit is not None:
+                reason = None
+            elif same:
+                reason = f"备注为「{label}」的版本生成失败，不能设为当前版本"
+            else:
+                reason = f"该样例没有备注为「{label}」的版本"
+        if hit is None:
+            items.append(BatchResolveItemOut(
+                case_ref=ref, matched=False, reason=reason,
+            ))
+            continue
+        items.append(BatchResolveItemOut(
+            case_ref=ref,
+            matched=True,
+            already_current=(current_by_ref.get(ref) == hit.id),
+            version_id=str(hit.id),
+            version_number=int(hit.version_number),
+            version_label=hit.version_label,
+            status=hit.status,
+        ))
+
+    labels, numbers = _batch_options(grouped)
+    matched = [i for i in items if i.matched]
+    unchanged = [i for i in matched if i.already_current]
+    return BatchResolveOut(
+        total=len(items),
+        matched_count=len(matched),
+        changed_count=len(matched) - len(unchanged),
+        unchanged_count=len(unchanged),
+        missing_count=len(items) - len(matched),
+        items=items,
+        label_options=labels,
+        version_number_options=numbers,
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 批量切换当前版本
+# ───────────────────────────────────────────────────────────────────────────
+
+
+@router.post("/batch-resolve", response_model=BatchResolveOut)
+async def batch_resolve_versions(req: BatchSetCurrentRequest):
+    """干跑：这批样例按这个标识各自会切到哪个版本，谁切不了、为什么。
+
+    前端弹窗先调它出预览（顺带拿到可选的版本备注 / 版本号下拉），用户确认后再
+    调 /batch-set-current。两次走同一套解析逻辑，不会预览一套、执行另一套。
+    """
+    dataset_type = _check_dataset_type(req.dataset_type)
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        return await _resolve_batch_versions(
+            repo,
+            dataset_type=dataset_type,
+            case_refs=req.case_refs,
+            selector=req.selector,
+        )
+
+
+@router.post("/batch-set-current", response_model=BatchSetCurrentOut)
+async def batch_set_current_versions(req: BatchSetCurrentRequest):
+    """按批量标识把每个样例的当前版本指针挪到各自解析出的那条版本。
+
+    部分成功即提交：解析不到版本的样例原样不动（missing），本来就是当前版本的
+    跳过（unchanged），只对真正要变的写。个别样例写失败计入 failed 并保留原因，
+    不因此整批回滚 —— 批量切换不是原子语义，让能切的先切完更符合使用意图。
+    """
+    dataset_type = _check_dataset_type(req.dataset_type)
+    async with async_session_factory() as session:
+        repo = Repository(session)
+        preview = await _resolve_batch_versions(
+            repo,
+            dataset_type=dataset_type,
+            case_refs=req.case_refs,
+            selector=req.selector,
+        )
+        changed = 0
+        failed = 0
+        out_items: list[BatchResolveItemOut] = []
+        for item in preview.items:
+            if not item.matched or item.already_current:
+                out_items.append(item)
+                continue
+            state = await repo.set_current_agent_reply_version(
+                dataset_type=dataset_type,
+                case_ref=item.case_ref,
+                version_id=uuid.UUID(str(item.version_id)),
+            )
+            if state is None:
+                failed += 1
+                out_items.append(item.model_copy(update={
+                    "matched": False,
+                    "reason": "版本与样例不匹配，未切换",
+                }))
+                continue
+            changed += 1
+            out_items.append(item)
+        await session.commit()
+        return BatchSetCurrentOut(
+            total=preview.total,
+            changed_count=changed,
+            unchanged_count=preview.unchanged_count,
+            missing_count=preview.missing_count,
+            failed_count=failed,
+            items=out_items,
+        )
 
 
 # ───────────────────────────────────────────────────────────────────────────

@@ -9,12 +9,16 @@ import type {
   ConversationColumnMap,
   ConversationInspectResult,
 } from '@/services/datasets'
+import { SelectionBar } from '@/components/SelectionBar'
 import ConversationView from '@/components/ConversationView'
 import ConversationEditor from '@/components/ConversationEditor'
 import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
 import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
+import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
 import type { TestCase } from '@/types'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import { addIds, collectAllIds, pageSelectionState, togglePageIds } from '@/lib/batchSelection'
 
 // 多轮对话样例：input_messages 含多条消息，或带 conversation_goal / turn_expectations。
 // 单轮老样例（仅 1 条 user 消息且无会话级字段）在此页过滤掉，避免与备选数据集页职责重叠。
@@ -77,7 +81,12 @@ export default function ConversationDatasetDetailPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [genOpen, setGenOpen] = useState(false)
   const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  // 批量切换当前版本：按「最新 / vN / 版本备注」在每个样例各自的版本链里解析
+  const [batchVerOpen, setBatchVerOpen] = useState(false)
   const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
+  // 提炼关键点：勾选了就只提炼勾选的，没勾选就全量扫该数据集里待提炼的轮次。
+  // 多轮集的关键点写回每轮的 turn_expectations[].criteria。
+  const [extractOpen, setExtractOpen] = useState(false)
   // 三步式导入：选文件 → 字段映射（拍平多行布局才需要）→ 解析预览 → 确认导入。
   // step 驱动弹窗内容：'file' 选文件、'map' 映射列、'preview' 看解析结果。
   const [importStep, setImportStep] = useState<'file' | 'map' | 'preview'>('file')
@@ -88,7 +97,9 @@ export default function ConversationDatasetDetailPage() {
   // 导入时为整批样例统一指定的类别（空串=不指定）。
   const [importCategory, setImportCategory] = useState('')
 
-  const pageSize = 20
+  const [pageSize, setPageSize] = useState(20)
+  // 跨页全选（逐页拉 id）进行中
+  const [selectingAll, setSelectingAll] = useState(false)
 
   const { data: dataset, isLoading: datasetLoading } = useQuery({
     queryKey: ['dataset', name],
@@ -97,7 +108,7 @@ export default function ConversationDatasetDetailPage() {
   })
 
   const { data: casesData, isLoading } = useQuery({
-    queryKey: ['conv-cases', name, page, search, categoryFilter],
+    queryKey: ['conv-cases', name, page, pageSize, search, categoryFilter],
     queryFn: () => datasetsApi.listCasesPaginated(name, {
       page, page_size: pageSize, search: search || undefined,
       category: categoryFilter || undefined,
@@ -267,6 +278,34 @@ export default function ConversationDatasetDetailPage() {
     () => cases.map(c => c.id).filter((id): id is string => !!id),
     [cases],
   )
+
+  // 表头 checkbox 只反映当页；跨页累积的总数走 SelectionBar。
+  const pageSel = pageSelectionState(selectedIds, caseIdsOnPage)
+
+  // 「选择全部 N 条」：按当前筛选逐页拉 id 并入选中集合。
+  async function selectAllMatching() {
+    setSelectingAll(true)
+    try {
+      const ids = await collectAllIds(async (p, size) => {
+        const r = await datasetsApi.listCasesPaginated(name, {
+          page: p, page_size: size,
+          search: search || undefined,
+          category: categoryFilter || undefined,
+        })
+        return {
+          ids: r.data.items.filter(isConversation).map(c => c.id).filter((id): id is string => !!id),
+          total: r.data.total,
+          // 前端还要按类型筛一遍，判停必须用服务端原始条数。
+          rawCount: r.data.items.length,
+        }
+      })
+      setSelectedIds(prev => addIds(prev, ids))
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '全选失败' })))
+    } finally {
+      setSelectingAll(false)
+    }
+  }
   const { data: replyStates } = useQuery({
     queryKey: ['agent-reply-states', 'conversation', caseIdsOnPage],
     queryFn: () => agentRepliesApi.listStates('conversation', caseIdsOnPage).then(r => r.data),
@@ -354,13 +393,36 @@ export default function ConversationDatasetDetailPage() {
         )}
         <div className="flex-1" />
         {canWrite && (
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={selectedIds.size === 0}
+              onClick={() => { setGenSingleId(null); setGenOpen(true) }}
+            >
+              agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+            </Button>
+            {/* 批量切换这些样例的当前版本：评估「使用已有回复」消费的就是当前版本 */}
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={selectedIds.size === 0}
+              onClick={() => setBatchVerOpen(true)}
+              title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的当前版本批量切到同一标识'}
+            >
+              批量切换版本{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+            </Button>
+          </>
+        )}
+        {canWrite && (
+          /* 勾选了就只提炼这几条，没勾选则全量扫该集里「有期望答案但没评分点」的轮次。 */
           <Button
             variant="secondary"
             size="sm"
-            disabled={selectedIds.size === 0}
-            onClick={() => { setGenSingleId(null); setGenOpen(true) }}
+            onClick={() => setExtractOpen(true)}
+            title="用大模型从每轮期望答案提炼评分点，写回 turn_expectations"
           >
-            agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+            提炼关键点{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
           </Button>
         )}
         {canWrite && selectedIds.size > 0 && (
@@ -419,6 +481,20 @@ export default function ConversationDatasetDetailPage() {
         )}
       </div>
 
+      {canWrite && (
+        <SelectionBar
+          selectedCount={selectedIds.size}
+          total={total}
+          pageCount={cases.length}
+          pageSelectedCount={pageSel.count}
+          onSelectAll={selectAllMatching}
+          onClear={() => setSelectedIds(new Set())}
+          selectingAll={selectingAll}
+          pageSize={pageSize}
+          onPageSizeChange={size => { setPageSize(size); setPage(1) }}
+        />
+      )}
+
       <div className="table-card">
         <table className="table-base">
           <thead>
@@ -427,12 +503,10 @@ export default function ConversationDatasetDetailPage() {
                 <th className="w-10 text-center">
                   <input
                     type="checkbox"
-                    checked={cases.length > 0 && cases.every(c => c.id && selectedIds.has(c.id))}
-                    onChange={() => {
-                      const ids = cases.map(c => c.id).filter(Boolean) as string[]
-                      const allSelected = ids.length > 0 && ids.every(id => selectedIds.has(id))
-                      setSelectedIds(allSelected ? new Set() : new Set(ids))
-                    }}
+                    checked={pageSel.all}
+                    ref={el => { if (el) el.indeterminate = pageSel.some }}
+                    onChange={() => setSelectedIds(prev => togglePageIds(prev, caseIdsOnPage))}
+                    aria-label="全选当前页"
                     className="accent-accent"
                   />
                 </th>
@@ -894,6 +968,14 @@ export default function ConversationDatasetDetailPage() {
         onFinished={refreshReplyStates}
       />
 
+      <AgentReplyBatchVersionDialog
+        open={batchVerOpen}
+        onClose={() => setBatchVerOpen(false)}
+        datasetType="conversation"
+        caseRefs={Array.from(selectedIds)}
+        onDone={refreshReplyStates}
+      />
+
       <AgentReplyVersionsDrawer
         open={!!versionsCaseRef}
         onClose={() => setVersionsCaseRef(null)}
@@ -907,6 +989,16 @@ export default function ConversationDatasetDetailPage() {
           setGenOpen(true)
         } : undefined}
         onChanged={refreshReplyStates}
+      />
+
+      {/* 批量提炼关键点：勾选集为空则由弹窗全量扫该数据集的待提炼轮次 */}
+      <KeyPointsExtractDialog
+        open={extractOpen}
+        onClose={() => setExtractOpen(false)}
+        target="multichat"
+        datasetName={name}
+        caseIds={Array.from(selectedIds)}
+        onFinished={() => queryClient.invalidateQueries({ queryKey: ['conv-cases'] })}
       />
     </div>
   )

@@ -10,8 +10,8 @@ from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
     admin, admin_entry_codes, admin_tenants, agent_replies, auth, benchmark, candidates,
     cases, config, datasets, evaluation, evaluator_providers, feedback_review, feishu_oauth,
-    generate, governance, img_proxy, langfuse_metrics, portal, projects, routing,
-    scheduled_tasks, scheduler, traces,
+    generate, governance, img_proxy, key_points, langfuse_metrics, portal, projects,
+    routing, scheduled_tasks, scheduler, traces,
 )
 from agent_eval.config import settings
 from agent_eval.logging_config import setup_logging
@@ -153,6 +153,10 @@ def create_app() -> FastAPI:
     # 持久化 agent 回复：数据集页面预生成答案 + 版本回溯 + 作为评估数据来源。
     # router 自带 prefix(/api/agent-replies) 与 require_internal 门禁。见迁移 0035。
     app.include_router(agent_replies.router)
+    # 答案关键点提炼：数据集/样例页触发 LLM 把参考答案压成可核对的关键点清单，
+    # 回填 key_points / turn_expectations[].criteria 供 judge 逐条核对。
+    # router 自带 prefix(/api/key-points) 与 require_internal 门禁。
+    app.include_router(key_points.router)
     app.include_router(admin.router)
     # 多租户 + 外部客户 Portal 三个新模块：admin 后台开户、客户 portal、内部反馈展示。
     # 各 router 已自带 prefix 与角色门禁（admin_tenants/feedback_review 挂 require_role(ROLE_ADMIN)，

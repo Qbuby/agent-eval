@@ -2,11 +2,15 @@ import { Fragment, useId, useState, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/ui'
-import { agentRepliesApi } from '@/services'
+import { agentRepliesApi, keyPointsApi } from '@/services'
 import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn, type ImportPreview } from '@/services/benchmark'
 import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
 import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
+import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
+import { SelectionBar } from '@/components/SelectionBar'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import { addIds, collectAllIds, pageSelectionState, togglePageIds } from '@/lib/batchSelection'
 
 export default function BenchmarkPage() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -53,9 +57,15 @@ export default function BenchmarkPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [genOpen, setGenOpen] = useState(false)
   const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  // 批量切换当前版本：按「最新 / vN / 版本备注」在每个样例各自的版本链里解析
+  const [batchVerOpen, setBatchVerOpen] = useState(false)
   const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
+  // 提炼关键点：勾选了就只提炼勾选的，没勾选就全量扫待提炼样例。
+  const [extractOpen, setExtractOpen] = useState(false)
 
-  const pageSize = 20
+  const [pageSize, setPageSize] = useState(20)
+  // 跨页全选（逐页拉 id）进行中
+  const [selectingAll, setSelectingAll] = useState(false)
 
   const { data: projects } = useQuery({
     queryKey: ['projects'],
@@ -70,7 +80,7 @@ export default function BenchmarkPage() {
   })
 
   const { data: casesData, isLoading } = useQuery({
-    queryKey: ['benchmark-cases', projectId, page, search, categoryFilter],
+    queryKey: ['benchmark-cases', projectId, page, pageSize, search, categoryFilter],
     queryFn: () => benchmarkApi.listCases(projectId!, {
       page, page_size: pageSize,
       search: search || undefined,
@@ -207,6 +217,9 @@ export default function BenchmarkPage() {
   })
   const replyStateMap = new Map((replyStates ?? []).map(s => [s.case_ref, s]))
 
+  // 表头 checkbox 只反映当页；跨页累积的总数走 SelectionBar。
+  const pageSel = pageSelectionState(selectedIds, caseIdsOnPage)
+
   function toggleSelect(id: string) {
     setSelectedIds(prev => {
       const next = new Set(prev)
@@ -214,6 +227,27 @@ export default function BenchmarkPage() {
       else next.add(id)
       return next
     })
+  }
+
+  // 「选择全部 N 条」：按当前筛选逐页拉 id 并入选中集合。
+  async function selectAllMatching() {
+    if (!projectId) return
+    setSelectingAll(true)
+    try {
+      const ids = await collectAllIds(async (p, size) => {
+        const r = await benchmarkApi.listCases(projectId, {
+          page: p, page_size: size,
+          search: search || undefined,
+          category_id: categoryFilter || undefined,
+        })
+        return { ids: r.data.items.map(c => c.id), total: r.data.total }
+      })
+      setSelectedIds(prev => addIds(prev, ids))
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '全选失败' })))
+    } finally {
+      setSelectingAll(false)
+    }
   }
 
   function refreshReplyStates() {
@@ -297,6 +331,25 @@ export default function BenchmarkPage() {
         >
           agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
         </Button>
+        {/* 批量切换这些样例的当前版本：评估「使用已有回复」消费的就是当前版本 */}
+        <Button
+          onClick={() => setBatchVerOpen(true)}
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的当前版本批量切到同一标识'}
+        >
+          批量切换版本{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 从参考答案提炼关键点：勾选了就只提炼这几条，没勾选就全量扫「有答案但关键点为空」的。 */}
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => setExtractOpen(true)}
+          title="用大模型从参考答案提炼关键点，供 judge 逐条核对"
+        >
+          提炼关键点{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
         <ExportMenu
           disabled={!projectId}
           onExport={async (format) => {
@@ -320,6 +373,18 @@ export default function BenchmarkPage() {
         </Button>
       </div>
 
+      <SelectionBar
+        selectedCount={selectedIds.size}
+        total={total}
+        pageCount={cases.length}
+        pageSelectedCount={pageSel.count}
+        onSelectAll={selectAllMatching}
+        onClear={() => setSelectedIds(new Set())}
+        selectingAll={selectingAll}
+        pageSize={pageSize}
+        onPageSizeChange={size => { setPageSize(size); setPage(1) }}
+      />
+
       <div className="table-card">
         <table className="table-base">
           <thead>
@@ -327,11 +392,10 @@ export default function BenchmarkPage() {
               <th className="w-10 text-center">
                 <input
                   type="checkbox"
-                  checked={cases.length > 0 && cases.every(c => selectedIds.has(c.id))}
-                  onChange={() => {
-                    const allSelected = cases.length > 0 && cases.every(c => selectedIds.has(c.id))
-                    setSelectedIds(allSelected ? new Set() : new Set(cases.map(c => c.id)))
-                  }}
+                  checked={pageSel.all}
+                  ref={el => { if (el) el.indeterminate = pageSel.some }}
+                  onChange={() => setSelectedIds(prev => togglePageIds(prev, caseIdsOnPage))}
+                  aria-label="全选当前页"
                   className="accent-accent w-3.5 h-3.5"
                 />
               </th>
@@ -756,6 +820,14 @@ export default function BenchmarkPage() {
         onFinished={refreshReplyStates}
       />
 
+      <AgentReplyBatchVersionDialog
+        open={batchVerOpen}
+        onClose={() => setBatchVerOpen(false)}
+        datasetType="benchmark"
+        caseRefs={Array.from(selectedIds)}
+        onDone={refreshReplyStates}
+      />
+
       <AgentReplyVersionsDrawer
         open={!!versionsCaseRef}
         onClose={() => setVersionsCaseRef(null)}
@@ -764,6 +836,15 @@ export default function BenchmarkPage() {
         caseTitle={cases.find(c => c.id === versionsCaseRef)?.question?.slice(0, 60) ?? null}
         onRetryCase={ref => { setVersionsCaseRef(null); setGenSingleId(ref); setGenOpen(true) }}
         onChanged={refreshReplyStates}
+      />
+
+      {/* 批量提炼关键点：勾选集为空则由弹窗全量扫待提炼样例 */}
+      <KeyPointsExtractDialog
+        open={extractOpen}
+        onClose={() => setExtractOpen(false)}
+        target="benchmark"
+        caseIds={Array.from(selectedIds)}
+        onFinished={() => queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })}
       />
     </div>
   )
@@ -801,6 +882,30 @@ function EditCaseModal({
   const updateExtra = (key: string, value: string) => {
     if (!editCase) return
     setEditCase({ ...editCase, extra_fields: { ...extraFields, [key]: value } })
+  }
+
+  const modalToast = useToast()
+  const [extractingOne, setExtractingOne] = useState(false)
+
+  // 单条提炼：结果只回填输入框，用户核对（可改）后随表单一起保存，不落库。
+  const extractOneKeyPoints = async () => {
+    if (!editCase?.reference_answer?.trim()) {
+      modalToast.error('请先填写参考答案')
+      return
+    }
+    setExtractingOne(true)
+    try {
+      const res = await keyPointsApi.extractOne({
+        answer: editCase.reference_answer,
+        question: editCase.question || undefined,
+      })
+      setEditCase({ ...editCase, key_points: res.data.points })
+      modalToast.success(`提炼出 ${res.data.points.length} 个关键点，确认后点保存`)
+    } catch (e) {
+      modalToast.error(toToastMessage(formatApiError(e, { fallbackMessage: '提炼失败' })))
+    } finally {
+      setExtractingOne(false)
+    }
   }
 
   const handleSave = () => {
@@ -896,7 +1001,19 @@ function EditCaseModal({
                 />
               </div>
               <div>
-                <label htmlFor={keyPointsId} className="field-label">关键点（逗号分隔）</label>
+                <div className="flex items-center justify-between">
+                  <label htmlFor={keyPointsId} className="field-label">关键点（逗号分隔）</label>
+                  {/* 提炼结果只回填输入框，用户核对（可改）后随表单一起保存 */}
+                  <button
+                    type="button"
+                    onClick={extractOneKeyPoints}
+                    disabled={extractingOne || !editCase.reference_answer?.trim()}
+                    className="text-action text-[11px] disabled:opacity-40"
+                    title={editCase.reference_answer?.trim() ? '用大模型从参考答案提炼关键点' : '请先填写参考答案'}
+                  >
+                    {extractingOne ? '提炼中…' : 'AI 提炼'}
+                  </button>
+                </div>
                 <input
                   id={keyPointsId}
                   value={editCase.key_points?.join(', ') || ''}

@@ -133,9 +133,9 @@ DEFAULT_VARIABLE_MAPPING: dict[str, str] = {
     "Query": "input",
     "Generation": "output",
     "GroundTruth": "expected_output",
-    # 多轮逐轮打分时，score_conversation 把该轮 criteria 注入 metadata.turn_criteria；
-    # 单轮场景无此 key → 渲染空字符串，无副作用。
-    "Criteria": "metadata.turn_criteria",
+    # 固化参考要点：多轮取该轮 turn_criteria，单轮取样例级 reference_criteria
+    # （评估启动时冻结）。两者都空时渲染空字符串，无副作用。
+    "Criteria": "reference_criteria",
 }
 
 
@@ -171,6 +171,9 @@ DEFAULT_COMPARATIVE_VARIABLE_MAPPING: dict[str, str] = {
     "GroundTruth": "expected_output",
     "ResponseA": "output_a",
     "ResponseB": "output_b",
+    # 与单模默认映射对齐：多轮取该轮 turn_criteria，单轮取样例级
+    # reference_criteria（评估启动时冻结）。两者都空时渲染空字符串。
+    "Criteria": "reference_criteria",
 }
 
 
@@ -284,6 +287,7 @@ def _resolve_source(
 
     * ``input`` / ``output`` / ``expected_output`` —— 直接取
     * ``output_a`` / ``output_b`` —— 双模对比时两侧回复（单模恒空串）
+    * ``reference_criteria`` —— 本次评估冻结的答案关键点（多轮该轮要点优先）
     * ``metadata`` —— 整体 JSON 序列化
     * ``metadata.<key>[.<sub>...]`` —— metadata 字典里点路径取子字段，
       最终值非字符串时 ``str(...)``；缺失返回空字符串
@@ -299,6 +303,9 @@ def _resolve_source(
         return output_b or ""
     if s == "expected_output":
         return expected_output or ""
+    if s == "reference_criteria":
+        # 本次评估启动时冻结的答案关键点；多轮该轮要点优先于样例级要点。
+        return _reference_criteria_text(metadata)
     if s == "metadata":
         return json.dumps(metadata or {}, ensure_ascii=False)
     if s.startswith("metadata."):
@@ -410,7 +417,10 @@ def _append_required_reference_criteria(
     referenced_names = set(_MUSTACHE_RE.findall(evaluation_prompt))
     data = metadata or {}
     consumed = any(
-        (
+        # reference_criteria 由 _resolve_source 统一解析（多轮/单轮都命中）；
+        # 能走到这里说明 criteria 非空，模板引用即视为已消费。
+        variable_mapping.get(name) == "reference_criteria"
+        or (
             variable_mapping.get(name) == "metadata.turn_criteria"
             and bool(str(data.get("turn_criteria") or "").strip())
         )

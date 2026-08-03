@@ -2,10 +2,14 @@ import { useId, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useToast, useConfirm, ExportMenu } from '@/components/ui'
 import { candidatesApi, projectsApi, type CandidateCase } from '@/services/benchmark'
-import { agentRepliesApi } from '@/services'
+import { agentRepliesApi, keyPointsApi } from '@/services'
 import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
 import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
+import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
+import { SelectionBar } from '@/components/SelectionBar'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import { addIds, collectAllIds, pageSelectionState, togglePageIds } from '@/lib/batchSelection'
 
 const STATUS_BADGE: Record<string, string> = {
   pending: 'badge badge-warning',
@@ -47,9 +51,17 @@ export default function CandidatesPage() {
   // agent 生成答案：勾选样例后开弹窗；null = 用当前勾选集，非空 = 只重跑这一条。
   const [genOpen, setGenOpen] = useState(false)
   const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  // 批量切换当前版本：按「最新 / vN / 版本备注」在每个样例各自的版本链里解析
+  const [batchVerOpen, setBatchVerOpen] = useState(false)
   const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
+  // 提炼关键点：勾选了就只提炼勾选的，没勾选就全量扫待提炼样例。
+  const [extractOpen, setExtractOpen] = useState(false)
+  // 编辑弹窗里的单条 AI 提炼：结果只回填输入框，用户可改后再保存。
+  const [extractingOne, setExtractingOne] = useState(false)
 
-  const pageSize = 20
+  const [pageSize, setPageSize] = useState(20)
+  // 跨页全选（逐页拉 id）进行中
+  const [selectingAll, setSelectingAll] = useState(false)
 
   const { data: projects } = useQuery({
     queryKey: ['projects'],
@@ -57,7 +69,7 @@ export default function CandidatesPage() {
   })
 
   const { data: casesData, isLoading } = useQuery({
-    queryKey: ['candidates', page, statusFilter, search],
+    queryKey: ['candidates', page, pageSize, statusFilter, search],
     queryFn: () => candidatesApi.list({
       page, page_size: pageSize,
       status: statusFilter || undefined,
@@ -124,8 +136,31 @@ export default function CandidatesPage() {
   })
   const replyStateMap = new Map((replyStates ?? []).map(s => [s.case_ref, s]))
 
+  // 表头 checkbox 只反映当页；跨页累积的总数走 SelectionBar。
+  const pageSel = pageSelectionState(selectedIds, caseIdsOnPage)
+
   function refreshReplyStates() {
     queryClient.invalidateQueries({ queryKey: ['agent-reply-states'] })
+  }
+
+  // 「选择全部 N 条」：按当前筛选逐页拉 id 并入选中集合。
+  async function selectAllMatching() {
+    setSelectingAll(true)
+    try {
+      const ids = await collectAllIds(async (p, size) => {
+        const r = await candidatesApi.list({
+          page: p, page_size: size,
+          status: statusFilter || undefined,
+          search: search || undefined,
+        })
+        return { ids: r.data.items.map(c => c.id), total: r.data.total }
+      })
+      setSelectedIds(prev => addIds(prev, ids))
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '全选失败' })))
+    } finally {
+      setSelectingAll(false)
+    }
   }
 
   function startEdit(c: CandidateCase) {
@@ -145,6 +180,28 @@ export default function CandidatesPage() {
         negative_points: editNegativePoints ? editNegativePoints.split(',').map(s => s.trim()).filter(Boolean) : null,
       },
     })
+  }
+
+  // 编辑弹窗里的单条提炼：只回填输入框，用户确认（可改）后随表单一起保存，不落库。
+  async function extractOneKeyPoints() {
+    if (!editAnswer.trim()) {
+      toast.error('请先填写参考答案')
+      return
+    }
+    const c = cases.find(x => x.id === editingId)
+    setExtractingOne(true)
+    try {
+      const res = await keyPointsApi.extractOne({
+        answer: editAnswer,
+        question: c?.question || undefined,
+      })
+      setEditKeyPoints(res.data.points.join(', '))
+      toast.success(`提炼出 ${res.data.points.length} 个关键点，确认后点保存`)
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '提炼失败' })))
+    } finally {
+      setExtractingOne(false)
+    }
   }
 
   function toggleSelect(id: string) {
@@ -208,6 +265,25 @@ export default function CandidatesPage() {
         >
           agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
         </Button>
+        {/* 批量切换这些样例的当前版本：评估「使用已有回复」消费的就是当前版本 */}
+        <Button
+          onClick={() => setBatchVerOpen(true)}
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的当前版本批量切到同一标识'}
+        >
+          批量切换版本{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 从参考答案提炼关键点：勾选了就只提炼这几条，没勾选就全量扫「有答案但关键点为空」的。 */}
+        <Button
+          onClick={() => setExtractOpen(true)}
+          variant="secondary"
+          size="md"
+          title="用大模型从参考答案提炼关键点，供 judge 逐条核对"
+        >
+          提炼关键点{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
         {selectedIds.size > 0 && statusFilter === 'ready' && (
           <Button onClick={() => setShowPromote(true)} variant="primary" size="md">
             导入基准测试集 ({selectedIds.size})
@@ -233,6 +309,18 @@ export default function CandidatesPage() {
         )}
       </div>
 
+      <SelectionBar
+        selectedCount={selectedIds.size}
+        total={total}
+        pageCount={cases.length}
+        pageSelectedCount={pageSel.count}
+        onSelectAll={selectAllMatching}
+        onClear={() => setSelectedIds(new Set())}
+        selectingAll={selectingAll}
+        pageSize={pageSize}
+        onPageSizeChange={size => { setPageSize(size); setPage(1) }}
+      />
+
       <div className="table-card">
         <table className="table-base">
           <thead>
@@ -240,11 +328,10 @@ export default function CandidatesPage() {
               <th className="w-10 text-center">
                 <input
                   type="checkbox"
-                  checked={cases.length > 0 && selectedIds.size === cases.length}
-                  onChange={() => {
-                    if (selectedIds.size === cases.length) setSelectedIds(new Set())
-                    else setSelectedIds(new Set(cases.map(c => c.id)))
-                  }}
+                  checked={pageSel.all}
+                  ref={el => { if (el) el.indeterminate = pageSel.some }}
+                  onChange={() => setSelectedIds(prev => togglePageIds(prev, caseIdsOnPage))}
+                  aria-label="全选当前页"
                   className="accent-accent w-3.5 h-3.5"
                 />
               </th>
@@ -396,7 +483,19 @@ export default function CandidatesPage() {
             />
           </div>
           <div>
-            <label htmlFor={editKeyPointsId} className="field-label">关键点（逗号分隔）</label>
+            <div className="flex items-center justify-between">
+              <label htmlFor={editKeyPointsId} className="field-label">关键点（逗号分隔）</label>
+              {/* 提炼结果只回填输入框，用户核对（可改）后随表单一起保存 */}
+              <button
+                type="button"
+                onClick={extractOneKeyPoints}
+                disabled={extractingOne || !editAnswer.trim()}
+                className="text-action text-[11px] disabled:opacity-40"
+                title={editAnswer.trim() ? '用大模型从参考答案提炼关键点' : '请先填写参考答案'}
+              >
+                {extractingOne ? '提炼中…' : 'AI 提炼'}
+              </button>
+            </div>
             <input
               id={editKeyPointsId}
               value={editKeyPoints}
@@ -519,6 +618,14 @@ export default function CandidatesPage() {
         onFinished={refreshReplyStates}
       />
 
+      <AgentReplyBatchVersionDialog
+        open={batchVerOpen}
+        onClose={() => setBatchVerOpen(false)}
+        datasetType="candidate"
+        caseRefs={Array.from(selectedIds)}
+        onDone={refreshReplyStates}
+      />
+
       <AgentReplyVersionsDrawer
         open={!!versionsCaseRef}
         onClose={() => setVersionsCaseRef(null)}
@@ -527,6 +634,15 @@ export default function CandidatesPage() {
         caseTitle={cases.find(c => c.id === versionsCaseRef)?.question?.slice(0, 60) ?? null}
         onRetryCase={ref => { setVersionsCaseRef(null); setGenSingleId(ref); setGenOpen(true) }}
         onChanged={refreshReplyStates}
+      />
+
+      {/* 批量提炼关键点：勾选集为空则由弹窗全量扫待提炼样例 */}
+      <KeyPointsExtractDialog
+        open={extractOpen}
+        onClose={() => setExtractOpen(false)}
+        target="candidate"
+        caseIds={Array.from(selectedIds)}
+        onFinished={() => queryClient.invalidateQueries({ queryKey: ['candidates'] })}
       />
     </div>
   )

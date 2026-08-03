@@ -82,6 +82,59 @@ export interface ReplyJob {
   items: ReplyJobItem[]
 }
 
+// ── 批量切换当前版本 ──
+// version_id 是 per-(dataset_type, case_ref) 的，跨样例不可复用，所以批量切换只
+// 能按跨样例可识别的标识来指定：最新 / 精确版本号 vN / 版本备注。
+export type BatchVersionMode = 'latest' | 'version_number' | 'label'
+
+export interface BatchVersionSelector {
+  mode: BatchVersionMode
+  version_number?: number | null
+  label?: string | null
+}
+
+export interface BatchSetCurrentRequest {
+  dataset_type: ReplyDatasetType
+  case_refs: string[]
+  selector: BatchVersionSelector
+}
+
+export interface BatchResolveItem {
+  case_ref: string
+  matched: boolean
+  already_current: boolean
+  version_id: string | null
+  version_number: number | null
+  version_label: string | null
+  status: string | null
+  reason: string | null
+}
+
+export interface BatchOption {
+  value: string
+  case_count: number
+}
+
+export interface BatchResolveResult {
+  total: number
+  matched_count: number
+  changed_count: number
+  unchanged_count: number
+  missing_count: number
+  items: BatchResolveItem[]
+  label_options: BatchOption[]
+  version_number_options: BatchOption[]
+}
+
+export interface BatchSetCurrentResult {
+  total: number
+  changed_count: number
+  unchanged_count: number
+  missing_count: number
+  failed_count: number
+  items: BatchResolveItem[]
+}
+
 export const agentRepliesApi = {
   // ── 生成任务 ──
   generate(data: GenerateRepliesRequest) {
@@ -136,6 +189,15 @@ export const agentRepliesApi = {
   },
   setCurrentVersion(versionId: string) {
     return api.post<ReplyVersion>(`/agent-replies/versions/${versionId}/set-current`)
+  },
+  // 干跑预览：这批样例按这个标识各自会切到哪个版本，谁切不了、为什么。
+  // 顺带返回可选的版本备注 / 版本号下拉（含各自命中样例数）。
+  batchResolve(data: BatchSetCurrentRequest) {
+    return api.post<BatchResolveResult>('/agent-replies/batch-resolve', data)
+  },
+  // 执行：部分成功即提交，解析不到的样例原样不动。
+  batchSetCurrent(data: BatchSetCurrentRequest) {
+    return api.post<BatchSetCurrentResult>('/agent-replies/batch-set-current', data)
   },
   deleteVersion(versionId: string) {
     return api.delete<{

@@ -924,6 +924,33 @@ class Repository:
         )).all()
         return {r[0]: int(r[1]) for r in rows}
 
+    async def list_agent_reply_versions_by_cases(
+        self, dataset_type: str, case_refs: list[str],
+    ) -> dict[str, list[AgentReplyVersionRow]]:
+        """批量取一批样例的全部版本，按 case_ref 分组，每组 version_number 降序。
+
+        「批量切换版本」用：同一个批量意图（最新 / vN / 某个版本备注）要在每个
+        样例各自的版本链里各自解析出一条版本，故一次查全再内存分组，避免 N 次
+        往返。没有任何版本的样例不出现在结果里。
+        """
+        if not case_refs:
+            return {}
+        rows = (await self.session.execute(
+            select(AgentReplyVersionRow)
+            .where(
+                AgentReplyVersionRow.dataset_type == dataset_type,
+                AgentReplyVersionRow.case_ref.in_(case_refs),
+            )
+            .order_by(
+                AgentReplyVersionRow.case_ref,
+                AgentReplyVersionRow.version_number.desc(),
+            )
+        )).scalars().all()
+        grouped: dict[str, list[AgentReplyVersionRow]] = {}
+        for r in rows:
+            grouped.setdefault(r.case_ref, []).append(r)
+        return grouped
+
     async def get_current_agent_replies(
         self, dataset_type: str, case_refs: list[str],
     ) -> dict[str, AgentReplyVersionRow]:

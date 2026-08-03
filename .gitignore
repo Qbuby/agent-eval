@@ -75,3 +75,29 @@ _verify*.py
 _*.sh
 _*.tar
 _headcheck/
+# Bundle-hash 核验脚本与抓下来的 bundle 副本（前端构建幻影排查用，见 #131）。
+# .served_bundle.js 是 localhost 实际返回的 1.4MB 产物，不入库。
+.check_bundle.js
+.served_bundle.js
+# 交互调试时在 frontend/ 下临时写的 node 脚本（DOM 探测、compose 转储、打补丁）
+frontend/*.cjs
+# 一次性 SQL 与 judge 参数快照（含 prompt 全文，属排查现场，不是产物）
+_q*.sql
+artifacts/
+# 仓库根的一次性 patch/探针 mjs
+_*.mjs
+# 一次性 UI 探针：写死样例 id、只为定位当次问题。
+# 验收脚本 e2e/verify-*.mjs 照旧入库；probe-131-db-check 是 #131 验收的 DB 侧一半，保留。
+e2e/diag-*.mjs
+e2e/find-*.mjs
+e2e/probe-131-*.mjs
+!e2e/probe-131-db-check.mjs
+# scripts/ 下的排查用一次性脚本与 SQL（inspect/verify/probe/dump 现场），
+# 可复用的工具（psql_q.sh、extract_key_points.py、patch_judge_criteria.py）照旧入库。
+scripts/dump_judge_prompts.py
+scripts/inspect_*.py
+scripts/inspect_*.sql
+scripts/probe_*.py
+scripts/verify_*.py
+scripts/verify_*.sql
+scripts/sample_answers.sql

@@ -10,6 +10,7 @@ import {
   projectsApi,
 } from '@/services'
 import type { CaseReplyState, ReplyDatasetType } from '@/services/agentReplies'
+import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import type { ExportFormat } from '@/lib/download'
 import type {
@@ -903,7 +904,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
             )}
 
             {selectionMode !== 'pick' && (
-              <Field label="最多跑多少条（空=不限制）">
+              <Field label="最多跑多少条（空=全部）">
                 <input
                   type="number" min={1} value={limit}
                   onChange={e => setLimit(e.target.value ? Number(e.target.value) : '')}
@@ -1375,9 +1376,12 @@ function ReplySourcePanel({
   children,
 }: ReplySourcePanelProps) {
   const [overrideCaseRef, setOverrideCaseRef] = useState('')
+  const [batchVerOpen, setBatchVerOpen] = useState(false)
   const stateMap = new Map(states.map(state => [state.case_ref, state]))
   const missing = cases.filter(item => !stateMap.get(item.id)?.has_reply)
   const ready = cases.length - missing.length
+  // 批量指定只对已有回复的样例有意义：没生成过的样例没有版本链可解析。
+  const readyRefs = cases.filter(item => stateMap.get(item.id)?.has_reply).map(item => item.id)
 
   return (
     <div className="rounded-md border border-border p-3">
@@ -1441,7 +1445,33 @@ function ReplySourcePanel({
           )}
 
           {cases.length > 0 && datasetType && (
-            <div className="grid grid-cols-2 gap-3 pt-2 border-t border-separator">
+            <div className="pt-2 border-t border-separator space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] text-text-secondary">
+                  按最新 / 版本号 / 版本备注一次性指定这批样例的版本
+                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setBatchVerOpen(true)}
+                    disabled={readyRefs.length === 0}
+                    title={readyRefs.length === 0 ? '这批样例都还没有生成过回复' : undefined}
+                    className="px-2 py-1 rounded border border-border text-[11px] text-text-secondary hover:text-text-primary hover:bg-fill/5 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    批量指定版本
+                  </button>
+                  {Object.keys(versionIds).length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => onVersionIdsChange({})}
+                      className="px-2 py-1 rounded border border-border text-[11px] text-text-tertiary hover:text-text-primary hover:bg-fill/5"
+                    >
+                      清除指定
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
               <Field label="覆盖历史版本（可选）">
                 <select
                   value={overrideCaseRef}
@@ -1466,6 +1496,7 @@ function ReplySourcePanel({
                   onVersionIdsChange(next)
                 }}
               />
+              </div>
             </div>
           )}
 
@@ -1473,6 +1504,17 @@ function ReplySourcePanel({
             <div className="text-[10px] text-text-tertiary">
               已为 {Object.keys(versionIds).length} 条样例指定历史版本；其余使用当前版本。
             </div>
+          )}
+
+          {datasetType && (
+            <AgentReplyBatchVersionDialog
+              open={batchVerOpen}
+              onClose={() => setBatchVerOpen(false)}
+              datasetType={datasetType}
+              caseRefs={readyRefs}
+              applyMode="select_only"
+              onResolved={resolved => onVersionIdsChange({ ...versionIds, ...resolved })}
+            />
           )}
         </div>
       )}
