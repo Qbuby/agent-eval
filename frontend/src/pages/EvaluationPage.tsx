@@ -585,6 +585,10 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const [replySourceB, setReplySourceB] = useState<ReplySource>('live')
   const [replyVersionIds, setReplyVersionIds] = useState<Record<string, string>>({})
   const [replyVersionIdsB, setReplyVersionIdsB] = useState<Record<string, string>>({})
+  // 回放已有回复时没有 agent 配置可推导模型名，交由用户标注，否则 A/B 两侧
+  // 在结果页都显示为同一个占位名，无法区分谁是谁。
+  const [persistedModel, setPersistedModel] = useState('')
+  const [persistedModelB, setPersistedModelB] = useState('')
   const [concurrency, setConcurrency] = useState(3)
   const [runName, setRunName] = useState('')
 
@@ -746,13 +750,14 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   const handleStart = () => {
     // 后端 schema 始终要求 agent / agent_b。persisted 侧传不会被调用的占位配置，
     // runner 会依据 _reply_version 切到 PersistedReplyAdapter，不建立任何网络连接。
-    const persistedAgent: EvalAgentConfig = {
+    // model 用用户标注的模型名，结果页据此区分 A/B 两侧；留空回落到占位名。
+    const makePersistedAgent = (label: string): EvalAgentConfig => ({
       type: 'sse',
       url: 'persisted://agent-reply',
-      model: 'persisted-reply',
-    }
+      model: label.trim() || 'persisted-reply',
+    })
     const agent = replySource === 'persisted'
-      ? persistedAgent
+      ? makePersistedAgent(persistedModel)
       : parseAgentDraft(agentDraft, evalMode === 'comparative' ? 'A 模型' : '')
     if (!agent) return
 
@@ -769,7 +774,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
 
     if (evalMode === 'comparative') {
       const agentB = replySourceB === 'persisted'
-        ? persistedAgent
+        ? makePersistedAgent(persistedModelB)
         : parseAgentDraft(agentDraftB, 'B 模型')
       if (!agentB) return
       body.eval_mode = 'comparative'
@@ -1187,6 +1192,8 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
             versionIds={replyVersionIds}
             onVersionIdsChange={setReplyVersionIds}
             persistedDisabled={sourceTab === 'upload'}
+            modelLabel={persistedModel}
+            onModelLabelChange={setPersistedModel}
           >
             <AgentConfigFields
               title={evalMode === 'comparative' ? 'A 模型 · 实时调用配置' : '实时调用配置'}
@@ -1212,6 +1219,8 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               versionIds={replyVersionIdsB}
               onVersionIdsChange={setReplyVersionIdsB}
               persistedDisabled={sourceTab === 'upload'}
+              modelLabel={persistedModelB}
+              onModelLabelChange={setPersistedModelB}
             >
               <AgentConfigFields
                 title="B 模型 · 实时调用配置"
@@ -1354,6 +1363,8 @@ type ReplySourcePanelProps = {
   versionIds: Record<string, string>
   onVersionIdsChange: (value: Record<string, string>) => void
   persistedDisabled: boolean
+  modelLabel: string
+  onModelLabelChange: (value: string) => void
   children: React.ReactNode
 }
 
@@ -1373,6 +1384,8 @@ function ReplySourcePanel({
   versionIds,
   onVersionIdsChange,
   persistedDisabled,
+  modelLabel,
+  onModelLabelChange,
   children,
 }: ReplySourcePanelProps) {
   const [overrideCaseRef, setOverrideCaseRef] = useState('')
@@ -1416,6 +1429,22 @@ function ReplySourcePanel({
           <p className="text-[11px] text-text-secondary">
             评估将直接回放持久化回复，不建立 SSE / agent 连接。默认使用每条样例的当前版本。
           </p>
+
+          {/* 回放模式没有真实 agent 配置可推导模型名，需用户手填，否则结果页 A/B 两侧
+              都会显示同一个占位名 persisted-reply，无法区分。 */}
+          <label className="block">
+            <span className="page-eyebrow">模型名称（用于结果展示）</span>
+            <input
+              type="text"
+              value={modelLabel}
+              onChange={e => onModelLabelChange(e.target.value)}
+              placeholder="例如 deepseek-v3 / claude-sonnet-4"
+              className="mt-1 w-full rounded-md border border-border bg-surface px-2.5 py-1.5 text-[12px] text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
+            />
+            <span className="mt-1 block text-[11px] text-text-tertiary">
+              留空则显示为 persisted-reply
+            </span>
+          </label>
 
           {statesLoading ? (
             <div className="rounded-md border border-border bg-fill/5 px-3 py-2 text-[11px] text-text-tertiary">
