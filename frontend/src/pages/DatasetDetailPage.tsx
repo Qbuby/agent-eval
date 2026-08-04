@@ -5,6 +5,7 @@ import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/u
 import { datasetsApi, candidatesApi, projectsApi, agentRepliesApi, keyPointsApi } from '@/services'
 import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
 import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
+import CaseCategoryBatchDialog from '@/components/CaseCategoryBatchDialog'
 import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
 import { SelectionBar } from '@/components/SelectionBar'
@@ -55,6 +56,8 @@ export default function DatasetDetailPage() {
   const [genSingleId, setGenSingleId] = useState<string | null>(null)
   // 批量切换当前版本：按「最新 / vN / 版本备注」在每个样例各自的版本链里解析
   const [batchVerOpen, setBatchVerOpen] = useState(false)
+  // 批量改类别：备选集的 category 是自由文本，弹窗允许填新名
+  const [batchCatOpen, setBatchCatOpen] = useState(false)
   const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
   // 提炼关键点：勾选了就只提炼勾选的，没勾选就全量扫待提炼样例。
   const [extractOpen, setExtractOpen] = useState(false)
@@ -397,6 +400,16 @@ export default function DatasetDetailPage() {
           title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的当前版本批量切到同一标识'}
         >
           批量切换版本{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 批量改类别：备选集的类别是自由文本，允许直接写一个新名字 */}
+        <Button
+          onClick={() => setBatchCatOpen(true)}
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的类别批量改成同一个，或清空'}
+        >
+          批量改类别{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
         </Button>
         {/* 从参考答案提炼关键点：勾选了就只提炼这几条，没勾选就全量扫「有答案但关键点为空」的。 */}
         <Button
@@ -837,6 +850,21 @@ export default function DatasetDetailPage() {
         datasetType="candidate"
         caseRefs={Array.from(selectedIds)}
         onDone={refreshReplyStates}
+      />
+
+      {/* 批量改类别：备选集的类别是自由文本，允许直接写一个新名字 */}
+      <CaseCategoryBatchDialog
+        open={batchCatOpen}
+        onClose={() => setBatchCatOpen(false)}
+        datasetType="candidate"
+        caseRefs={Array.from(selectedIds)}
+        datasetName={name}
+        onDone={() => {
+          queryClient.invalidateQueries({ queryKey: ['dataset-candidates'] })
+          queryClient.invalidateQueries({ queryKey: ['candidates'] })
+          // 自由文本类别可能是刚新建的，筛选下拉与类别建议 datalist 都要跟着刷。
+          queryClient.invalidateQueries({ queryKey: ['dataset-candidate-categories'] })
+        }}
       />
 
       {/* 批量提炼关键点：勾选集为空则由弹窗全量扫待提炼样例 */}

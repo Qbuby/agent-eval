@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from agent_eval.api.middleware import RequestContextMiddleware
 from agent_eval.api.routers import (
     admin, admin_entry_codes, admin_tenants, agent_replies, auth, benchmark, candidates,
+    case_categories,
     cases, config, datasets, evaluation, evaluator_providers, feedback_review, feishu_oauth,
     generate, governance, img_proxy, key_points, langfuse_metrics, portal, projects,
     routing, scheduled_tasks, scheduler, traces,
@@ -157,6 +158,10 @@ def create_app() -> FastAPI:
     # 回填 key_points / turn_expectations[].criteria 供 judge 逐条核对。
     # router 自带 prefix(/api/key-points) 与 require_internal 门禁。
     app.include_router(key_points.router)
+    # 样例类别批量修改：四个数据集列表页勾选后批量设置/清空类别。三类存储
+    # （candidate.category / benchmark.category_id / 对话集 metadata.category）
+    # 在同一对「干跑预览 + 执行」端点里分流。router 自带 prefix 与 require_internal。
+    app.include_router(case_categories.router)
     app.include_router(admin.router)
     # 多租户 + 外部客户 Portal 三个新模块：admin 后台开户、客户 portal、内部反馈展示。
     # 各 router 已自带 prefix 与角色门禁（admin_tenants/feedback_review 挂 require_role(ROLE_ADMIN)，

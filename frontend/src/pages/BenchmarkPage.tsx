@@ -6,6 +6,7 @@ import { agentRepliesApi, keyPointsApi } from '@/services'
 import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn, type ImportPreview } from '@/services/benchmark'
 import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
 import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
+import CaseCategoryBatchDialog from '@/components/CaseCategoryBatchDialog'
 import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
 import { SelectionBar } from '@/components/SelectionBar'
@@ -59,6 +60,8 @@ export default function BenchmarkPage() {
   const [genSingleId, setGenSingleId] = useState<string | null>(null)
   // 批量切换当前版本：按「最新 / vN / 版本备注」在每个样例各自的版本链里解析
   const [batchVerOpen, setBatchVerOpen] = useState(false)
+  // 批量改类别：在样例所在 project 的既有类别之间搬动，或清空
+  const [batchCatOpen, setBatchCatOpen] = useState(false)
   const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
   // 提炼关键点：勾选了就只提炼勾选的，没勾选就全量扫待提炼样例。
   const [extractOpen, setExtractOpen] = useState(false)
@@ -340,6 +343,16 @@ export default function BenchmarkPage() {
           title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的当前版本批量切到同一标识'}
         >
           批量切换版本{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 批量改类别：只在该 project 已有的类别之间搬动或清空，新建类别走上方类别管理 */}
+        <Button
+          onClick={() => setBatchCatOpen(true)}
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的类别批量改成同一个，或清空'}
+        >
+          批量改类别{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
         </Button>
         {/* 从参考答案提炼关键点：勾选了就只提炼这几条，没勾选就全量扫「有答案但关键点为空」的。 */}
         <Button
@@ -826,6 +839,18 @@ export default function BenchmarkPage() {
         datasetType="benchmark"
         caseRefs={Array.from(selectedIds)}
         onDone={refreshReplyStates}
+      />
+
+      {/* 基准集类别是 project 维度的实体（category_id），弹窗只给既有类别，不允许现场造新名 */}
+      <CaseCategoryBatchDialog
+        open={batchCatOpen}
+        onClose={() => setBatchCatOpen(false)}
+        datasetType="benchmark"
+        caseRefs={Array.from(selectedIds)}
+        onDone={() => {
+          queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })
+          queryClient.invalidateQueries({ queryKey: ['categories', projectId] })
+        }}
       />
 
       <AgentReplyVersionsDrawer

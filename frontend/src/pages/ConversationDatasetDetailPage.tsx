@@ -14,6 +14,7 @@ import ConversationView from '@/components/ConversationView'
 import ConversationEditor from '@/components/ConversationEditor'
 import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
 import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
+import CaseCategoryBatchDialog from '@/components/CaseCategoryBatchDialog'
 import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
 import type { TestCase } from '@/types'
@@ -83,6 +84,8 @@ export default function ConversationDatasetDetailPage() {
   const [genSingleId, setGenSingleId] = useState<string | null>(null)
   // 批量切换当前版本：按「最新 / vN / 版本备注」在每个样例各自的版本链里解析
   const [batchVerOpen, setBatchVerOpen] = useState(false)
+  // 批量改类别：多轮集的类别存在 item metadata.category，只能用该集下已建好的类别名
+  const [batchCatOpen, setBatchCatOpen] = useState(false)
   const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
   // 提炼关键点：勾选了就只提炼勾选的，没勾选就全量扫该数据集里待提炼的轮次。
   // 多轮集的关键点写回每轮的 turn_expectations[].criteria。
@@ -411,6 +414,16 @@ export default function ConversationDatasetDetailPage() {
               title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的当前版本批量切到同一标识'}
             >
               批量切换版本{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+            </Button>
+            {/* 批量改类别：只在该集已有的类别之间搬动或清空，新建类别走上方类别管理 */}
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={selectedIds.size === 0}
+              onClick={() => setBatchCatOpen(true)}
+              title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的类别批量改成同一个，或清空'}
+            >
+              批量改类别{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
             </Button>
           </>
         )}
@@ -974,6 +987,19 @@ export default function ConversationDatasetDetailPage() {
         datasetType="conversation"
         caseRefs={Array.from(selectedIds)}
         onDone={refreshReplyStates}
+      />
+
+      {/* 多轮集的类别存在 dataset item 的 metadata.category 里，后端要 dataset_name 才能定位 */}
+      <CaseCategoryBatchDialog
+        open={batchCatOpen}
+        onClose={() => setBatchCatOpen(false)}
+        datasetType="conversation"
+        caseRefs={Array.from(selectedIds)}
+        datasetName={name}
+        onDone={() => {
+          queryClient.invalidateQueries({ queryKey: ['conv-cases'] })
+          queryClient.invalidateQueries({ queryKey: ['conv-categories', name] })
+        }}
       />
 
       <AgentReplyVersionsDrawer
