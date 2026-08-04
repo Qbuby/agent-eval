@@ -39,9 +39,14 @@ RUN find /app/alembic -type d -name __pycache__ -prune -exec rm -rf {} + && \
 # Windows host (see scripts/docker-entrypoint.sh for the full rationale).
 COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
 COPY scripts/migrate-and-restore.sh /app/scripts/migrate-and-restore.sh
+COPY scripts/sync_evaluator_reference_criteria.py /app/scripts/sync_evaluator_reference_criteria.py
+COPY deploy/evaluator-migrations /app/deploy/evaluator-migrations
 RUN sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
     sed -i 's/\r$//' /app/scripts/migrate-and-restore.sh && \
-    chmod +x /app/scripts/docker-entrypoint.sh /app/scripts/migrate-and-restore.sh
+    sed -i 's/\r$//' /app/scripts/sync_evaluator_reference_criteria.py && \
+    chmod +x /app/scripts/docker-entrypoint.sh \
+        /app/scripts/migrate-and-restore.sh \
+        /app/scripts/sync_evaluator_reference_criteria.py
 
 # NOTE: the production data seed (deploy/seed/seed.sql) is deliberately NOT
 # baked into the image — it carries password hashes, Fernet-encrypted provider

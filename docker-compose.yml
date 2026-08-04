@@ -51,7 +51,7 @@ services:
     restart: unless-stopped
 
   # ─────────────────────────────────────────────────────────────────
-  # migrate：数据库结构迁移（一次性任务）
+  # migrate：数据库结构迁移 + 镜像内置数据同步（一次性任务）
   #
   # 为什么需要这个服务？
   #   后端代码里有 SQLAlchemy ORM 模型（src/agent_eval/db_models/tables.py），
@@ -68,7 +68,8 @@ services:
   #   1. 用和 backend 完全相同的镜像（包含 alembic 和迁移脚本）
   #   2. 连上 postgres，对比当前 DB 版本和 alembic/versions/ 下的最高版本
   #   3. 执行差量升级（缺哪些迁移补哪些），全新库会从 0001 一路升到 head
-  #   4. 升级完成后容器退出（restart: "no"）
+  #   4. schema 就位后幂等同步镜像内置的评估器定义
+  #   5. 全部完成后容器退出（restart: "no"）
   #
   # 为什么独立成一个服务而不是在 backend 启动时跑？
   #   - 多副本时只需迁移一次，不会让多个 backend 实例并发 ALTER TABLE 死锁
@@ -100,6 +101,10 @@ services:
       # 数据 seed 还原路径（容器内）。SEED_DISABLE=1 可强制跳过还原，只建结构。
       SEED_FILE: /app/deploy/seed/seed.sql
       SEED_DISABLE: ${SEED_DISABLE:-}
+      # 镜像内置的 provider-neutral 评估器定义。schema 升级后由 migrate 幂等同步；
+      # 可在一次性回滚命令中复用同一镜像：
+      # docker compose run --rm migrate python /app/scripts/sync_evaluator_reference_criteria.py revert
+      EVALUATOR_MIGRATION_FILE: /app/deploy/evaluator-migrations/reference-criteria-v1.json
     depends_on:
       postgres:
         condition: service_healthy
@@ -108,7 +113,7 @@ services:
       # Fernet 加密的 provider key / 明文入口码。部署时把 deploy/seed/seed.sql
       # 随 compose 一起放到宿主，migrate 在空库时还原它（非空库一律跳过）。
       - ./deploy/seed:/app/deploy/seed:ro
-    # 先按空库门禁还原数据 seed，再 alembic upgrade head 追平结构。
+    # 先按空库门禁还原 seed，再升级 schema，最后幂等同步评估器定义。
     command: ["/app/scripts/migrate-and-restore.sh"]
     restart: "no"
 

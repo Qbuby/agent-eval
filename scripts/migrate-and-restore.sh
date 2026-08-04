@@ -12,9 +12,12 @@
 #        - empty  (table missing OR zero rows) → restore deploy/seed/seed.sql
 #        - non-empty                            → SKIP restore (never clobber)
 #   3. Always run `alembic upgrade head`:
-#        - after a seed restore, the dump already carries alembic_version=0020,
+#        - after a seed restore, the dump already carries an alembic_version,
 #          so this is a no-op unless newer revisions exist (then it catches up)
 #        - on a non-empty DB, this is the normal migrate behaviour
+#   4. Run the image-bundled evaluator data sync after schema convergence.
+#      This is intentionally not an Alembic revision: it is an idempotent,
+#      explicitly reversible production-data migration owned by this job.
 #
 # The gate keys on `users` because every real deployment has users; the empty
 # schema created by a fresh `alembic upgrade` would also have the table but
@@ -80,4 +83,12 @@ fi
 # it only does work when newer revisions exist than the seed snapshot.
 echo "[migrate] running alembic upgrade head"
 alembic upgrade head
+echo "[migrate] schema migration complete"
+
+# --- Converge image-bundled evaluator definitions -------------------------
+# The sync is idempotent and keeps its own rollback metadata.  A failure must
+# fail the one-shot job so backend never starts with only half of the release
+# applied.
+echo "[migrate] syncing evaluator reference-criteria definitions"
+python /app/scripts/sync_evaluator_reference_criteria.py apply
 echo "[migrate] done"
