@@ -221,6 +221,14 @@ export function AgentReplyVersionsDrawer({
                         {v.version_label}
                       </span>
                     )}
+                    {v.agent_config?.model ? (
+                      <span
+                        className="shrink-0 truncate rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                        title={String(v.agent_config.model)}
+                      >
+                        {String(v.agent_config.model)}
+                      </span>
+                    ) : null}
                     <span className="flex-1" />
                     <span className="text-xs text-slate-400">{fmtTime(v.created_at)}</span>
                   </div>

@@ -6,7 +6,10 @@
  * 为什么不是「选一个 version_id 应用到所有样例」：version_id 是
  * per-(dataset_type, case_ref) 的，A 样例的 v2 和 B 样例的 v2 是两条不同的版本
  * 行，跨样例不存在同一个 id。所以批量只能按跨样例可识别的标识来指定：
- *   最新 / 精确版本号 vN / 版本备注完全相同的那条。
+ *   最新 / 精确版本号 vN / 版本备注完全相同的那条 / 同一模型生成的那条。
+ *
+ * 「按模型」取自各版本的 agent 配置快照，是「这批样例被哪些模型跑过」的真实来源，
+ * 不依赖用户生成时有没有手填版本备注 —— 换模型重跑后一键把整批切到新模型的回复。
  *
  * 先干跑预览（batchResolve）再执行（batchSetCurrent），两次走后端同一套解析逻辑，
  * 用户看到的和实际切的一致。不是原子语义：能切的先切，切不了的原样不动并列出原因。
@@ -58,6 +61,7 @@ export default function AgentReplyBatchVersionDialog({
   const [mode, setMode] = useState<BatchVersionMode>('latest')
   const [versionNumber, setVersionNumber] = useState<number | null>(null)
   const [label, setLabel] = useState('')
+  const [model, setModel] = useState('')
   const [showDetail, setShowDetail] = useState(false)
   // 切换模式后「等选项到了再默认选中命中最多的那个」的待办标记，见下方 effect。
   const [autoPick, setAutoPick] = useState(false)
@@ -68,16 +72,18 @@ export default function AgentReplyBatchVersionDialog({
       setMode('latest')
       setVersionNumber(null)
       setLabel('')
+      setModel('')
       setShowDetail(false)
       setAutoPick(false)
     }
   }, [open])
 
-  // 选了「按版本号 / 按版本备注」但还没选具体值时不请求（后端会 400）。
+  // 选了「按版本号 / 版本备注 / 模型」但还没选具体值时不请求（后端会 400）。
   const selectorReady =
     mode === 'latest' ||
     (mode === 'version_number' && versionNumber !== null) ||
-    (mode === 'label' && label.trim() !== '')
+    (mode === 'label' && label.trim() !== '') ||
+    (mode === 'model' && model.trim() !== '')
 
   const refsKey = caseRefs.join(',')
 
@@ -85,6 +91,7 @@ export default function AgentReplyBatchVersionDialog({
     mode: BatchVersionMode
     version_number: number | null
     label: string | null
+    model: string | null
   }) =>
     agentRepliesApi
       .batchResolve({ dataset_type: datasetType, case_refs: caseRefs, selector })
@@ -96,7 +103,8 @@ export default function AgentReplyBatchVersionDialog({
   // queryKey 与 mode==='latest' 时的预览完全一致，两者会被合并成同一次请求。
   const optionsQuery = useQuery({
     queryKey: ['agent-reply-batch-resolve', datasetType, refsKey, 'latest', null, ''],
-    queryFn: () => resolve({ mode: 'latest', version_number: null, label: null }),
+    queryFn: () =>
+      resolve({ mode: 'latest', version_number: null, label: null, model: null }),
     enabled: open && caseRefs.length > 0,
   })
 
@@ -108,12 +116,14 @@ export default function AgentReplyBatchVersionDialog({
       mode,
       versionNumber,
       label.trim(),
+      model.trim(),
     ],
     queryFn: () =>
       resolve({
         mode,
         version_number: mode === 'version_number' ? versionNumber : null,
         label: mode === 'label' ? label.trim() : null,
+        model: mode === 'model' ? model.trim() : null,
       }),
     enabled: open && caseRefs.length > 0 && selectorReady,
   })
@@ -122,6 +132,7 @@ export default function AgentReplyBatchVersionDialog({
 
   const labelOptions = optionsQuery.data?.label_options ?? []
   const numberOptions = optionsQuery.data?.version_number_options ?? []
+  const modelOptions = optionsQuery.data?.model_options ?? []
 
   // 选项可能在切换模式之后才到（首次打开就立刻切「按版本号」）。到了再补上默认值，
   // 否则 versionNumber 一直是 null，预览请求不会发出去。
@@ -143,8 +154,19 @@ export default function AgentReplyBatchVersionDialog({
       }
       return
     }
+    if (mode === 'model' && !model.trim()) {
+      const first = modelOptions[0]
+      if (first) {
+        setModel(first.value)
+        setAutoPick(false)
+      }
+      return
+    }
     setAutoPick(false)
-  }, [autoPick, mode, versionNumber, label, numberOptions, labelOptions])
+  }, [
+    autoPick, mode, versionNumber, label, model,
+    numberOptions, labelOptions, modelOptions,
+  ])
 
   const blockedItems = useMemo(
     () => (preview?.items || []).filter(i => !i.matched),
@@ -186,6 +208,7 @@ export default function AgentReplyBatchVersionDialog({
             mode,
             version_number: mode === 'version_number' ? versionNumber : null,
             label: mode === 'label' ? label.trim() : null,
+            model: mode === 'model' ? model.trim() : null,
           },
         })
         .then(r => r.data),
@@ -213,7 +236,20 @@ export default function AgentReplyBatchVersionDialog({
       ? '每个样例各自切到自己版本链里最新的成功版本。'
       : mode === 'version_number'
         ? '每个样例各自切到自己的第 N 个版本（不同样例的 vN 是不同的回复）。'
-        : '每个样例各自切到版本备注完全相同的那条；同一备注有多条时取最新。'
+        : mode === 'label'
+          ? '每个样例各自切到版本备注完全相同的那条；同一备注有多条时取最新。'
+          : '每个样例各自切到该模型生成的那条回复；同一模型有多条时取最新。'
+
+  // 预览里实际命中了哪些模型：确认前能核对「切过去的确实是想要的那个模型」。
+  const matchedModels = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const i of preview?.items || []) {
+      if (!i.matched) continue
+      const key = i.model || '未记录模型'
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1])
+  }, [preview])
 
   return (
     <Dialog
@@ -274,6 +310,7 @@ export default function AgentReplyBatchVersionDialog({
             <option value="latest">最新版本</option>
             <option value="version_number">指定版本号</option>
             <option value="label">指定版本备注</option>
+            <option value="model">指定模型</option>
           </select>
         </label>
 
@@ -334,11 +371,41 @@ export default function AgentReplyBatchVersionDialog({
           </label>
         )}
 
+        {mode === 'model' && (
+          <label className="flex flex-col gap-0">
+            <span className="field-label">模型</span>
+            {modelOptions.length > 0 ? (
+              <select
+                value={model}
+                onChange={e => setModel(e.target.value)}
+                className="input"
+              >
+                <option value="">请选择</option>
+                {modelOptions.map(o => (
+                  <option key={o.value} value={o.value}>
+                    {o.value}（{o.case_count} 条样例有）
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={model}
+                onChange={e => setModel(e.target.value)}
+                className="input"
+                placeholder="生成时用的模型标识，如 claude-opus-5"
+              />
+            )}
+          </label>
+        )}
+
         <p className="text-[11px] text-text-tertiary">{modeHint}</p>
 
         {!selectorReady ? (
           <div className="rounded-md border border-border p-3 text-caption text-text-tertiary">
-            选择具体的{mode === 'version_number' ? '版本号' : '版本备注'}后显示预览。
+            选择具体的
+            {mode === 'version_number' ? '版本号' : mode === 'label' ? '版本备注' : '模型'}
+            后显示预览。
           </div>
         ) : previewQuery.isLoading ? (
           <div className="rounded-md border border-border p-3 text-caption text-text-tertiary">
@@ -372,6 +439,17 @@ export default function AgentReplyBatchVersionDialog({
               )}
               <span className="text-text-tertiary">共 {preview.total} 条</span>
             </div>
+
+            {matchedModels.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-text-tertiary">
+                <span>解析到的模型：</span>
+                {matchedModels.map(([name, count]) => (
+                  <span key={name} className="badge badge-neutral">
+                    {name} · {count} 条
+                  </span>
+                ))}
+              </div>
+            )}
 
             {blockedItems.length > 0 && (
               <div className="rounded-md border border-border">

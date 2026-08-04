@@ -73,6 +73,7 @@ class ReplyVersionOut(BaseModel):
     case_ref: str
     version_number: int
     version_label: str | None = None
+    model: str | None = None
     content: str | None = None
     turns: list[Any] | None = None
     status: str
@@ -103,6 +104,7 @@ class CaseReplyStateOut(BaseModel):
     current_version_id: str | None = None
     current_version_number: int | None = None
     current_version_label: str | None = None
+    current_model: str | None = None
     version_count: int = 0
 
 
@@ -115,11 +117,13 @@ class BatchVersionSelector(BaseModel):
     - ``latest``          每个样例各自版本链里最新的成功版本
     - ``version_number``  精确 vN（各样例的 vN 是不同的版本行）
     - ``label``           版本备注完全相同的那条；同一备注多条时取最新
+    - ``model``           agent_config.model 相同的那条；同一模型多条时取最新
     """
 
     mode: str = "latest"
     version_number: int | None = None
     label: str | None = None
+    model: str | None = None
 
 
 class BatchSetCurrentRequest(BaseModel):
@@ -137,6 +141,7 @@ class BatchResolveItemOut(BaseModel):
     version_id: str | None = None
     version_number: int | None = None
     version_label: str | None = None
+    model: str | None = None
     status: str | None = None
     reason: str | None = None
 
@@ -157,6 +162,7 @@ class BatchResolveOut(BaseModel):
     items: list[BatchResolveItemOut]
     label_options: list[BatchOptionOut] = []
     version_number_options: list[BatchOptionOut] = []
+    model_options: list[BatchOptionOut] = []
 
 
 class BatchSetCurrentOut(BaseModel):
@@ -183,6 +189,7 @@ class JobOut(BaseModel):
     dataset_name: str | None = None
     status: str
     version_label: str | None = None
+    model: str | None = None
     total_count: int
     succeeded_count: int
     failed_count: int
@@ -303,6 +310,29 @@ async def _resolve_cases(
     return cases
 
 
+def _cfg_model(row: Any) -> str | None:
+    """版本 / 任务的配置快照里的模型标识；取不到返回 None（UI 显示「未记录」）。"""
+    cfg = getattr(row, "agent_config", None) or {}
+    if not isinstance(cfg, dict):
+        return None
+    model = cfg.get("model")
+    if not model:
+        return None
+    return str(model).strip() or None
+
+
+def _default_version_label(label: str | None, agent_cfg: dict[str, Any]) -> str | None:
+    """版本备注留空时回落到模型标识。
+
+    备注是跨样例可识别的批量标识，留空会让整条版本链无从区分。用模型名兜底后，
+    「按版本备注」和「按模型」两个维度对同一批版本都能对齐。
+    """
+    text = (label or "").strip()
+    if not text:
+        text = str(agent_cfg.get("model") or "").strip()
+    return text[:64] or None
+
+
 def _version_out(
     row: Any,
     *,
@@ -318,6 +348,7 @@ def _version_out(
         case_ref=row.case_ref,
         version_number=row.version_number,
         version_label=row.version_label,
+        model=_cfg_model(row),
         content=row.content,
         turns=row.turns,
         status=row.status,
@@ -345,6 +376,7 @@ def _job_out(job: Any, items: list[Any], user_names: dict[str, str]) -> JobOut:
         dataset_name=job.dataset_name,
         status=job.status,
         version_label=job.version_label,
+        model=_cfg_model(job),
         total_count=int(job.total_count or 0),
         succeeded_count=int(mem.get("succeeded", job.succeeded_count or 0)),
         failed_count=int(mem.get("failed", job.failed_count or 0)),
@@ -370,13 +402,16 @@ def _job_out(job: Any, items: list[Any], user_names: dict[str, str]) -> JobOut:
 
 def _batch_options(
     grouped: dict[str, list[Any]],
-) -> tuple[list[BatchOptionOut], list[BatchOptionOut]]:
+) -> tuple[list[BatchOptionOut], list[BatchOptionOut], list[BatchOptionOut]]:
     """从一批样例的版本链里汇总出可用的批量标识及各自命中的样例数。
 
     只统计成功版本 —— 失败版本设不了当前，出现在下拉里只会误导用户。
+    模型一栏取自各版本的配置快照，是「这批样例被哪些模型跑过」的真实来源，
+    不依赖用户有没有手填版本备注。
     """
     label_cases: dict[str, set[str]] = {}
     number_cases: dict[int, set[str]] = {}
+    model_cases: dict[str, set[str]] = {}
     for ref, versions in grouped.items():
         for v in versions:
             if v.status != "succeeded":
@@ -384,6 +419,9 @@ def _batch_options(
             if v.version_label:
                 label_cases.setdefault(v.version_label, set()).add(ref)
             number_cases.setdefault(int(v.version_number), set()).add(ref)
+            model = _cfg_model(v)
+            if model:
+                model_cases.setdefault(model, set()).add(ref)
     labels = [
         BatchOptionOut(value=k, case_count=len(v))
         for k, v in sorted(label_cases.items(), key=lambda kv: (-len(kv[1]), kv[0]))
@@ -392,7 +430,11 @@ def _batch_options(
         BatchOptionOut(value=f"v{k}", case_count=len(v))
         for k, v in sorted(number_cases.items(), reverse=True)
     ]
-    return labels, numbers
+    models = [
+        BatchOptionOut(value=k, case_count=len(v))
+        for k, v in sorted(model_cases.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    ]
+    return labels, numbers, models
 
 
 async def _resolve_batch_versions(
@@ -406,10 +448,10 @@ async def _resolve_batch_versions(
 
     「预览」和「执行」共用这里，保证用户看到的和实际切的是同一套判定。
     """
-    if selector.mode not in ("latest", "version_number", "label"):
+    if selector.mode not in ("latest", "version_number", "label", "model"):
         raise HTTPException(
             status_code=400,
-            detail="selector.mode 必须是 latest / version_number / label 之一",
+            detail="selector.mode 必须是 latest / version_number / label / model 之一",
         )
     if selector.mode == "version_number" and selector.version_number is None:
         raise HTTPException(
@@ -417,6 +459,8 @@ async def _resolve_batch_versions(
         )
     if selector.mode == "label" and not (selector.label or "").strip():
         raise HTTPException(status_code=400, detail="按版本备注批量切换必须提供 label")
+    if selector.mode == "model" and not (selector.model or "").strip():
+        raise HTTPException(status_code=400, detail="按模型批量切换必须提供 model")
 
     refs = list(dict.fromkeys(case_refs))
     grouped = await repo.list_agent_reply_versions_by_cases(dataset_type, refs)
@@ -425,6 +469,7 @@ async def _resolve_batch_versions(
         s.case_ref: s.current_version_id for s in states if s.current_version_id
     }
     label = (selector.label or "").strip()
+    model = (selector.model or "").strip()
 
     items: list[BatchResolveItemOut] = []
     for ref in refs:
@@ -449,7 +494,7 @@ async def _resolve_batch_versions(
                 reason = f"v{selector.version_number} 生成失败，不能设为当前版本"
             else:
                 reason = f"该样例没有 v{selector.version_number}"
-        else:
+        elif selector.mode == "label":
             same = [v for v in versions if (v.version_label or "") == label]
             hit = next((v for v in same if v.status == "succeeded"), None)
             if hit is not None:
@@ -458,6 +503,15 @@ async def _resolve_batch_versions(
                 reason = f"备注为「{label}」的版本生成失败，不能设为当前版本"
             else:
                 reason = f"该样例没有备注为「{label}」的版本"
+        else:
+            same = [v for v in versions if (_cfg_model(v) or "") == model]
+            hit = next((v for v in same if v.status == "succeeded"), None)
+            if hit is not None:
+                reason = None
+            elif same:
+                reason = f"用「{model}」生成的版本失败了，不能设为当前版本"
+            else:
+                reason = f"该样例没有用「{model}」生成的版本"
         if hit is None:
             items.append(BatchResolveItemOut(
                 case_ref=ref, matched=False, reason=reason,
@@ -470,10 +524,11 @@ async def _resolve_batch_versions(
             version_id=str(hit.id),
             version_number=int(hit.version_number),
             version_label=hit.version_label,
+            model=_cfg_model(hit),
             status=hit.status,
         ))
 
-    labels, numbers = _batch_options(grouped)
+    labels, numbers, models = _batch_options(grouped)
     matched = [i for i in items if i.matched]
     unchanged = [i for i in matched if i.already_current]
     return BatchResolveOut(
@@ -485,6 +540,7 @@ async def _resolve_batch_versions(
         items=items,
         label_options=labels,
         version_number_options=numbers,
+        model_options=models,
     )
 
 
@@ -578,6 +634,7 @@ async def generate_replies(
     dataset_type = _check_dataset_type(req.dataset_type)
     agent_cfg = req.agent.model_dump()
     fingerprint = reply_generator.config_fingerprint(agent_cfg)
+    version_label = _default_version_label(req.version_label, agent_cfg)
     project_id: uuid.UUID | None = None
     if req.project_id:
         try:
@@ -617,7 +674,7 @@ async def generate_replies(
         agent_cfg=agent_cfg,
         dataset_name=req.dataset_name,
         project_id=project_id,
-        version_label=req.version_label,
+        version_label=version_label,
         concurrency=req.concurrency,
         created_by=(user.id if user is not None else None),
         tenant_ctx=ctx,
@@ -723,7 +780,7 @@ async def retry_failed(
             dataset_name=job.dataset_name,
             session=session,
         )
-        version_label = job.version_label
+        version_label = _default_version_label(job.version_label, agent_cfg)
         dataset_type = job.dataset_type
         dataset_name = job.dataset_name
         project_id = job.project_id
@@ -799,6 +856,7 @@ async def list_case_states(
                 current_version_id=str(cur.id) if cur is not None else None,
                 current_version_number=cur.version_number if cur is not None else None,
                 current_version_label=cur.version_label if cur is not None else None,
+                current_model=_cfg_model(cur) if cur is not None else None,
                 version_count=int(counts.get(ref, 0)),
             ))
         return out

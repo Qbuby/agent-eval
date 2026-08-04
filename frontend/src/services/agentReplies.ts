@@ -30,6 +30,8 @@ export interface ReplyVersion {
   case_ref: string
   version_number: number
   version_label: string | null
+  /** 生成该版本所用的模型标识，取自配置快照的 model；老数据可能为 null */
+  model: string | null
   content: string | null
   turns: Array<Record<string, unknown>> | null
   status: string
@@ -52,6 +54,7 @@ export interface CaseReplyState {
   current_version_id: string | null
   current_version_number: number | null
   current_version_label: string | null
+  current_model: string | null
   version_count: number
 }
 
@@ -70,6 +73,7 @@ export interface ReplyJob {
   dataset_name: string | null
   status: string
   version_label: string | null
+  model: string | null
   total_count: number
   succeeded_count: number
   failed_count: number
@@ -84,13 +88,15 @@ export interface ReplyJob {
 
 // ── 批量切换当前版本 ──
 // version_id 是 per-(dataset_type, case_ref) 的，跨样例不可复用，所以批量切换只
-// 能按跨样例可识别的标识来指定：最新 / 精确版本号 vN / 版本备注。
-export type BatchVersionMode = 'latest' | 'version_number' | 'label'
+// 能按跨样例可识别的标识来指定：最新 / 精确版本号 vN / 版本备注 / 生成所用模型。
+// model 维度取自各版本的配置快照，不依赖用户手填备注，是「换个模型评一遍」的主路径。
+export type BatchVersionMode = 'latest' | 'version_number' | 'label' | 'model'
 
 export interface BatchVersionSelector {
   mode: BatchVersionMode
   version_number?: number | null
   label?: string | null
+  model?: string | null
 }
 
 export interface BatchSetCurrentRequest {
@@ -106,6 +112,7 @@ export interface BatchResolveItem {
   version_id: string | null
   version_number: number | null
   version_label: string | null
+  model: string | null
   status: string | null
   reason: string | null
 }
@@ -124,6 +131,7 @@ export interface BatchResolveResult {
   items: BatchResolveItem[]
   label_options: BatchOption[]
   version_number_options: BatchOption[]
+  model_options: BatchOption[]
 }
 
 export interface BatchSetCurrentResult {
