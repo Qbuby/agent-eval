@@ -65,6 +65,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_eval.data.content_blocks import content_to_text
 from agent_eval.db_models.tables import EvaluatorProviderRow
 from agent_eval.evaluation.judge_clients import (
     JudgeClientError,
@@ -291,18 +292,23 @@ def _resolve_source(
     * ``metadata`` —— 整体 JSON 序列化
     * ``metadata.<key>[.<sub>...]`` —— metadata 字典里点路径取子字段，
       最终值非字符串时 ``str(...)``；缺失返回空字符串
+
+    带附件样例的 ``input`` 可能是 canonical blocks 数组（``content_to_text``
+    投影成 ``[图片]`` 占位）。judge 是纯文本模型，这里统一收口成 str——上游
+    调用点也各自投影了一遍，这层是兜底：漏一处也不会让 ``re.sub`` 抛
+    ``TypeError: expected str instance, list found`` 把整个维度打成 skipped。
     """
     s = (spec or "").strip()
     if s == "input":
-        return input_text or ""
+        return content_to_text(input_text)
     if s == "output":
-        return output_text or ""
+        return content_to_text(output_text)
     if s == "output_a":
-        return output_a or ""
+        return content_to_text(output_a)
     if s == "output_b":
-        return output_b or ""
+        return content_to_text(output_b)
     if s == "expected_output":
-        return expected_output or ""
+        return content_to_text(expected_output)
     if s == "reference_criteria":
         # 本次评估启动时冻结的答案关键点；多轮该轮要点优先于样例级要点。
         return _reference_criteria_text(metadata)
@@ -898,6 +904,7 @@ async def run_configurable_judge(
     expected_output: str | None = None,
     metadata: dict[str, Any] | None = None,
     evaluator_name: str = "score",
+    attachments: list[dict[str, Any]] | None = None,
 ) -> ConfigurableJudgeResult:
     """对一组 (input, output) 用 evaluator 配置打一个分。
 
@@ -948,6 +955,11 @@ async def run_configurable_judge(
         except JudgeClientError as e:
             # 客户端构造失败（如缺 model）是确定性错误，重试无益，直接返回。
             return ConfigurableJudgeResult(rendered_messages=messages, error=str(e))
+
+        # 附件走旁路：prompt 文本已是渲染好的字符串（图只留 [图片] 占位），真实
+        # 图片块在 client 层按各家方言转形状再挂到用户消息上。messages 本身不改，
+        # 故 rendered_messages 落库时不会混进 base64。
+        client.attachments = list(attachments or [])
 
         try:
             async with client as judge:
@@ -1160,6 +1172,7 @@ async def run_comparative_judge(
     expected_output: str | None = None,
     metadata: dict[str, Any] | None = None,
     evaluator_name: str = "comparison",
+    attachments: list[dict[str, Any]] | None = None,
 ) -> ComparativeJudgeResult:
     """对同一样例的两份回复 (output_a, output_b) 做单次对比打分。
 
@@ -1199,6 +1212,9 @@ async def run_comparative_judge(
             )
         except JudgeClientError as e:
             return ComparativeJudgeResult(rendered_messages=messages, error=str(e))
+        # 附件旁路：prompt 已渲染成纯文本，图片在 client 侧按方言转形状后挂到
+        # 用户消息上（不进 rendered_messages，避免 base64 撑爆审计记录）。
+        client.attachments = list(attachments or [])
 
         try:
             async with client as judge:

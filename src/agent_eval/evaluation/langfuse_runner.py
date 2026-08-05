@@ -38,6 +38,11 @@ from agent_eval.config import settings
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import BenchmarkCaseRow
+from agent_eval.data.content_blocks import (
+    content_attachments,
+    content_to_text,
+    split_question_content,
+)
 from agent_eval.evaluation.agent_adapter import (
     AgentResponse,
     OpenAICompatibleAdapter,
@@ -727,7 +732,9 @@ async def _run_multiturn_case(
     input_messages = case.get("input_messages") or []
     conversation_goal = case.get("conversation_goal")
     turn_expectations = case.get("turn_expectations") or []
-    question = case.get("question") or ""
+    # 多轮的 question 是首条 user 消息的单值快照；带图轮下它是 canonical
+    # blocks，而 test_results.question 是 Text 列 —— 落库前投影成纯文本。
+    question = content_to_text(case.get("question"))
     expected = case.get("expected_output") or ""
     agent_type = agent_cfg.get("type", "sse")
 
@@ -977,6 +984,12 @@ async def _run_comparative_case(
     slot 顺序喂 judge，拿回后按 swap 标记把 verdict 还原到真实 A/B。
     """
     question = case["question"]
+    # 带附件样例的 question 是 canonical blocks：原始形状送 agent（附件不丢），
+    # 纯文本投影供 judge prompt 与落库快照（question 列是 Text）。
+    question_text = content_to_text(question)
+    # 附件走旁路送 judge：prompt 文本仍是投影（``[图片]`` 占位、可落库回显），
+    # 图片本身在 client 层按方言转形状挂到用户消息上，让 judge 真看到图。
+    question_attachments = content_attachments(question)
     expected = case.get("expected_output") or ""
     invoked_at = datetime.now(timezone.utc)
 
@@ -1074,12 +1087,13 @@ async def _run_comparative_case(
                 cmp_result = await run_comparative_judge(
                     params=spec.get("params") or {},
                     provider=provider_row,
-                    input_text=question,
+                    input_text=question_text,
                     output_a=slot_a,
                     output_b=slot_b,
                     expected_output=expected,
                     metadata=case.get("metadata"),
                     evaluator_name=label,
+                    attachments=question_attachments,
                 )
             except Exception as exc:
                 entry["error"] = f"{label}: {type(exc).__name__}: {exc}"
@@ -1110,7 +1124,8 @@ async def _run_comparative_case(
         "case_name": case.get("name"),
         "case_source": case.get("source"),
         "thread_id": a_res["thread_id"],
-        "question": question,
+        # question 列是 Text：落纯文本投影（附件成 [图片] 占位），不落 blocks 数组。
+        "question": question_text,
         "expected_output": expected,
         "expected_tool_calls": case.get("expected_tool_calls") or [],
         "invoked_at": invoked_at,
@@ -1363,6 +1378,7 @@ async def _run_multiturn_comparative_case(
             *, spec: dict[str, Any], input_text: str, real_a: str, real_b: str,
             expected_output: str, metadata: dict[str, Any] | None, evaluator_name: str,
             tools_a: str | None = None, tools_b: str | None = None,
+            attachments: list[dict[str, Any]] | None = None,
         ) -> tuple[dict[str, Any] | None, str | None]:
             """按 swap 喂 judge 并还原，返回 (restored_verdict, error)。
 
@@ -1370,6 +1386,10 @@ async def _run_multiturn_comparative_case(
             走**同一个 swap 决策**入槽——否则位置随机化后 judge 看到的「回答 A」是一侧、
             「工具调用 A」却是另一侧，判定就建立在错配的组合上。故按 swap 把工具调用注入
             metadata 副本的 actual_tool_calls_a/_b（不改传入 metadata，避免污染下一次调用）。
+
+            attachments 是该轮 user 的 canonical 附件块，原样透传给 judge 客户端。它与
+            tools_a/tools_b 相反——附件属于「题面」、A/B 两侧共享，故不参与 swap；
+            input_text 仍是纯文本投影，真实图片另挂成多模态块。仅逐轮对比传。
             """
             provider_row = spec.get("_provider")
             if provider_row is None:
@@ -1391,6 +1411,7 @@ async def _run_multiturn_comparative_case(
                     expected_output=expected_output,
                     metadata=call_metadata,
                     evaluator_name=evaluator_name,
+                    attachments=attachments,
                 )
             except Exception as exc:
                 return None, f"{evaluator_name}: {type(exc).__name__}: {exc}"
@@ -1452,12 +1473,16 @@ async def _run_multiturn_comparative_case(
                 turn_meta["turn_index"] = ti
                 turn_meta["expected_tool_calls"] = json.dumps(expected_tc, ensure_ascii=False)
                 verdict, err = await _compare_once(
-                    spec=spec, input_text=a_turn.get("user", ""),
+                    # 带附件轮的 user 是 canonical blocks 数组：prompt 里仍用纯文本
+                    # 投影（附件→``[图片]`` 占位、可落库回显），真实图片另经
+                    # attachments 挂成多模态块，judge 才能真看图判两侧优劣。
+                    spec=spec, input_text=content_to_text(a_turn.get("user")),
                     real_a=a_turn.get("assistant", ""), real_b=b_turn.get("assistant", ""),
                     expected_output=turn_expected, metadata=turn_meta,
                     evaluator_name=f"{label}.turn{ti}",
                     tools_a=json.dumps(a_turn.get("tool_calls") or [], ensure_ascii=False),
                     tools_b=json.dumps(b_turn.get("tool_calls") or [], ensure_ascii=False),
+                    attachments=content_attachments(a_turn.get("user")),
                 )
                 if err:
                     scoped.append({
@@ -1475,6 +1500,9 @@ async def _run_multiturn_comparative_case(
             if conversation_goal:
                 conv_meta = dict(case_metadata or {})
                 conv_meta["conversation_goal"] = conversation_goal
+                # 会话级刻意不传 attachments：input 是纯文本 goal，output 是整段
+                # transcript（图已投影成占位）；跨轮聚合还会撞 JUDGE_MAX_ATTACHMENTS
+                # 的静默截断，judge 拿到残缺图集比统一不看图更容易误判。看图放逐轮那层。
                 verdict, err = await _compare_once(
                     spec=spec, input_text=conversation_goal,
                     real_a=transcript_a, real_b=transcript_b,
@@ -1632,6 +1660,15 @@ async def _run_one_case(
         )
 
     question = case["question"]
+    # 带附件样例的 question 是 canonical blocks 数组：原样送 agent（多模态入参），
+    # 但 judge prompt / 内建 evaluator / 落库快照（Text 列）一律用纯文本投影。
+    question_text = content_to_text(question)
+    # 附件走旁路送 judge：prompt 文本仍是投影（``[图片]`` 占位、可落库回显），
+    # 图片本身在 client 层按方言转形状挂到用户消息上，让 judge 真看到图。
+    # 默认带图、不设能力开关：纯文本样例这里得到 []，请求体与改造前逐字节一致；
+    # 带图样例若把 provider 指向纯文本模型，judge 会 4xx 并如实落 evaluation_error
+    # ——比让它对着 [图片] 占位给出一个自信的假分更可取（与「绝不伪造分数」一致）。
+    question_attachments = content_attachments(question)
     expected = case.get("expected_output") or ""
     expected_tool_calls = case.get("expected_tool_calls") or []
     # We send a thread_id the agent CAN consume; the agent may rewrite it on
@@ -1747,11 +1784,12 @@ async def _run_one_case(
                     judge_result = await run_configurable_judge(
                         params=spec.get("params") or {},
                         provider=provider_row,
-                        input_text=question,
+                        input_text=question_text,
                         output_text=output_text,
                         expected_output=expected,
                         metadata=case.get("metadata"),
                         evaluator_name=label,
+                        attachments=question_attachments,
                     )
                 except Exception as e:
                     logger.warning(
@@ -1819,7 +1857,8 @@ async def _run_one_case(
         "case_name": case.get("name"),
         "case_source": case.get("source"),
         "thread_id": thread_id,
-        "question": question,
+        # question 列是 Text：落纯文本投影（附件渲染成 [图片] 占位）。
+        "question": question_text,
         "expected_output": expected,
         "expected_tool_calls": expected_tool_calls,
         "invoked_at": invoked_at,
@@ -1965,10 +2004,14 @@ async def _execute_run(
                             full_trace["steps"] = res["cot_steps"]
                         if res.get("conversation"):
                             full_trace["conversation"] = res["conversation"]
+                    # 冻结评估输入的原始附件 blocks。question 仍落纯文本投影，
+                    # 旧导出/搜索/judge 消费方不变；纯文本样例这里得到 None。
+                    _, question_content = split_question_content(case.get("question"))
                     created = await repo.create_test_result(
                         uuid.UUID(run_id),
                         benchmark_case_id=bench_id,
                         question=res["question"],
+                        question_content=question_content,
                         expected_output=res.get("expected_output") or None,
                         # 冻结本次运行的答案关键点快照，补评复用不漂移。
                         expected_output_criteria=_case_reference_criteria(case),
@@ -2944,6 +2987,7 @@ async def _rescore_comparison_result(
     async def _compare_once(
         *, spec: dict[str, Any], input_text: str, real_a: str, real_b: str,
         expected_output: str, metadata: dict[str, Any] | None, evaluator_name: str,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         provider_row = spec.get("_provider")
         if provider_row is None:
@@ -2960,6 +3004,8 @@ async def _rescore_comparison_result(
                 expected_output=expected_output,
                 metadata=metadata,
                 evaluator_name=evaluator_name,
+                # 附件属于题面、A/B 两侧共享，故不随 swap 入槽（与 slot_a/slot_b 不同）。
+                attachments=attachments,
             )
         except Exception as exc:  # noqa: BLE001
             return None, f"{evaluator_name}: {type(exc).__name__}: {exc}"
@@ -3016,17 +3062,23 @@ async def _rescore_comparison_result(
                         b_turn.get("tool_calls") or [], ensure_ascii=False),
                 }
                 verdict, err = await _compare_once(
-                    spec=spec, input_text=a_turn.get("user", ""),
+                    # 带图轮的 user 是 canonical blocks：prompt 里仍是纯文本投影，
+                    # 真实图片走 attachments 旁路，与首评的带图口径保持一致——否则
+                    # 同一维度首评看得到图、补评看不到，两次打分依据不同。
+                    spec=spec, input_text=content_to_text(a_turn.get("user")),
                     real_a=a_turn.get("assistant", ""), real_b=b_turn.get("assistant", ""),
                     expected_output=te.get("expected_output") or "",
                     metadata=turn_meta,
                     evaluator_name=f"{label}.turn{ti}",
+                    attachments=content_attachments(a_turn.get("user")),
                 )
             elif scope == "conversation":
                 if not goal:
                     continue
                 conv_meta = {"conversation_goal": goal}
                 verdict, err = await _compare_once(
+                    # 会话级不传 attachments：input 是纯文本 goal，output 是整段
+                    # transcript（各轮图已投影成 [图片] 占位），与首评侧同口径。
                     spec=spec, input_text=goal,
                     real_a=transcript_a, real_b=transcript_b,
                     expected_output=goal, metadata=conv_meta,
@@ -3236,6 +3288,10 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                             expected_output=r.expected_output or "",
                             metadata=rescore_metadata,
                             evaluator_name=label,
+                            # 回喂本次运行冻结的原始附件 blocks（question 列只有纯文本
+                            # 投影）：补评只看投影会与首评口径不一致。纯文本样例该列为
+                            # NULL，content_attachments 返回 []，请求体与改造前一致。
+                            attachments=content_attachments(r.question_content),
                         )
                     except Exception as e:  # noqa: BLE001
                         logger.warning("rescore single[%s] crashed on result %s: %s", label, r.id, e)

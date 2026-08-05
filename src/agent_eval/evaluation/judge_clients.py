@@ -43,10 +43,44 @@ from typing import Any
 
 import httpx
 
+from agent_eval.data.content_blocks import (
+    JUDGE_MAX_ATTACHMENTS,
+    attachments_to_anthropic_blocks,
+    attachments_to_openai_blocks,
+)
 from agent_eval.db_models.tables import EvaluatorProviderRow
 from agent_eval.evaluation.crypto import decrypt_secret
 
 logger = logging.getLogger(__name__)
+
+
+def _inject_attachments(
+    messages: list[dict[str, Any]],
+    blocks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把已转好方言的附件块挂到最后一条非 system 消息上。
+
+    judge prompt 是渲染好的字符串，附件走旁路参数传进来，最后在这里合流：
+    该消息的 ``content`` 从 str 升成 ``[{text}, ...附件]`` 数组。system 段只
+    放输出契约，不挂图——多模态块挂在 system 上各家支持度不一。
+
+    原 ``messages`` 不改（浅拷贝每条），因为调用方会把它当 rendered_messages
+    落库/回显，混进 base64 图会把审计记录撑爆。
+    """
+    if not blocks:
+        return messages
+    out = [dict(m) for m in messages]
+    for m in reversed(out):
+        if m.get("role") == "system":
+            continue
+        text = m.get("content")
+        if isinstance(text, list):
+            m["content"] = [*text, *blocks]
+        else:
+            m["content"] = [{"type": "text", "text": str(text or "")}, *blocks]
+        return out
+    # 全是 system（不该发生）——原样返回，宁可丢图也不改契约段。
+    return out
 
 
 # Network-layer transients that are safe to retry. We deliberately exclude
@@ -127,6 +161,10 @@ class _BaseJudgeClient:
         self.max_tokens = max_tokens
         self.extra_config = extra_config or {}
         self._client: httpx.AsyncClient | None = None
+        # 本次评分要随 prompt 一起送出的 canonical 附件块（image/document/…）。
+        # 由调用方在 ainvoke 前赋值：prompt 文本是模板渲染出来的字符串，附件走这条
+        # 旁路，最后在 ainvoke 里按各家方言转形状再挂到用户消息上。
+        self.attachments: list[dict[str, Any]] = []
 
     async def __aenter__(self) -> "_BaseJudgeClient":
         self._client = httpx.AsyncClient(timeout=self.timeout)
@@ -150,10 +188,23 @@ class _BaseJudgeClient:
     def _parse_response(self, body: dict[str, Any]) -> JudgeInvocation:
         raise NotImplementedError
 
+    def _attachment_blocks(self) -> list[dict[str, Any]]:
+        """canonical 附件 → 本方言的多模态块。缺省不支持，返回空（纯文本降级）。"""
+        return []
+
+    def _messages_with_attachments(
+        self, messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not self.attachments:
+            return messages
+        return _inject_attachments(messages, self._attachment_blocks())
+
     async def ainvoke(self, messages: list[dict[str, Any]]) -> JudgeInvocation:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self.timeout)
-        url, headers, payload = self._build_request(messages)
+        url, headers, payload = self._build_request(
+            self._messages_with_attachments(messages)
+        )
 
         last_exc: Exception | None = None
         for attempt in range(1, _RETRY_ATTEMPTS + 1):
@@ -210,6 +261,9 @@ class OpenAICompatJudgeClient(_BaseJudgeClient):
 
     provider_type = "openai_compatible"
 
+    def _attachment_blocks(self) -> list[dict[str, Any]]:
+        return attachments_to_openai_blocks(self.attachments)
+
     def _build_request(
         self, messages: list[dict[str, Any]],
     ) -> tuple[str, dict[str, str], dict[str, Any]]:
@@ -265,6 +319,9 @@ class AnthropicJudgeClient(_BaseJudgeClient):
     """
 
     provider_type = "anthropic"
+
+    def _attachment_blocks(self) -> list[dict[str, Any]]:
+        return attachments_to_anthropic_blocks(self.attachments)
 
     def _build_request(
         self, messages: list[dict[str, Any]],
@@ -333,6 +390,9 @@ class AzureOpenAIJudgeClient(_BaseJudgeClient):
     Auth header is ``api-key``, not ``Authorization``."""
 
     provider_type = "azure"
+
+    # 消息体与 OpenAI 完全同形，附件转换直接复用同一个方言函数。
+    _attachment_blocks = OpenAICompatJudgeClient._attachment_blocks  # type: ignore[assignment]
 
     def _build_request(
         self, messages: list[dict[str, Any]],
@@ -411,6 +471,14 @@ class AgentSSEJudgeClient(_BaseJudgeClient):
     # 评分模式，由 build_judge_client 注入：'single'（默认）| 'comparative'。
     mode: str = "single"
 
+    def _attachment_blocks(self) -> list[dict[str, Any]]:
+        """SSE agent 吃 canonical 形状本身——不需要转方言，只按 judge 上限截断。
+
+        被测 agent 的 ``ChatAgentRequest.question`` 声明为 ``str | list[dict]``，
+        其 content 预处理认 canonical 的 image/document/video 块，故原样透传。
+        """
+        return list(self.attachments[:JUDGE_MAX_ATTACHMENTS])
+
     def _flatten_question(self, messages: list[dict[str, Any]]) -> str:
         system_parts: list[str] = []
         user_parts: list[str] = []
@@ -436,6 +504,20 @@ class AgentSSEJudgeClient(_BaseJudgeClient):
         )
         return f"{combined}{contract}"
 
+    def _build_question(
+        self, messages: list[dict[str, Any]],
+    ) -> str | list[dict[str, Any]]:
+        """拍平后的 question：无附件时是字符串，带附件时升成 canonical blocks。
+
+        ``[{"type":"text","text":<拍平的 prompt>}, ...附件块]``——与录入侧
+        question_content 同构，被测 agent 直接认。
+        """
+        text = self._flatten_question(messages)
+        blocks = self._attachment_blocks() if self.attachments else []
+        if not blocks:
+            return text
+        return [{"type": "text", "text": text}, *blocks]
+
     async def ainvoke(self, messages: list[dict[str, Any]]) -> JudgeInvocation:
         # Import here to avoid a module-level cycle (agent_adapter is a
         # sibling under evaluation/ and imports nothing from this module,
@@ -443,7 +525,7 @@ class AgentSSEJudgeClient(_BaseJudgeClient):
         # dependency-light" intent and avoids surprises if that changes).
         from agent_eval.evaluation.agent_adapter import SSEStreamAdapter
 
-        question = self._flatten_question(messages)
+        question = self._build_question(messages)
         mode = self.extra_config.get("mode") or "langgraph_v2"
         language = self.extra_config.get("language") or "请用中文回复"
         headers = self.extra_config.get("headers") or None

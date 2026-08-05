@@ -31,6 +31,7 @@ import json
 import logging
 from typing import Any, Awaitable, Callable
 
+from agent_eval.data.content_blocks import content_attachments, content_to_text
 from agent_eval.evaluation.configurable_judge import run_configurable_judge
 
 logger = logging.getLogger(__name__)
@@ -52,11 +53,17 @@ def _user_turn_indices(messages: list[dict[str, Any]]) -> list[int]:
 
 
 def build_transcript(turns: list[dict[str, Any]]) -> str:
-    """把回放出的逐轮记录拼成可读 transcript，供会话级 judge 当 output。"""
+    """把回放出的逐轮记录拼成可读 transcript，供会话级 judge 当 output。
+
+    ``turns[].user`` 在带图轮里是 content blocks 数组（``replay_conversation``
+    原样取 ``input_messages[idx]["content"]`` 存入，以便附件原样送 agent），
+    故这里走 ``content_to_text`` 取纯文本投影——附件渲染成 ``[图片]`` 占位。
+    直接 ``.strip()`` 会在带图样例上 AttributeError。
+    """
     lines: list[str] = []
     for t in turns:
-        u = (t.get("user") or "").strip()
-        a = (t.get("assistant") or "").strip()
+        u = content_to_text(t.get("user")).strip()
+        a = content_to_text(t.get("assistant")).strip()
         if u:
             lines.append(f"用户：{u}")
         if a:
@@ -328,11 +335,16 @@ async def score_conversation(
                 res = await run_configurable_judge(
                     params=params,
                     provider=provider_row,
-                    input_text=turn.get("user", ""),
+                    # 带图轮的 user 是 canonical blocks 数组（回放原样存下以便
+                    # 送给 agent）。prompt 文本仍走投影（[图片] 占位、可落库回显），
+                    # 真实图片经 attachments 旁路在 client 层按方言转形状挂到用户
+                    # 消息上，让 judge 真看到这一轮的图。
+                    input_text=content_to_text(turn.get("user")),
                     output_text=turn.get("assistant", ""),
                     expected_output=expected,
                     metadata=turn_meta,
                     evaluator_name=f"{label}.turn{ti}",
+                    attachments=content_attachments(turn.get("user")),
                 )
             except Exception as e:
                 logger.warning(
@@ -376,6 +388,10 @@ async def score_conversation(
                 res = await run_configurable_judge(
                     params=params,
                     provider=provider_row,
+                    # 会话级不带图（与双模会话级同一判断）：input 是纯文本 goal，
+                    # output 是 build_transcript 产物（各轮图已成 [图片] 占位）。
+                    # 各轮附件聚合易越过 JUDGE_MAX_ATTACHMENTS 被静默截断，且聚合
+                    # 视图里图与轮次的对应已丢失。图只在逐轮维度真送。
                     input_text=conversation_goal,
                     output_text=transcript,
                     expected_output=conversation_goal,
