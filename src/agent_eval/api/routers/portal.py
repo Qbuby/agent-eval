@@ -22,6 +22,8 @@ from agent_eval.auth.dependencies import (
     get_current_user,
     require_external,
 )
+from agent_eval.data.content_blocks import ContentValidationError, split_question_content
+from agent_eval.data.xlsx_images import row_images_for_upload
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.tables import (
     PortalSampleBatchRow,
@@ -120,6 +122,11 @@ async def upload_batch(
             detail="文件为空",
         )
 
+    # 内嵌（浮动）图片是 drawing 锚点、不是单元格值，openpyxl 读不到；直接从上传
+    # 的原始字节里按 1-based Excel 行号抽。解析失败返回空 dict——读图是增强，
+    # 不该成为导入失败的理由。所以 read_only=True 可以保留。
+    row_images = row_images_for_upload(content, filename)
+
     try:
         workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
     except Exception as exc:  # openpyxl 抛多种异常，统一转 400
@@ -162,7 +169,12 @@ async def upload_batch(
 
         samples: list[PortalSampleRow] = []
         row_index = 0
+        with_images = 0
+        # excel_row 跟真实 Excel 行号（1-based，表头即第 1 行），用来对齐
+        # row_images 的键；row_index 只在保留行上自增，两者不能混用。
+        excel_row = 1
         for raw_row in rows_iter:
+            excel_row += 1
             if raw_row is None:
                 continue
             row = list(raw_row)
@@ -185,10 +197,25 @@ async def upload_batch(
                 # question 是 NOT NULL，缺失则跳过该行而非整批失败
                 continue
 
+            # 双写：question 恒为纯文本投影（附件位置留 [图片] 占位），
+            # question_content 仅在有附件时非空，纯文本行保持 NULL。
+            images = row_images.get(excel_row)
+            question_content = None
+            if images:
+                try:
+                    question, question_content = split_question_content(
+                        [{"type": "text", "text": question}, *images]
+                    )
+                except ContentValidationError:
+                    question_content = None  # 读图是增强，不该让整行导入失败
+                else:
+                    with_images += 1
+
             samples.append(
                 PortalSampleRow(
                     row_index=row_index,
                     question=question,
+                    question_content=question_content,
                     answer=answer,
                     extra={k: v for k, v in extra.items() if v is not None},
                 )
@@ -232,6 +259,7 @@ async def upload_batch(
         question_column=q_name,
         answer_column=a_name,
         extra_columns=list(extra_names.values()),
+        with_images=with_images,
     )
 
 
@@ -459,6 +487,7 @@ async def list_samples(
                     id=str(s.id),
                     row_index=s.row_index,
                     question=s.question,
+                    question_content=s.question_content,
                     answer=s.answer,
                     extra=s.extra or {},
                     feedback=(

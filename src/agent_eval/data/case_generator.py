@@ -5,6 +5,7 @@ import logging
 import uuid
 from typing import Any
 
+from agent_eval.data.content_blocks import content_to_text, has_attachments
 from agent_eval.evaluation.agent_adapter import AgentResponse
 from agent_eval.models.optimization import FailureCluster
 from agent_eval.models.test_case import TestCase
@@ -249,9 +250,20 @@ class CaseGenerator:
                 return
             # Reuse self.adapter (already open, thread_id=None) for single-turn;
             # each single-turn invoke is independent so no context bleed.
-            question = str(users[-1].get("content", "")).strip()
-            if not question:
-                return
+            # content 可能是多模态 blocks 数组（带附件样例）——原样透传给 adapter，
+            # 空判定看文本投影 + 是否带附件，不能 str() 后 strip（会把数组变成
+            # "[{'type': ...}]" 这种 JSON 噪音发给 agent）。
+            raw_content = users[-1].get("content", "")
+            if isinstance(raw_content, str):
+                question: Any = raw_content.strip()
+                if not question:
+                    return
+            else:
+                question = raw_content
+                if not (
+                    content_to_text(question).strip() or has_attachments(question)
+                ):
+                    return
             try:
                 resp, _ = await _invoke(self.adapter, [{"role": "user", "content": question}])
             except Exception as e:  # noqa: BLE001 — one bad case shouldn't sink the batch

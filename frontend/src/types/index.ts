@@ -1,3 +1,7 @@
+import type { MessageContent } from '@/lib/contentBlocks'
+
+export type { MessageContent }
+
 export interface LoginRequest {
   username: string
   password: string
@@ -76,7 +80,10 @@ export interface TestCase {
   // 受管单值类别（对齐基准测试集）：类别名字符串，存进 Langfuse item metadata.category。
   category?: string | null
   source?: string
-  input_messages: Array<{ role: string; content: string }>
+  // content 为「字符串 或 canonical blocks 数组」：带图/带附件的样例走数组形态
+  // （见 @/lib/contentBlocks 与后端 data/content_blocks.py）。无附件时后端降级
+  // 回字符串，故纯文本样例的形状与改造前一致。
+  input_messages: Array<{ role: string; content: MessageContent }>
   agent_config_override?: Record<string, unknown>
   expected_output?: string
   expected_output_criteria?: string[]
@@ -641,7 +648,8 @@ export interface CotStep {
 export interface ConversationTurn {
   turn_index: number
   turn_no?: number
-  user: string
+  // 带附件轮保留 canonical blocks，纯文本轮仍为 string。
+  user: MessageContent
   assistant: string
   tool_calls?: Array<Record<string, unknown>>
   steps?: CotStep[]
@@ -748,6 +756,8 @@ export interface EvalResultRow {
   criterion_results?: Array<Record<string, unknown>>
   actual_output: string | null
   question?: string | null
+  // 评估启动时冻结的原始问题 blocks；纯文本/旧结果为 null。
+  question_content?: MessageContent | null
   // 评估启动时冻结的答案关键点（后端 0036 起持久化到 test_results）。
   // 源样例后续被改也不影响本次评估的参考依据，详情页据此展示"按什么标准打分"。
   expected_output_criteria?: string[]

@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 
+from agent_eval.data.content_blocks import content_to_text, has_attachments
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tenant_context import (
@@ -195,8 +196,17 @@ async def generate_one_reply(
                 out["error"] = "对话没有可回放的 user 轮次"
                 out["error_type"] = "empty_conversation"
         else:
-            question = (case.get("question") or "").strip()
-            if not question:
+            # question 可能是多模态 content blocks 数组（带附件样例），原样透传
+            # 给 adapter；空判定只看文本投影 + 是否带附件，不能对数组 strip。
+            question = case.get("question") or ""
+            if isinstance(question, str):
+                question = question.strip()
+                is_empty = not question
+            else:
+                is_empty = not (
+                    content_to_text(question).strip() or has_attachments(question)
+                )
+            if is_empty:
                 out["error"] = "样例没有问题内容，无法生成回复"
                 out["error_type"] = "empty_question"
                 return out
@@ -288,7 +298,9 @@ async def start_generation_job(
             item = await repo.create_agent_reply_job_item(
                 job_id=job.id,
                 case_ref=str(c.get("id")),
-                question=(c.get("question") or None),
+                # item.question 是 Text 列，仅作进度页展示用；带附件样例存文本
+                # 投影（附件渲染成 [图片] 占位），不把 blocks 数组塞进字符串列。
+                question=(content_to_text(c.get("question")) or None),
             )
             item_ids.append((str(c.get("id")), str(item.id)))
         await session.commit()

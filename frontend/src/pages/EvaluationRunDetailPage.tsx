@@ -6,10 +6,11 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
 } from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail, RunDetail, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail, Comparison, ComparisonVerdict, ComparisonAnswerCounts } from '@/types'
+import type { EvalResultRow, EvalRunDetail, RunDetail, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail, Comparison, ComparisonVerdict, ComparisonAnswerCounts, MessageContent } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
 import { CotTimeline, ToolCallsTable } from '@/components/TraceTimeline'
 import MarkdownView from '@/components/MarkdownView'
+import MessageContentView from '@/components/MessageContentView'
 import { Button, Drawer, ErrorCard, ExportMenu } from '@/components/ui'
 import {
   getScoreMeta, isPassing, directionMark, tone,
@@ -571,8 +572,8 @@ function ScopedVerdictBody({ verdict, status, error }: {
   )
 }
 
-function ComparisonMessageBubble({ role, side, text }: {
-  role: 'user' | 'assistant'; side?: 'A' | 'B'; text: string
+function ComparisonMessageBubble({ role, side, content }: {
+  role: 'user' | 'assistant'; side?: 'A' | 'B'; content: MessageContent
 }) {
   const isUser = role === 'user'
   const labelTone = side === 'A' ? 'text-accent' : side === 'B' ? 'text-info' : 'text-text-tertiary'
@@ -585,7 +586,7 @@ function ComparisonMessageBubble({ role, side, text }: {
           {isUser ? '用户' : `助手 ${side}`}
         </div>
         <div className="text-[12px] text-text-primary">
-          <MarkdownView text={text} />
+          <MessageContentView content={content} />
         </div>
       </div>
     </div>
@@ -604,8 +605,8 @@ function MultiTurnAnswers({ row, comparison }: { row: EvalResultRow; comparison:
   if (turnIndexes.length === 0) {
     return (
       <div className="grid grid-cols-2 gap-3">
-        <ComparisonMessageBubble role="assistant" side="A" text={row.actual_output || '（无输出）'} />
-        <ComparisonMessageBubble role="assistant" side="B" text={comparison.agent_b?.output || '（无输出）'} />
+        <ComparisonMessageBubble role="assistant" side="A" content={row.actual_output || '（无输出）'} />
+        <ComparisonMessageBubble role="assistant" side="B" content={comparison.agent_b?.output || '（无输出）'} />
       </div>
     )
   }
@@ -619,17 +620,17 @@ function MultiTurnAnswers({ row, comparison }: { row: EvalResultRow; comparison:
         return (
           <div key={turnIndex} className="rounded-lg border border-border p-3 space-y-3">
             <div className="text-[11px] font-medium text-text-secondary">第 {turnIndex + 1} 轮</div>
-            {user && <ComparisonMessageBubble role="user" text={user} />}
+            {user && <ComparisonMessageBubble role="user" content={user} />}
             <div className="grid grid-cols-2 gap-3">
               <ComparisonMessageBubble
                 role="assistant"
                 side="A"
-                text={aTurn ? (aTurn.assistant || '（无输出）') : '（该侧无此轮）'}
+                content={aTurn ? (aTurn.assistant || '（无输出）') : '（该侧无此轮）'}
               />
               <ComparisonMessageBubble
                 role="assistant"
                 side="B"
-                text={bTurn ? (bTurn.assistant || '（无输出）') : '（该侧无此轮）'}
+                content={bTurn ? (bTurn.assistant || '（无输出）') : '（该侧无此轮）'}
               />
             </div>
           </div>
@@ -1702,6 +1703,15 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
         </div>
       </div>
 
+      {(row.question_content || row.question) && (
+        <div className="mb-4" data-testid="result-question-content">
+          <div className="field-label">问题</div>
+          <div className="rounded-md border border-border bg-fill/5 px-3 py-2 text-[12px] text-text-primary">
+            <MessageContentView content={row.question_content ?? row.question ?? ''} />
+          </div>
+        </div>
+      )}
+
       {/* 评估参考依据：首评时冻结的答案关键点，对比 run 亦适用（A/B 同一套标准）。 */}
       {(row.expected_output_criteria?.length ?? 0) > 0 && (
         <div className="mb-4">
@@ -2235,7 +2245,7 @@ function ConversationResultView({
                   用户 · 第 {i + 1} 轮
                 </div>
                 <div className="text-[12px] text-text-primary">
-                  <MarkdownView text={t.user} />
+                  <MessageContentView content={t.user} />
                 </div>
               </div>
               {/* 该轮期望（评判要点 / 期望输出）——按什么标准打分 */}

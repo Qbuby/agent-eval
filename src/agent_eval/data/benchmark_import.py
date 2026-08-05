@@ -35,6 +35,17 @@ from typing import Any
 import openpyxl
 
 from agent_eval.data._utils import normalize_messages
+from agent_eval.data.content_blocks import (
+    ContentValidationError,
+    content_to_text,
+    normalize_content,
+)
+
+# 行迭代器往每行 dict 里塞的保留键，值是该行在 Excel 里的 1-based 行号
+# （表头 = 1，首条数据 = 2）。内嵌图片的 drawing 锚点只记行号，导入时靠这个
+# 把图片贴回对应样例。取值用 row_excel_index，下游做列映射前先剔掉它，见
+# strip_reserved。
+ROW_INDEX_KEY = "__excel_row__"
 
 VEHICLE_MODEL_PATTERN = re.compile(
     r"(RPL[A-Z0-9]+|CPD[A-Z0-9]+|CQD[A-Z0-9]+|EPT[A-Z0-9\-]+|EXP[A-Z0-9]+|"
@@ -238,14 +249,39 @@ def _iter_xlsx(content: bytes) -> tuple[list[str], Iterator[dict[str, Any]]]:
 
     def gen() -> Iterator[dict[str, Any]]:
         try:
+            # 表头是第 1 行，数据从第 2 行起；行号用于把内嵌图片（drawing 锚点
+            # 只记行号，见 xlsx_images）贴回对应的样例。空行不消耗行号——
+            # enumerate 独立于 continue，故用显式计数。
+            excel_row = 1
             for row in row_iter:
+                excel_row += 1
                 if not any(cell is not None for cell in row):
                     continue
-                yield dict(zip(raw_headers, row))
+                item = dict(zip(raw_headers, row))
+                item[ROW_INDEX_KEY] = excel_row
+                yield item
         finally:
             wb.close()
 
     return raw_headers, gen()
+
+
+def row_excel_index(row: dict[str, Any]) -> int | None:
+    """取该行的 Excel 行号（1-based），非 xlsx 来源的行没有这个键，返回 None。"""
+    val = row.get(ROW_INDEX_KEY)
+    return val if isinstance(val, int) else None
+
+
+def strip_reserved(row: dict[str, Any]) -> dict[str, Any]:
+    """去掉行迭代器注入的保留键，得到只含源列的干净行。
+
+    列映射、extra_fields、预览样例都该吃这个——保留键不在任何别名表里，正常
+    不会被误当成源列，但一旦有地方遍历整行（如把未映射列兜进 extra），它就会
+    漏进用户可见数据。取完行号后立刻剥掉最稳妥。
+    """
+    if ROW_INDEX_KEY not in row:
+        return row
+    return {k: v for k, v in row.items() if k != ROW_INDEX_KEY}
 
 
 def auto_detect_field_mapping(headers: list[str]) -> dict[str, str | None]:
@@ -581,10 +617,56 @@ def _expand_qa_turns(turns: list) -> tuple[list[dict[str, str]], list[dict[str, 
     return messages, turn_expectations
 
 
+def _with_images(
+    content: Any, images: list[dict[str, Any]] | None,
+) -> str | list[dict[str, Any]]:
+    """把该行的 xlsx 内嵌图片追加到已有 content 后面，返回 canonical content。
+
+    无图（非 xlsx / 该行没图）时原样返回入参，故纯文本对话的 input_messages 与
+    改造前逐字节一致。已是 blocks 数组的 content（布局 A/B 行内数组本就可带图）
+    原样保留后再追加，不会被拍平成 ``[图片]`` 占位。
+
+    图片块结构非法时退回原 content——读图是增强，不该让整段对话导入失败（与单轮
+    导入端点同一取舍）。
+    """
+    if not images:
+        return content
+    if isinstance(content, list):
+        base: list[Any] = list(content)
+    else:
+        text = "" if content is None else str(content)
+        base = [{"type": "text", "text": text}] if text else []
+    try:
+        return normalize_content([*base, *images])
+    except ContentValidationError:
+        return content
+
+
+def _attach_images_to_first_user(
+    messages: list[dict[str, Any]], images: list[dict[str, Any]],
+) -> None:
+    """原地把 images 挂到 messages 里第一条 user 消息的 content 上。
+
+    没有 user 消息时挂到第 0 条（回放只重放 user 轮，但导入侧不该因为角色缺失
+    就丢图）。挂载走 _with_images，故非法图片块会退回原 content 而非抛错。
+    """
+    target = next(
+        (m for m in messages if str(m.get("role") or "") == "user"),
+        messages[0],
+    )
+    target["content"] = _with_images(target.get("content"), images)
+
+
 def _conversation_from_list(
-    row: dict[str, Any], raw: list, *, goal_column: str | None
+    row: dict[str, Any], raw: list, *, goal_column: str | None,
+    images: list[dict[str, Any]] | None = None,
 ) -> ParsedConversation | None:
-    """单行里已有完整对话数组（布局 A / B）→ ParsedConversation。"""
+    """单行里已有完整对话数组（布局 A / B）→ ParsedConversation。
+
+    images：该行的 xlsx 内嵌图片。布局 A/B 是「一行一整段对话」，图片锚点只记
+    行号、无法分辨该挂到哪一轮，故统一挂到**第一条 user 消息**上（带图多轮的
+    典型形态就是首轮发图后续追问）。
+    """
     low = _lower_map(row)
     if _looks_like_qa_turns(raw):
         messages, turn_exp = _expand_qa_turns(raw)
@@ -593,6 +675,8 @@ def _conversation_from_list(
         turn_exp = []
     if not messages:
         return None
+    if images:
+        _attach_images_to_first_user(messages, images)
     goal = resolve_conversation_goal(row, goal_column=goal_column)
     if not goal:
         gv = _first_value(row, low, _GOAL_ROW_KEYS)
@@ -611,6 +695,7 @@ def _conversation_from_list(
 def _parse_flattened(
     rows: list[tuple[dict[str, Any], dict[str, str]]], *, goal_column: str | None,
     column_map: dict[str, str] | None = None,
+    row_images: dict[int, list[dict[str, Any]]] | None = None,
 ) -> tuple[list[ParsedConversation], int]:
     """拍平布局（布局 C）：每行一个 turn，按 conversation_id 聚合成对话。
 
@@ -621,6 +706,10 @@ def _parse_flattened(
     未指定的字段回退别名自动识别。expected_output 显式映射时写入该轮
     turn_expectations 的 expected_output（这是导入侧唯一能带入「期望答案」的
     路径——answer 仍作 assistant 消息存档，二者独立）。
+
+    row_images（可选）：Excel 行号 → 该行内嵌图片块。拍平布局一行恰好一个
+    turn，故图片能精确挂到**该行自己的 user 轮**上（不像布局 A/B 只能统一挂
+    首轮）。非 xlsx 来源的行没有行号，取不到图，退化为纯文本。
     """
     groups: dict[str, list[tuple[dict[str, Any], dict[str, str]]]] = {}
     order: list[str] = []
@@ -663,14 +752,22 @@ def _parse_flattened(
 
         items.sort(key=_turn_sort)
 
-        messages: list[dict[str, str]] = []
+        # content 可能是纯文本或 content blocks 数组（带图轮），故 value 用 Any。
+        messages: list[dict[str, Any]] = []
         turn_exp: list[dict[str, Any]] = []
         goal: str | None = None
         name = ""
         for r, lw in items:
             q = _mapped_value(r, lw, "question", column_map)
             idx = len(messages)
-            messages.append({"role": "user", "content": str(q).strip()})
+            # 本行的内嵌图片挂到本行这条 user 轮上：拍平布局行与 turn 一一对应，
+            # 锚点行号足以定位到轮。无图时 _with_images 原样返回字符串，故纯文本
+            # 对话的 content 仍是 str 而非 blocks。
+            imgs = row_images.get(row_excel_index(r) or -1) if row_images else None
+            messages.append({
+                "role": "user",
+                "content": _with_images(str(q).strip(), imgs),
+            })
             # answer 是 agent 实际「生成的答案」，作 assistant 消息存档进对话流。
             a = _mapped_value(r, lw, "answer", column_map)
             if a not in (None, ""):
@@ -724,6 +821,7 @@ def parse_conversations(
     messages_column: str | None = None,
     goal_column: str | None = None,
     column_map: dict[str, str] | None = None,
+    row_images: dict[int, list[dict[str, Any]]] | None = None,
 ) -> tuple[list[ParsedConversation], int]:
     """把上传文件的所有行解析成多轮对话样例，自动适配三种布局。
 
@@ -734,6 +832,11 @@ def parse_conversations(
     指定 question / answer / expected_output / criteria / conversation_id /
     turn_no / goal / name 各自对应哪一列，覆盖别名自动识别。仅作用于布局 C
     （行内数组的 A/B 布局结构自解释，不需要列映射）。
+
+    row_images（可选）：Excel 行号 → 该行内嵌图片块（见 xlsx_images）。图片按
+    布局分别落位：A/B 一行一整段对话，锚点行号分不出轮次，统一挂首条 user 轮；
+    C 一行恰好一个 turn，挂到该行自己的 user 轮。传 None / 非 xlsx 来源时整条
+    链路退化为纯文本导入，input_messages 与改造前逐字节一致。
 
     返回 (conversations, skipped_rows)。skipped_rows 为既不含对话数组、也不含
     问句列、无法构成任何轮次的行数。
@@ -764,7 +867,10 @@ def parse_conversations(
             if raw_list is not None:
                 break
         if raw_list is not None:
-            conv = _conversation_from_list(row, raw_list, goal_column=goal_column)
+            imgs = row_images.get(row_excel_index(row) or -1) if row_images else None
+            conv = _conversation_from_list(
+                row, raw_list, goal_column=goal_column, images=imgs,
+            )
             if conv is not None:
                 conversations.append(conv)
             else:
@@ -775,6 +881,7 @@ def parse_conversations(
     if flattened:
         flat_convs, flat_skipped = _parse_flattened(
             flattened, goal_column=goal_column, column_map=column_map,
+            row_images=row_images,
         )
         conversations.extend(flat_convs)
         skipped += flat_skipped

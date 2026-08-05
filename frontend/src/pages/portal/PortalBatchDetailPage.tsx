@@ -3,6 +3,8 @@ import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, useToast } from '@/components/ui'
 import MarkdownView from '@/components/MarkdownView'
+import MessageContentView from '@/components/MessageContentView'
+import { contentToText, hasAttachments } from '@/lib/contentBlocks'
 import {
   portalApi,
   SCORE_DIMENSIONS,
@@ -135,7 +137,9 @@ function SampleDetail({ sample }: { sample: PortalSample }) {
         <div className="mb-5">
           <div className="field-label">问题</div>
           <div className="text-[14px] leading-relaxed text-text-primary font-medium">
-            <MarkdownView text={sample.question} />
+            {/* 带附件样例走 question_content（图片缩略图 + 文本），纯文本样例
+                回退到 question 字符串，渲染结果与改动前一致。 */}
+            <MessageContentView content={sample.question_content ?? sample.question ?? ''} />
           </div>
         </div>
 
@@ -276,7 +280,9 @@ export default function PortalBatchDetailPage() {
     return items.filter(
       (s) =>
         String(s.row_index + 1).includes(kw) ||
-        (s.question ?? '').toLowerCase().includes(kw),
+        // 带附件样例搜 question_content 的文本投影（含 [图片] 占位），
+        // 纯文本样例行为不变。
+        contentToText(s.question_content ?? s.question).toLowerCase().includes(kw),
     )
   }, [items, search])
 
@@ -353,7 +359,14 @@ export default function PortalBatchDetailPage() {
                         #{s.row_index + 1}
                       </span>
                       <span className="flex-1 min-w-0 text-[12px] leading-snug text-text-secondary line-clamp-2">
-                        {s.question || '（无问题文本）'}
+                        {/* 导航项是 button，不能塞 AttachmentStrip 的 a（嵌套交互元素），
+                            带图只给一个 🖼️ 标记，缩略图留给右侧详情。 */}
+                        {hasAttachments(s.question_content) && (
+                          <span className="mr-1" title="含图片">
+                            🖼️
+                          </span>
+                        )}
+                        {contentToText(s.question_content ?? s.question) || '（无问题文本）'}
                       </span>
                       {reviewed && (
                         <span

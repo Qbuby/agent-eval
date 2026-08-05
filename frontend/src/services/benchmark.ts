@@ -1,5 +1,6 @@
 import api from './client'
 import { triggerExport, type ExportFormat } from '@/lib/download'
+import type { ContentBlock, MessageContent } from '@/lib/contentBlocks'
 
 export interface Project {
   id: string
@@ -19,7 +20,11 @@ export interface BenchmarkCase {
   id: string
   project_id: string
   category_id: string | null
+  // question 恒为纯文本投影（附件渲染成 [图片] 占位）；带附件样例另有
+  // question_content 存 canonical blocks，展示/回填以它为准。见
+  // lib/contentBlocks.ts 与后端 data/content_blocks.py。
   question: string
+  question_content: ContentBlock[] | null
   reference_answer: string | null
   key_points: string[]
   negative_points: string[]
@@ -56,7 +61,9 @@ export interface CandidateCase {
   project_id: string | null
   category: string | null
   source: string
+  // 同 BenchmarkCase：question 是纯文本投影，question_content 是带附件时的 blocks。
   question: string
+  question_content: ContentBlock[] | null
   answer: string | null
   key_points: string[] | null
   negative_points: string[] | null
@@ -121,10 +128,12 @@ export const benchmarkApi = {
   listCases(projectId: string, params?: { category_id?: string; tag?: string; search?: string; status?: string; page?: number; page_size?: number }) {
     return api.get<PaginatedResponse<BenchmarkCase>>(`/benchmark/${projectId}/cases`, { params })
   },
-  createCase(projectId: string, data: Partial<BenchmarkCase>) {
+  // question 可传纯文本或 canonical blocks 数组（带附件样例）；后端
+  // split_question_content 落库时拆成 question 文本投影 + question_content。
+  createCase(projectId: string, data: Omit<Partial<BenchmarkCase>, 'question'> & { question?: MessageContent }) {
     return api.post<{ id: string }>(`/benchmark/${projectId}/cases`, data)
   },
-  updateCase(caseId: string, data: Partial<BenchmarkCase>) {
+  updateCase(caseId: string, data: Omit<Partial<BenchmarkCase>, 'question'> & { question?: MessageContent }) {
     return api.put(`/benchmark/cases/${caseId}`, data)
   },
   deleteCase(caseId: string) {
@@ -202,20 +211,20 @@ export const candidatesApi = {
       fallbackName: 'candidates',
     })
   },
-  create(data: { question: string; answer?: string; project_id?: string; dataset_name?: string; category?: string; tags?: string[]; source?: string }) {
+  create(data: { question: MessageContent; answer?: string; project_id?: string; dataset_name?: string; category?: string; tags?: string[]; source?: string }) {
     return api.post<{ id: string; status: string }>('/candidates', data)
   },
   // 批量创建备选样例（生成页在 candidate 数据集上「确认添加」走这里，落 candidate_cases）。
   batchCreate(data: {
     dataset_name: string
-    cases: { question: string; answer?: string; category?: string; tags?: string[]; source?: string }[]
+    cases: { question: MessageContent; answer?: string; category?: string; tags?: string[]; source?: string }[]
   }) {
     return api.post<{ added: number; ids: string[] }>('/candidates/batch', data)
   },
   categories(params?: { dataset_name?: string; project_id?: string }) {
     return api.get<{ categories: string[] }>('/candidates/categories', { params })
   },
-  update(caseId: string, data: Partial<CandidateCase>) {
+  update(caseId: string, data: Omit<Partial<CandidateCase>, 'question'> & { question?: MessageContent }) {
     return api.put<{ updated: string; status: string }>(`/candidates/${caseId}`, data)
   },
   delete(caseId: string) {

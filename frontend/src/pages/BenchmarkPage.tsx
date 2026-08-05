@@ -10,6 +10,10 @@ import CaseCategoryBatchDialog from '@/components/CaseCategoryBatchDialog'
 import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
 import { SelectionBar } from '@/components/SelectionBar'
+import QuestionContentEditor, { questionFilled } from '@/components/QuestionContentEditor'
+import MessageContentView from '@/components/MessageContentView'
+import { contentToText } from '@/lib/contentBlocks'
+import type { MessageContent } from '@/lib/contentBlocks'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import { addIds, collectAllIds, pageSelectionState, togglePageIds } from '@/lib/batchSelection'
 
@@ -48,7 +52,10 @@ export default function BenchmarkPage() {
   // switch to the preview step (conditional render), so fileRef would be null
   // at confirm time. Keeping the File here makes confirm-import reliable.
   const [importFile, setImportFile] = useState<File | null>(null)
-  const [newQuestion, setNewQuestion] = useState('')
+  // 问题支持带附件：字符串（纯文本）或 canonical blocks 数组（带图/文档/视频）
+  const [newQuestion, setNewQuestion] = useState<MessageContent>('')
+  // 提交成功后 +1 重挂 QuestionContentEditor，清掉它内部的空附件行草稿
+  const [newAttachKey, setNewAttachKey] = useState(0)
   const [newAnswer, setNewAnswer] = useState('')
   const [newKeyPoints, setNewKeyPoints] = useState('')
   const [newNegativePoints, setNewNegativePoints] = useState('')
@@ -161,6 +168,7 @@ export default function BenchmarkPage() {
       queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })
       setShowCreate(false)
       setNewQuestion('')
+      setNewAttachKey(k => k + 1)
       setNewAnswer('')
       setNewKeyPoints('')
       setNewNegativePoints('')
@@ -448,7 +456,11 @@ export default function BenchmarkPage() {
                 </td>
                 <td className="max-w-[460px]">
                   <span className="inline-block w-3 mr-1 text-text-tertiary">{isOpen ? '▾' : '▸'}</span>
-                  <span className="truncate inline-block max-w-[420px] align-middle">{c.question}</span>
+                  {/* 带附件样例的预览用 question_content 的文本投影（含 [图片] 占位），
+                      与后端落库的 question 快照措辞一致；纯文本样例即 question 本身。 */}
+                  <span className="truncate inline-block max-w-[420px] align-middle">
+                    {contentToText(c.question_content ?? c.question)}
+                  </span>
                 </td>
                 {!categoryFilter && <td className="text-text-tertiary">{getCategoryName(c.category_id)}</td>}
                 {extraColumns.map((col: SchemaColumn) => (
@@ -499,6 +511,14 @@ export default function BenchmarkPage() {
               {isOpen && (
                 <tr className="bg-fill/5">
                   <td colSpan={colSpan} className="px-3 py-3">
+                    {/* 列表列只放文本投影（含 [图片] 占位），附件缩略图放展开行，
+                        避免表格行高被图片撑开。纯文本样例不渲染这一块。 */}
+                    {c.question_content ? (
+                      <div className="mb-4">
+                        <div className="page-eyebrow mb-1">问题</div>
+                        <MessageContentView content={c.question_content} />
+                      </div>
+                    ) : null}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <div className="page-eyebrow mb-1">参考答案</div>
@@ -716,7 +736,7 @@ export default function BenchmarkPage() {
             <Button
               variant="primary"
               size="md"
-              disabled={!newQuestion.trim()}
+              disabled={!questionFilled(newQuestion)}
               loading={createMutation.isPending}
               onClick={() => createMutation.mutate()}
             >
@@ -728,13 +748,13 @@ export default function BenchmarkPage() {
         <div className="space-y-4">
           <div>
             <label htmlFor={newQuestionId} className="field-label">问题</label>
-            <textarea
-              id={newQuestionId}
+            <QuestionContentEditor
+              key={newAttachKey}
+              textareaId={newQuestionId}
               value={newQuestion}
-              onChange={e => setNewQuestion(e.target.value)}
+              onChange={setNewQuestion}
               rows={3}
               placeholder="输入测试问题…"
-              className="input resize-y"
             />
           </div>
           <div>
@@ -912,6 +932,20 @@ function EditCaseModal({
   const modalToast = useToast()
   const [extractingOne, setExtractingOne] = useState(false)
 
+  // 问题内容从 editCase 派生：带附件读 question_content 的 blocks，纯文本读 question。
+  // 写回时同步两个字段（question 存文本投影），保存后由后端 split_question_content 重算。
+  const editQuestion: MessageContent = editCase
+    ? (editCase.question_content ?? editCase.question ?? '')
+    : ''
+  const setEditQuestion = (next: MessageContent) => {
+    if (!editCase) return
+    if (typeof next === 'string') {
+      setEditCase({ ...editCase, question: next, question_content: null })
+    } else {
+      setEditCase({ ...editCase, question: contentToText(next), question_content: next })
+    }
+  }
+
   // 单条提炼：结果只回填输入框，用户核对（可改）后随表单一起保存，不落库。
   const extractOneKeyPoints = async () => {
     if (!editCase?.reference_answer?.trim()) {
@@ -922,7 +956,8 @@ function EditCaseModal({
     try {
       const res = await keyPointsApi.extractOne({
         answer: editCase.reference_answer,
-        question: editCase.question || undefined,
+        // 提炼只吃纯文本，带附件样例传文本投影（含 [图片] 占位）
+        question: contentToText(editQuestion) || undefined,
       })
       setEditCase({ ...editCase, key_points: res.data.points })
       modalToast.success(`提炼出 ${res.data.points.length} 个关键点，确认后点保存`)
@@ -936,7 +971,8 @@ function EditCaseModal({
   const handleSave = () => {
     if (!editCase) return
     const data: any = {
-      question: editCase.question,
+      // 后端 split_question_content 会把它拆成 question 文本投影 + question_content
+      question: editQuestion,
       reference_answer: editCase.reference_answer,
       category_id: editCase.category_id,
     }
@@ -961,7 +997,7 @@ function EditCaseModal({
           <Button
             variant="primary"
             size="md"
-            disabled={!editCase?.question?.trim()}
+            disabled={!questionFilled(editQuestion)}
             loading={isPending}
             onClick={handleSave}
           >
@@ -974,12 +1010,13 @@ function EditCaseModal({
         <div className="space-y-4">
           <div>
             <label htmlFor={questionId} className="field-label">问题</label>
-            <textarea
-              id={questionId}
-              value={editCase.question}
-              onChange={e => setEditCase({ ...editCase, question: e.target.value })}
+            {/* key 绑 case id：切换样例时重置控件内部的空附件行 draft */}
+            <QuestionContentEditor
+              key={editCase.id}
+              value={editQuestion}
+              onChange={setEditQuestion}
+              textareaId={questionId}
               rows={3}
-              className="input resize-y"
             />
           </div>
 

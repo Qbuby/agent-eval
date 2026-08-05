@@ -2,21 +2,35 @@ import { useState } from 'react'
 import { Button, useToast } from './ui'
 import { keyPointsApi } from '@/services'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import {
+  attachmentInputs,
+  buildContent,
+  contentText,
+  contentToText,
+} from '@/lib/contentBlocks'
+import type { MessageContent } from '@/lib/contentBlocks'
+import AttachmentRows from './AttachmentRows'
 import type { TestCase, TurnExpectation } from '@/types'
 
 // ──────────────────────────────────────────────────────────────────────────
 // 多轮对话样例编辑器：受控组件，对外通过 value/onChange 暴露一个 TestCase。
 // 支持：
 //   - 增删/编辑每条消息（role 下拉 + content 文本域）
+//   - 每条消息挂图片/文档附件：填 URL（或 data:...;base64 串），实时缩略预览
 //   - 会话级目标 conversation_goal
 //   - 逐轮期望：仅对 user 消息开放，turn_index 锁定为该消息在 input_messages
 //     里的下标，避免手填错位。
 // 父组件负责 name/description/提交，本组件只管对话主体 + 期望。
+//
+// content 的两种形态（字符串 / canonical blocks 数组）在这里是**派生**的：
+// 文本框读 contentText、附件行读 attachmentInputs，任一侧改动都用 buildContent
+// 重新组装整个 content。无附件时 buildContent 回落成字符串，故纯文本样例提交的
+// payload 与改造前逐字节相同。
 // ──────────────────────────────────────────────────────────────────────────
 
 const ROLES = ['user', 'assistant', 'system', 'tool'] as const
 
-type Msg = { role: string; content: string }
+type Msg = { role: string; content: MessageContent }
 
 export default function ConversationEditor({
   value,
@@ -30,6 +44,10 @@ export default function ConversationEditor({
   for (const te of value.turn_expectations ?? []) expByIndex.set(te.turn_index, te)
 
   const [expandedExp, setExpandedExp] = useState<Set<number>>(new Set())
+  // 附件 URL 输入行的草稿态：刚点「+ 附件」时那一行是空串，而 content 里不存空
+  // 附件（buildContent 会滤掉），派生不回来。故按消息下标存一份可见行数组，
+  // 有草稿时以草稿为准，没有则从 content 派生。
+  const [attachDrafts, setAttachDrafts] = useState<Record<number, string[]>>({})
   const toast = useToast()
 
   function patch(p: Partial<TestCase>) {
@@ -42,6 +60,22 @@ export default function ConversationEditor({
 
   function updateMsg(i: number, m: Partial<Msg>) {
     setMessages(messages.map((x, idx) => (idx === i ? { ...x, ...m } : x)))
+  }
+
+  /** 第 i 条消息当前应显示的附件 URL 行。 */
+  function attachRows(i: number): string[] {
+    return attachDrafts[i] ?? attachmentInputs(messages[i]?.content)
+  }
+
+  /** 覆写第 i 条消息的附件行：同步草稿态 + 重组 content。 */
+  function setAttachRows(i: number, rows: string[]) {
+    setAttachDrafts(prev => ({ ...prev, [i]: rows }))
+    updateMsg(i, { content: buildContent(contentText(messages[i]?.content), rows) })
+  }
+
+  /** 改文本框：文本换新的，附件保持当前行。 */
+  function updateText(i: number, text: string) {
+    updateMsg(i, { content: buildContent(text, attachRows(i)) })
   }
 
   function addMsg() {
@@ -57,6 +91,16 @@ export default function ConversationEditor({
     const nextExps = (value.turn_expectations ?? [])
       .filter(te => te.turn_index !== i)
       .map(te => (te.turn_index > i ? { ...te, turn_index: te.turn_index - 1 } : te))
+    // 附件草稿按消息下标存，同样要跟着左移，否则删中间一条会把草稿错位到别人身上。
+    setAttachDrafts(prev => {
+      const next: Record<number, string[]> = {}
+      for (const [k, rows] of Object.entries(prev)) {
+        const idx = Number(k)
+        if (idx === i) continue
+        next[idx > i ? idx - 1 : idx] = rows
+      }
+      return next
+    })
     onChange({ ...value, input_messages: nextMsgs, turn_expectations: nextExps })
   }
 
@@ -91,7 +135,8 @@ export default function ConversationEditor({
     try {
       const res = await keyPointsApi.extractOne({
         answer,
-        question: messages[i]?.content || undefined,
+        // 提炼服务只认字符串问句：带图消息取纯文本投影（附件渲染成占位标记）。
+        question: contentToText(messages[i]?.content) || undefined,
       })
       setExp(i, { criteria: res.data.points })
       toast.success(`提炼出 ${res.data.points.length} 个评判要点，确认后点保存`)
@@ -125,6 +170,7 @@ export default function ConversationEditor({
             const isUser = m.role === 'user'
             const exp = expByIndex.get(i)
             const expanded = expandedExp.has(i)
+            const rows = attachRows(i)
             return (
               <div key={i} className="border border-border rounded-md p-2.5 bg-fill/5">
                 <div className="flex items-center gap-2 mb-1.5">
@@ -155,12 +201,21 @@ export default function ConversationEditor({
                   </button>
                 </div>
                 <textarea
-                  value={m.content}
-                  onChange={e => updateMsg(i, { content: e.target.value })}
+                  value={contentText(m.content)}
+                  onChange={e => updateText(i, e.target.value)}
                   rows={2}
                   placeholder="消息内容（支持 Markdown）"
                   className="input resize-y text-[12px]"
                 />
+
+                <AttachmentRows
+                  rows={rows}
+                  onChange={next => setAttachRows(i, next)}
+                  content={m.content}
+                  onError={msg => toast.error(msg)}
+                  idPrefix={`msg-${i}-attach`}
+                />
+
                 {isUser && (expanded || exp) && (
                   <div className="mt-2 ml-2 border-l-2 border-accent/40 pl-2.5 space-y-2">
                     <div>

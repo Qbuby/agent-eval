@@ -36,6 +36,7 @@ import {
   evaluatorDisplayName,
   normalizeComparisonSummary,
 } from '@/lib/comparativeMetrics'
+import { contentToText } from '@/lib/contentBlocks'
 
 type Tab = 'history' | 'new'
 
@@ -613,7 +614,8 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
         : rows.slice(0, typeof limit === 'number' && limit > 0 ? limit : undefined)
       return selected.flatMap(c => {
         if (!c.id) return []
-        const firstUser = (c.input_messages ?? []).find(m => m.role === 'user')?.content
+        // content 可能是带附件的 blocks 数组，取纯文本投影当标签。
+        const firstUser = contentToText((c.input_messages ?? []).find(m => m.role === 'user')?.content)
         return [{ id: c.id, label: firstUser || c.name || c.id }]
       })
     }
@@ -1128,7 +1130,7 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                       {convCasesQuery.data?.items.map((c: TestCase) => {
                         const cid = c.id ?? ''
                         const checked = convPickedIds.has(cid)
-                        const firstUser = (c.input_messages ?? []).find(m => m.role === 'user')?.content ?? ''
+                        const firstUser = contentToText((c.input_messages ?? []).find(m => m.role === 'user')?.content)
                         // 展示 question（首条 user 消息）而非样例名；question 为空才退回样例名。
                         const label = firstUser || c.name
                         return (

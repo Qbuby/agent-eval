@@ -24,6 +24,8 @@ class UploadBatchResponse(BaseModel):
     question_column: str | None = None
     answer_column: str | None = None
     extra_columns: list[str] = Field(default_factory=list)
+    # 带内嵌图片的样例数（xlsx 浮动图按行归属），0 表示纯文本批次。
+    with_images: int = 0
 
 
 class FeedbackPayload(BaseModel):
@@ -45,6 +47,9 @@ class SampleItem(BaseModel):
     id: str
     row_index: int
     question: str
+    # 带附件样例的 canonical content blocks；纯文本样例为 None，此时 question
+    # 即全部输入。question 恒为纯文本投影，既有消费方不受影响。
+    question_content: list[dict[str, Any]] | None = None
     answer: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
     feedback: FeedbackPayload | None = None

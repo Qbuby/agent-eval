@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from agent_eval.api.schemas import EvalAgentConfig
 from agent_eval.auth.dependencies import require_internal
+from agent_eval.data.content_blocks import merge_question_content
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import (
@@ -257,7 +258,9 @@ async def _resolve_cases(
         for r in rows:
             cases.append({
                 "id": str(r.id),
-                "question": r.question or "",
+                # 带附件样例送 blocks（生成引擎与 adapter 原样透传），纯文本样例
+                # 回落字符串，与改造前逐字节一致。
+                "question": merge_question_content(r.question, r.question_content),
                 "multi_turn": False,
             })
     elif dataset_type == "benchmark":
@@ -271,7 +274,9 @@ async def _resolve_cases(
         for r in rows:
             cases.append({
                 "id": str(r.id),
-                "question": r.question or "",
+                # 与 candidate 分支同理：带附件样例必须送 blocks，否则图片在这里
+                # 丢掉，agent 只收到含 [图片] 占位的纯文本。
+                "question": merge_question_content(r.question, r.question_content),
                 "multi_turn": False,
             })
     else:

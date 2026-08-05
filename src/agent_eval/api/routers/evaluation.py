@@ -34,6 +34,7 @@ from agent_eval.api.schemas import (
     UpdateEvaluatorRequest,
     UploadCasesResponse,
 )
+from agent_eval.data.content_blocks import merge_question_content
 from agent_eval.data.trace_extractor import TraceExtractor
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
@@ -260,7 +261,9 @@ async def resolve_eval_start_args(
             cases.append({
                 "id": str(b.id),
                 "name": str(b.id)[:8],
-                "question": b.question,
+                # 带附件样例送 canonical blocks（adapter 原样透传给 agent），
+                # 纯文本样例回落成字符串，与改造前逐字节一致。
+                "question": merge_question_content(b.question, b.question_content),
                 "expected_output": b.reference_answer or "",
                 "expected_output_criteria": reference_criteria,
                 "expected_tool_calls": expected_tool_calls,
@@ -609,6 +612,7 @@ async def get_run_results(
             comparison=comparison,
             actual_output=r.actual_output,
             question=r.question,
+            question_content=getattr(r, "question_content", None),
             expected_output=r.expected_output,
             expected_output_criteria=list(r.expected_output_criteria or []),
             latency_ms=r.latency_ms,

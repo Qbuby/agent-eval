@@ -19,6 +19,7 @@ import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
 import type { TestCase } from '@/types'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import { contentToText } from '@/lib/contentBlocks'
 import { addIds, collectAllIds, pageSelectionState, togglePageIds } from '@/lib/batchSelection'
 
 // 多轮对话样例：input_messages 含多条消息，或带 conversation_goal / turn_expectations。
@@ -659,7 +660,7 @@ export default function ConversationDatasetDetailPage() {
               variant="primary"
               size="md"
               loading={saveMutation.isPending}
-              disabled={!editing?.name?.trim() || !(editing?.input_messages?.some(m => m.content.trim()))}
+              disabled={!editing?.name?.trim() || !(editing?.input_messages?.some(m => contentToText(m.content).trim()))}
               onClick={() => editing && saveMutation.mutate(editing)}
             >
               {isNew ? '添加' : '保存'}

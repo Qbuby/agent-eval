@@ -221,6 +221,9 @@ class TestResultRow(Base, TenantMixin):
     )
 
     question: Mapped[str | None] = mapped_column(Text)
+    # 评估启动时冻结的原始问题 content blocks；仅带附件样例非空。
+    # question 继续存纯文本投影，搜索/导出/judge 等既有消费方不受影响。
+    question_content: Mapped[list | None] = mapped_column(JSONB)
     # Expected/reference answer, snapshotted at run time from the case source
     # (benchmark reference_answer or uploaded expected_output). Persisted here
     # so the export/detail view always has it, independent of whether the
@@ -627,6 +630,10 @@ class BenchmarkCaseRow(Base, TenantMixin):
         UUID(as_uuid=True), ForeignKey("benchmark_versions.id", ondelete="SET NULL"), index=True
     )
     question: Mapped[str] = mapped_column(Text, nullable=False)
+    # 带附件样例的 canonical content blocks；纯文本样例为 None，此时 question
+    # 就是全部输入。question 恒为纯文本投影（去重/搜索/导出/judge 都吃它），
+    # 见 data/content_blocks.py 的 split_question_content。
+    question_content: Mapped[list | None] = mapped_column(JSONB)
     reference_answer: Mapped[str | None] = mapped_column(Text)
     key_points: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     negative_points: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
@@ -651,6 +658,9 @@ class CandidateCaseRow(Base, TenantMixin):
     dataset_name: Mapped[str | None] = mapped_column(String(256), index=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     question: Mapped[str] = mapped_column(Text, nullable=False)
+    # 带附件样例的 canonical content blocks，语义同 BenchmarkCaseRow.question_content。
+    # promote 到 benchmark 时整列搬过去（见 candidates.promote）。
+    question_content: Mapped[list | None] = mapped_column(JSONB)
     answer: Mapped[str | None] = mapped_column(Text)
     # 自由文本类别名（不绑 project 的 CategoryRow）。promote 时按名同步到目标
     # project 的 categories（有则复用、无则新增），见 candidates.promote。
@@ -853,6 +863,9 @@ class PortalSampleRow(Base, TenantMixin):
     )
     row_index: Mapped[int] = mapped_column(Integer, nullable=False)
     question: Mapped[str] = mapped_column(Text, nullable=False)
+    # 带附件样例的 canonical content blocks，语义同 BenchmarkCaseRow.question_content。
+    # 上传 xlsx 时从内嵌图提取（见 data/xlsx_images.py），纯文本样例为 None。
+    question_content: Mapped[list | None] = mapped_column(JSONB)
     answer: Mapped[str | None] = mapped_column(Text)
     extra: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

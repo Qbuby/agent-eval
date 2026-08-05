@@ -23,6 +23,8 @@ from agent_eval.data.benchmark_import import (
     iter_upload_rows,
     parse_conversations,
 )
+from agent_eval.data.content_blocks import content_to_text
+from agent_eval.data.xlsx_images import row_images_for_upload
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.data.schemas import validate_and_parse
 from agent_eval.db import async_session_factory
@@ -181,9 +183,13 @@ async def _parse_conversation_cases(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # xlsx 内嵌图片：锚点只记行号，故按 Excel 行号取图，由 parse_conversations
+    # 按布局挂到对应的 user 轮（见其 row_images 说明）。非 xlsx / 无图时是空
+    # dict，整条链路退化为纯文本导入。
     return _cases_from_conversation_rows(
         row_iter, messages_column=messages_column, goal_column=goal_column,
         category=category, column_map=column_map, source="file_imported",
+        row_images=row_images_for_upload(content, filename),
     )
 
 
@@ -195,25 +201,32 @@ def _cases_from_conversation_rows(
     category: str | None = None,
     column_map: dict[str, str] | None = None,
     source: str = "file_imported",
+    row_images: dict[int, list[dict]] | None = None,
 ) -> tuple[list[TestCase], int]:
     """行迭代器 → (对话 TestCase 列表, 跳过行数)。
 
     与文件格式解耦——上传文件走 iter_upload_rows 产出行，飞书多维表格走
     records_to_rows 产出同形行（{列名: 值} 的 dict），两者共用此下游：同一套
     parse_conversations 三布局识别 + column_map + TestCase 构造。
+
+    row_images（可选）：xlsx 内嵌图片，Excel 行号 → 图片块。只有上传 xlsx 才有；
+    飞书来源的行没有行号，传 None 即纯文本路径。
     """
     try:
         conversations, skipped = parse_conversations(
             rows, messages_column=messages_column, goal_column=goal_column,
-            column_map=column_map,
+            column_map=column_map, row_images=row_images,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"解析失败：{e}") from e
 
     cases: list[TestCase] = []
     for i, conv in enumerate(conversations):
+        # content 可能是 content blocks 数组（带图样例），直接切片会把块对象
+        # 拼进名字（base64 图更会把整段编码塞进去）；走纯文本投影拿可读首句。
         first = next(
-            (m["content"] for m in conv.input_messages if m.get("content")), ""
+            (content_to_text(m["content"]) for m in conv.input_messages
+             if m.get("content")), ""
         )
         cases.append(TestCase(
             dataset_version="",  # 由调用方（import 端点）按 name 设定
@@ -340,7 +353,11 @@ async def preview_conversations(
     samples = []
     for c in cases[:5]:
         user_msgs = [m for m in c.input_messages if m.get("role") == "user"]
-        first_user = next((m["content"] for m in user_msgs if m.get("content")), "")
+        # 带图消息的 content 是 content blocks 数组，直接切片会漏出块对象；
+        # 走纯文本投影（附件渲染成 [图片] 占位）拿到可读首句。
+        first_user = next(
+            (content_to_text(m["content"]) for m in user_msgs if m.get("content")), ""
+        )
         samples.append({
             "name": c.name,
             "turns": len(user_msgs),

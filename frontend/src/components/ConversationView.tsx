@@ -1,9 +1,11 @@
 import MarkdownView from './MarkdownView'
+import MessageContentView from './MessageContentView'
 import type { TestCase, TurnExpectation } from '@/types'
 
 // ──────────────────────────────────────────────────────────────────────────
 // 多轮对话样例的只读展示：消息按 role 渲染成左右气泡（user 右、assistant/其余
-// 左），内容走 MarkdownView。可选地在每条 user 消息下方挂出该轮的逐轮期望
+// 左），内容走 MessageContentView（字符串走 Markdown，blocks 数组额外挂附件
+// 缩略图）。可选地在每条 user 消息下方挂出该轮的逐轮期望
 // （turn_expectations 按 turn_index 对齐到 input_messages 下标），并在顶部展示
 // 会话级目标 conversation_goal。
 // 单轮老数据（仅一条 user 消息、无 goal/turn_expectations）也能正常渲染。
@@ -70,7 +72,7 @@ export default function ConversationView({ testCase }: { testCase: TestCase }) {
                 {ROLE_LABEL[m.role] || m.role}
               </div>
               <div className="text-[12px] text-text-primary">
-                <MarkdownView text={m.content} />
+                <MessageContentView content={m.content} />
               </div>
             </div>
             {isUser && exp && (

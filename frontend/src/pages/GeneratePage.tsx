@@ -4,6 +4,8 @@ import { generateApi, datasetsApi, candidatesApi } from '@/services'
 import { Button, Dialog, useToast } from '@/components/ui'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import { useConfigOptions, configOptionToString } from '@/hooks/useConfigOptions'
+import { attachmentInputs, buildContent, contentText, contentToText } from '@/lib/contentBlocks'
+import { AttachmentStrip } from '@/components/MessageContentView'
 import type { TestCase, TurnExpectation } from '@/types'
 
 type Category = 'normal' | 'bad_case' | 'edge_case'
@@ -33,9 +35,10 @@ function extractErrorMessage(err: unknown): string {
 }
 
 // 取一条样例的首条 user 问句（多轮取第一条 user 消息）。
+// content 可能是带附件的 blocks 数组，故取纯文本投影（附件渲染成 [图片] 占位）。
 function firstUserQuestion(c: TestCase): string {
   const msg = (c.input_messages || []).find((m) => m.role === 'user' && m.content)
-  return msg?.content || ''
+  return contentToText(msg?.content)
 }
 
 export default function GeneratePage() {
@@ -331,7 +334,15 @@ export default function GeneratePage() {
                     {c.input_messages.map((msg, mi) => (
                       <div key={mi} className="text-[11px] font-mono bg-fill/5 rounded-md px-2.5 py-1.5">
                         <span className="text-text-tertiary">{msg.role}:</span>{' '}
-                        <span className="text-text-primary">{msg.content.length > 200 ? msg.content.slice(0, 200) + '…' : msg.content}</span>
+                        {/* 带附件的 content 是 blocks 数组，先取纯文本投影再截断 */}
+                        {(() => {
+                          const text = contentToText(msg.content)
+                          return (
+                            <span className="text-text-primary">
+                              {text.length > 200 ? text.slice(0, 200) + '…' : text}
+                            </span>
+                          )
+                        })()}
                       </div>
                     ))}
                   </div>
@@ -395,8 +406,14 @@ function PreviewCaseEditorDialog({
 
   const isMultiTurn = messages.filter((m) => m.role === 'user').length > 1 || turnExpectations.length > 0
 
-  function updateMessage(i: number, content: string) {
-    setMessages((prev) => prev.map((m, idx) => (idx === i ? { ...m, content } : m)))
+  // 只改文本部分：附件（若有）按原样保留，用 buildContent 重组。无附件时
+  // buildContent 回落成字符串，与改造前提交的 payload 逐字节相同。
+  function updateMessage(i: number, text: string) {
+    setMessages((prev) =>
+      prev.map((m, idx) =>
+        idx === i ? { ...m, content: buildContent(text, attachmentInputs(m.content)) } : m,
+      ),
+    )
   }
 
   function updateTurnExpected(turnIndex: number, value: string) {
@@ -470,11 +487,13 @@ function PreviewCaseEditorDialog({
                     <span className={`badge ${msg.role === 'user' ? 'badge-info' : 'badge-neutral'}`}>{msg.role}</span>
                   </div>
                   <textarea
-                    value={msg.content}
+                    value={contentText(msg.content)}
                     onChange={(e) => updateMessage(i, e.target.value)}
                     rows={3}
                     className="input resize-y text-[12px]"
                   />
+                  {/* 附件在此只读展示：生成结果的附件由生成侧给定，评审改文本不动图 */}
+                  <AttachmentStrip content={msg.content} />
                   {isMultiTurn && msg.role === 'user' && (
                     <div>
                       <label className="text-[11px] text-text-tertiary">本轮期望输出</label>

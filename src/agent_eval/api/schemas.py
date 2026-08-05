@@ -5,6 +5,11 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from agent_eval.data.content_blocks import (
+    ContentValidationError,
+    normalize_content,
+)
+
 
 # 数据集类型：区分用途不同的两类数据集，避免在各自页面里互相串。
 # - candidate    备选数据集（单轮问答样例，老数据无标记一律按此处理，向后兼容）
@@ -99,8 +104,14 @@ class TestCaseInput(BaseModel):
                 raise ValueError(
                     f"消息 #{i + 1} role 非法：{role!r}，须为 {sorted(_ALLOWED_ROLES)} 之一"
                 )
-            if not isinstance(m.get("content"), str):
-                raise ValueError(f"消息 #{i + 1} content 必须是字符串")
+            # content 允许两种形态：纯文本字符串，或多模态 content 数组
+            # （text/image/document/video 块）。这里就地归一成 canonical 形状，
+            # 后续链路（落库、judge prompt、adapter payload）拿到的都是同一形状。
+            # 纯文本经 normalize_content 后与改造前逐字节一致，存量数据零影响。
+            try:
+                m["content"] = normalize_content(m.get("content"))
+            except ContentValidationError as e:
+                raise ValueError(f"消息 #{i + 1} content 非法：{e}") from e
         return v
 
 
@@ -373,6 +384,8 @@ class EvalResultRow(BaseModel):
     criterion_results: list[dict[str, Any]] = []
     actual_output: str | None = None
     question: str | None = None
+    # 评估启动时冻结的原始问题 blocks；纯文本/旧结果为 None。
+    question_content: list[dict[str, Any]] | None = None
     expected_output: str | None = None
     # 评估启动时冻结的答案关键点；首评与补评均以此为准。
     expected_output_criteria: list[str] = []

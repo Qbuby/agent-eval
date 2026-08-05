@@ -25,7 +25,13 @@ from agent_eval.data.benchmark_import import (
     auto_detect_field_mapping, auto_match_columns, collect_sample_values,
     iter_upload_rows,
     parse_upload_file, resolve_extra_fields, resolve_question_answer,
+    row_excel_index,
 )
+from agent_eval.data.content_blocks import (
+    ContentValidationError,
+    split_question_content,
+)
+from agent_eval.data.xlsx_images import row_images_for_upload
 
 # Router-level login gate: every endpoint requires an authenticated internal
 # user (admin|user). Preserves the auth.enabled bypass.
@@ -36,9 +42,13 @@ router = APIRouter(
 )
 
 
+# question 接受两种形态：纯文本字符串（既有写法），或带附件的 canonical
+# content blocks 数组（带图样例）。落库时由 split_question_content 拆成
+# question（纯文本投影）+ question_content（blocks），保证只认字符串的既有
+# 消费点（去重、搜索、导出、judge prompt）零改动。
 class BenchmarkCaseCreate(BaseModel):
     category_id: str | None = None
-    question: str
+    question: str | list[dict[str, Any]]
     reference_answer: str | None = None
     key_points: list[str] = []
     negative_points: list[str] = []
@@ -48,7 +58,7 @@ class BenchmarkCaseCreate(BaseModel):
 
 class BenchmarkCaseUpdate(BaseModel):
     category_id: str | None = None
-    question: str | None = None
+    question: str | list[dict[str, Any]] | None = None
     reference_answer: str | None = None
     key_points: list[str] | None = None
     negative_points: list[str] | None = None
@@ -158,11 +168,19 @@ async def export_benchmark_cases(
 
 @router.post("/{project_id}/cases")
 async def create_benchmark_case(project_id: str, req: BenchmarkCaseCreate):
+    try:
+        question_text, question_content = split_question_content(req.question)
+    except ContentValidationError as e:
+        raise HTTPException(status_code=400, detail=f"问题内容非法：{e}") from e
+    if not question_text and not question_content:
+        raise HTTPException(status_code=400, detail="问题不能为空")
+
     async with async_session_factory() as session:
         row = BenchmarkCaseRow(
             project_id=project_id,
             category_id=req.category_id,
-            question=req.question,
+            question=question_text,
+            question_content=question_content,
             reference_answer=req.reference_answer,
             key_points=req.key_points,
             negative_points=req.negative_points,
@@ -185,7 +203,16 @@ async def update_benchmark_case(case_id: str, req: BenchmarkCaseUpdate):
             raise HTTPException(status_code=404, detail="Case not found")
 
         if req.question is not None:
-            row.question = req.question
+            try:
+                question_text, question_content = split_question_content(req.question)
+            except ContentValidationError as e:
+                raise HTTPException(status_code=400, detail=f"问题内容非法：{e}") from e
+            if not question_text and not question_content:
+                raise HTTPException(status_code=400, detail="问题不能为空")
+            # 两列同写：改回纯文本时必须把 question_content 清成 None，否则
+            # 旧图片会残留并继续被 merge_question_content 送进 agent。
+            row.question = question_text
+            row.question_content = question_content
         if req.reference_answer is not None:
             row.reference_answer = req.reference_answer
         if req.key_points is not None:
@@ -248,6 +275,11 @@ async def import_file(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # xlsx 内嵌图片：drawing 锚点只记行号，故按 Excel 行号取图，再靠行迭代器
+    # 注入的保留键贴回对应样例（见 benchmark_import.ROW_INDEX_KEY）。非 xlsx
+    # 或无图时是空 dict，整条链路退化为纯文本导入。
+    row_images = row_images_for_upload(content, filename)
+
     # Load category schema_config if available (for extra_fields + mapping).
     schema_columns: list[dict] = []
     field_mapping: dict[str, str] = {}
@@ -257,6 +289,7 @@ async def import_file(
     pending = 0
     skipped = 0
     duplicates = 0
+    with_images = 0
     pending_batch: list[Any] = []
 
     async with async_session_factory() as session:
@@ -309,6 +342,22 @@ async def import_file(
                 skipped += 1
                 continue
 
+            # 本行的内嵌图片贴到 question 前面之后，question 落库为纯文本投影
+            # （图片渲染成占位符），blocks 落 question_content。去重必须用投影
+            # 后的文本，否则重复上传时库里的带占位文本对不上原始文本，会漏判。
+            images = row_images.get(row_excel_index(row_data) or -1)
+            question_content = None
+            if images:
+                try:
+                    question, question_content = split_question_content(
+                        [{"type": "text", "text": question}, *images]
+                    )
+                except ContentValidationError:
+                    # 读图是增强，不该让整行导入失败；退化为纯文本样例。
+                    question_content = None
+                else:
+                    with_images += 1
+
             # Skip duplicates (already in DB, or seen earlier in this file).
             if question in seen:
                 duplicates += 1
@@ -335,6 +384,7 @@ async def import_file(
                     project_id=project_id,
                     category_id=category_id,
                     question=question,
+                    question_content=question_content,
                     reference_answer=ref_answer,
                     key_points=key_points,
                     negative_points=negative_points,
@@ -349,6 +399,7 @@ async def import_file(
                     project_id=project_id,
                     source="file_imported",
                     question=question,
+                    question_content=question_content,
                     tags=tags,
                     extra_metadata=extra_fields,
                     status="pending",
@@ -398,6 +449,7 @@ async def import_file(
         "pending_in_staging": pending,
         "skipped": skipped,
         "duplicates": duplicates,
+        "with_images": with_images,
         "field_mapping": used_mapping or None,
     }
 
@@ -472,6 +524,9 @@ def _case_to_dict(c: BenchmarkCaseRow) -> dict[str, Any]:
         "project_id": str(c.project_id),
         "category_id": str(c.category_id) if c.category_id else None,
         "question": c.question,
+        # 带附件样例才有值；前端据此渲染缩略图并回填编辑器（纯文本样例为 None，
+        # 前端逻辑与改造前一致）。
+        "question_content": c.question_content,
         "reference_answer": c.reference_answer,
         "key_points": c.key_points,
         "negative_points": c.negative_points,

@@ -9,7 +9,11 @@ import CaseCategoryBatchDialog from '@/components/CaseCategoryBatchDialog'
 import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
 import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
 import { SelectionBar } from '@/components/SelectionBar'
+import QuestionContentEditor, { questionFilled } from '@/components/QuestionContentEditor'
+import { AttachmentStrip } from '@/components/MessageContentView'
 import type { CandidateCase, ImportPreview } from '@/services/benchmark'
+import { contentToText } from '@/lib/contentBlocks'
+import type { MessageContent } from '@/lib/contentBlocks'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import { addIds, collectAllIds, pageSelectionState, togglePageIds } from '@/lib/batchSelection'
 
@@ -26,6 +30,7 @@ export default function DatasetDetailPage() {
   const confirm = useConfirm()
   const toast = useToast()
   const reactId = useId()
+  const editQuestionId = `${reactId}-edit-question`
   const editAnswerId = `${reactId}-edit-answer`
   const editKeyPointsId = `${reactId}-edit-key-points`
   const editNegativePointsId = `${reactId}-edit-negative-points`
@@ -41,12 +46,17 @@ export default function DatasetDetailPage() {
   const [showPromote, setShowPromote] = useState(false)
   const [promoteProjectId, setPromoteProjectId] = useState('')
   const [editingCase, setEditingCase] = useState<CandidateCase | null>(null)
+  // 问题从「只读展示」改成可编辑的 canonical content：带附件样例要能改图，
+  // 纯文本样例 buildContent 回落成字符串，提交 payload 与改造前一致。
+  const [editQuestion, setEditQuestion] = useState<MessageContent>('')
   const [editAnswer, setEditAnswer] = useState('')
   const [editCategory, setEditCategory] = useState('')
   const [editKeyPoints, setEditKeyPoints] = useState('')
   const [editNegativePoints, setEditNegativePoints] = useState('')
   const [showAddModal, setShowAddModal] = useState(false)
-  const [addQuestion, setAddQuestion] = useState('')
+  const [addQuestion, setAddQuestion] = useState<MessageContent>('')
+  // 编辑器内部存着「空附件行」草稿，无法从 addQuestion 派生；提交成功后靠换 key 重挂来清空。
+  const [addAttachKey, setAddAttachKey] = useState(0)
   const [addAnswer, setAddAnswer] = useState('')
   const [addCategory, setAddCategory] = useState('')
   const [deletingId, setDeletingId] = useState<string | null>(null)
@@ -131,6 +141,7 @@ export default function DatasetDetailPage() {
       queryClient.invalidateQueries({ queryKey: ['dataset-candidate-categories'] })
       setShowAddModal(false)
       setAddQuestion('')
+      setAddAttachKey(k => k + 1)
       setAddAnswer('')
       setAddCategory('')
     },
@@ -229,6 +240,8 @@ export default function DatasetDetailPage() {
 
   function openEdit(c: CandidateCase) {
     setEditingCase(c)
+    // 带附件样例回填 blocks（question_content），纯文本样例回填 question 字符串。
+    setEditQuestion(c.question_content ?? c.question ?? '')
     setEditAnswer(c.answer || '')
     setEditCategory(c.category || '')
     setEditKeyPoints((c.key_points || []).join(', '))
@@ -240,6 +253,8 @@ export default function DatasetDetailPage() {
     updateMutation.mutate({
       id: editingCase.id,
       data: {
+        // 后端 split_question_content 会把它拆成 question 文本投影 + question_content
+        question: editQuestion,
         answer: editAnswer || null,
         category: editCategory.trim() || null,
         key_points: editKeyPoints ? editKeyPoints.split(',').map(s => s.trim()).filter(Boolean) : null,
@@ -479,7 +494,10 @@ export default function DatasetDetailPage() {
                   <input type="checkbox" checked={selectedIds.has(c.id)} onChange={() => toggleSelect(c.id)} className="accent-accent" />
                 </td>
                 <td className="max-w-[460px]">
-                  <div className="truncate">{c.question}</div>
+                  {/* 带附件时问题文本用后端的纯文本投影（含 [图片] 占位），
+                      再挂一排缩略图，列表里也能一眼看出这条是带图样例。 */}
+                  <div className="truncate">{contentToText(c.question_content ?? c.question)}</div>
+                  <AttachmentStrip content={c.question_content ?? undefined} />
                   {c.answer && <div className="text-[11px] text-text-tertiary mt-0.5 truncate">答：{c.answer.slice(0, 80)}</div>}
                 </td>
                 <td>
@@ -585,8 +603,15 @@ export default function DatasetDetailPage() {
         {editingCase && (
           <div className="space-y-4">
             <div>
-              <label className="field-label">问题</label>
-              <div className="py-2 px-3 text-[12px] border border-border rounded-md bg-fill/5 text-text-secondary">{editingCase.question}</div>
+              <label htmlFor={editQuestionId} className="field-label">问题</label>
+              {/* key 绑样例 id：切换样例时重置编辑器内部的空附件行 draft */}
+              <QuestionContentEditor
+                key={editingCase.id}
+                textareaId={editQuestionId}
+                value={editQuestion}
+                onChange={setEditQuestion}
+                rows={3}
+              />
             </div>
             <div>
               <label htmlFor={editAnswerId} className="field-label">参考答案</label>
@@ -667,7 +692,7 @@ export default function DatasetDetailPage() {
             <Button
               variant="primary"
               size="md"
-              disabled={!addQuestion.trim()}
+              disabled={!questionFilled(addQuestion)}
               loading={addMutation.isPending}
               onClick={() => addMutation.mutate()}
             >
@@ -679,13 +704,14 @@ export default function DatasetDetailPage() {
         <div className="space-y-4">
           <div>
             <label htmlFor={addQuestionId} className="field-label">问题</label>
-            <textarea
-              id={addQuestionId}
+            {/* key 随每次提交自增：控件内部的空附件行 draft 无法从 value 派生，
+                靠重挂载来清空，否则下一条新增会带着上一条的空行。 */}
+            <QuestionContentEditor
+              key={addAttachKey}
+              textareaId={addQuestionId}
               value={addQuestion}
-              onChange={e => setAddQuestion(e.target.value)}
+              onChange={setAddQuestion}
               rows={3}
-              placeholder="输入测试问题…"
-              className="input resize-y"
             />
           </div>
           <div>

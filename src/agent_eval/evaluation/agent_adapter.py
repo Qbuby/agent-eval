@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from agent_eval.data.content_blocks import content_to_text
+
 
 @dataclass
 class AgentResponse:
@@ -38,10 +40,16 @@ class AgentHTTPStatusError(httpx.HTTPStatusError):
         return f"{base}\nResponse body: {self.response_body}"
 
 
-def _render_payload_value(value: Any, question: str) -> Any:
-    """递归展开 payload 模板中的运行时占位符。"""
+def _render_payload_value(value: Any, question: str | list[dict[str, Any]]) -> Any:
+    """递归展开 payload 模板中的运行时占位符。
+
+    带图样例的 question 是多模态 content 数组，无法嵌进模板字符串；此时
+    ``{input}`` 用数组里的文本块拼接后的纯文本替换（模板通常只用它填提示语），
+    真正的多模态数组由 ``_build_payload`` 直接写进 ``question`` 字段。
+    """
     if isinstance(value, str):
-        return value.replace("{input}", question).replace(
+        text = content_to_text(question)
+        return value.replace("{input}", text).replace(
             "{uuid}", uuid.uuid4().hex[:12]
         )
     if isinstance(value, dict):
@@ -166,7 +174,16 @@ class SSEStreamAdapter:
             self._client = httpx.AsyncClient(headers=req_headers, timeout=timeout)
             self._owns_client = True
 
-    def _build_payload(self, question: str) -> dict[str, Any]:
+    def _build_payload(self, question: str | list[dict[str, Any]]) -> dict[str, Any]:
+        """构造请求体。``question`` 可以是纯文本，也可以是多模态 content 数组
+        （Anthropic canonical blocks：``[{"type":"text",...},{"type":"image",...}]``）。
+
+        数组形态原样进 ``question`` 字段——被测 agent 的 ``ChatAgentRequest.question``
+        声明为 ``str | list[dict]``，其 content 预处理会把 image/document/video 的
+        URL 块下载落沙箱、按 provider 归一化格式，评测侧不需要做任何转换。
+        ``payload_template`` 的 ``{input}`` 占位符只在纯文本时代换（数组无法做字符串
+        替换），故渲染时用文本摘要，避免把 JSON 塞进模板槽位。
+        """
         rendered = _render_payload_value(self.payload_template, question)
         if not isinstance(rendered, dict):
             rendered = {}
@@ -212,10 +229,13 @@ class SSEStreamAdapter:
         return payload
 
     async def invoke(self, messages: list[dict[str, Any]]) -> AgentResponse:
-        question = ""
+        # 取最后一条 user 消息的 content 原样送出：可能是 str，也可能是多模态
+        # content 数组（带图样例）。不在此拍平成字符串，否则图片信息丢失。
+        question: str | list[dict[str, Any]] = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
-                question = msg.get("content", "")
+                content = msg.get("content", "")
+                question = content if isinstance(content, (str, list)) else str(content)
                 break
 
         payload = self._build_payload(question)

@@ -113,3 +113,12 @@ e2e/scan-*.mjs
 e2e/q*.sql
 e2e/_out_*.json
 e2e/_run_*.log
+# 带图链路排查现场（#148-#159）。沿用既有约定：verify-*.mjs 入库，
+# probe-*/一次性产物/凭据不入库。portal-ext-user.json 是明文口令，务必挡住。
+e2e/portal-ext-user.json
+e2e/probe-multiturn-*.mjs
+e2e/result-*.json
+e2e/_build_*.log
+e2e/_make_fixtures_*.py
+e2e/_fixture_*.xlsx
+frontend/tsc_out.txt
