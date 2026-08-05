@@ -356,19 +356,29 @@ export function AgentReplyVersionsDrawer({
                 ) : active.turns && active.turns.length > 0 ? (
                   // 多轮对话集：逐轮展示 agent 回复
                   <div className="space-y-3">
-                    {active.turns.map((t, i) => (
-                      <div key={i} className="rounded-md bg-slate-50 p-3 dark:bg-slate-800/60">
-                        <p className="page-eyebrow">第 {i + 1} 轮</p>
-                        {t.question != null && (
-                          <p className="mt-1 whitespace-pre-wrap text-xs text-slate-500 dark:text-slate-400">
-                            用户：{String(t.question)}
+                    {active.turns.map((t, i) => {
+                      // 落库的 turn 与 multiturn.replay_conversation 同构，键是
+                      // user/assistant；answer/question/content 是旧形状的兜底。
+                      const userText = t.user ?? t.question
+                      const replyText = t.assistant ?? t.answer ?? t.content
+                      return (
+                        <div key={i} className="rounded-md bg-slate-50 p-3 dark:bg-slate-800/60">
+                          <p className="page-eyebrow">第 {i + 1} 轮</p>
+                          {userText != null && String(userText).trim() !== '' && (
+                            <p className="mt-1 whitespace-pre-wrap text-xs text-slate-500 dark:text-slate-400">
+                              用户：{String(userText)}
+                            </p>
+                          )}
+                          <p className="mt-1 whitespace-pre-wrap text-sm">
+                            {replyText != null && String(replyText).trim() !== '' ? (
+                              String(replyText)
+                            ) : (
+                              <span className="text-slate-400 dark:text-slate-500">（本轮空回复）</span>
+                            )}
                           </p>
-                        )}
-                        <p className="mt-1 whitespace-pre-wrap text-sm">
-                          {String(t.answer ?? t.content ?? '')}
-                        </p>
-                      </div>
-                    ))}
+                        </div>
+                      )
+                    })}
                   </div>
                 ) : active.status === 'failed' ? (
                   <p className="whitespace-pre-wrap text-sm text-rose-600 dark:text-rose-400">
