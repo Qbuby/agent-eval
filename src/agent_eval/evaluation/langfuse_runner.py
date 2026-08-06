@@ -2932,13 +2932,83 @@ def _expected_judge_dims(
     return dims
 
 
+# 补评失败原因分类：区分「等一会儿再点可能就好」与「不改配置永远不会好」。
+# 判据取自 judge_clients 抛出的 JudgeClientError 文本形态（provider_type 前缀 +
+# HTTP 码 / httpx 异常类名）。先认暂时性、再认配置类，两者都认不出时算暂时性
+# ——宁可让用户白试一次，也不要误报「你得先改配置」。
+_RESCORE_TRANSIENT_RE = re.compile(
+    r"timeout|timed out|ReadError|WriteError|ConnectError|ConnectTimeout"
+    r"|RemoteProtocolError|connection error|HTTP 5[0-9][0-9]|HTTP 429"
+    r"|overload|rate limit|too many requests",
+    re.IGNORECASE,
+)
+# 4xx（参数被拒 / 鉴权 / 体积超限）、多模态不支持、以及缺 model/base_url 这类
+# 确定性配置缺失。带图样例配纯文本 judge 就落在这里：附件块照方言转好送出去，
+# 上游模型 400 拒收 —— 重试一百次都是同一个 400，必须先换 provider/模型。
+_RESCORE_CONFIG_RE = re.compile(
+    r"HTTP 4[0-9][0-9]|image|vision|multimodal|media[_ ]type|unsupported"
+    r"|not support|is required|invalid.?api.?key|unauthorized",
+    re.IGNORECASE,
+)
+# 前端提示条只展示前若干条原因（全量在服务端日志里），免得撑满整页。
+_RESCORE_FAILURE_SAMPLES = 5
+# 上游 4xx/5xx 常把整页 HTML 错误页塞进 body（nginx 的 405 页面就有六七行标签），
+# 原样贴进提示条既撑版面又没信息量。只留标签里的可读文字：优先 <title>，没有就
+# 取剥掉标签后的正文，再把换行压成空格 —— 顺带让原因文本能被 DOM 文本匹配到。
+_HTML_MARKUP_RE = re.compile(r"<\s*(?:html|head|body|title|center|h1|pre)\b", re.IGNORECASE)
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+# 单条原因在提示条里的展示上限；全量原文在服务端日志里。
+_RESCORE_ERROR_MAXLEN = 200
+
+
+def _classify_rescore_error(message: str) -> str:
+    """判一条 judge 错误是 ``"transient"``（可重试）还是 ``"config"``（须先改配置）。"""
+    if not message:
+        return "transient"
+    if _RESCORE_TRANSIENT_RE.search(message):
+        return "transient"
+    if _RESCORE_CONFIG_RE.search(message):
+        return "config"
+    return "transient"
+
+
+def _compact_judge_error(message: str) -> str:
+    """把 judge 错误压成一行可读文本：剥掉 HTML 错误页、合并空白、截断。"""
+    text = message or ""
+    if _HTML_MARKUP_RE.search(text):
+        # 保留 HTML 之前的前缀（provider 名 + HTTP 码就在这一段），只换掉页面本体。
+        cut = text.index("<")
+        head, page = text[:cut], text[cut:]
+        title = _HTML_TITLE_RE.search(page)
+        text = f"{head}{title.group(1) if title else _HTML_TAG_RE.sub(' ', page)}"
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    if len(text) > _RESCORE_ERROR_MAXLEN:
+        text = text[:_RESCORE_ERROR_MAXLEN].rstrip() + "…"
+    return text
+
+
+def _dedupe_failures(failures: list[dict[str, str]]) -> list[dict[str, str]]:
+    """同一维度在多条样例上同样报错时只留一条，免得提示条列出一串重复项。"""
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for f in failures:
+        key = (f["dimension"], f["error"], f["kind"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(f)
+    return unique
+
+
 async def _rescore_comparison_result(
     *,
     comparison: dict[str, Any],
     judge_specs: list[dict[str, Any]],
     full_trace: dict[str, Any],
     result_id: str,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, list[dict[str, str]]]:
     """对一条对比 result 的 comparison 补评——复用已存 A/B 回答，不重跑 agent。
 
     对比模式的分数存在 ``comparison`` JSONB（evaluator_verdicts[].scoped_verdicts[]），
@@ -2954,7 +3024,9 @@ async def _rescore_comparison_result(
     返回 ``(recovered_scope_count, still_has_unscored)``：
       * recovered = 本次成功补回的 scope 数；
       * still_has_unscored = 补评后是否仍有 evaluation_error 的 scope（决定 result
-        能否回到 completed）。
+        能否回到 completed）；
+      * errors = 本次失败 scope 的 {dimension, error}，供上层透出「为什么还没补上」
+        —— 只写日志的话用户在页面上永远只能看到一句「仍未出分」。
     """
     conv = full_trace.get("conversation") if isinstance(full_trace, dict) else None
     a_turns = (conv.get("turns") or []) if isinstance(conv, dict) else []
@@ -3014,9 +3086,10 @@ async def _rescore_comparison_result(
         return restore_verdict(cmp_result.verdict, swapped=swap), None
 
     recovered = 0
+    errors: list[dict[str, str]] = []
     entries = comparison.get("evaluator_verdicts") if isinstance(comparison, dict) else None
     if not isinstance(entries, list):
-        return 0, False
+        return 0, False, []
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -3090,6 +3163,16 @@ async def _rescore_comparison_result(
             if err:
                 logger.warning("rescore comparison[%s] result %s scope %s failed: %s",
                                label, result_id, scope, err)
+                dim_name = (
+                    f"{label}.turn{sv.get('turn_index')}" if scope == "turn"
+                    else f"{label}.conversation"
+                )
+                # err 由 _compare_once 拼成 "{evaluator_name}: ..."，而 evaluator_name
+                # 就是 dim_name，去掉前缀免得前端把维度名显示两遍。
+                errors.append({
+                    "dimension": dim_name,
+                    "error": err.removeprefix(f"{dim_name}: "),
+                })
                 continue
             sv["status"] = "scored"
             sv["verdict"] = verdict
@@ -3133,7 +3216,7 @@ async def _rescore_comparison_result(
         for entry in entries if isinstance(entry, dict)
         for sv in (entry.get("scoped_verdicts") or [])
     )
-    return recovered, still_unscored
+    return recovered, still_unscored, errors
 
 
 async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
@@ -3151,7 +3234,12 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
       5. 不触碰 execution_error（agent 没答的样例无回答可评）。
 
     返回统计：{run_id, results_scanned, dimensions_recovered, results_completed,
-              results_still_missing}。汇总刷新由上层 reaggregate 负责。
+              results_still_missing, failures_transient, failures_config,
+              failures}。汇总刷新由上层 reaggregate 负责。
+    ``failures`` 是失败维度的原因样本（同维度同错去重后取前
+    _RESCORE_FAILURE_SAMPLES 条；原因已压成一行并剥掉上游 HTML 错误页），
+    ``failures_config`` > 0 表示至少有一个维度是上游 judge 拒收本次输入
+    （典型：带图样例配了纯文本模型），这类再点重试不会变好，得先换 provider。
     """
     from agent_eval.evaluation import multiturn
 
@@ -3170,6 +3258,7 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
         return {
             "run_id": run_id, "results_scanned": 0, "dimensions_recovered": 0,
             "results_completed": 0, "results_still_missing": 0,
+            "failures_transient": 0, "failures_config": 0, "failures": [],
             "note": "no configurable_judge evaluators on this run",
         }
     await _resolve_judge_providers(judge_specs)
@@ -3178,6 +3267,17 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
     results_completed = 0
     results_still_missing = 0
     results_scanned = 0
+    # 失败维度的原因（全量收集，响应里只带前若干条）。
+    failures: list[dict[str, str]] = []
+
+    def _note_failure(dimension: str, message: str) -> None:
+        # 分类看原文（HTTP 码有时只出现在会被剥掉的那段页面文字里），展示用压缩后的一行。
+        raw = (message or "").strip()
+        failures.append({
+            "dimension": dimension,
+            "error": _compact_judge_error(raw) or "未知错误",
+            "kind": _classify_rescore_error(raw),
+        })
 
     async with async_session_factory() as session:
         repo = Repository(session)
@@ -3194,12 +3294,14 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
             cmp_json = r.comparison if isinstance(r.comparison, dict) else None
             if cmp_json is not None:
                 full_trace = r.full_trace if isinstance(r.full_trace, dict) else {}
-                recovered, still_missing = await _rescore_comparison_result(
+                recovered, still_missing, cmp_errors = await _rescore_comparison_result(
                     comparison=cmp_json,
                     judge_specs=judge_specs,
                     full_trace=full_trace,
                     result_id=str(r.id),
                 )
+                for ce in cmp_errors:
+                    _note_failure(ce["dimension"], ce["error"])
                 if recovered <= 0 and not still_missing:
                     # 无失败 scoped、无恢复 → 该条对比结果本就齐全，跳过。
                     continue
@@ -3228,7 +3330,16 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                 turns = conv.get("turns") or []
                 goal = conv.get("goal")
                 turn_exps = conv.get("turn_expectations") or []
-                turn_idxs = {t.get("turn_index") for t in turns if isinstance(t.get("turn_index"), int)}
+                # 只把「回复非空」的轮算进本应出分：score_conversation 对空回复轮
+                # 一律跳过、不产 score（见 multiturn.score_conversation 的空白轮
+                # 判据）。若这里把空回复轮也算上，该维度会永远落在 missing 里、
+                # 永远补不上，样例状态就再也回不到 scored。
+                turn_idxs = {
+                    t.get("turn_index")
+                    for t in turns
+                    if isinstance(t.get("turn_index"), int)
+                    and (t.get("assistant") or "").strip()
+                }
                 expected_dims = _expected_judge_dims(
                     specs=judge_specs, is_multiturn=True,
                     turn_expectations=turn_exps, turn_indices=turn_idxs,
@@ -3254,7 +3365,7 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
             new_checks: dict[str, list[dict[str, Any]]] = {}
             if is_multiturn:
                 (
-                    new_scores, new_reasons, new_checks, _fd, _le,
+                    new_scores, new_reasons, new_checks, mt_failed, mt_error,
                 ) = await multiturn.score_conversation(
                     turns=turns,
                     conversation_goal=goal,
@@ -3264,6 +3375,12 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                     case_id=str(r.id),
                     only_dims=missing,
                 )
+                if mt_failed and mt_error:
+                    # score_conversation 只透出「失败维度数 + 最后一条错误」，无法
+                    # 逐维度归因，故按批记一条并带上一个代表维度名。
+                    _note_failure(
+                        f"多轮 {mt_failed} 个维度（如 {sorted(missing)[0]}）", mt_error,
+                    )
             else:
                 # 回喂本次运行冻结的答案关键点（落库快照，非源样例）——与首评
                 # 走 metadata.reference_criteria 同一注入路径，保证补评的 judge
@@ -3295,8 +3412,10 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                         )
                     except Exception as e:  # noqa: BLE001
                         logger.warning("rescore single[%s] crashed on result %s: %s", label, r.id, e)
+                        _note_failure(label, f"{type(e).__name__}: {e}")
                         continue
                     if jr.error and not jr.scores:
+                        _note_failure(label, jr.error)
                         continue
                     for s in jr.scores:
                         new_scores[label] = float(s.value)
@@ -3344,4 +3463,7 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
         "dimensions_recovered": dims_recovered,
         "results_completed": results_completed,
         "results_still_missing": results_still_missing,
+        "failures_transient": sum(1 for f in failures if f["kind"] == "transient"),
+        "failures_config": sum(1 for f in failures if f["kind"] == "config"),
+        "failures": _dedupe_failures(failures)[:_RESCORE_FAILURE_SAMPLES],
     }

@@ -1340,6 +1340,7 @@ async def rescore_run(run_id: str):
         "run_id": run_id, "status": "running", "started_at": time.time(),
         "results_scanned": 0, "dimensions_recovered": 0,
         "results_completed": 0, "results_still_missing": 0,
+        "failures_transient": 0, "failures_config": 0, "failures": [],
     }
     asyncio.create_task(_run_rescore_job(run_id))
     return {"run_id": run_id, "status": "running"}

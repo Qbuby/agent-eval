@@ -1026,11 +1026,36 @@ export default function EvaluationRunDetailPage() {
         </div>
       )}
       {rescoreStatusQuery.data?.status === 'completed' && (
-        <div className="mb-3 text-[12px] text-positive border border-border bg-fill/5 rounded-md px-3 py-2">
-          已补评：扫描 {rescoreStatusQuery.data.results_scanned ?? 0} 条缺分样例，
-          补回维度 {rescoreStatusQuery.data.dimensions_recovered ?? 0} 个，
-          恢复完整 {rescoreStatusQuery.data.results_completed ?? 0} 条
-          {(rescoreStatusQuery.data.results_still_missing ?? 0) > 0 ? `，仍缺 ${rescoreStatusQuery.data.results_still_missing} 条（上游 judge 仍未出分，可稍后再点）` : ''}
+        <div className="mb-3 text-[12px] border border-border bg-fill/5 rounded-md px-3 py-2 space-y-1">
+          <div
+            className={
+              (rescoreStatusQuery.data.results_still_missing ?? 0) > 0
+                ? 'text-text-secondary'
+                : 'text-positive'
+            }
+          >
+            已补评：扫描 {rescoreStatusQuery.data.results_scanned ?? 0} 条缺分样例，
+            补回维度 {rescoreStatusQuery.data.dimensions_recovered ?? 0} 个，
+            恢复完整 {rescoreStatusQuery.data.results_completed ?? 0} 条
+            {(rescoreStatusQuery.data.results_still_missing ?? 0) > 0 ? `，仍缺 ${rescoreStatusQuery.data.results_still_missing} 条` : ''}
+          </div>
+          {(rescoreStatusQuery.data.results_still_missing ?? 0) > 0 && (
+            <div className="text-text-secondary">
+              {(rescoreStatusQuery.data.failures_config ?? 0) > 0
+                ? '有维度是上游 judge 拒收了本次输入（例如带图样例配了纯文本模型），再点重试仍是同样结果 —— 需先把该评估器换成支持这类输入的 provider / 模型。'
+                : '失败原因多为超时、断流等暂时性问题，可稍后再点重试。'}
+            </div>
+          )}
+          {(rescoreStatusQuery.data.failures?.length ?? 0) > 0 && (
+            <ul className="list-disc pl-4 space-y-0.5 text-text-secondary">
+              {rescoreStatusQuery.data.failures!.map((f, i) => (
+                <li key={i}>
+                  <span className="font-mono">{f.dimension}</span>
+                  {f.kind === 'config' ? '（配置）' : '（暂时性）'}：{f.error}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
       {rescoreStatusQuery.data?.status === 'error' && (
