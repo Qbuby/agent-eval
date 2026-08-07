@@ -22,7 +22,8 @@ import { exportRunReport } from '@/lib/reportExport'
 import { collapseScoreKey, collapseDimAvg } from '@/lib/dimensionCollapse'
 import {
   deriveFacts, deriveAcceptance, deriveCostScored, deriveCostAbnormal,
-  acceptancePassRateText, runDecisionLabel, type EvalFacts, type EvalAcceptance,
+  acceptancePassRateText, runDecisionLabel, rowIsAbnormal, rowHasBlankReply,
+  type EvalFacts, type EvalAcceptance,
 } from '@/lib/evalSemantics'
 import {
   aggregateComparativeResources,
@@ -826,7 +827,7 @@ export default function EvaluationRunDetailPage() {
   const langfuseHost = deriveLangfuseHost(run)
 
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
-  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，仅指执行异常）+ 分数低于阈值（阈值 + 指定维度）。
+  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，含执行异常与空回复）+ 分数低于阈值（阈值 + 指定维度）。
   const [abnormalMode, setAbnormalMode] = useState<'all' | 'only' | 'exclude'>('all')
   const [threshold, setThreshold] = useState('')
   const [thresholdDim, setThresholdDim] = useState('')
@@ -870,11 +871,11 @@ export default function EvaluationRunDetailPage() {
   const allItems = resultsQuery.data?.items ?? []
   // 供「低分维度」下拉：折叠逐轮后的评估器维度全集（跨所有样例）。
   const filterDims = collectFilterDims(allItems)
-  // 执行异常状态集合（仅执行异常，不含 fail —— fail 是判分未过而非跑挂）。
+  // 异常样例 = 执行状态异常（跑挂/不可达/超时）或空回复；均不含 fail。
   const thr = threshold.trim() === '' ? null : Number(threshold)
   const thrValid = thr != null && !Number.isNaN(thr)
   const items = allItems.filter((r: EvalResultRow) => {
-    const isAbnormal = ABNORMAL_STATUSES.has(r.status)
+    const isAbnormal = rowIsAbnormal(r)
     if (abnormalMode === 'only' && !isAbnormal) return false
     if (abnormalMode === 'exclude' && isAbnormal) return false
     if (thrValid && !rowBelowThreshold(r, thr, thresholdDim)) return false
@@ -1328,7 +1329,7 @@ export default function EvaluationRunDetailPage() {
         <div className="toolbar mb-2">
           <div className="flex items-center gap-1.5 text-[12px]">
             <span className="text-text-tertiary">异常样例</span>
-            <span className="text-[10px] text-text-tertiary">(error / 不可达 / 超时)</span>
+            <span className="text-[10px] text-text-tertiary">(error / 不可达 / 超时 / 空回复)</span>
             <div className="inline-flex rounded-md border border-border overflow-hidden text-[11px]">
               {([
                 ['all', '不筛'],
@@ -1580,7 +1581,12 @@ function ResultRow({ row, langfuseHost, selected, onSelect, comparative }: {
             {row.question || '—'}
           </div>
         </td>
-        <td><RunStatusBadge status={row.status} /></td>
+        <td>
+          <div className="flex flex-col items-start gap-0.5">
+            <RunStatusBadge status={row.status} />
+            {rowHasBlankReply(row) && <BlankReplyTag />}
+          </div>
+        </td>
         <td>
           {verdicts.length > 0 ? (
             <div className="flex flex-col items-start gap-1">
@@ -1631,7 +1637,12 @@ function ResultRow({ row, langfuseHost, selected, onSelect, comparative }: {
           {row.question || '—'}
         </div>
       </td>
-      <td><RunStatusBadge status={row.status} /></td>
+      <td>
+        <div className="flex flex-col items-start gap-0.5">
+          <RunStatusBadge status={row.status} />
+          {rowHasBlankReply(row) && <BlankReplyTag />}
+        </div>
+      </td>
       <td className="tabular-nums">{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</td>
       <td className="tabular-nums">{row.prompt_tokens ?? '—'}</td>
       <td className="tabular-nums">{row.completion_tokens ?? '—'}</td>
@@ -2003,6 +2014,16 @@ function RunStatusBadge({ status }: { status: string }) {
         <span className="inline-block w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
       )}
       {label}
+    </span>
+  )
+}
+
+// 空回复标记：状态徽章仍是 scored（judge 跑完了），但 agent 没吐出内容。
+// 单挂一枚标记，让「仅异常」筛出来的行能自证为什么算异常。
+function BlankReplyTag() {
+  return (
+    <span className="badge badge-warning" title="agent 跑通了但没有回复内容（多轮为某轮空白）">
+      空回复
     </span>
   )
 }
@@ -2382,9 +2403,8 @@ function ConversationResultView({
 
 // collapseScoreKey / collapseDimAvg 已抽到 @/lib/dimensionCollapse（与 reportExport 共用）。
 
-// 「执行异常」状态：agent 跑挂 / 不可达 / 超时 / 报错。不含 fail —— fail 是判分
-// 未达合格线（跑通了但没答好），不是执行异常，快筛「异常样例」时不纳入。
-const ABNORMAL_STATUSES = new Set(['error', 'agent_unreachable', 'agent_timeout'])
+// 「异常样例」判定已抽到 @/lib/evalSemantics（与对比页共用）：执行状态异常
+// （error / 不可达 / 超时）或空回复。不含 fail —— fail 是判分未达合格线而非跑挂。
 
 // 收集所有样例出现过的评估器维度（折叠 .turnN / .conversation），供「低分维度」
 // 下拉选择。按名排序，稳定展示。

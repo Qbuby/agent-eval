@@ -11,7 +11,8 @@ import { formatApiError, toToastMessage } from '@/lib/errors'
 import { exportCompareReport } from '@/lib/reportExport'
 import {
   deriveFacts, deriveAcceptance, deriveCostScored, aggregateProjectedRows,
-  acceptancePassRateText, runDecisionLabel, type EvalFacts, type EvalAcceptance,
+  acceptancePassRateText, runDecisionLabel, rowIsAbnormal,
+  type EvalFacts, type EvalAcceptance,
 } from '@/lib/evalSemantics'
 import type { EvalResultRow, EvalRunDetail, EvalResultsPage } from '@/types'
 
@@ -756,7 +757,7 @@ function SampleAlignmentSection({
   // 交叉对齐：仅保留所有 run 都运行过的样例（每个 run 都有该样例的结果行），
   // 排除「某次未运行」的样例，让对比只落在可比的公共子集上。
   const [crossOnly, setCrossOnly] = useState(false)
-  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，任一 run 执行异常）+ 分数低于阈值（阈值 + 维度）。
+  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，任一 run 执行异常或空回复）+ 分数低于阈值（阈值 + 维度）。
   const [abnormalMode, setAbnormalMode] = useState<'all' | 'only' | 'exclude'>('all')
   const [threshold, setThreshold] = useState('')
   const [thresholdDim, setThresholdDim] = useState('')
@@ -869,7 +870,7 @@ function SampleAlignmentSection({
         </label>
         <div className="flex items-center gap-1.5 text-[12px]">
           <span className="text-text-tertiary">异常样例</span>
-          <span className="text-[10px] text-text-tertiary">(任一 run error/不可达/超时)</span>
+          <span className="text-[10px] text-text-tertiary">(任一 run error/不可达/超时/空回复)</span>
           <div className="inline-flex rounded-md border border-border overflow-hidden text-[11px]">
             {([
               ['all', '不筛'],
@@ -1072,20 +1073,19 @@ function sampleHasDifference(a: AlignedSample, runs: EvalRunDetail[]): boolean {
   return false
 }
 
-// 「执行异常」状态：agent 跑挂 / 不可达 / 超时 / 报错。不含 fail —— fail 是判分
-// 未达合格线（跑通了但没答好），不是执行异常。
-const ABNORMAL_STATUSES = new Set(['error', 'agent_unreachable', 'agent_timeout'])
+// 「异常样例」判定已抽到 @/lib/evalSemantics（与单次详情页共用）：执行状态异常
+// （error / 不可达 / 超时）或空回复。不含 fail —— fail 是判分未达合格线而非跑挂。
 
 // 折叠逐轮 score key（`<base>.turn<N>` / `<base>.conversation`）到评估器级 base。
 function collapseCompareDim(key: string): string {
   return parseDimKey(key).base
 }
 
-// 对齐样例是否「异常」：任一 run 上该样例执行异常即命中。
+// 对齐样例是否「异常」：任一 run 上该样例执行异常或空回复即命中。
 function alignedHasAbnormal(a: AlignedSample, runs: EvalRunDetail[]): boolean {
   return runs.some(r => {
     const row = a.byRun[r.id]
-    return row != null && ABNORMAL_STATUSES.has(row.status)
+    return row != null && rowIsAbnormal(row)
   })
 }
 

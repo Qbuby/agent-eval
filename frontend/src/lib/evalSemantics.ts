@@ -225,3 +225,86 @@ export function aggregateProjectedRows(rows: ProjectedRow[]): {
     },
   }
 }
+
+// ---------------------------------------------------------------------------
+// 「样例异常」快筛判定（详情页 + 对比页共用）
+// ---------------------------------------------------------------------------
+
+/**
+ * 执行状态本身即异常：agent 跑挂 / 不可达 / 超时。
+ *
+ * 不含 fail —— fail 是判分未达合格线（跑通了但没答好），属评分事实而非执行异常。
+ */
+const ABNORMAL_STATUSES = new Set(['error', 'agent_unreachable', 'agent_timeout'])
+
+/**
+ * 尚未产出回复的中间态。这些状态下 actual_output 本来就是空，
+ * 判空会把「还没跑」误判成「跑出了空回复」，故一律豁免空回复判定。
+ */
+const PENDING_STATUSES = new Set(['pending', 'running', 'stopping'])
+
+function isBlank(v: unknown): boolean {
+  return typeof v !== 'string' || v.trim() === ''
+}
+
+/** 空回复判定所需的最小行结构（与后端 EvalResultRow 对齐，除 status 外全可选）。 */
+export interface AbnormalRowLike {
+  status: string
+  actual_output?: string | null
+  full_trace?: {
+    conversation?: { turns?: Array<{ assistant?: unknown }> } | null
+  } | null
+  comparison?: {
+    agent_b?: {
+      output?: string | null
+      conversation?: { turns?: Array<{ assistant?: unknown }> } | null
+    } | null
+    answer_counts?: { a_blank?: number; b_blank?: number } | null
+  } | null
+}
+
+/**
+ * 该行是否含「空回复」——agent 跑通了但没吐出内容。四类 run 各有取法：
+ *
+ * - 多轮双模：`comparison.answer_counts.{a_blank,b_blank}`（后端已分侧统计）；
+ * - 多轮单模：`full_trace.conversation.turns[].assistant` 现数（旧 run 没有
+ *   answer_counts，故不读它，直接数轮次，顺带兼容旧数据）；
+ * - 单轮双模：A 侧 `actual_output` + B 侧 `comparison.agent_b.output`；
+ * - 单轮单模：`actual_output`。
+ *
+ * 任一侧、任一轮为空即算命中：一次 A/B 对比里 B 侧空了同样是不可用样例。
+ * 中间态（pending/running/stopping）一律返回 false。
+ */
+export function rowHasBlankReply(row: AbnormalRowLike): boolean {
+  if (PENDING_STATUSES.has(row.status)) return false
+
+  const cmp = row.comparison
+  const aTurns = row.full_trace?.conversation?.turns
+  const bTurns = cmp?.agent_b?.conversation?.turns
+
+  // 多轮：以轮次为准（双模两侧各自判）。任一侧有回放轮次即走多轮分支。
+  const aMulti = Array.isArray(aTurns) && aTurns.length > 0
+  const bMulti = Array.isArray(bTurns) && bTurns.length > 0
+  if (aMulti || bMulti) {
+    const counts = cmp?.answer_counts
+    if (counts && (num(counts.a_blank) > 0 || num(counts.b_blank) > 0)) return true
+    if (aMulti && aTurns!.some(t => isBlank(t?.assistant))) return true
+    if (bMulti && bTurns!.some(t => isBlank(t?.assistant))) return true
+    return false
+  }
+
+  // 单轮：A 侧必判；对比 run 另判 B 侧。
+  if (isBlank(row.actual_output)) return true
+  if (cmp && isBlank(cmp.agent_b?.output)) return true
+  return false
+}
+
+/**
+ * 快筛「异常样例」的统一判定：执行状态异常 **或** 空回复。
+ *
+ * 两者并入同一口径 —— 对使用者而言都是「这条结果不可用」，无论是 agent 没连上
+ * 还是连上了没说话。
+ */
+export function rowIsAbnormal(row: AbnormalRowLike): boolean {
+  return ABNORMAL_STATUSES.has(row.status) || rowHasBlankReply(row)
+}
