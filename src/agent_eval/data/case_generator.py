@@ -277,7 +277,12 @@ class CaseGenerator:
             # Multi-turn needs a *fresh* adapter with a stable thread_id so the
             # server-side agent keeps conversation context across turns.
             thread_id = f"gen-{(case.name or 'conv')[:24]}-{uuid.uuid4().hex[:8]}"
-            adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+            # sticky_thread=True：整段对话共用这一个会话号。单轮路径下 adapter
+            # 每次 invoke 会现场派生新会话号（避免重试撞进上一次的脏上下文），
+            # 多轮必须显式关掉这个行为，否则逐轮上下文会断。
+            adapter = _make_adapter(
+                agent_cfg, thread_id=thread_id, client=http_client, sticky_thread=True,
+            )
             try:
                 replay = await multiturn.replay_conversation(
                     adapter=adapter,

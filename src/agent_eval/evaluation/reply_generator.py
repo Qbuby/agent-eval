@@ -197,7 +197,12 @@ async def generate_one_reply(
 
     is_multi = bool(case.get("multi_turn"))
     thread_id = f"reply-{case.get('id', 'case')}-{uuid.uuid4().hex[:8]}"
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    # 只有多轮才该整段共用一个会话号（agent 端靠它维持上下文）。单轮传 False，
+    # adapter 每次 invoke 现场派生新会话号 —— 这样 _invoke_with_retry 的每次重试
+    # 都落在干净会话里，而不是让 agent 带着上次失败尝试的残留上下文重答。
+    adapter = _make_adapter(
+        agent_cfg, thread_id=thread_id, client=http_client, sticky_thread=is_multi,
+    )
     policy = _retry_policy_from_cfg(agent_cfg)
 
     async def _invoke(adp: Any, msgs: list[dict[str, Any]]):
@@ -233,7 +238,11 @@ async def generate_one_reply(
                 "tool_calls": replay.get("tool_calls") or [],
                 "usage": usage,
                 "attempts": replay.get("attempts"),
+                # 多轮走 sticky_thread=True，整段共用这一个会话号，故它就是实际
+                # 发出的值。sticky 语义显式记下来，事后能区分「本条本该共用」与
+                # 「本条本该逐次新建」，不必回去翻代码推断。
                 "thread_id": thread_id,
+                "sticky_thread": True,
             }
             # 逐轮容错：某轮失败时前面已完成的轮仍保留，但整条记为失败——
             # 半截对话不该被当成可用于评估的回复。
@@ -262,10 +271,26 @@ async def generate_one_reply(
             out["content"] = resp.content or ""
             out["latency_ms"] = int(getattr(resp, "latency_ms", 0) or 0)
             raw = getattr(resp, "raw_response", None)
-            trace: dict[str, Any] = {"attempts": attempts, "thread_id": thread_id}
+            # 单轮 sticky_thread=False：adapter 每次 invoke 现场派生会话号，上面
+            # 那个 thread_id 只是可读前缀。这里先按前缀兜底，拿到 adapter 交回的
+            # 实际值就覆盖 —— 落库必须是实际发出的号，否则事后无法判定这条回复
+            # 究竟生成在哪个会话里，也就无法自证会话是干净的。
+            trace: dict[str, Any] = {
+                "attempts": attempts,
+                "thread_id": thread_id,
+                "sticky_thread": False,
+            }
             if isinstance(raw, dict):
                 trace["steps"] = raw.get("steps") or []
                 trace["tool_calls"] = raw.get("tool_calls") or []
+                sent = raw.get("sent_thread_id")
+                if isinstance(sent, str) and sent:
+                    trace["thread_id"] = sent
+                ident = raw.get("identity")
+                if isinstance(ident, str) and ident:
+                    trace["agent_identity"] = ident
+                if raw.get("truncated"):
+                    trace["stream_truncated"] = True
                 usage = raw.get("usage")
                 if isinstance(usage, dict):
                     trace["usage"] = usage

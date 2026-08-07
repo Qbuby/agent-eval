@@ -254,6 +254,7 @@ def _make_adapter(
     thread_id: str | None = None,
     client: httpx.AsyncClient | None = None,
     reply_version: Any | None = None,
+    sticky_thread: bool = False,
 ) -> Any:
     """Build the HTTP adapter for one case.
 
@@ -264,10 +265,20 @@ def _make_adapter(
 
     - ``type='sse'`` defaults to LangGraph v2 payload/event shape (the production
       agent used in D:/files/EPtestcases/agent_chat_sse_*.py). The caller passes
-      a per-case thread_id so the agent receives a stable conversation handle
-      (even though agent-side id rewriting may change what LangSmith records).
+      a per-case thread_id, which the adapter uses as a **readable prefix** for
+      the session id it derives per invocation.
     - ``type='openai'`` for OpenAI-compatible /v1/chat/completions.
     - ``type='sse_generic'`` for the legacy templated SSE behaviour.
+
+    ``sticky_thread`` 决定会话号的复用策略，只有多轮回放该传 True：
+    被测 agent 按 ``configurable.thread_id`` 划会话——同一 thread_id 就是同一场
+    对话，带上一次调用的上下文继续。
+      - False（默认，单轮）：adapter 每次 invoke 现场派生一个新会话号，因此同一
+        样例的每次重试也各自落在干净会话里。历史缺陷是会话号一存到底，
+        ``_invoke_with_retry`` 在同一 adapter 上重试时 agent 带着上次失败尝试的
+        残留上下文重答，且无日志无标记。
+      - True（多轮回放）：整段对话共用一个会话号，agent 端要靠它维持上下文
+        （见 multiturn.replay_conversation，每轮只发当轮 user 消息）。
 
     ``client`` lets the caller inject one shared, connection-pooled
     ``httpx.AsyncClient`` for the whole run so 20 concurrent cases reuse
@@ -299,6 +310,7 @@ def _make_adapter(
             thread_id=thread_id,
             language=agent_cfg.get("language", "请用中文回复"),
             client=client,
+            sticky_thread=sticky_thread,
         )
     if t == "sse_generic":
         return SSEStreamAdapter(
@@ -307,7 +319,9 @@ def _make_adapter(
             payload_template=agent_cfg.get("payload_template"),
             timeout=float(agent_cfg.get("timeout", 120.0)),
             mode="generic",
+            thread_id=thread_id,
             client=client,
+            sticky_thread=sticky_thread,
         )
     raise ValueError(f"unknown agent type: {t!r}")
 
@@ -738,13 +752,15 @@ async def _run_multiturn_case(
     expected = case.get("expected_output") or ""
     agent_type = agent_cfg.get("type", "sse")
 
-    # 整段对话共用一个 thread_id（agent 端按它维持上下文）。
+    # 整段对话共用一个 thread_id（agent 端按它维持上下文）—— 多轮回放必须
+    # sticky_thread=True，否则每轮拿到新会话号、agent 上下文断裂，多轮评估失去意义。
     thread_id = f"eval-{case.get('name','conv')}-{uuid.uuid4().hex[:8]}"
     adapter = _make_adapter(
         agent_cfg,
         thread_id=thread_id,
         client=http_client,
         reply_version=case.get("_reply_version"),
+        sticky_thread=True,
     )
     if retry_policy is None:
         retry_policy = _retry_policy_from_cfg(agent_cfg)
@@ -921,6 +937,8 @@ async def _invoke_one_agent(
         },
         "error_message": None, "error_type": None, "attempts_made": 0,
         "thread_id": thread_id,
+        # 实际发出的会话号（adapter 逐次派生），成功后由 raw_response 交回。
+        "sent_thread_id": None,
     }
     try:
         try:
@@ -933,6 +951,9 @@ async def _invoke_one_agent(
             out["usage"] = _extract_usage(resp)
             raw = getattr(resp, "raw_response", None)
             if isinstance(raw, dict):
+                sent = raw.get("sent_thread_id")
+                if isinstance(sent, str) and sent:
+                    out["sent_thread_id"] = sent
                 tcs = raw.get("tool_calls")
                 if isinstance(tcs, list):
                     out["tool_calls"] = tcs
@@ -1166,8 +1187,10 @@ async def _replay_one_side(
 
     agent_type = agent_cfg.get("type", "sse")
     thread_id = f"eval-{case_name}-{uuid.uuid4().hex[:8]}"
+    # sticky_thread=True：多轮回放要靠固定会话号让 agent 端维持上下文。
     adapter = _make_adapter(
         agent_cfg, thread_id=thread_id, client=http_client, reply_version=reply_version,
+        sticky_thread=True,
     )
     policy = retry_policy or _retry_policy_from_cfg(agent_cfg)
 
@@ -1696,6 +1719,15 @@ async def _run_one_case(
     first_thinking_token_ms: int | None = None
     first_answer_token_ms: int | None = None
     attempts_made = 0
+    # adapter 每次 invoke 现场派生会话号，上面这个 thread_id 只是可读前缀。
+    # 实际发出的那个由 adapter 经 raw_response.sent_thread_id 交回——落库必须记
+    # 实际值，否则事后无法判定某条样例究竟落在哪个会话里（这正是历史上
+    # 208×2 条样例无法自证会话是否干净的根因）。
+    sent_thread_id: str | None = None
+    agent_identity: str | None = None
+    # 流被中途切断（ReadError/RemoteProtocolError）时 adapter 保留部分内容并标记
+    # truncated。落进 full_trace 让详情页能看出这条回答本身就不完整。
+    stream_truncated = False
     usage = {
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
         "cache_creation_tokens": None, "cache_read_tokens": None,
@@ -1720,6 +1752,18 @@ async def _run_one_case(
                 steps_raw = raw.get("steps")
                 if isinstance(steps_raw, list):
                     cot_steps = steps_raw
+                # adapter 每次 invoke 现场派生会话号，因此上面这个 thread_id 变量
+                # 只是前缀，真正发给 agent 的是 adapter 记在 raw 里的这一个。落库
+                # 必须记实际值，否则事后无法判定某条样例落在哪个会话（正是历史上
+                # 208 条样例无法自证会话干净的根因）。
+                sent = raw.get("sent_thread_id")
+                if isinstance(sent, str) and sent:
+                    sent_thread_id = sent
+                ident = raw.get("identity")
+                if isinstance(ident, str) and ident:
+                    agent_identity = ident
+                if raw.get("truncated"):
+                    stream_truncated = True
             if not actual_tool_calls:
                 actual_tool_calls = _extract_tool_calls_from_response(resp)
             # Time-to-first-token, derived from per-step first_token_ms that
@@ -1856,7 +1900,10 @@ async def _run_one_case(
         "case_id": case.get("id"),
         "case_name": case.get("name"),
         "case_source": case.get("source"),
-        "thread_id": thread_id,
+        # 落**实际发出**的会话号，不落 runner 生成的前缀 —— 只有前者能拿去被测
+        # 服务端反查这条样例究竟落在哪个会话里。agent 没被调到（预生成回复、
+        # 空问题、连接彻底失败）时才退回前缀。
+        "thread_id": sent_thread_id or thread_id,
         # question 列是 Text：落纯文本投影（附件渲染成 [图片] 占位）。
         "question": question_text,
         "expected_output": expected,
@@ -1875,6 +1922,13 @@ async def _run_one_case(
         "tool_call_count": len(actual_tool_calls),
         "message_count": len(messages),
         "scores": scores,
+        # 溯源三元组，落进 full_trace.session 供详情页与事后审计读：
+        # 实际发出的会话号 + 本次请求身份 + 尝试次数。attempts_made > 1 时
+        # 说明发生过重试，而每次重试现在各有独立会话号，最后成功那次的号即
+        # sent_thread_id —— 前面失败尝试写脏的会话不会污染它。
+        "sent_thread_id": sent_thread_id,
+        "agent_identity": agent_identity,
+        "stream_truncated": stream_truncated,
         **usage,
     }
 
@@ -2004,6 +2058,19 @@ async def _execute_run(
                             full_trace["steps"] = res["cot_steps"]
                         if res.get("conversation"):
                             full_trace["conversation"] = res["conversation"]
+                    # 会话溯源：把**实际发出**的会话号 / 身份 / 是否被截断落进
+                    # full_trace，使每条样例事后都能自证「跑在哪个会话里、是否干
+                    # 净」。thread_id 列已存实际值，这里冗余一份是为了在 steps 为
+                    # 空（零字节即断、agent 报错）时仍留有溯源线索 —— 那恰恰是最
+                    # 需要追查会话的场景。只取需要的标量，绝不整个 headers 落库
+                    # （里面有 Authorization / api key，full_trace 会直接渲染到前端）。
+                    _prov = {
+                        k: res.get(k)
+                        for k in ("sent_thread_id", "agent_identity", "stream_truncated")
+                        if res.get(k)
+                    }
+                    if _prov:
+                        full_trace = {**(full_trace or {}), "session": _prov}
                     # 冻结评估输入的原始附件 blocks。question 仍落纯文本投影，
                     # 旧导出/搜索/judge 消费方不变；纯文本样例这里得到 None。
                     _, question_content = split_question_content(case.get("question"))

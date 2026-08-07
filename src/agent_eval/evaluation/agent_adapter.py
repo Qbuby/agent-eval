@@ -153,17 +153,36 @@ class SSEStreamAdapter:
         thread_id: str | None = None,
         language: str = "请用中文回复",
         client: httpx.AsyncClient | None = None,
+        sticky_thread: bool = False,
     ):
         self.url = url
+        self.payload_template = payload_template or {}
         self.timeout = timeout
         self.mode = mode
         self.thread_id = thread_id
         self.language = language
-        self.payload_template = payload_template or {}
+        # 会话复用策略。被测 agent 按 configurable.thread_id 划会话——同一
+        # thread_id 就是同一场对话，带着上一次调用的上下文继续。
+        #   sticky_thread=False（默认）：每次 invoke 派生一个**新**会话号，
+        #     单轮样例之间、以及同一样例的每次重试，都落在互不相干的干净会话里。
+        #   sticky_thread=True：整个 adapter 生命周期共用一个会话号，仅供
+        #     multiturn.replay_conversation 逐轮回放使用（agent 端要靠它维持
+        #     上下文，每轮只发当轮 user 消息）。
+        # 历史缺陷：thread_id 曾作为实例属性一存到底，非多轮路径下每次重试都
+        # 复用同一会话号，agent 带着上次未完成尝试的残留上下文重答，且全程无
+        # 日志无标记（见 _invoke_with_retry 在同一 adapter 上循环）。
+        self.sticky_thread = bool(sticky_thread)
+        self._invocations = 0
         req_headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if headers:
             req_headers.update(headers)
         self._headers = req_headers
+        # 调用方显式配了身份就尊重它；否则每次请求注入一个唯一的 X-User-Id，
+        # 使被测服务端日志能反查到底是哪一次评测调用。header 必须 latin-1 可编码
+        # （h11 硬要求），故身份用纯 ASCII 的 uuid，不复用可能含中文的 thread_id。
+        self._inject_identity = not any(
+            k.lower() == "x-user-id" for k in req_headers
+        )
         # Reuse an injected pooled client on high-concurrency runs; otherwise
         # own a private client (CLI / tests). Headers are applied per-request
         # so a shared client can serve many adapters with different auth.
@@ -174,7 +193,24 @@ class SSEStreamAdapter:
             self._client = httpx.AsyncClient(headers=req_headers, timeout=timeout)
             self._owns_client = True
 
-    def _build_payload(self, question: str | list[dict[str, Any]]) -> dict[str, Any]:
+    def _next_thread_id(self) -> str:
+        """本次调用要用的会话号。
+
+        ``sticky_thread=True``（多轮回放）时整段对话共用 ``self.thread_id``；
+        否则**每次调用现场派生一个新号**，把传入的 thread_id 仅当作可读前缀，
+        再缀上单调计数与随机段。这样同一 adapter 的第 N 次调用（含每一次重试）
+        都落在互不相干的干净会话里，且从会话号本身就能看出这是第几次调用。
+        """
+        base = self.thread_id
+        if self.sticky_thread and base:
+            return base
+        self._invocations += 1
+        suffix = f"i{self._invocations}-{uuid.uuid4().hex[:8]}"
+        return f"{base}-{suffix}" if base else f"eval_{suffix}"
+
+    def _build_payload(
+        self, question: str | list[dict[str, Any]], thread_id: str | None = None,
+    ) -> dict[str, Any]:
         """构造请求体。``question`` 可以是纯文本，也可以是多模态 content 数组
         （Anthropic canonical blocks：``[{"type":"text",...},{"type":"image",...}]``）。
 
@@ -183,6 +219,10 @@ class SSEStreamAdapter:
         URL 块下载落沙箱、按 provider 归一化格式，评测侧不需要做任何转换。
         ``payload_template`` 的 ``{input}`` 占位符只在纯文本时代换（数组无法做字符串
         替换），故渲染时用文本摘要，避免把 JSON 塞进模板槽位。
+
+        ``thread_id`` 由 ``invoke`` 经 ``_next_thread_id`` 算好后传入，以便调用方
+        拿到**实际发出**的会话号写进 raw_response；单独调用本方法（测试）时省略，
+        此时按同一策略现场派生。
         """
         rendered = _render_payload_value(self.payload_template, question)
         if not isinstance(rendered, dict):
@@ -201,7 +241,7 @@ class SSEStreamAdapter:
                 if key not in {"question", "configurable"}
             }
             configurable: dict[str, Any] = {
-                "thread_id": self.thread_id or f"eval_{uuid.uuid4().hex[:12]}",
+                "thread_id": thread_id or self._next_thread_id(),
                 "language": self.language,
             }
             template_configurable = rendered.get("configurable")
@@ -224,7 +264,9 @@ class SSEStreamAdapter:
             payload["question"] = question
 
         if "conversation_id" not in payload:
-            payload["conversation_id"] = f"eval_{uuid.uuid4().hex[:12]}"
+            # generic 模式的会话键是 conversation_id，同样每次调用一个新值；
+            # 用 invoke 算好的那个，使 raw_response 记录的与发出的是同一个值。
+            payload["conversation_id"] = thread_id or self._next_thread_id()
 
         return payload
 
@@ -238,7 +280,20 @@ class SSEStreamAdapter:
                 question = content if isinstance(content, (str, list)) else str(content)
                 break
 
-        payload = self._build_payload(question)
+        # 本次调用实际发出的会话号与身份，先算出来再建 payload/header，使
+        # raw_response 记录的与真正发出的必然是同一个值（而非事后猜测）。
+        sent_thread_id = self._next_thread_id()
+        payload = self._build_payload(question, thread_id=sent_thread_id)
+        req_headers = self._headers
+        identity: str | None = next(
+            (v for k, v in self._headers.items() if k.lower() == "x-user-id"), None
+        )
+        if self._inject_identity:
+            # 每次请求一个唯一身份，使被测服务端日志能定位到具体这一次调用。
+            # 只在本次请求的头副本上加，不污染 self._headers（共享 client 下
+            # 同一 adapter 会发多次请求，逐次身份必须各不相同）。
+            identity = f"agent-eval-{uuid.uuid4().hex[:16]}"
+            req_headers = {**self._headers, "X-User-Id": identity}
         full_text: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         active_tools: dict[str, dict[str, Any]] = {}
@@ -276,7 +331,7 @@ class SSEStreamAdapter:
         # HTTPStatusError（上游明确 4xx/5xx 拒绝）不在此捕获，照常冒泡。
         truncated = False
         try:
-            async with self._client.stream("POST", self.url, json=payload, headers=self._headers) as resp:
+            async with self._client.stream("POST", self.url, json=payload, headers=req_headers) as resp:
                 try:
                     resp.raise_for_status()
                 except httpx.HTTPStatusError as exc:
@@ -347,6 +402,13 @@ class SSEStreamAdapter:
         # Build raw_response carrying tool_calls, usage, and the ordered CoT
         # step list so the runner can persist it into test_results.full_trace.
         raw: dict[str, Any] = {}
+        # 本次**实际发出**的会话号与身份，无条件记录。放在 tool_calls/steps/usage
+        # 的条件写之前且不带任何 if：零字节即断（truncated）时恰恰最需要知道当时
+        # 用的是哪个会话，若挂在条件下就会正好在最该溯源的场景里丢掉。
+        # 上层据此可判定每条样例是否落在干净会话里 —— 落库前无从事后补算。
+        raw["sent_thread_id"] = sent_thread_id
+        if identity:
+            raw["identity"] = identity
         if truncated:
             # 流被中途切断——已累积内容可能不完整。上层据此把「拿到部分答案」
             # 与「连接彻底失败/无评分」区分开，并允许散文兜底对部分文本抽分。
