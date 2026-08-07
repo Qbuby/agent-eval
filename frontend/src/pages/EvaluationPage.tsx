@@ -645,7 +645,49 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   })
   const replyStates = replyStatesQuery.data ?? []
   const replyStateMap = new Map(replyStates.map(s => [s.case_ref, s]))
-  const missingReplyCases = replyCaseOptions.filter(c => !replyStateMap.get(c.id)?.has_reply)
+  // 手工指定历史版本后，当前版本的 has_reply / is_empty_reply 已不能代表实际将回放的版本；
+  // 这类样例交给后端按 version_ids 精确校验，前端不再用当前版本状态误拦。
+  const replyIssuesFor = (versionIds: Record<string, string>) => ({
+    missing: replyCaseOptions.filter(c => !versionIds[c.id] && !replyStateMap.get(c.id)?.has_reply),
+    empty: replyCaseOptions.filter(c => !versionIds[c.id] && replyStateMap.get(c.id)?.is_empty_reply),
+  })
+  const replyIssuesA = replyIssuesFor(replyVersionIds)
+  const replyIssuesB = replyIssuesFor(replyVersionIdsB)
+  const activeReplyIssues = [
+    ...(replySource === 'persisted' ? [replyIssuesA] : []),
+    ...(evalMode === 'comparative' && replySourceB === 'persisted' ? [replyIssuesB] : []),
+  ]
+  const uniqueCases = (rows: ReplyCaseOption[]) => Array.from(
+    new Map(rows.map(row => [row.id, row])).values(),
+  )
+  const missingReplyCases = uniqueCases(activeReplyIssues.flatMap(issue => issue.missing))
+  const emptyReplyCases = uniqueCases(activeReplyIssues.flatMap(issue => issue.empty))
+  // 一键排除：让后端用启动评估时的同一份 resolve_reply_versions 算出该保留哪些，
+  // 再把结果写回勾选（切成 pick 模式），这样「能排掉」与「开跑不被拦」必然一致。
+  const excludeEmptyMutation = useMutation({
+    mutationFn: (selectedVersionIds: Record<string, string>) => agentRepliesApi.filterEmpty({
+      dataset_type: replyDatasetType!,
+      case_refs: replyCaseRefs,
+      version_ids: selectedVersionIds,
+    }).then(r => r.data),
+    onSuccess: result => {
+      const kept = new Set(result.kept_refs)
+      if (sourceTab === 'benchmark') {
+        setSelectionMode('pick')
+        setPickedCaseIds(kept)
+      } else if (sourceTab === 'conversation') {
+        setConvSelectionMode('pick')
+        setConvPickedIds(kept)
+      }
+      // 被剔掉的样例若之前手工指定过版本，一并清掉，避免残留无效指定。
+      const dropped = new Set([...result.empty_refs, ...result.missing_refs])
+      const prune = (m: Record<string, string>) => Object.fromEntries(
+        Object.entries(m).filter(([ref]) => !dropped.has(ref)),
+      )
+      setReplyVersionIds(prev => prune(prev))
+      setReplyVersionIdsB(prev => prune(prev))
+    },
+  })
   // Trace 来源：'none' = 不关联外部 trace（纯本地评分）；'langsmith' = agent
   // 自报 trace 到 LangSmith，运行后按 project+时间窗回查贴回 langsmith_run_id；
   // 'langfuse' = agent 自报 trace 到 Langfuse，运行后按 trace name+时间窗回查、
@@ -724,6 +766,9 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   }
   if (persistedEnabled && replyPrecheckExact && !replyStatesQuery.isLoading && missingReplyCases.length > 0) {
     startBlockers.push(`${missingReplyCases.length} 条样例没有可用的已有回复`)
+  }
+  if (persistedEnabled && replyPrecheckExact && !replyStatesQuery.isLoading && emptyReplyCases.length > 0) {
+    startBlockers.push(`${emptyReplyCases.length} 条样例的已有回复是空回复（用「排除空回复样例」剔除）`)
   }
   const canStart = startBlockers.length === 0 && !startMutation.isPending
 
@@ -1196,6 +1241,9 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
             persistedDisabled={sourceTab === 'upload'}
             modelLabel={persistedModel}
             onModelLabelChange={setPersistedModel}
+            onExcludeEmpty={() => excludeEmptyMutation.mutate(replyVersionIds)}
+            excludingEmpty={excludeEmptyMutation.isPending}
+            excludeEmptyError={excludeEmptyMutation.error}
           >
             <AgentConfigFields
               title={evalMode === 'comparative' ? 'A 模型 · 实时调用配置' : '实时调用配置'}
@@ -1223,6 +1271,9 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
               persistedDisabled={sourceTab === 'upload'}
               modelLabel={persistedModelB}
               onModelLabelChange={setPersistedModelB}
+              onExcludeEmpty={() => excludeEmptyMutation.mutate(replyVersionIdsB)}
+              excludingEmpty={excludeEmptyMutation.isPending}
+              excludeEmptyError={excludeEmptyMutation.error}
             >
               <AgentConfigFields
                 title="B 模型 · 实时调用配置"
@@ -1367,6 +1418,10 @@ type ReplySourcePanelProps = {
   persistedDisabled: boolean
   modelLabel: string
   onModelLabelChange: (value: string) => void
+  // 一键排除空回复：由父组件持有（要改的是父级的勾选状态），面板只负责触发与展示。
+  onExcludeEmpty: () => void
+  excludingEmpty: boolean
+  excludeEmptyError: unknown
   children: React.ReactNode
 }
 
@@ -1388,15 +1443,24 @@ function ReplySourcePanel({
   persistedDisabled,
   modelLabel,
   onModelLabelChange,
+  onExcludeEmpty,
+  excludingEmpty,
+  excludeEmptyError,
   children,
 }: ReplySourcePanelProps) {
   const [overrideCaseRef, setOverrideCaseRef] = useState('')
   const [batchVerOpen, setBatchVerOpen] = useState(false)
   const stateMap = new Map(states.map(state => [state.case_ref, state]))
-  const missing = cases.filter(item => !stateMap.get(item.id)?.has_reply)
-  const ready = cases.length - missing.length
-  // 批量指定只对已有回复的样例有意义：没生成过的样例没有版本链可解析。
-  const readyRefs = cases.filter(item => stateMap.get(item.id)?.has_reply).map(item => item.id)
+  // 已手工指定历史版本时，当前版本状态不代表实际回放内容；交由同口径的后端接口
+  // 按 versionIds 精确判定，面板不能继续拿当前版本误报。
+  const missing = cases.filter(item => !versionIds[item.id] && !stateMap.get(item.id)?.has_reply)
+  // 空回复：有版本指针但那一版一个字都没回。和缺失一样不可评估，但要分开报——
+  // 「没生成过」的解法是去生成，「生成了是空的」的解法是排除或重新生成。
+  const empty = cases.filter(item => !versionIds[item.id] && stateMap.get(item.id)?.is_empty_reply)
+  const ready = cases.length - missing.length - empty.length
+  const blocked = missing.length + empty.length
+  // 批量指定只对已有版本链的样例有意义；已指定历史版本也属于可覆盖范围。
+  const readyRefs = cases.filter(item => !!versionIds[item.id] || stateMap.get(item.id)?.has_reply).map(item => item.id)
 
   return (
     <div className="rounded-md border border-border p-3">
@@ -1454,12 +1518,13 @@ function ReplySourcePanel({
             </div>
           ) : (
             <div className={`rounded-md border px-3 py-2 text-[11px] ${
-              missing.length > 0
+              blocked > 0
                 ? 'border-warning/30 bg-warning/10 text-warning'
                 : 'border-positive/30 bg-positive/5 text-positive'
             }`}>
               已检查 {cases.length} 条：{ready} 条可用
               {missing.length > 0 && `，${missing.length} 条缺少回复`}
+              {empty.length > 0 && `，${empty.length} 条是空回复`}
               {!precheckExact && (
                 <span className="text-text-tertiary ml-1">
                   （当前仅预检已加载范围，启动时后端会校验最终样例集）
@@ -1472,6 +1537,40 @@ function ReplySourcePanel({
             <div className="text-[11px] text-warning break-all">
               缺失：{missing.slice(0, 5).map(item => item.label).join('；')}
               {missing.length > 5 && ` 等 ${missing.length} 条`}
+            </div>
+          )}
+
+          {empty.length > 0 && (
+            <div className="text-[11px] text-warning break-all">
+              空回复：{empty.slice(0, 5).map(item => item.label).join('；')}
+              {empty.length > 5 && ` 等 ${empty.length} 条`}
+              <span className="block mt-0.5 text-text-tertiary">
+                这些样例存过回复，但 agent 一个字都没回。直接评估会得到凭空分数，
+                启动时会被后端拦下——请一键排除，或重新生成这些样例的回复。
+              </span>
+            </div>
+          )}
+
+          {/* 缺失与空回复都不可评估，一键排除对两者一起生效（后端 filter-empty
+              返回的 kept_refs 已经把两类都剔掉了）。 */}
+          {blocked > 0 && datasetType && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={onExcludeEmpty}
+                disabled={excludingEmpty}
+                className="px-2 py-1 rounded border border-warning/40 text-[11px] text-warning hover:bg-warning/10 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {excludingEmpty ? '正在排除…' : `排除这 ${blocked} 条不可评估样例`}
+              </button>
+              <span className="text-[10px] text-text-tertiary">
+                会把剩余 {ready} 条写回勾选
+              </span>
+              {!!excludeEmptyError && (
+                <span className="text-[11px] text-negative">
+                  排除失败：{extractError(excludeEmptyError)}
+                </span>
+              )}
             </div>
           )}
 

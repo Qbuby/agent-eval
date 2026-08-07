@@ -107,6 +107,29 @@ class CaseReplyStateOut(BaseModel):
     current_version_label: str | None = None
     current_model: str | None = None
     version_count: int = 0
+    # 当前版本是「空回复」（有版本但 agent 一个字没回）。has_reply=True 时才有
+    # 意义。拿这种样例去评估只会得到凭空分数，前端据此标红并支持一键排除。
+    # 只有历史遗留数据会出现——生成侧现在把空回复直接判失败。
+    is_empty_reply: bool = False
+
+
+class FilterEmptyRepliesRequest(BaseModel):
+    """一键排除空回复：传入待评估的样例集，返回该剔掉哪些、该留哪些。"""
+
+    dataset_type: str
+    case_refs: list[str] = Field(default_factory=list)
+    # 与评估请求里的 reply_version_ids 同义：显式指定某些样例用哪个版本。
+    # 不传则按各样例的「当前版本」判定，与评估侧解析口径一致——只有口径一致，
+    # 这里剔完之后开跑才不会又被后端的空回复门禁拦下。
+    version_ids: dict[str, str] = Field(default_factory=dict)
+
+
+class FilterEmptyRepliesOut(BaseModel):
+    """一键排除空回复的结果。``kept_refs`` 可直接覆盖前端的勾选。"""
+
+    empty_refs: list[str] = Field(default_factory=list)
+    missing_refs: list[str] = Field(default_factory=list)
+    kept_refs: list[str] = Field(default_factory=list)
 
 
 class BatchVersionSelector(BaseModel):
@@ -863,8 +886,41 @@ async def list_case_states(
                 current_version_label=cur.version_label if cur is not None else None,
                 current_model=_cfg_model(cur) if cur is not None else None,
                 version_count=int(counts.get(ref, 0)),
+                is_empty_reply=(
+                    reply_generator.version_is_empty(cur) if cur is not None else False
+                ),
             ))
         return out
+
+
+@router.post("/filter-empty", response_model=FilterEmptyRepliesOut)
+async def filter_empty_replies(req: FilterEmptyRepliesRequest):
+    """一键排除空回复：算出待评估样例里哪些的已有回复是空的。
+
+    前端拿 ``kept_refs`` 覆盖勾选（或用 ``empty_refs`` 取差集）后再发起评估，
+    评估侧就不会被空回复的凭空分数污染。判定完全复用
+    ``resolve_reply_versions``——与评估启动时的解析同一份代码、同一份口径，
+    不会出现「这里说能排掉、开跑时又拦下来」的分叉。
+
+    ``missing_refs``（没有可用回复）一并返回：这类样例评估侧本来就会拒绝启动，
+    前端可以在同一次操作里把它们也剔掉。
+    """
+    _check_dataset_type(req.dataset_type)
+    refs = [str(x) for x in (req.case_refs or []) if str(x)]
+    if not refs:
+        return FilterEmptyRepliesOut()
+
+    _resolved, missing, empty = await reply_generator.resolve_reply_versions(
+        dataset_type=req.dataset_type,
+        case_refs=refs,
+        version_ids=req.version_ids or None,
+    )
+    drop = set(missing) | set(empty)
+    return FilterEmptyRepliesOut(
+        empty_refs=empty,
+        missing_refs=missing,
+        kept_refs=[r for r in refs if r not in drop],
+    )
 
 
 @router.get("/versions", response_model=list[ReplyVersionOut])

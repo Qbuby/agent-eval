@@ -115,6 +115,57 @@ def is_job_active(job_id: str) -> bool:
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# 空回复 / 空输入判定（生成侧与评估侧共用同一口径）
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def reply_text_of(content: Any, turns: Any = None) -> str:
+    """取一条回复里「可用于评估的文本」投影。
+
+    单轮取 ``content`` 的文本投影；多轮**只取各轮 assistant**——多轮的
+    ``content`` 是 ``build_transcript(turns)``，里面含用户发言，agent 一个字
+    没回时它照样非空，拿它判空永远判不出来。
+    """
+    if isinstance(turns, list) and turns:
+        parts = [
+            content_to_text(t.get("assistant")).strip()
+            for t in turns
+            if isinstance(t, dict)
+        ]
+        return "\n".join(p for p in parts if p)
+    return content_to_text(content).strip()
+
+
+def is_empty_reply(content: Any, turns: Any = None) -> bool:
+    """回复是否为空（没有任何可评估文本）。"""
+    return not reply_text_of(content, turns)
+
+
+def version_is_empty(row: Any) -> bool:
+    """一条 ``AgentReplyVersionRow`` 是否是空回复。"""
+    return is_empty_reply(getattr(row, "content", None), getattr(row, "turns", None))
+
+
+def is_empty_question(question: Any) -> bool:
+    """样例输入是否为空。带附件的样例即使没有文字也算有输入（图本身可评）。"""
+    if isinstance(question, str):
+        return not question.strip()
+    return not (content_to_text(question).strip() or has_attachments(question))
+
+
+def is_empty_input_messages(messages: Any) -> bool:
+    """多轮样例是否没有可回放的输入（没有任何非空 user 消息）。"""
+    if not isinstance(messages, list):
+        return True
+    return not any(
+        isinstance(m, dict)
+        and m.get("role") == "user"
+        and not is_empty_question(m.get("content"))
+        for m in messages
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # 单样例生成
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -201,12 +252,7 @@ async def generate_one_reply(
             question = case.get("question") or ""
             if isinstance(question, str):
                 question = question.strip()
-                is_empty = not question
-            else:
-                is_empty = not (
-                    content_to_text(question).strip() or has_attachments(question)
-                )
-            if is_empty:
+            if is_empty_question(question):
                 out["error"] = "样例没有问题内容，无法生成回复"
                 out["error_type"] = "empty_question"
                 return out
@@ -231,6 +277,13 @@ async def generate_one_reply(
                 if isinstance(tk, int):
                     out["total_tokens"] = tk
             out["raw_trace"] = trace
+
+        # agent 连上了、没抛错，但一个字都没回。这种回复拿去评估只会得到
+        # 「正确性 0.3 / 幻觉率 1.0」这类凭空分数污染结果，故在生成侧就判失败：
+        # _persist_one 会落成 status='failed' 且不把当前版本指针指向它。
+        if not out["error"] and is_empty_reply(out["content"], out["turns"]):
+            out["error"] = "agent 返回了空回复（没有任何文本内容）"
+            out["error_type"] = "empty_reply"
     except Exception as e:
         attempts = getattr(e, "_eval_attempts_made", 1)
         msg = str(e)
@@ -611,18 +664,27 @@ async def resolve_reply_versions(
     dataset_type: str,
     case_refs: list[str],
     version_ids: dict[str, str] | None = None,
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], list[str], list[str]]:
     """解析评估要消费的回复版本。
 
     ``version_ids`` 显式指定 case_ref -> version_id 时用它；未指定的样例回落到
     ``agent_reply_case_states.current_version_id``。返回
-    ``(by_case_ref, missing_refs)``——``missing_refs`` 是没有可用回复（无版本、
-    版本不属于该样例、或版本不是 succeeded）的样例，调用方据此拒绝启动评估，
-    而不是静默跳过导致「评估结果里少了样例」这种难查的偏差。
+    ``(by_case_ref, missing_refs, empty_refs)``：
+
+    - ``missing_refs``：没有可用回复（无版本、版本不属于该样例、或版本不是
+      succeeded）的样例。
+    - ``empty_refs``：有 succeeded 版本但回复没有任何可评估文本的样例。这类是
+      历史遗留数据——生成侧现在会把空回复直接判失败，但老版本行仍是
+      succeeded。拿它们去评估只会得到凭空分数，故单列出来让调用方拒绝或排除。
+
+    两者都**不**静默跳过：静默跳过会导致「评估结果里少了样例」这种难查的偏差。
+    ``by_case_ref`` 仍包含 ``empty_refs`` 对应的行，便于调用方在明确排除后仍能
+    按同一份映射赋值。
     """
     explicit = {str(k): str(v) for k, v in (version_ids or {}).items()}
     resolved: dict[str, Any] = {}
     missing: list[str] = []
+    empty: list[str] = []
 
     async with async_session_factory() as session:
         repo = Repository(session)
@@ -649,9 +711,11 @@ async def resolve_reply_versions(
             if row is None or row.status != "succeeded":
                 missing.append(ref)
                 continue
+            if version_is_empty(row):
+                empty.append(ref)
             resolved[ref] = row
 
-    return resolved, missing
+    return resolved, missing, empty
 
 
 async def sweep_orphaned_jobs() -> int:

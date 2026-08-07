@@ -62,6 +62,13 @@ from agent_eval.evaluation.langfuse_runner import (
     rescore_missing_dimensions,
     start_run,
 )
+# 空输入 / 空回复判定与生成侧共用同一实现，避免两处口径漂移。
+# reply_generator 顶层只依赖 data / db 层（langfuse_runner 是函数内延迟导入），
+# 故这里可以顶层 import 而不成环。
+from agent_eval.evaluation.reply_generator import (
+    is_empty_input_messages,
+    is_empty_question,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/eval", tags=["eval"], dependencies=[Depends(require_internal())])
@@ -81,6 +88,7 @@ async def list_builtin_evaluators():
 
 async def resolve_eval_start_args(
     req: StartEvalRequest, session, repo,
+    excluded_out: list[str] | None = None,
 ) -> dict[str, Any]:
     """把 ``StartEvalRequest`` 解析成 ``start_run`` 的 kwargs（不含 notify）。
 
@@ -113,6 +121,12 @@ async def resolve_eval_start_args(
         )
 
     cases: list[dict[str, Any]] = []
+    # 输入为空（没有问题内容）的样例：三类来源统一在此收集并排除，不送去跑。
+    # 空输入根本问不出东西，agent 只会回一句无意义的话，judge 却照样给分，
+    # 于是"评了但毫无意义的样例"混进统计里拉偏结果。排除而非报错，是因为这类
+    # 样例通常是导入时的空行/脏数据，不该让整次评估起不来；被排除的 id 汇总
+    # 进 excluded_case_refs 让调用方能在 UI 上说清楚。
+    skipped_empty_input: list[str] = []
 
     def _criteria(value: Any) -> list[str]:
         """把各数据源的 key_points / criteria / keywords 统一成非空文本列表。"""
@@ -175,8 +189,11 @@ async def resolve_eval_start_args(
             if wanted_category is not None and (c.category or "") != wanted_category:
                 continue
             msgs = c.input_messages or []
-            if not any(m.get("role") == "user" and m.get("content") for m in msgs):
-                # 没有任何 user 消息的样例无法回放，跳过。
+            if is_empty_input_messages(msgs):
+                # 没有任何非空 user 消息的样例无法回放，跳过。判定与生成侧共用
+                # 同一口径（reply_generator.is_empty_input_messages）：只有空白
+                # 字符的 user 消息也算空，带附件的算有输入。
+                skipped_empty_input.append(str(c.id))
                 continue
             # 内存筛选路径下 limit 未下推给 provider，在此按"将跑样例数"截断。
             if load_limit is None and req.limit and len(cases) >= req.limit:
@@ -216,7 +233,11 @@ async def resolve_eval_start_args(
         raw_cases = src.cases or []
         if req.limit:
             raw_cases = raw_cases[: req.limit]
-        for c in raw_cases:
+        for idx, c in enumerate(raw_cases):
+            if is_empty_question(c.get("question")):
+                # 上传文件常见空行/占位行：没有问题内容，排除。
+                skipped_empty_input.append(str(c.get("name") or f"case-{idx+1}"))
+                continue
             reference_criteria = _criteria(
                 c.get("expected_output_criteria")
                 or c.get("key_points")
@@ -251,6 +272,11 @@ async def resolve_eval_start_args(
             stmt = stmt.limit(req.limit)
         bench_rows = (await session.execute(stmt)).scalars().all()
         for b in bench_rows:
+            merged_question = merge_question_content(b.question, b.question_content)
+            if is_empty_question(merged_question):
+                # 只有空白字符 / 完全没录问题的基准样例，排除；带附件的不算空。
+                skipped_empty_input.append(str(b.id))
+                continue
             expected_tool_calls = []
             if isinstance(b.extra_fields, dict):
                 for t in (b.extra_fields.get("expected_tool_calls") or []):
@@ -263,7 +289,7 @@ async def resolve_eval_start_args(
                 "name": str(b.id)[:8],
                 # 带附件样例送 canonical blocks（adapter 原样透传给 agent），
                 # 纯文本样例回落成字符串，与改造前逐字节一致。
-                "question": merge_question_content(b.question, b.question_content),
+                "question": merged_question,
                 "expected_output": b.reference_answer or "",
                 "expected_output_criteria": reference_criteria,
                 "expected_tool_calls": expected_tool_calls,
@@ -274,6 +300,19 @@ async def resolve_eval_start_args(
             })
 
     if not cases:
+        # 区分「筛选条件没命中」与「命中了但全是空输入」——后者报 no cases match
+        # 会把人引向去查筛选条件，实际该去查数据。
+        if skipped_empty_input:
+            n = len(skipped_empty_input)
+            shown = "、".join(skipped_empty_input[:5])
+            more = f" 等 {n} 个" if n > 5 else ""
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"所选样例全部没有输入内容（{n} 条），无法评估：{shown}{more}。"
+                    "请检查数据集里这些样例的问题字段是否为空。"
+                ),
+            )
         raise HTTPException(status_code=400, detail="no cases match the selection")
 
     # ── 2. resolve evaluator instances ──
@@ -389,7 +428,7 @@ async def resolve_eval_start_args(
         ):
             if src != "persisted":
                 continue
-            resolved, missing = await resolve_reply_versions(
+            resolved, missing, empty = await resolve_reply_versions(
                 dataset_type=reply_dataset_type,
                 case_refs=case_refs,
                 version_ids=vids or None,
@@ -405,9 +444,28 @@ async def resolve_eval_start_args(
                         "请先在数据集页面用「agent生成答案」生成，或改回实时调用 agent。"
                     ),
                 )
+            # 空回复（历史遗留的 succeeded 空版本）同样拒绝而不是静默评估：
+            # 空回复被 judge 打出的分是凭空分数，会污染整轮结果。前端可用
+            # /api/agent-replies/filter-empty 一键把这些样例从勾选里剔掉后重跑。
+            if empty:
+                shown = "、".join(empty[:5])
+                more = f" 等 {len(empty)} 个" if len(empty) > 5 else ""
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{side} 侧选择了「使用已有回复」，但以下样例的已有回复是空回复"
+                        f"（agent 没有返回任何文本）：{shown}{more}。"
+                        "请用「排除空回复样例」一键剔除这些样例，或重新生成回复。"
+                    ),
+                )
             key = "_reply_version" if side == "A" else "_reply_version_b"
             for c in cases:
                 c[key] = resolved[str(c["id"])]
+
+    # 被排除的空输入样例经 out 参数回传（不能进返回 dict——它是 start_run 的
+    # kwargs，多一个键会 TypeError）。调度器不传这个参数，行为与改造前一致。
+    if excluded_out is not None:
+        excluded_out.extend(skipped_empty_input)
 
     # start_run 的 kwargs（notify_open_ids 由调用方按触发来源另行注入）。
     return {
@@ -436,16 +494,24 @@ async def resolve_eval_start_args(
 async def start_eval(req: StartEvalRequest):
     """HTTP 发起一次评估：解析 → start_run。解析主体见
     ``resolve_eval_start_args``（与定时调度器共用）。"""
+    excluded: list[str] = []
     async with async_session_factory() as session:
         repo = Repository(session)
-        args = await resolve_eval_start_args(req, session, repo)
+        args = await resolve_eval_start_args(req, session, repo, excluded_out=excluded)
     try:
         # notify_open_ids 由调用方（机器人经 body 注入触发者 open_id）透传给
         # 完成通知；resolve 不含 notify，避免与调度器的显式透传冲突。
         run_id = await start_run(**args, notify_open_ids=req.notify_open_ids or None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"failed to start run: {e}") from e
-    return {"run_id": run_id, "status": "running", "case_count": len(args["cases"])}
+    # excluded_empty_input_case_refs：被自动排除的空输入样例，前端据此提示
+    # 「已排除 N 条无输入样例」，避免用户以为勾了 100 条却只跑了 97 条是 bug。
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "case_count": len(args["cases"]),
+        "excluded_empty_input_case_refs": excluded,
+    }
 
 
 def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRunSummary:

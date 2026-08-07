@@ -56,6 +56,22 @@ export interface CaseReplyState {
   current_version_label: string | null
   current_model: string | null
   version_count: number
+  // 当前版本是空回复（有版本但 agent 一个字没回）。has_reply 为 true 时才有意义。
+  // 这类样例拿去评估只会得到凭空分数，前端标出来并支持一键排除。
+  is_empty_reply: boolean
+}
+
+// ── 一键排除空回复 ──
+export interface FilterEmptyRepliesRequest {
+  dataset_type: ReplyDatasetType
+  case_refs: string[]
+  version_ids?: Record<string, string>
+}
+
+export interface FilterEmptyRepliesResult {
+  empty_refs: string[]
+  missing_refs: string[]
+  kept_refs: string[]
 }
 
 export interface ReplyJobItem {
@@ -179,6 +195,11 @@ export const agentRepliesApi = {
     return api.get<CaseReplyState[]>('/agent-replies/states', {
       params: { dataset_type: datasetType, case_refs: caseRefs.join(',') },
     })
+  },
+  // 一键排除空回复：后端复用评估启动时的 resolve_reply_versions，口径与开跑时
+  // 的拦截完全一致，不会出现「这里说排掉了、开跑又被拦」。
+  filterEmpty(data: FilterEmptyRepliesRequest) {
+    return api.post<FilterEmptyRepliesResult>('/agent-replies/filter-empty', data)
   },
   listVersions(datasetType: ReplyDatasetType, caseRef: string) {
     return api.get<ReplyVersion[]>('/agent-replies/versions', {
