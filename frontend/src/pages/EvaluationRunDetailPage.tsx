@@ -12,6 +12,7 @@ import { CotTimeline, ToolCallsTable } from '@/components/TraceTimeline'
 import MarkdownView from '@/components/MarkdownView'
 import MessageContentView from '@/components/MessageContentView'
 import { Button, Drawer, ErrorCard, ExportMenu } from '@/components/ui'
+import { RunCostSection } from '@/components/CostPanel'
 import {
   getScoreMeta, isPassing, directionMark, tone,
 } from '@/lib/scoreSemantics'
@@ -1305,6 +1306,14 @@ export default function EvaluationRunDetailPage() {
           <CostCard title="执行异常样例的成本" data={costAbnormal} />
         </section>
       )}
+
+      {/* 实算成本：按本地配价 + 本 run 真实 token 实时计算，与上方 token 均值卡并列。 */}
+      <RunCostSection
+        items={allItems}
+        modelA={(run.agent_config as { model?: string } | null)?.model ?? null}
+        modelB={isComparative ? ((run.agent_config_b as { model?: string } | null)?.model ?? null) : null}
+        comparative={isComparative}
+      />
 
       <RetryStatsCard stats={run.summary_scores?.retry_stats} />
 
