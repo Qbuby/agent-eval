@@ -44,16 +44,19 @@ function TokenRow({ label, value, hint }: { label: string; value: string; hint?:
 
 // ─── 可视化 ─────────────────────────────────────────────────────────────────
 //
-// 三档计费的颜色跟「实体」走（A=accent 绿 / B=info 蓝，与全站 A/B 语义色一致），
-// 档位靠同色系深浅区分——切勿给三档另配一组独立色，那会和 A/B 实体色抢语义。
+// 三档计费的颜色跟「实体」走（单 run 内 A=accent 绿 / B=info 蓝，与全站 A/B 语义色
+// 一致；跨 run 对比时由调用方给每个运行指定色，与该页圆点/图表同色），
+// 档位靠同色系深浅区分——切勿给三档另配一组独立色，那会和实体色抢语义。
 // 深浅按单价档递进：命中输入（最便宜）最浅 → 未命中输入 → 输出（最贵）最深。
 
+/** 单个 run 内部的两侧。跨 run 对比不用这个，直接给 rgbVar。 */
 type Side = 'a' | 'b'
 
 const SIDE_RGB: Record<Side, string> = { a: 'var(--accent)', b: 'var(--info)' }
 const TIER_ALPHA = [0.32, 0.6, 1] as const
 
-const tierFill = (side: Side, tier: number) => `rgb(${SIDE_RGB[side]} / ${TIER_ALPHA[tier]})`
+/** rgbVar 为未包 rgb() 的原始 CSS 变量（如 `var(--accent)`），才能按档叠 alpha。 */
+const tierFill = (rgbVar: string, tier: number) => `rgb(${rgbVar} / ${TIER_ALPHA[tier]})`
 
 const sharePct = (value: number, total: number) =>
   total > 0 ? `${((value / total) * 100).toFixed(0)}%` : '—'
@@ -99,16 +102,16 @@ function StackBar({ label, segments, ariaLabel }: {
  * 口径：缓存写入 token 已含在未命中输入内（见 pricing.ts 的计价口径），故不单列
  * 成段，否则同一批 token 会被数两次、占比失真。
  */
-function CostShareBars({ agg, currency, side }: {
+function CostShareBars({ agg, currency, rgbVar }: {
   agg: CostAggregate
   currency: string
-  side: Side
+  rgbVar: string
 }) {
   const tiers = [
     { key: 'hit', label: '命中输入', tokens: agg.hitInputTokens, cost: agg.hitInputCost },
     { key: 'miss', label: '未命中输入', tokens: agg.missInputTokens, cost: agg.missInputCost },
     { key: 'out', label: '输出', tokens: agg.outputTokens, cost: agg.outputCost },
-  ].map((t, i) => ({ ...t, fill: tierFill(side, i) }))
+  ].map((t, i) => ({ ...t, fill: tierFill(rgbVar, i) }))
 
   const tokTotal = tiers.reduce((sum, t) => sum + t.tokens, 0)
   if (tokTotal <= 0) return null
@@ -166,39 +169,49 @@ function CostShareBars({ agg, currency, side }: {
 }
 
 /**
- * A/B 总成本同标尺对比：两条按同一最大值缩放，条长直接可比——表格里两个数字
- * 要来回读才知道差多少，条长是一眼的事。颜色跟实体走（A=accent / B=info）。
+ * 总成本同标尺对比：N 条按同一最大值缩放，条长直接可比——表格里几个数字要来回读
+ * 才知道差多少，条长是一眼的事。颜色跟实体走（单 run 内 A=accent / B=info；跨 run
+ * 由调用方按运行指定，与该页圆点/图表同色）。
+ * 条内不放文字，金额固定在右侧列——避免短条上的数字被裁掉。
+ *
+ * caption 必须画在屏幕上：多组条上下相邻时，条内标签都是实体名，唯一能区分口径
+ * （总成本 / 单样例均成本）的就是组标题——样例数相同的两个运行会让两组条长完全
+ * 一样，只把口径写进 aria-label 等于视觉上没写。
  */
-function CostCompareBars({ aTotal, bTotal, aLabel, bLabel, currency }: {
-  aTotal: number
-  bTotal: number
-  aLabel: string
-  bLabel: string
+function CostScaleBars({ rows, currency, labelWidthClass = 'w-14', caption = '总成本对比' }: {
+  rows: Array<{ key: string; label: string; value: number; rgbVar: string }>
   currency: string
+  /** 标签列宽。跨 run 的 `id · model` 比「A 侧」长，需要更宽。 */
+  labelWidthClass?: string
+  /** 可见组标题，同时作为 aria 前缀——口径只维护一份，不会图文不一致。 */
+  caption?: string
 }) {
-  const max = Math.max(aTotal, bTotal)
+  const max = Math.max(0, ...rows.map(r => r.value))
   if (max <= 0) return null
-  const rows = [
-    { key: 'a', label: aLabel, value: aTotal, fill: tierFill('a', 2) },
-    { key: 'b', label: bLabel, value: bTotal, fill: tierFill('b', 2) },
-  ]
   return (
-    <div
-      className="mt-2 space-y-1"
-      role="img"
-      aria-label={`总成本对比：${aLabel} ${formatCost(aTotal, currency)}，${bLabel} ${formatCost(bTotal, currency)}`}
-    >
-      {rows.map(r => (
-        <div key={r.key} className="flex items-center gap-2 text-[10px]">
-          <span className="w-14 shrink-0 text-text-tertiary truncate" title={r.label}>{r.label}</span>
-          <div className="flex-1 h-3 rounded-sm bg-fill/10 overflow-hidden">
-            <div className="h-full rounded-sm" style={{ width: `${(r.value / max) * 100}%`, backgroundColor: r.fill }} />
+    /* mt-3 > 组内 space-y-1：组间距明显大于行间距，四条才不会读成一组。 */
+    <div className="mt-3">
+      <div className="text-[10px] font-medium text-text-secondary mb-1">{caption}</div>
+      <div
+        className="space-y-1"
+        role="img"
+        aria-label={`${caption}：${rows.map(r => `${r.label} ${formatCost(r.value, currency)}`).join('，')}`}
+      >
+        {rows.map(r => (
+          <div key={r.key} className="flex items-center gap-2 text-[10px]">
+            <span className={`${labelWidthClass} shrink-0 text-text-tertiary truncate`} title={r.label}>{r.label}</span>
+            <div className="flex-1 h-3 rounded-sm bg-fill/10 overflow-hidden">
+              <div
+                className="h-full rounded-sm"
+                style={{ width: `${(r.value / max) * 100}%`, backgroundColor: tierFill(r.rgbVar, 2) }}
+              />
+            </div>
+            <span className="w-20 shrink-0 text-right font-mono text-text-secondary tabular-nums">
+              {formatCost(r.value, currency)}
+            </span>
           </div>
-          <span className="w-20 shrink-0 text-right font-mono text-text-secondary tabular-nums">
-            {formatCost(r.value, currency)}
-          </span>
-        </div>
-      ))}
+        ))}
+      </div>
     </div>
   )
 }
@@ -212,14 +225,14 @@ function CostColumn({
   model,
   agg,
   currency,
-  side,
+  rgbVar,
 }: {
   title: string
   model: string | null
   agg: CostAggregate
   currency: string
-  /** 该列对应的实体，决定图形色（A=accent / B=info），与全站 A/B 语义色一致。 */
-  side: Side
+  /** 该列实体的图形色，未包 rgb() 的原始 CSS 变量（单 run 内用 SIDE_RGB，跨 run 由调用方指定）。 */
+  rgbVar: string
 }) {
   const { priceOf, matchOf } = usePricing()
   const price = priceOf(model)
@@ -266,7 +279,7 @@ function CostColumn({
       )}
 
       {/* 构成条放在单价与 token 明细之间：先知道单价，再看量与钱分别落在哪一档。 */}
-      <CostShareBars agg={agg} currency={currency} side={side} />
+      <CostShareBars agg={agg} currency={currency} rgbVar={rgbVar} />
 
       <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11px]">
         <TokenRow label="计价样例数" value={String(agg.n)} />
@@ -338,7 +351,7 @@ export function RunCostSection({
           model={modelA}
           agg={aggA}
           currency={currency}
-          side="a"
+          rgbVar={SIDE_RGB.a}
         />
         {comparative && aggB && (
           <CostColumn
@@ -346,7 +359,7 @@ export function RunCostSection({
             model={modelB ?? null}
             agg={aggB}
             currency={currency}
-            side="b"
+            rgbVar={SIDE_RGB.b}
           />
         )}
       </div>
@@ -360,13 +373,113 @@ export function RunCostSection({
 
       {/* 差额文字之后紧跟同标尺条：文字给差多少，条给差多大。 */}
       {aggA.total != null && aggB?.total != null && (
-        <CostCompareBars
-          aTotal={aggA.total}
-          bTotal={aggB.total}
-          aLabel="A 侧"
-          bLabel="B 侧"
+        <CostScaleBars
+          rows={[
+            { key: 'a', label: 'A 侧', value: aggA.total, rgbVar: SIDE_RGB.a },
+            { key: 'b', label: 'B 侧', value: aggB.total, rgbVar: SIDE_RGB.b },
+          ]}
           currency={currency}
         />
+      )}
+
+      <div className="mt-2 text-[10px] text-text-tertiary">{PRICING_NOTE}</div>
+    </section>
+  )
+}
+
+/** 跨运行成本区的单个运行入参。rgbVar 必须是未包 rgb() 的裸变量。 */
+export interface CrossRunCostEntry {
+  id: string
+  /** 与该页圆点/图表一致的运行标签。 */
+  label: string
+  model: string | null
+  items: EvalResultRow[]
+  /** 该运行在本页的实体色，形如 `var(--accent)`。传已包 rgb() 的值会生成非法 CSS。 */
+  rgbVar: string
+}
+
+/**
+ * N 个运行的实算成本区。每个运行一列（总成本 / 均成本 / 三档构成条），
+ * 下方给同标尺对比条：总成本按批量比，均成本按单样例比——两个运行样例数不同时，
+ * 只看总成本会把「样例更多」误读成「更贵」。
+ *
+ * 颜色跟运行实体走，由调用方按运行传入，与该页概览圆点、图表同色；勾选子集
+ * 重算时颜色不变（色不跟排名走）。
+ */
+export function CrossRunCostSection({ entries, subsetNote }: {
+  entries: CrossRunCostEntry[]
+  /** 子集模式提示，例如「· 子集（12 个样例）」。 */
+  subsetNote?: string
+}) {
+  const { currency, priceOf } = usePricing()
+
+  const priced = useMemo(
+    () => entries.map(e => ({
+      ...e,
+      agg: aggregateCost(e.items.map(row => ({ usage: usageOfA(row), price: priceOf(e.model) }))),
+    })),
+    [entries, priceOf],
+  )
+
+  if (priced.length === 0) return null
+
+  const totalRows = priced
+    .filter(p => p.agg.total != null)
+    .map(p => ({ key: p.id, label: p.label, value: p.agg.total as number, rgbVar: p.rgbVar }))
+  const meanRows = priced
+    .filter(p => p.agg.mean != null)
+    .map(p => ({ key: p.id, label: p.label, value: p.agg.mean as number, rgbVar: p.rgbVar }))
+
+  // 极差用均成本口径：样例数不同的运行之间，只有单样例成本才可比。
+  const cheapest = meanRows.length >= 2
+    ? meanRows.reduce((min, r) => (r.value < min.value ? r : min))
+    : null
+  const dearest = meanRows.length >= 2
+    ? meanRows.reduce((max, r) => (r.value > max.value ? r : max))
+    : null
+  const spreadPct = cheapest && dearest && cheapest.value > 0
+    ? ((dearest.value - cheapest.value) / cheapest.value) * 100
+    : null
+
+  return (
+    <section className="mb-5">
+      <div className="section-row mb-2">
+        <div className="page-eyebrow">实算成本（按运行）{subsetNote}</div>
+        <PricingButton
+          suggestModels={priced.map(p => p.model).filter((m): m is string => Boolean(m))}
+        />
+      </div>
+
+      <div
+        className="grid gap-3"
+        style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))' }}
+      >
+        {priced.map(p => (
+          <CostColumn
+            key={p.id}
+            title={p.label}
+            model={p.model}
+            agg={p.agg}
+            currency={currency}
+            rgbVar={p.rgbVar}
+          />
+        ))}
+      </div>
+
+      {cheapest && dearest && cheapest.key !== dearest.key && (
+        <div className="mt-2 text-[11px] text-text-secondary">
+          单样例最省 <span className="font-mono">{cheapest.label}</span>（{formatCost(cheapest.value, currency)}），
+          最贵 <span className="font-mono">{dearest.label}</span>（{formatCost(dearest.value, currency)}）
+          {spreadPct != null && `，贵 ${spreadPct.toFixed(1)}%`}
+        </div>
+      )}
+
+      {/* 文字给差多少，条给差多大；总成本与均成本各一条，避免样例数差异误读。 */}
+      {totalRows.length >= 2 && (
+        <CostScaleBars rows={totalRows} currency={currency} labelWidthClass="w-32" caption="总成本对比" />
+      )}
+      {meanRows.length >= 2 && (
+        <CostScaleBars rows={meanRows} currency={currency} labelWidthClass="w-32" caption="单样例均成本对比" />
       )}
 
       <div className="mt-2 text-[10px] text-text-tertiary">{PRICING_NOTE}</div>

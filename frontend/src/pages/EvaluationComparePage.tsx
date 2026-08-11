@@ -6,6 +6,7 @@ import {
 } from 'recharts'
 import { evaluationApi } from '@/services'
 import { Drawer, ExportMenu } from '@/components/ui'
+import { CrossRunCostSection, type CrossRunCostEntry } from '@/components/CostPanel'
 import { directionMark, getScoreMeta, isPassing, tone } from '@/lib/scoreSemantics'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import { exportCompareReport } from '@/lib/reportExport'
@@ -27,6 +28,21 @@ const BAR_COLORS = [
   'rgb(var(--positive) / 0.7)',
   'rgb(var(--info) / 0.7)',
 ]
+// 同序的「裸」变量版本：CostPanel 要按计费档叠 alpha，只能吃未包 rgb() 的变量，
+// 传上面已包好的值会拼出 rgb(rgb(...) / a) 这种非法 CSS 并静默失效。
+// 同一索引 = 同一个运行，与概览圆点、图表保持同色。
+// 注意第 7/8 位：BAR_COLORS 靠 alpha 0.7 与第 2/4 位区分，而成本区的 alpha 已被
+// 三个计费档占用，无法再叠——故这两位在成本区与第 2/4 位同色。跨运行成本区因此
+// 只对前 6 个运行保证唯一色，超出的运行只出卡片、不进对比条（见挂载处）。
+const RUN_RGB_VARS = [
+  'var(--accent)',
+  'var(--positive)',
+  'var(--warning)',
+  'var(--info)',
+  'var(--negative)',
+  'var(--accent-hover)',
+]
+const MAX_COLORED_RUNS = RUN_RGB_VARS.length
 const COST_METRIC_DEFS: Array<{
   key: string
   label: string
@@ -141,6 +157,31 @@ export default function EvaluationComparePage() {
   const hasMultiTurnDims = dimTrendChart.series.length > 0
   const costChart = useMemo(() => buildCostChart(runs, statsByRun), [runs, statsByRun])
   const passRateChart = useMemo(() => buildPassRateChart(runs, statsByRun), [runs, statsByRun])
+
+  // 实算成本的入参：钱要按真实 usage 逐样例累加，不能拿 summary 的均值反推，
+  // 所以这里走明细行（子集模式只取勾选的样例，与上面的统计口径一致）。
+  const costEntries = useMemo<CrossRunCostEntry[]>(() =>
+    runs.slice(0, MAX_COLORED_RUNS).map((run, i) => {
+      let items: EvalResultRow[]
+      if (usingSubset) {
+        items = []
+        for (const a of aligned) {
+          if (!selectedKeys.has(a.key)) continue
+          const row = a.byRun[run.id]
+          if (row) items.push(row)
+        }
+      } else {
+        items = resultsByRun[run.id]?.items ?? []
+      }
+      return {
+        id: run.id,
+        label: runLabel(run),
+        model: (run.agent_config as { model?: string }).model ?? null,
+        items,
+        rgbVar: RUN_RGB_VARS[i],
+      }
+    }),
+  [runs, resultsByRun, aligned, selectedKeys, usingSubset])
 
   if (ids.length === 0) {
     return (
@@ -400,6 +441,12 @@ export default function EvaluationComparePage() {
               )}
             </section>
           )}
+
+          {/* 钱在前、量在后：下面那张图是 token/时延口径，回答的是「为什么贵」。 */}
+          <CrossRunCostSection
+            entries={costEntries}
+            subsetNote={usingSubset ? `· 子集（${selectedKeys.size} 个样例）` : undefined}
+          />
 
           {costChart.data.length > 0 && (
             <section className="card p-4 mb-5">
