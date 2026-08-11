@@ -122,3 +122,13 @@ e2e/_build_*.log
 e2e/_make_fixtures_*.py
 e2e/_fixture_*.xlsx
 frontend/tsc_out.txt
+# 成本区可视化排查现场（#169-#173）。沿用既有约定：verify-*.mjs / expect-*.mjs
+# 生成器 / check-*.mjs 入库；日志、报告、按本机数据算出的期望值 JSON 不入库。
+# 注意连字符与下划线的分工：expect-173-crossrun-cost.mjs 是生成器（入库），
+# expect_173_crossrun.json 是它的产物（不入库）。
+e2e/build-frontend.log
+e2e/out-173.txt
+e2e/run_173.log
+e2e/report_*.json
+e2e/expect_*.json
+e2e/probe-cost-tier-colors.mjs
