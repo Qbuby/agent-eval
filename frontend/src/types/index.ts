@@ -655,6 +655,16 @@ export interface ConversationTurn {
   steps?: CotStep[]
   latency_ms?: number | null
   attempts?: number
+  // 本轮 token 用量。agent 未报 token 时为 null（而非补零），据此可区分
+  // 「这轮没花 token」和「这轮拿不到 token 数」。字段名与会话级/单轮同构，
+  // 可直接喂 pricing 的 TokenUsage 算本轮成本。
+  usage?: {
+    prompt_tokens?: number | null
+    completion_tokens?: number | null
+    total_tokens?: number | null
+    cache_creation_tokens?: number | null
+    cache_read_tokens?: number | null
+  } | null
 }
 
 // 多轮评估结果的会话级上下文（落在 full_trace.conversation）。

@@ -154,6 +154,10 @@ async def replay_conversation(
         # 从 raw_response 抽 tool_calls / steps / usage（与单轮同结构）。
         turn_tool_calls: list[dict[str, Any]] = []
         turn_steps: list[dict[str, Any]] = []
+        # 本轮 usage 单独留一份存进 turn，供详情页逐轮展示 token/成本；
+        # 与 usage_acc 的会话级累加同源但互不覆盖（某轮缺 usage 时该轮为 None，
+        # 不影响其余轮，也不会让会话级合计凭空补零）。
+        turn_usage: dict[str, int | None] | None = None
         raw = getattr(resp, "raw_response", None)
         if isinstance(raw, dict):
             tcs = raw.get("tool_calls")
@@ -167,14 +171,19 @@ async def replay_conversation(
                 inp = u.get("input_tokens") or u.get("prompt_tokens")
                 outp = u.get("output_tokens") or u.get("completion_tokens")
                 tot = u.get("total_tokens")
+                t_prompt = t_completion = t_total = None
+                t_cc = t_cr = None
                 if isinstance(inp, int):
                     usage_acc["prompt_tokens"] += inp
+                    t_prompt = inp
                     usage_seen = True
                 if isinstance(outp, int):
                     usage_acc["completion_tokens"] += outp
+                    t_completion = outp
                     usage_seen = True
                 if isinstance(tot, int):
                     usage_acc["total_tokens"] += tot
+                    t_total = tot
                     usage_seen = True
                 details = u.get("input_token_details") or {}
                 if isinstance(details, dict):
@@ -182,8 +191,21 @@ async def replay_conversation(
                     cr = details.get("cache_read")
                     if isinstance(cc, int):
                         usage_acc["cache_creation_tokens"] += cc
+                        t_cc = cc
                     if isinstance(cr, int):
                         usage_acc["cache_read_tokens"] += cr
+                        t_cr = cr
+                # total 缺失时按本轮 输入+输出 兜底，口径与单轮 _extract_usage 一致。
+                if t_total is None and (t_prompt is not None or t_completion is not None):
+                    t_total = (t_prompt or 0) + (t_completion or 0)
+                if any(v is not None for v in (t_prompt, t_completion, t_total, t_cc, t_cr)):
+                    turn_usage = {
+                        "prompt_tokens": t_prompt,
+                        "completion_tokens": t_completion,
+                        "total_tokens": t_total,
+                        "cache_creation_tokens": t_cc,
+                        "cache_read_tokens": t_cr,
+                    }
 
         total_latency += float(getattr(resp, "latency_ms", 0) or 0)
         merged_tool_calls.extend(turn_tool_calls)
@@ -202,6 +224,9 @@ async def replay_conversation(
             "steps": turn_steps,
             "latency_ms": int(getattr(resp, "latency_ms", 0) or 0),
             "attempts": attempts,
+            # agent 未报 token 时为 None（而非补零），让详情页能区分
+            # 「这轮没花 token」和「这轮拿不到 token 数」。
+            "usage": turn_usage,
         })
 
     usage = {

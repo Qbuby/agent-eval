@@ -2291,6 +2291,13 @@ function ConversationResultView({
         const criteria = exp?.criteria ?? []
         const turnSteps = t.steps ?? []
         const turnToolCalls = t.tool_calls ?? []
+        // 本轮 token：后端按轮单独留存（会话级合计仍在结果行的 token 列）。
+        // 全为 null 表示 agent 没报用量，此时整行不渲染，不显示误导性的 0。
+        const tu = t.usage
+        const hasTurnUsage = !!tu && [
+          tu.prompt_tokens, tu.completion_tokens, tu.total_tokens,
+          tu.cache_creation_tokens, tu.cache_read_tokens,
+        ].some(v => typeof v === 'number')
         return (
           <div key={i} className="space-y-1.5">
             {/* user 气泡（右） */}
@@ -2363,6 +2370,15 @@ function ConversationResultView({
               ) : turnToolCalls.length > 0 && (
                 <div className="max-w-[85%] mt-1 text-[11px] text-text-tertiary">
                   本轮工具调用：{turnToolCalls.length} 次
+                </div>
+              )}
+              {/* 本轮 token 用量：逐轮之和即结果行的会话级合计，便于定位哪轮最贵。 */}
+              {hasTurnUsage && (
+                <div className="max-w-[85%] mt-1 text-[11px] text-text-tertiary tabular-nums">
+                  本轮 token：入 {tu!.prompt_tokens ?? '—'} / 出 {tu!.completion_tokens ?? '—'}
+                  {typeof tu!.total_tokens === 'number' && <> · 合计 {tu!.total_tokens}</>}
+                  {typeof tu!.cache_read_tokens === 'number' && <> · 缓存命中 {tu!.cache_read_tokens}</>}
+                  {typeof tu!.cache_creation_tokens === 'number' && <> · 缓存写入 {tu!.cache_creation_tokens}</>}
                 </div>
               )}
             </div>
