@@ -196,9 +196,12 @@ DEFAULT_CONFIGS: list[dict[str, Any]] = [
     },
     {
         "key": "langfuse_metrics.environments",
-        "value": _pack([{"value": "saas-prod,xinchai-prod,smartlink-hc-dev", "label": None}], 0),
+        "value": _pack([{"value": "", "label": None}], 0),
         "category": "langfuse_metrics",
-        "description": "拉取的目标环境列表，逗号分隔。留空则用内置默认。",
+        "description": (
+            "拉取的目标环境白名单，逗号分隔。**留空（默认）= 拉取该 project 下全部环境**，"
+            "Langfuse 新增环境无需改配置即自动入库。仅在需要刻意收窄拉取范围时才填写。"
+        ),
     },
 ]
 

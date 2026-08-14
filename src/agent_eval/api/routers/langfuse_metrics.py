@@ -346,11 +346,19 @@ def _parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
-def _trace_filters(environment: str | None, from_: str | None, to: str | None):
-    """构造 LangfuseTraceMetricRow 上的 environment + trace_timestamp 窗口 where 列表。"""
+def _trace_filters(environment: list[str] | None, from_: str | None, to: str | None):
+    """构造 LangfuseTraceMetricRow 上的 environment + trace_timestamp 窗口 where 列表。
+
+    ``environment`` 是**多选**过滤项：重复传同名 query param 即多选
+    （``?environment=a&environment=b``），空列表 / None 表示不过滤（全部环境）。
+    单值走 ``==``、多值走 ``IN``，让 Postgres 对单值仍能用等值索引。
+    """
     clauses = []
-    if environment:
-        clauses.append(LangfuseTraceMetricRow.environment == environment)
+    envs = [e for e in (environment or []) if e and e.strip()]
+    if len(envs) == 1:
+        clauses.append(LangfuseTraceMetricRow.environment == envs[0])
+    elif envs:
+        clauses.append(LangfuseTraceMetricRow.environment.in_(envs))
     dt_from = _parse_dt(from_)
     dt_to = _parse_dt(to)
     if dt_from is not None:
@@ -365,7 +373,9 @@ def _trace_filters(environment: str | None, from_: str | None, to: str | None):
 # --------------------------------------------------------------------------- #
 @router.get("/stats", response_model=MetricsStatsResponse)
 async def get_metrics_stats(
-    environment: str | None = Query(None, description="精确匹配某 env；不传则全 env"),
+    environment: list[str] | None = Query(
+        None, description="多选 env（可重复传）；不传则全 env"
+    ),
     from_: str | None = Query(None, alias="from", description="trace_timestamp 下界 (ISO)"),
     to: str | None = Query(None, description="trace_timestamp 上界 (ISO)"),
 ) -> MetricsStatsResponse:
@@ -438,7 +448,9 @@ async def get_metrics_stats(
 
 @router.get("/trends", response_model=MetricsTrendResponse)
 async def get_metrics_trends(
-    environment: str | None = Query(None),
+    environment: list[str] | None = Query(
+        None, description="多选 env（可重复传）；不传则全 env"
+    ),
     from_: str | None = Query(None, alias="from"),
     to: str | None = Query(None),
     bucket: str = Query("day", description="时间分桶粒度，传给 date_trunc"),
@@ -508,7 +520,9 @@ async def get_metrics_trends(
 
 @router.get("/traces", response_model=TraceListResponse)
 async def list_traces(
-    environment: str | None = Query(None),
+    environment: list[str] | None = Query(
+        None, description="多选 env（可重复传）；不传则全 env"
+    ),
     from_: str | None = Query(None, alias="from"),
     to: str | None = Query(None),
     name: str | None = Query(None, description="按 trace name 模糊匹配 (ilike)"),
