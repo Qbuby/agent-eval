@@ -182,7 +182,6 @@ async def replay_conversation(
                     t_completion = outp
                     usage_seen = True
                 if isinstance(tot, int):
-                    usage_acc["total_tokens"] += tot
                     t_total = tot
                     usage_seen = True
                 details = u.get("input_token_details") or {}
@@ -198,6 +197,14 @@ async def replay_conversation(
                 # total 缺失时按本轮 输入+输出 兜底，口径与单轮 _extract_usage 一致。
                 if t_total is None and (t_prompt is not None or t_completion is not None):
                     t_total = (t_prompt or 0) + (t_completion or 0)
+                # 会话级 total 累加**兜底后**的逐轮 total：agent 只报 input/output
+                # 不报 total 时（LangChain usage_metadata 的常见形状），若只累加
+                # 原样上报的 total，会话级 total_tokens 会退成 None —— 而它正是
+                # 落库主列 total_tokens 与列表/详情页 token 计数展示的输入。
+                # （成本金额不走这里：前端 splitBillableTokens 只按 prompt/
+                # completion/cache_read/cache_creation 分三档计价，不读 total。）
+                if t_total is not None:
+                    usage_acc["total_tokens"] += t_total
                 if any(v is not None for v in (t_prompt, t_completion, t_total, t_cc, t_cr)):
                     turn_usage = {
                         "prompt_tokens": t_prompt,
