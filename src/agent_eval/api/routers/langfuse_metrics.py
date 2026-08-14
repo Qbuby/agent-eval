@@ -80,21 +80,26 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def _input_preview(value, max_len: int = 300) -> str | None:
-    """列表用 input 预览：文本化后截断，避免大 JSON 撑爆列表 payload。
+    """列表用 input 预览：优先提取用户问题正文，取不到才退回紧凑 JSON。
 
-    str 原样使用；dict/list 等用紧凑 JSON 序列化。超长截断并加省略号。
+    直接序列化整个 trace.input 会让列表列全是 ``{"messages":[{"role":"user",…``
+    这种壳，真正的问题被挤到截断之外。所以先走 ``_question_from_trace_input``
+    （与导入备选数据集同一套口径），提取失败再退回 JSON 以免丢信息。
+    超长截断并加省略号。
     """
     if value is None:
         return None
-    if isinstance(value, str):
-        text = value
-    else:
-        try:
-            import json
+    text = _question_from_trace_input(value)
+    if not text:
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                import json
 
-            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        except (TypeError, ValueError):
-            text = str(value)
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                text = str(value)
     text = text.strip()
     if not text:
         return None
@@ -787,7 +792,12 @@ def _text_from_value(value) -> str:
 
 
 def _question_from_trace_input(trace_input) -> str:
-    """从 trace.input 提取用户问题：优先 messages 里最后一条 user，回退整体文本。"""
+    """从 trace.input 提取用户问题：优先 messages 里最后一条 user，回退整体文本。
+
+    LangGraph 中断恢复（interrupt/resume）的 trace 没有 messages，形状是
+    ``{"goto":[],"graph":null,"resume":"<用户补充的内容>","update":null}``，
+    用户输入在 ``resume`` 里，单独兜一层。
+    """
     if isinstance(trace_input, dict):
         messages = trace_input.get("messages")
         if isinstance(messages, list):
@@ -796,6 +806,11 @@ def _question_from_trace_input(trace_input) -> str:
                     txt = _text_from_value(msg.get("content"))
                     if txt:
                         return txt
+        resume = trace_input.get("resume")
+        if resume is not None:
+            txt = _text_from_value(resume)
+            if txt:
+                return txt
     return _text_from_value(trace_input)
 
 
