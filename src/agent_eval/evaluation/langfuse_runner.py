@@ -2009,25 +2009,17 @@ async def _execute_run(
                 handle.progress["failed"] += 1
                 handle.progress["completed"] += 1
                 return
-            # 对比模式不走 acceptance/scores 投影（相对胜负，非通过/失败）——直接按
-            # 行 status 映射执行/评分事实：scored=评分完成，execution_error=执行异常，
-            # 其余（judge 未出结论）计为评分错误。
-            if agent_cfg_b is not None:
-                st = res.get("status")
-                projection = {
-                    "execution_status": "abnormal" if st == "execution_error" else "success",
-                    "evaluation_status": "completed" if st == "scored" else (
-                        "error" if st == "evaluation_error" else "unknown"
-                    ),
-                    "acceptance_decision": None,
-                }
-            else:
-                projection = project_case(
-                    stored_status=res.get("status"),
-                    error_type=res.get("error_type"),
-                    scores=res.get("scores") or {},
-                    acceptance_policy=acceptance_policy,
-                )
+            # 对比模式不走 acceptance/scores 投影（相对胜负，非通过/失败）。这里
+            # 把模式标记与 comparison 原文一并交给 project_case 统一判定，避免逐样
+            # 例投影与下面 aggregate_semantics 的 run 级 facts 两套口径打架。
+            projection = project_case(
+                stored_status=res.get("status"),
+                error_type=res.get("error_type"),
+                scores=res.get("scores") or {},
+                acceptance_policy=acceptance_policy,
+                comparison=res.get("comparison"),
+                is_comparative=agent_cfg_b is not None,
+            )
             res.update(projection)
             per_case_results.append(res)
             if projection["execution_status"] == "abnormal" or projection[

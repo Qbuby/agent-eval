@@ -646,25 +646,15 @@ async def get_run_results(
     for r in rows:
         scores = score_index.get(r.id, {})
         comparison = getattr(r, "comparison", None)
-        if comparison is not None:
-            # 对比样例不走 scores/acceptance 投影（相对胜负，非通过/失败）——
-            # 直接按行 status 映射执行/评分事实，acceptance_decision 恒 None。
-            projection = {
-                "execution_status": "abnormal" if r.status == "execution_error" else "success",
-                "evaluation_status": "completed" if r.status == "scored" else (
-                    "error" if r.status == "evaluation_error" else "unknown"
-                ),
-                "acceptance_decision": None,
-                "decision_source": "current",
-                "criterion_results": [],
-            }
-        else:
-            projection = project_case(
-                stored_status=r.status,
-                error_type=r.error_type,
-                scores=scores,
-                acceptance_policy=acceptance_policy,
-            )
+        # 对比样例的投影口径由 project_case 统一承担（相对胜负、不参与阈值验收），
+        # 与 run 级 aggregate_semantics 走同一条分支，避免两边算出不同的 facts。
+        projection = project_case(
+            stored_status=r.status,
+            error_type=r.error_type,
+            scores=scores,
+            acceptance_policy=acceptance_policy,
+            comparison=comparison,
+        )
         items.append(EvalResultRow(
             id=str(r.id),
             benchmark_case_id=str(r.benchmark_case_id) if r.benchmark_case_id else None,
@@ -736,11 +726,13 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
     rows: list[dict[str, Any]] = []
     for r in sorted(results, key=lambda x: x.created_at or x.id.hex):
         score_map = {s.dimension: float(s.score) for s in scores_by_result.get(r.id, [])}
+        comparison = getattr(r, "comparison", None)
         projection = project_case(
             stored_status=r.status,
             error_type=getattr(r, "error_type", None),
             scores=score_map,
             acceptance_policy=acceptance_policy,
+            comparison=comparison,
         )
         dims.update(score_map.keys())
         rows.append({
@@ -761,6 +753,9 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
             "acceptance_decision": projection["acceptance_decision"],
             "decision_source": projection["decision_source"],
             "criterion_results": projection["criterion_results"],
+            # 对比矩阵按列展开后拿不到 comparison 原文，这里带一个标记，
+            # 让子集重算能声明「这是对比样例」而不退回单模口径。
+            "is_comparative": comparison is not None,
             "actual_output": r.actual_output,
             "latency_ms": r.latency_ms,
             "prompt_tokens": r.prompt_tokens,
@@ -853,6 +848,8 @@ _COMPARE_PERF_FIELDS = {
     "status", "execution_status", "evaluation_status", "acceptance_decision",
     "decision_source", "error_type", "latency_ms", "total_tokens",
     "prompt_tokens", "completion_tokens", "tool_call_count",
+    # 对比模式标记：随矩阵一起展开，供子集重算声明模式，不是评分维度。
+    "is_comparative",
 }
 
 
@@ -891,6 +888,9 @@ def _subset_run_summary(
             "error_type": slot.get(f"{run_id}::error_type"),
             "scores": _score_values(slot, run_id),
             "decision_source": slot.get(f"{run_id}::decision_source"),
+            # 矩阵按列展开后没有 comparison 原文，靠这个标记让对比样例走相对胜负
+            # 分支，否则 score_map 恒空会被算成 skipped。
+            "is_comparative": bool(slot.get(f"{run_id}::is_comparative")),
         }
         for slot in present
     ]
@@ -1107,6 +1107,9 @@ async def _build_compare_matrix(
             for semantic_key in (
                 "status", "execution_status", "evaluation_status",
                 "acceptance_decision", "decision_source", "error_type",
+                # 带上对比模式标记：矩阵按列展开后拿不到 comparison 原文，
+                # 子集重算靠它声明模式，否则对比样例会被按单模口径算成 skipped。
+                "is_comparative",
             ):
                 slot[f"{run_id}::{semantic_key}"] = r.get(semantic_key)
             for perf_key in (
@@ -1520,6 +1523,9 @@ async def reaggregate_run(run_id: str):
                 "status": r.status,
                 "error_type": getattr(r, "error_type", None),
                 "scores": scores_by_result.get(r.id, {}),
+                # 对比样例的分数在 comparison JSONB 而非 evaluation_scores 表，
+                # 不带上它重算会把已出分的对比样例算成 skipped。
+                "comparison": getattr(r, "comparison", None),
             }
             for r in results
         ]

@@ -167,19 +167,47 @@ def project_case(
     acceptance_policy: Mapping[str, Any] | None = None,
     decision_source: str | None = None,
     comparison: Mapping[str, Any] | None = None,
+    is_comparative: bool = False,
 ) -> dict[str, Any]:
     """把持久化结果保守投影为执行、评分和可选验收三层语义。
 
     ``comparison`` 为对比模式的 comparison JSONB（可为 None）。对比样例的分数不在
     ``scores`` 里而在此，故据它把「有对比结论、score_map 为空」的样例投影为评分完成，
-    避免误判为 skipped。
+    避免误判为 skipped。``is_comparative`` 供只知道「这是对比样例」但手上没有
+    comparison 原文的调用方（如按列展开的对比矩阵）显式声明模式。
     """
     status = (stored_status or "").strip()
     score_map = dict(scores or {})
     has_cmp_verdict = _comparison_has_scored_verdict(comparison)
+    comparative = is_comparative or comparison is not None
     source = decision_source or (
         "legacy_derived" if status in {"pass", "fail", "error"} else "current"
     )
+
+    if comparative:
+        # 对比模式是相对胜负而非通过/失败：分数落在 comparison JSONB 里，score_map
+        # 恒空，也不参与阈值验收（acceptance_decision 恒 None）。这里必须与逐样例
+        # 接口同一口径，否则 run 级 facts 会把已出分的对比样例算成 skipped。
+        if status in _EXECUTION_ERROR_STATUSES:
+            execution_status = "abnormal"
+            evaluation_status = "not_run"
+        else:
+            execution_status = "success"
+            if status in _EVALUATION_ERROR_STATUSES or error_type == "judge_error":
+                evaluation_status = "error"
+            elif status == "scored" or has_cmp_verdict:
+                evaluation_status = "completed"
+            elif status == "skipped":
+                evaluation_status = "skipped"
+            else:
+                evaluation_status = "unknown"
+        return {
+            "execution_status": execution_status,
+            "evaluation_status": evaluation_status,
+            "acceptance_decision": None,
+            "decision_source": source,
+            "criterion_results": [],
+        }
 
     if status in _EXECUTION_ERROR_STATUSES or (
         status == "error" and error_type != "judge_error"
@@ -259,7 +287,11 @@ def aggregate_semantics(
     cases: Iterable[Mapping[str, Any]],
     acceptance_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """聚合互斥事实计数及运行级验收结论。"""
+    """聚合互斥事实计数及运行级验收结论。
+
+    ``cases`` 里可带 ``comparison``（对比模式 JSONB）或 ``is_comparative`` 标记；
+    两者都会透传给 ``project_case``，使 run 级 facts 与逐样例接口同一口径。
+    """
     policy = validate_acceptance_policy(acceptance_policy)
     case_list = list(cases)
     projections = [
@@ -269,6 +301,8 @@ def aggregate_semantics(
             scores=case.get("scores") or {},
             acceptance_policy=policy,
             decision_source=case.get("decision_source"),
+            comparison=case.get("comparison"),
+            is_comparative=bool(case.get("is_comparative")),
         )
         for case in case_list
     ]
