@@ -259,24 +259,68 @@ export function buildRunReportHtml(
     </div>
   </header>`
 
+  // 双模对比的评分单位是 evaluator × 评估范围（不是样例），故对比汇总提前解析一次，
+  // 概览与后面的裁决区共用同一份，避免两处各自解析出现口径偏差。
+  const isComparative = run.eval_mode === 'comparative'
+  const cmpSummary = run.summary_scores?.comparison_summary
+  const cmpSummaries = isComparative ? normalizeComparisonSummary(cmpSummary) : []
+  const agentName = (cfg: unknown, fallback: string) => {
+    const c = (cfg ?? {}) as { model?: string; type?: string }
+    return c.model || c.type || fallback
+  }
+  const modelA = agentName(run.agent_config, 'A')
+  const modelB = agentName(run.agent_config_b, 'B')
+
   // 概览 KPI —— 三层语义：验收通过率仅在配置了显式验收策略时展示，
   // 否则标「仅评分」，绝不用分数编造合格率。
+  //
+  // 对比模式另走一套口径：它是相对胜负、没有阈值验收，故 headline 只报胜负结论，
+  // 绝不出现通过率百分比；「评分完成/跳过」是样例级单模概念，对比样例的分数落在
+  // comparison JSONB 且按 evaluator × scope 计，样例级计数在此无可解释含义，
+  // 因此不显示，改报 A/B 有效回答数，评分完成度另起一行按 evaluator 展开。
   const prText = acceptancePassRateText(acceptance)
-  const headline = prText != null
-    ? `<div class="kpi-big">${esc(prText)}</div><div class="muted">验收通过率 · ${esc(runDecisionLabel(acceptance.run_decision))}</div>`
-    : `<div class="kpi-big" style="font-size:20px">仅评分</div><div class="muted">未配置验收规则</div>`
+  const cmpAnswerCounts = cmpSummary?.answer_counts
+  const cmpWins = cmpSummaries.reduce(
+    (acc, s) => ({ a: acc.a + (s.a_wins || 0), b: acc.b + (s.b_wins || 0) }),
+    { a: 0, b: 0 },
+  )
+  const cmpHeadlineText = !cmpSummaries.length
+    ? '暂无对比裁决'
+    : cmpWins.a === cmpWins.b
+      ? `${modelA} 与 ${modelB} 持平`
+      : cmpWins.a > cmpWins.b ? `${modelA} 胜出` : `${modelB} 胜出`
+  const headline = isComparative
+    ? `<div class="kpi-big" style="font-size:20px">${esc(cmpHeadlineText)}</div><div class="muted">A/B 相对胜负 · 无阈值验收</div>`
+    : prText != null
+      ? `<div class="kpi-big">${esc(prText)}</div><div class="muted">验收通过率 · ${esc(runDecisionLabel(acceptance.run_decision))}</div>`
+      : `<div class="kpi-big" style="font-size:20px">仅评分</div><div class="muted">未配置验收规则</div>`
+  const kpiCells = isComparative
+    ? `
+        <div class="kpi"><div class="v">${facts.total}</div><div class="l">总样例</div></div>
+        <div class="kpi"><div class="v pos">${cmpAnswerCounts ? cmpAnswerCounts.a_valid : '—'}</div><div class="l">A 有效回答</div></div>
+        <div class="kpi"><div class="v pos">${cmpAnswerCounts ? cmpAnswerCounts.b_valid : '—'}</div><div class="l">B 有效回答</div></div>
+        <div class="kpi"><div class="v neg">${facts.execution_abnormal}</div><div class="l">执行异常</div></div>`
+    : `
+        <div class="kpi"><div class="v">${facts.total}</div><div class="l">总样例</div></div>
+        <div class="kpi"><div class="v pos">${facts.evaluation_completed}</div><div class="l">评分完成</div></div>
+        <div class="kpi"><div class="v">${facts.skipped}</div><div class="l">跳过</div></div>
+        <div class="kpi"><div class="v neg">${facts.execution_abnormal}</div><div class="l">执行异常</div></div>`
+  const cmpEvaluatorLine = isComparative && cmpSummaries.length
+    ? `
+    <div class="muted" style="margin-top:10px">评分单位为评估器 × 评估范围：${
+      cmpSummaries.map(s => `${esc(evaluatorDisplayName(s))} 有效 ${s.scored}／评分失败 ${s.evaluation_errors}`
+        + (s.skipped ? `／空白跳过 ${s.skipped}` : '')
+        + `（A 胜 ${s.a_wins} · B 胜 ${s.b_wins} · 平 ${s.ties}）`).join('；')
+    }</div>`
+    : ''
   const overview = `
   <section class="card">
     <h2>概览</h2>
     <div class="kpis">
       ${headline}
-      <div class="kpi-grid" style="margin-left:auto">
-        <div class="kpi"><div class="v">${facts.total}</div><div class="l">总样例</div></div>
-        <div class="kpi"><div class="v pos">${facts.evaluation_completed}</div><div class="l">评分完成</div></div>
-        <div class="kpi"><div class="v">${facts.skipped}</div><div class="l">跳过</div></div>
-        <div class="kpi"><div class="v neg">${facts.execution_abnormal}</div><div class="l">执行异常</div></div>
+      <div class="kpi-grid" style="margin-left:auto">${kpiCells}
       </div>
-    </div>
+    </div>${cmpEvaluatorLine}
   </section>`
 
   // 维度均分（雷达 + 表）
@@ -374,14 +418,9 @@ export function buildRunReportHtml(
 
   // 双模对比 run：每个 evaluator 独立展示，绝不把同名维度或胜负数跨 evaluator
   // 相加。成本/性能直接从 A/B 执行快照聚合，judge 失败不影响资源统计。
-  if (run.eval_mode === 'comparative') {
-    const summaries = normalizeComparisonSummary(run.summary_scores?.comparison_summary)
-    const agentName = (cfg: unknown, fallback: string) => {
-      const c = (cfg ?? {}) as { model?: string; type?: string }
-      return c.model || c.type || fallback
-    }
-    const modelA = agentName(run.agent_config, 'A')
-    const modelB = agentName(run.agent_config_b, 'B')
+  if (isComparative) {
+    // 复用概览已解析的 cmpSummaries / modelA / modelB，保证概览与裁决区同一口径。
+    const summaries = cmpSummaries
     const evaluatorBlocks = summaries.map(summary => {
       const total = summary.scored || 0
       const pct = (n: number) => total > 0 ? `${((n / total) * 100).toFixed(0)}%` : '—'

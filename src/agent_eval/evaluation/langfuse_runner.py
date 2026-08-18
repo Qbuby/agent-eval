@@ -2390,24 +2390,57 @@ async def _notify_run_complete(
         evaluation_completed = int(facts.get("evaluation_completed") or 0)
         skipped = int(facts.get("skipped") or 0)
         icon = "✅" if status == "completed" else "⚠️"
+        # 对比 run 的评分单位是 evaluator × 评估范围，不是样例：分数落在
+        # comparison JSONB 而非 score 行，样例级「完成/跳过」在这里无可解释含义。
+        # 故 Judge 行按 evaluator 展开；且对比是相对胜负、无阈值验收，验收整行去掉，
+        # 避免「仅评分，未配置验收规则」这种对对比无信息量又易误读的表述。
+        cmp_summary = (summary or {}).get("comparison_summary")
+        cmp_evaluators = (
+            cmp_summary.get("evaluators")
+            if isinstance(cmp_summary, dict) else None
+        )
+        cmp_evaluators = [e for e in (cmp_evaluators or []) if isinstance(e, dict)]
         head = (
             f"{icon} **评估完成：{run_name}**\n"
             f"- 运行状态：**{status}**\n"
             f"- Agent 执行：成功 **{execution_success}/{total}**，异常 **{execution_abnormal}**\n"
-            f"- Judge 评分：完成 **{evaluation_completed}**，跳过 **{skipped}**\n"
         )
-        if acceptance.get("configured"):
-            pass_rate = acceptance.get("pass_rate")
-            rate_text = (
-                f"{float(pass_rate) * 100:.1f}%"
-                if pass_rate is not None else "无数据"
-            )
-            head += (
-                f"- 显式验收：通过率 **{rate_text}**，结论 "
-                f"**{acceptance.get('run_decision') or 'undetermined'}**\n"
-            )
+        if cmp_evaluators:
+            ac = cmp_summary.get("answer_counts")
+            if isinstance(ac, dict):
+                head += (
+                    f"- A/B 有效回答：A **{int(ac.get('a_valid') or 0)}**（空白 "
+                    f"{int(ac.get('a_blank') or 0)}）／B **{int(ac.get('b_valid') or 0)}**"
+                    f"（空白 {int(ac.get('b_blank') or 0)}）\n"
+                )
+            head += "- Judge 评分（按评估器 × 评估范围）：\n"
+            for e in cmp_evaluators:
+                label = e.get("label") or e.get("evaluator_key") or "对比评估器"
+                seg = (
+                    f"  · {label}：有效 **{int(e.get('scored') or 0)}**，"
+                    f"评分失败 **{int(e.get('evaluation_errors') or 0)}**"
+                )
+                if int(e.get("skipped") or 0):
+                    seg += f"，空白跳过 **{int(e.get('skipped') or 0)}**"
+                seg += (
+                    f"；A 胜 **{int(e.get('a_wins') or 0)}** / B 胜 "
+                    f"**{int(e.get('b_wins') or 0)}** / 平 **{int(e.get('ties') or 0)}**\n"
+                )
+                head += seg
         else:
-            head += "- 显式验收：**仅评分，未配置验收规则**\n"
+            head += f"- Judge 评分：完成 **{evaluation_completed}**，跳过 **{skipped}**\n"
+            if acceptance.get("configured"):
+                pass_rate = acceptance.get("pass_rate")
+                rate_text = (
+                    f"{float(pass_rate) * 100:.1f}%"
+                    if pass_rate is not None else "无数据"
+                )
+                head += (
+                    f"- 显式验收：通过率 **{rate_text}**，结论 "
+                    f"**{acceptance.get('run_decision') or 'undetermined'}**\n"
+                )
+            else:
+                head += "- 显式验收：**仅评分，未配置验收规则**\n"
 
         # 分析摘要（LLM 叙述，失败自动退规则摘要；这里再兜一层，绝不阻断通知）。
         try:
