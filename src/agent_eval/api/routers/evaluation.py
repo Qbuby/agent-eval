@@ -373,19 +373,12 @@ async def resolve_eval_start_args(
                 status_code=400,
                 detail="双模对比评估基于相对胜负，不使用验收策略（acceptance_policy）",
             )
-        provider_rows: dict[str, Any] = {}
-        for spec in evaluator_specs:
-            provider_id = (spec.get("params") or {}).get("provider_id")
-            if not provider_id or provider_id in provider_rows:
-                continue
-            try:
-                provider_rows[provider_id] = await repo.get_evaluator_provider(
-                    uuid.UUID(str(provider_id))
-                )
-            except (TypeError, ValueError):
-                provider_rows[provider_id] = None
+        # 确定性配置错误（evaluator 不是 configurable_judge / provider 缺失失效 /
+        # variable_mapping 没接 output_a·output_b）必须在这里变成 400 带原因返回。
+        # 注意：该校验是 async 且吃 Repository —— 漏 await 或错传 dict 会让整段成为
+        # 死代码，错误一路漏到 start_run 再被包成不透明的「500 failed to start run」。
         try:
-            _validate_comparative_evaluator_specs(evaluator_specs, provider_rows)
+            await _validate_comparative_evaluator_specs(evaluator_specs, repo)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         agent_cfg_b = req.agent_b.model_dump()

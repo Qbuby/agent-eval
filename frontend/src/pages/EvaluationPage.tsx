@@ -724,6 +724,18 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
   })
   const [selectedEvaluatorIds, setSelectedEvaluatorIds] = useState<Set<string>>(new Set())
 
+  // 对比模式下选到单模评估器，后端 _validate_comparative_evaluator_specs 会拒绝启动。
+  // 这里用同一口径先在页面上拦：判据与后端逐条对齐（configurable_judge +
+  // variable_mapping 指向 output_a/output_b + evaluation_prompt 真的引用这些占位符），
+  // 避免用户配了半天点下去只拿到一句启动失败。
+  const comparativeUnfitEvaluators = useMemo(() => {
+    if (evalMode !== 'comparative') return []
+    const all = evaluatorsQuery.data ?? []
+    return all
+      .filter((e: EvaluatorInstance) => selectedEvaluatorIds.has(e.id))
+      .filter((e: EvaluatorInstance) => !isComparativeCapable(e))
+  }, [evalMode, evaluatorsQuery.data, selectedEvaluatorIds])
+
   // ── start mutation ──
   const startMutation = useMutation({
     mutationFn: (body: StartEvalRequest) => evaluationApi.startRun(body).then(r => r.data),
@@ -752,6 +764,10 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
     startBlockers.push('勾选至少 1 条对话样例')
   }
   if (selectedEvaluatorIds.size === 0) startBlockers.push('勾选至少 1 个评估器')
+  if (comparativeUnfitEvaluators.length > 0) {
+    const names = comparativeUnfitEvaluators.map(e => e.name).join('、')
+    startBlockers.push(`取消勾选单模评估器（${names}）——双模对比要用对比专用评估器`)
+  }
   if (replySource === 'live' && agentDraft.url.trim().length === 0) {
     startBlockers.push(evalMode === 'comparative' ? '填写 A 模型智能体 URL' : '填写智能体 URL')
   }
@@ -1328,10 +1344,14 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
         <div className="flex flex-col gap-2">
           {evaluatorsQuery.data?.map((e: EvaluatorInstance) => {
             const checked = selectedEvaluatorIds.has(e.id)
+            // 对比模式下单模评估器会被后端拒绝启动：勾选前就标出来，别等点了才报错。
+            const unfit = evalMode === 'comparative' && !isComparativeCapable(e)
             return (
               <label key={e.id}
                      className={`flex items-start gap-2 border rounded-md p-3 cursor-pointer transition-colors ${
-                       checked ? 'border-accent bg-accent/5' : 'border-border hover:border-border-strong'
+                       checked && unfit ? 'border-negative bg-negative/5'
+                       : checked ? 'border-accent bg-accent/5'
+                       : 'border-border hover:border-border-strong'
                      }`}>
                 <input
                   type="checkbox" checked={checked}
@@ -1348,6 +1368,12 @@ function NewRunTab({ onStarted }: { onStarted: () => void }) {
                     <span className="badge badge-accent font-mono" title="写到 Langfuse trace 的 tag">
                       {e.tag || e.name}
                     </span>
+                    {unfit && (
+                      <span className="badge badge-negative"
+                            title="该评估器按单模写法配置（variable_mapping 没有接 output_a / output_b），无法接收对比的 A/B 两侧回复">
+                        不支持对比
+                      </span>
+                    )}
                   </div>
                   <div className="text-[11px] text-text-tertiary mt-0.5">{e.description || '—'}</div>
                 </div>
@@ -1858,5 +1884,35 @@ function fmtTime(iso: string | null): string {
 
 function extractError(err: unknown): string {
   return toToastMessage(formatApiError(err, { fallbackMessage: '未知错误' }))
+}
+
+// 与后端 langfuse_runner._validate_comparative_evaluator_specs 同口径的占位符正则。
+const MUSTACHE_RE = /\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g
+
+// 这个评估器能不能用于双模对比。判据逐条对齐后端：
+//   1) evaluator_type 必须是 configurable_judge；
+//   2) variable_mapping 若是用户自定义的 dict，必须有项指向 output_a / output_b
+//      （不给 mapping 会走后端的 DEFAULT_COMPARATIVE_VARIABLE_MAPPING，已含 A/B，放行）；
+//   3) evaluation_prompt 必须真的引用这些占位符，否则 judge 收到的 A/B 恒为空串。
+// 只做「后端一定会拒」的判定，不额外从严：这里多拦一个，用户就少一个能选的评估器。
+// provider_id 是否存在/启用只有后端能查库，故不在前端判（那类错误仍由后端拦）。
+function isComparativeCapable(e: EvaluatorInstance): boolean {
+  if (e.evaluator_type !== 'configurable_judge') return false
+  const params = (e.params ?? {}) as Record<string, unknown>
+  const mapping = params.variable_mapping
+  if (mapping === null || mapping === undefined) return true
+  if (typeof mapping !== 'object' || Array.isArray(mapping)) return true
+  const abVars = Object.entries(mapping as Record<string, unknown>)
+    .filter(([, source]) => {
+      const s = String(source ?? '').trim()
+      return s === 'output_a' || s === 'output_b'
+    })
+    .map(([name]) => name)
+  if (abVars.length === 0) return false
+  const prompt = typeof params.evaluation_prompt === 'string' ? params.evaluation_prompt : ''
+  const referenced = new Set(
+    Array.from(prompt.matchAll(MUSTACHE_RE), m => m[1]),
+  )
+  return abVars.some(name => referenced.has(name))
 }
 
