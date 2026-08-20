@@ -2,11 +2,12 @@
 # Agent Eval · Docker Compose
 # ─────────────────────────────────────────────────────────────────────
 #
-# 整套部署包含 4 个服务，按依赖关系顺序启动：
+# 整套部署包含 5 个服务，按依赖关系顺序启动：
 #   1. postgres   ─ 数据库（持久化在 volume pgdata）
 #   2. migrate    ─ 一次性任务：建表/升表后退出（依赖 postgres healthy）
-#   3. backend    ─ FastAPI 后端（依赖 migrate 完成）
-#   4. frontend   ─ Nginx 静态资源 + /api 反代到 backend
+#   3. omniagent  ─ 系统智能体（独立容器，依赖 postgres healthy）
+#   4. backend    ─ FastAPI 后端（依赖 migrate 完成）
+#   5. frontend   ─ Nginx 静态资源 + /api 反代到 backend
 #
 # 一步部署：
 #   1) cp .env.example .env  并填写 AUTH_SECRET_KEY、SECURITY_FERNET_KEY、
@@ -184,6 +185,53 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────────
+  # omniagent：agent-eval 内置系统智能体（隔离容器）
+  #   - 从相邻 ../OmniAgent 源码构建，不把框架源码复制进本仓库
+  #   - 与业务后端仅共享 PostgreSQL 服务；使用独立 omniagent 数据库
+  #   - 配置只启用基础对话，skill / 工具 / 系统提示词后续单独设计
+  #   - 配置目录必须挂到 /OmniAgent/.omniagent；上游仓库自带 compose
+  #     的 /OmniAgent/config.yaml 挂载点不会被 ConfigDiscovery 读取
+  # ─────────────────────────────────────────────────────────────────
+  omniagent:
+    image: ${OMNIAGENT_IMAGE:-agent-eval-omniagent}:${IMAGE_TAG:-latest}
+    build:
+      context: ../OmniAgent
+      dockerfile: Dockerfile
+    container_name: agent-eval-omniagent
+    environment:
+      OMNIAGENT_CONFIG_DIR: /OmniAgent/.omniagent
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      OMNIAGENT_MODEL: ${OMNIAGENT_MODEL:-${LLM_MODEL:-claude-opus-4-6}}
+      # kiro.aidong-ai.com 是 OpenAI-compatible 网关；模型名含 claude 时
+      # 必须强制 provider，否则 OmniAgent 会按名称误选 ChatAnthropic。
+      LLM_PROVIDER: openai
+      OPENAI_BASE_URL: ${OMNIAGENT_BASE_URL:-${LLM_BASE_URL:-https://kiro.aidong-ai.com/v1}}
+      OPENAI_API_KEY: ${OMNIAGENT_API_KEY:-${LLM_API_KEY:-}}
+      # 不继承 agent_eval 的 Langfuse 凭据，避免未授权的重复 trace 上报。
+      LANGFUSE_PUBLIC_KEY: ${OMNIAGENT_LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${OMNIAGENT_LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${OMNIAGENT_LANGFUSE_BASE_URL:-https://langfuse.aidong-ai.com}
+    volumes:
+      - ./deploy/omniagent:/OmniAgent/.omniagent:ro
+    ports:
+      - "${OMNIAGENT_PORT:-8091}:8090"
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+      - 8.8.8.8
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8090/openapi.json >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
   # ─────────────────────────────────────────────────────────────────

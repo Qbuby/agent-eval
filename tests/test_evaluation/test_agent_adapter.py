@@ -449,3 +449,195 @@ def test_owned_client_closed_by_adapter():
         assert inner.is_closed, "owned client should be closed by adapter.close()"
 
     asyncio.run(_run())
+
+
+# ─── 带内控制帧（OmniAgent 把异常/中断写在 HTTP 200 的流里）──────────────────
+# StreamingResponse 一开就发响应头，所以服务端异常和人工中断都赶不上
+# raise_for_status，只能在流里发现。这三种帧不是 astream_events 事件，
+# _handle_langgraph_event 按 obj["event"] 分派时落不进任何分支 → 被静默丢弃 →
+# 上层只看到 content == ""，与「agent 正常答了空话」不可区分，判成 skipped 甚至
+# 假 pass。下面几条把「识别」「落库标记」「读流是否继续」三侧都钉死。
+
+
+def _sse_body(*frames: str) -> str:
+    """拼一段 SSE 正文，末尾补 [DONE]（真实服务端正常收尾的样子）。"""
+    return "".join(f"data: {f}\n\n" for f in frames) + "data: [DONE]\n\n"
+
+
+def _text_frame(text: str) -> str:
+    return json.dumps({
+        "event": "on_chat_model_stream",
+        "data": {"chunk": {"kwargs": {"content": text}}},
+    })
+
+
+def _invoke_sse(body: str, *, mode: str = "langgraph_v2"):
+    """用 MockTransport 回放一段 SSE 正文，返回 AgentResponse。"""
+    async def _run():
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, text=body, headers={"Content-Type": "text/event-stream"},
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        kwargs: dict = {"url": "http://x", "mode": mode, "client": client}
+        if mode == "generic":
+            kwargs["payload_template"] = {"question": "{input}"}
+        ad = SSEStreamAdapter(**kwargs)
+        try:
+            return await ad.invoke([{"role": "user", "content": "q"}])
+        finally:
+            await client.aclose()
+
+    return asyncio.run(_run())
+
+
+def test_detect_control_frame_recognizes_three_kinds():
+    """三种帧的形状按服务端实际发出的键名识别（status / interrupt / message）。"""
+    assert SSEStreamAdapter._detect_control_frame(
+        {"status": "error", "error": "boom"},
+    ) == {"kind": "error", "detail": "boom"}
+
+    interrupt = {"type": "tool_approval", "tool": "shell"}
+    assert SSEStreamAdapter._detect_control_frame(
+        {"event": "interrupted", "interrupt": interrupt},
+    ) == {"kind": "interrupted", "detail": interrupt}
+
+    assert SSEStreamAdapter._detect_control_frame(
+        {"event": "enqueued", "message": "thread busy"},
+    ) == {"kind": "enqueued", "detail": "thread busy"}
+
+
+def test_detect_control_frame_ignores_normal_events():
+    """正常事件必须返回 None，否则整条流会被误判成失败。"""
+    for obj in (
+        {"event": "on_chat_model_stream", "data": {"chunk": {}}},
+        {"event": "on_tool_start", "run_id": "r1", "name": "t"},
+        {"event": "on_chat_model_end", "data": {}},
+        {"status": "ok"},
+        {},
+    ):
+        assert SSEStreamAdapter._detect_control_frame(obj) is None
+
+
+def test_error_frame_marks_agent_error():
+    """服务端异常帧要落成 agent_error（明细原样交回），且不算 incomplete。"""
+    resp = _invoke_sse(_sse_body(
+        json.dumps({"status": "error", "error": "RuntimeError: sandbox died"}),
+    ))
+
+    assert resp.raw_response["control_frames"] == [
+        {"kind": "error", "detail": "RuntimeError: sandbox died"},
+    ]
+    assert resp.raw_response["agent_error"] == "RuntimeError: sandbox died"
+    # error 是「agent 挂了」，与「停下等人工输入」是两种处置，不该混成一个标记。
+    assert "incomplete" not in resp.raw_response
+
+
+def test_error_frame_does_not_stop_stream():
+    """error 帧后面还有内容就继续读——实现里 error 走 continue 而非 break。
+
+    服务端可能先报一个子步骤异常再接着答，把已产出的文本丢掉会让本可散文兜底
+    的样例退化成零内容。
+    """
+    resp = _invoke_sse(_sse_body(
+        _text_frame("前半"),
+        json.dumps({"status": "error", "error": "step failed"}),
+        _text_frame("后半"),
+    ))
+
+    assert resp.content == "前半后半"
+    assert resp.raw_response["agent_error"] == "step failed"
+
+
+def test_interrupted_frame_marks_incomplete_and_stops_stream():
+    """中断帧后必须立刻收流：agent 在等人工输入，继续读只会阻塞到超时。
+
+    「不再读」这件事用 interrupted 之后那帧文本是否进 content 来判定——它若被
+    累积，说明 break 没生效。
+    """
+    resp = _invoke_sse(_sse_body(
+        _text_frame("中断前"),
+        json.dumps({"event": "interrupted",
+                    "interrupt": {"type": "user_question", "question": "确认吗？"}}),
+        _text_frame("不该被读到"),
+    ))
+
+    assert resp.content == "中断前"
+    assert resp.raw_response["incomplete"] is True
+    assert resp.raw_response["control_frames"] == [{
+        "kind": "interrupted",
+        "detail": {"type": "user_question", "question": "确认吗？"},
+    }]
+    # 等人工输入不是 agent 挂了，不该冒充 error。
+    assert "agent_error" not in resp.raw_response
+
+
+def test_enqueued_frame_marks_incomplete_and_stops_stream():
+    """排队帧同理：该 thread 有未答中断，本次请求不会产出答案。"""
+    resp = _invoke_sse(_sse_body(
+        json.dumps({"event": "enqueued", "message": "pending ask on this thread"}),
+        _text_frame("不该被读到"),
+    ))
+
+    assert resp.content == ""
+    assert resp.raw_response["incomplete"] is True
+    assert resp.raw_response["control_frames"] == [
+        {"kind": "enqueued", "detail": "pending ask on this thread"},
+    ]
+    assert "agent_error" not in resp.raw_response
+
+
+def test_clean_stream_carries_no_control_markers():
+    """正常流一个控制标记都不能带，否则上层会把好样例判成失败。"""
+    resp = _invoke_sse(_sse_body(_text_frame("正常回答")))
+
+    assert resp.content == "正常回答"
+    for key in ("control_frames", "agent_error", "incomplete", "truncated"):
+        assert key not in resp.raw_response
+
+
+def test_generic_mode_does_not_scan_control_frames():
+    """控制帧识别只属于 langgraph_v2：generic 端的 status 字段语义不同，
+    误判会把正常流判成失败。"""
+    resp = _invoke_sse(
+        _sse_body(
+            json.dumps({"status": "error", "error": "not ours"}),
+            json.dumps({"payload": {"response": "hello"}}),
+            json.dumps({"payload": {"type": "done"}}),
+        ),
+        mode="generic",
+    )
+
+    assert resp.content == "hello"
+    assert "control_frames" not in resp.raw_response
+    assert "agent_error" not in resp.raw_response
+
+
+def test_error_frame_without_detail_still_flags_error():
+    """服务端漏带 error 字段时，agent_error 仍须是真值。
+
+    注释承诺 agent_error 是「不必解析明细就能判 error 的布尔位」，若明细缺失时
+    落成 None，上层布尔判定会把挂掉的样例当成正常，正是这个改动要防的假 pass。
+    """
+    resp = _invoke_sse(_sse_body(json.dumps({"status": "error"})))
+
+    assert resp.raw_response["control_frames"] == [{"kind": "error", "detail": None}]
+    assert resp.raw_response["agent_error"], (
+        "error 帧无明细时 agent_error 退化成假值，上层会漏判"
+    )
+
+
+def test_multiple_control_frames_are_all_recorded():
+    """多帧并存时逐条留痕，且两个标记各自独立成立（error 且 incomplete）。"""
+    resp = _invoke_sse(_sse_body(
+        json.dumps({"status": "error", "error": "first"}),
+        json.dumps({"status": "error", "error": "second"}),
+        json.dumps({"event": "interrupted", "interrupt": {"type": "tool_approval"}}),
+    ))
+
+    kinds = [c["kind"] for c in resp.raw_response["control_frames"]]
+    assert kinds == ["error", "error", "interrupted"]
+    # 取第一条明细（最早的失败原因，后续多半是它的次生结果）。
+    assert resp.raw_response["agent_error"] == "first"
+    assert resp.raw_response["incomplete"] is True

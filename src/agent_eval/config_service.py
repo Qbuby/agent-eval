@@ -124,7 +124,16 @@ DEFAULT_CONFIGS: list[dict[str, Any]] = [
     },
     {
         "key": "target_agent.endpoint_url",
-        "value": _pack([{"value": "", "label": None}], 0),
+        "value": _pack(
+            [
+                {"value": "", "label": None},
+                {
+                    "value": "http://omniagent:8090/api/agent/langgraph",
+                    "label": "OmniAgent（系统智能体）",
+                },
+            ],
+            0,
+        ),
         "category": "target_agent",
         "description": "测试目标模型 POST 接口地址",
     },

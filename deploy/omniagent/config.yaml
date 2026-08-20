@@ -1,0 +1,46 @@
+# OmniAgent 作为 agent-eval 系统智能体的最小运行配置。
+# skill、业务工具与系统提示词后续单独设计；本配置只打通基础对话和评估链路。
+postgres:
+  host: "postgres"
+  port: 5432
+  database: "omniagent"
+  user: "${DB_USER:-postgres}"
+  password: "${DB_PASSWORD:-postgres}"
+
+react_agent:
+  default_model: "${OMNIAGENT_MODEL:-claude-opus-4-6}"
+  # 集成验收期间仅启用 ask，用于实测 interrupted/enqueued 控制帧；
+  # skill 与其他业务工具仍保持关闭，后续单独设计。
+  tools: ["__no_tools_until_designed__"]
+  disabled_tools: []
+  max_tokens: 8192
+  recursion_limit: 20
+  subagent_depth: 0
+  checkpointer: "postgres"
+  message_cache_enabled: false
+
+llm_params:
+  openai:
+    temperature: 0.2
+    timeout: 120
+    # 认证/参数错误应立即进入 SSE 控制帧，不能在一次评估里隐式重试数分钟。
+    max_retries: 0
+
+skill_execution:
+  enabled: false
+
+channels:
+  feishu:
+    enabled: false
+  wecom:
+    enabled: false
+  telegram:
+    enabled: false
+  whatsapp:
+    enabled: false
+
+dream:
+  auto_dream:
+    enabled: false
+  daily_dream:
+    enabled: false

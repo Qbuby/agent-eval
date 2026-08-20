@@ -320,6 +320,10 @@ class SSEStreamAdapter:
             "cache_creation_tokens": 0,
         }
         usage_seen = False
+        # OmniAgent 的带内控制帧（服务端异常 / 中断 / 排队）。见 invoke 内
+        # _detect_control_frame 处的说明：这些帧走 HTTP 200 的流，不截获就会
+        # 让失败伪装成空答案。
+        control_frames: list[dict[str, Any]] = []
 
         start = time.perf_counter()
         # 流式读取途中对端切断（judge 的大 payload 常触发被测 agent 或上游网关
@@ -362,6 +366,23 @@ class SSEStreamAdapter:
                         continue
 
                     if self.mode == "langgraph_v2":
+                        # OmniAgent 把异常与中断**写在流里**（HTTP 200 早已发出，
+                        # 见 omniagent/api/services/response_service.py）：
+                        #   {"status": "error", "error": ...}      服务端异常
+                        #   {"event": "interrupted", "interrupt": ...} 等待人工输入
+                        #   {"event": "enqueued", "message": ...}  该会话有未答中断，本次排队
+                        # 这三种帧都不是 astream_events 事件，_handle_langgraph_event
+                        # 认不出而静默丢弃，结果是「跑失败」长得和「答了空话」一样。
+                        # 必须在这里显式截获并记录，让上层把样例判成 error 而不是
+                        # 假 pass / 无差别 skipped。
+                        control = self._detect_control_frame(obj)
+                        if control is not None:
+                            control_frames.append(control)
+                            if control["kind"] in ("interrupted", "enqueued"):
+                                # agent 停下等输入 / 被排队，本次调用不会再产出答案，
+                                # 继续读只会阻塞到超时。收流走收尾逻辑。
+                                break
+                            continue
                         if self._handle_langgraph_event(
                             obj, full_text, tool_calls, active_tools, usage_acc,
                             steps, thought_state, start,
@@ -413,6 +434,26 @@ class SSEStreamAdapter:
             # 流被中途切断——已累积内容可能不完整。上层据此把「拿到部分答案」
             # 与「连接彻底失败/无评分」区分开，并允许散文兜底对部分文本抽分。
             raw["truncated"] = True
+        if control_frames:
+            # 带内控制帧（服务端异常 / 中断 / 排队）。与 truncated 同理无条件
+            # 落库：这是判定「本次调用是否算失败」的唯一依据，HTTP 层看不出来。
+            # agent_error 给上层一个不必解析明细就能判 error 的布尔位；
+            # interrupted / enqueued 不算 agent 挂了，但同样没有有效答案，
+            # 由上层按 incomplete 处理（沙箱在服务端也被 hold 着）。
+            raw["control_frames"] = control_frames
+            kinds = {c["kind"] for c in control_frames}
+            if "error" in kinds:
+                # 明细优先，但必须保持**真值**：服务端偶尔只发 {"status": "error"}
+                # 而不带 error 字段，此时 detail 是 None。若直接落 None，上层
+                # `if raw.get("agent_error")` 会把挂掉的样例判成正常 —— 这一位的
+                # 全部意义就是不解析明细也能判 error，故明细为空时退回 True。
+                raw["agent_error"] = next(
+                    (c["detail"] for c in control_frames
+                     if c["kind"] == "error" and c.get("detail")),
+                    True,
+                )
+            if kinds & {"interrupted", "enqueued"}:
+                raw["incomplete"] = True
         if tool_calls:
             raw["tool_calls"] = tool_calls
         if steps:
@@ -436,6 +477,39 @@ class SSEStreamAdapter:
             latency_ms=latency_ms,
             raw_response=raw or None,
         )
+
+    @staticmethod
+    def _detect_control_frame(obj: dict[str, Any]) -> dict[str, Any] | None:
+        """识别 OmniAgent 写在 SSE 流里的**非事件**控制帧，非控制帧返回 None。
+
+        OmniAgent 的 ``astream_raw_events`` 用同一条 ``text/event-stream``
+        混发两类东西：LangGraph 的 ``astream_events`` 事件（带 ``event``:
+        ``on_chat_model_stream`` 等），以及三种自造的控制帧。控制帧要害在于
+        **HTTP 状态码早已是 200**（StreamingResponse 一开就发头），所以服务端
+        异常不会走 ``raise_for_status``，只能在流里发现：
+
+        - ``{"status": "error", "error": "..."}`` — 服务端 500 级异常
+          （``_run()`` 的 except 把它塞进队列）
+        - ``{"event": "interrupted", "interrupt": {...}}`` — agent 等人工输入
+          （tool_approval 或 user_question）；该会话沙箱被 hold 不回收
+        - ``{"event": "enqueued", "message": "..."}`` — 该 thread 有未回答的
+          ask 中断，本次请求被排队，不会产出答案
+
+        返回 ``{"kind": ..., "detail": ...}``；``kind`` 取上述三者之一。
+
+        为什么必须显式识别：``_handle_langgraph_event`` 按 ``obj["event"]``
+        分派，``status``/``interrupted``/``enqueued`` 都落不进任何分支，被静默
+        丢弃 → 上层只看到 ``content == ""``，与「agent 正常答了空话」不可区分，
+        判成 skipped 甚至假 pass。评估必须把它们记成 error。
+        """
+        if obj.get("status") == "error":
+            return {"kind": "error", "detail": obj.get("error")}
+        event = obj.get("event")
+        if event == "interrupted":
+            return {"kind": "interrupted", "detail": obj.get("interrupt")}
+        if event == "enqueued":
+            return {"kind": "enqueued", "detail": obj.get("message")}
+        return None
 
     @staticmethod
     def _handle_langgraph_event(
