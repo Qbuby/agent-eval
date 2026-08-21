@@ -6,8 +6,10 @@ const BASE = 'http://localhost'
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const STORAGE = path.join(HERE, 'auth.json')
 const EXEC = process.env.PW_CHROMIUM || 'C:\\Users\\frh\\AppData\\Local\\ms-playwright\\chromium-1228\\chrome-win64\\chrome.exe'
-const OMNI_URL = 'http://omniagent:8090/api/agent/langgraph'
-const OMNI_LABEL = 'OmniAgent（系统智能体）'
+const COMPOSE_URL = 'http://omniagent:8090/api/agent/langgraph'
+const COMPOSE_LABEL = 'OmniAgent（Docker Compose）'
+const SIDECAR_URL = 'http://127.0.0.1:8090/api/agent/langgraph'
+const SIDECAR_LABEL = 'OmniAgent（同 Pod sidecar）'
 
 const browser = await chromium.launch({ headless: false, executablePath: EXEC })
 const context = await browser.newContext({
@@ -22,8 +24,10 @@ const out = {
   configStatus: null,
   defaultIndex: null,
   defaultValue: null,
-  omniCount: null,
-  optionVisible: false,
+  composeCount: null,
+  sidecarCount: null,
+  composeOptionVisible: false,
+  sidecarOptionVisible: false,
   selectedValue: null,
 }
 
@@ -48,12 +52,20 @@ try {
   out.configStatus = config.status
   out.defaultIndex = config.body.default_index
   out.defaultValue = config.body.value
-  out.omniCount = (config.body.options || []).filter(o => o.value === OMNI_URL && o.label === OMNI_LABEL).length
+  out.composeCount = (config.body.options || []).filter(
+    o => o.value === COMPOSE_URL,
+  ).length
+  out.sidecarCount = (config.body.options || []).filter(
+    o => o.value === SIDECAR_URL && o.label === SIDECAR_LABEL,
+  ).length
 
   if (config.status !== 200) throw new Error(`配置 API 返回 ${config.status}`)
-  if (out.omniCount !== 1) throw new Error(`OmniAgent 预设数量错误: ${out.omniCount}`)
+  if (out.composeCount !== 1) throw new Error(`Compose 预设数量错误: ${out.composeCount}`)
+  if (out.sidecarCount !== 1) throw new Error(`sidecar 预设数量错误: ${out.sidecarCount}`)
   if (out.defaultIndex !== 0) throw new Error(`默认索引被改动: ${out.defaultIndex}`)
-  if (out.defaultValue === OMNI_URL) throw new Error('OmniAgent 被意外设为默认值')
+  if ([COMPOSE_URL, SIDECAR_URL].includes(out.defaultValue)) {
+    throw new Error('OmniAgent 被意外设为默认值')
+  }
 
   const urlField = page.locator('label').filter({ hasText: '智能体 URL' }).first()
   await urlField.waitFor({ state: 'visible', timeout: 20_000 })
@@ -61,13 +73,16 @@ try {
   const picker = urlField.getByRole('button', { name: '选择预设值' })
   await picker.click()
 
-  const option = page.getByRole('option', { name: new RegExp(OMNI_LABEL) })
-  await option.waitFor({ state: 'visible', timeout: 10_000 })
-  out.optionVisible = true
-  await option.click()
+  const composeOption = page.getByRole('option').filter({ hasText: COMPOSE_URL })
+  const sidecarOption = page.getByRole('option', { name: new RegExp(SIDECAR_LABEL) })
+  await composeOption.waitFor({ state: 'visible', timeout: 10_000 })
+  await sidecarOption.waitFor({ state: 'visible', timeout: 10_000 })
+  out.composeOptionVisible = true
+  out.sidecarOptionVisible = true
+  await composeOption.click()
   out.selectedValue = await input.inputValue()
 
-  if (out.selectedValue !== OMNI_URL) {
+  if (out.selectedValue !== COMPOSE_URL) {
     throw new Error(`URL 回填错误: ${out.selectedValue}`)
   }
 

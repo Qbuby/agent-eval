@@ -129,7 +129,11 @@ DEFAULT_CONFIGS: list[dict[str, Any]] = [
                 {"value": "", "label": None},
                 {
                     "value": "http://omniagent:8090/api/agent/langgraph",
-                    "label": "OmniAgent（系统智能体）",
+                    "label": "OmniAgent（Docker Compose）",
+                },
+                {
+                    "value": "http://127.0.0.1:8090/api/agent/langgraph",
+                    "label": "OmniAgent（同 Pod sidecar）",
                 },
             ],
             0,
