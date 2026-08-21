@@ -14,13 +14,12 @@ spec:
         - name: omniagent
           image: "${OMNIAGENT_IMAGE}"
           imagePullPolicy: IfNotPresent
+          workingDir: /OmniAgent
           ports:
             - name: omniagent-http
               containerPort: 8090
               protocol: TCP
           env:
-            - name: OMNIAGENT_CONFIG_DIR
-              value: /OmniAgent/.omniagent
             - name: OMNIAGENT_MODEL
               value: "${OMNIAGENT_MODEL}"
             - name: LLM_PROVIDER

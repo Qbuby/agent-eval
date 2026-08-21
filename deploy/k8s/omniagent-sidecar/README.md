@@ -1,6 +1,6 @@
 # OmniAgent backend sidecar
 
-本目录把 OmniAgent 作为第二个普通容器追加到现有 `Deployment/backend` Pod。它不会替换 backend，也不会修改 `wait-for-postgres`、`db-migrate` 等 init container。两个容器共享 Pod 网络，因此 backend 使用：
+本目录把 OmniAgent v1（`1.0.0a57+`）作为第二个普通容器追加到现有 `Deployment/backend` Pod。它不会替换 backend，也不会修改 `wait-for-postgres`、`db-migrate` 等 init container。两个容器共享 Pod 网络，因此 backend 使用：
 
 ```text
 http://127.0.0.1:8090/api/agent/langgraph

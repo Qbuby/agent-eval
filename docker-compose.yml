@@ -192,8 +192,8 @@ services:
   #   - 从相邻 ../OmniAgent 源码构建，不把框架源码复制进本仓库
   #   - 与业务后端仅共享 PostgreSQL 服务；使用独立 omniagent 数据库
   #   - 配置只启用基础对话，skill / 工具 / 系统提示词后续单独设计
-  #   - 配置目录必须挂到 /OmniAgent/.omniagent；上游仓库自带 compose
-  #     的 /OmniAgent/config.yaml 挂载点不会被 ConfigDiscovery 读取
+  #   - v1 只读取工作目录下的 .omniagent，故挂载点固定为
+  #     /OmniAgent/.omniagent，容器工作目录由 v1 镜像固定为 /OmniAgent
   # ─────────────────────────────────────────────────────────────────
   omniagent:
     image: ${OMNIAGENT_IMAGE:-agent-eval-omniagent}:${IMAGE_TAG:-latest}
@@ -202,10 +202,9 @@ services:
       dockerfile: Dockerfile
     container_name: agent-eval-omniagent
     environment:
-      OMNIAGENT_CONFIG_DIR: /OmniAgent/.omniagent
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-postgres}
-      OMNIAGENT_MODEL: ${OMNIAGENT_MODEL:-${LLM_MODEL:-claude-opus-4-6}}
+      OMNIAGENT_MODEL: ${OMNIAGENT_MODEL:-${LLM_MODEL:-gpt-5.6-terra}}
       # kiro.aidong-ai.com 是 OpenAI-compatible 网关；模型名含 claude 时
       # 必须强制 provider，否则 OmniAgent 会按名称误选 ChatAnthropic。
       LLM_PROVIDER: openai

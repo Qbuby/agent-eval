@@ -1,16 +1,17 @@
-# OmniAgent 作为 agent-eval 系统智能体的最小运行配置。
-# skill、业务工具与系统提示词后续单独设计；本配置只打通基础对话和评估链路。
+# OmniAgent v1 作为 agent-eval 系统智能体的最小运行配置。
+# skill、业务工具与提示词增强后续单独设计；当前只启用基础 HTTP 对话与 PG 会话持久化。
 postgres:
   host: "${DB_HOST:-postgres}"
   port: 5432
   database: "omniagent"
   user: "${DB_USER:-postgres}"
   password: "${DB_PASSWORD:-postgres}"
+  sslmode: "${DB_SSLMODE:-disable}"
 
-react_agent:
-  default_model: "${OMNIAGENT_MODEL:-claude-opus-4-6}"
-  # tools 为空表示启用全部工具。使用不可能命中的非空白名单，确保当前阶段为零工具；
-  # skill 与业务工具后续单独设计。
+agent:
+  default_model: "${OMNIAGENT_MODEL:-gpt-5.6-terra}"
+  # v1 的 tools 空列表表示启用全部工具。使用不可能命中的非空白名单保持零工具；
+  # HTTP 入口本身也不会暴露 ask/审批能力。
   tools: ["__no_tools_until_designed__"]
   disabled_tools: []
   max_tokens: 8192
@@ -23,10 +24,9 @@ llm_params:
   openai:
     temperature: 0.2
     timeout: 120
-    # 认证/参数错误应立即进入 SSE 控制帧，不能在一次评估里隐式重试数分钟。
     max_retries: 0
 
-skill_execution:
+schedule:
   enabled: false
 
 channels:
@@ -34,9 +34,7 @@ channels:
     enabled: false
   wecom:
     enabled: false
-  telegram:
-    enabled: false
-  whatsapp:
+  gateway:
     enabled: false
 
 dream:

@@ -320,10 +320,11 @@ class SSEStreamAdapter:
             "cache_creation_tokens": 0,
         }
         usage_seen = False
-        # OmniAgent 的带内控制帧（服务端异常 / 中断 / 排队）。见 invoke 内
-        # _detect_control_frame 处的说明：这些帧走 HTTP 200 的流，不截获就会
-        # 让失败伪装成空答案。
+        # OmniAgent 的带内控制帧（服务端异常 / 0.x 中断与排队）以及 v1 的
+        # command_result / structured_output 协议帧。它们都混在 HTTP 200 的 SSE
+        # 流里，不属于 LangGraph astream_events，须在事件解析前单独截获。
         control_frames: list[dict[str, Any]] = []
+        protocol_frames: list[dict[str, Any]] = []
 
         start = time.perf_counter()
         # 流式读取途中对端切断（judge 的大 payload 常触发被测 agent 或上游网关
@@ -379,9 +380,17 @@ class SSEStreamAdapter:
                         if control is not None:
                             control_frames.append(control)
                             if control["kind"] in ("interrupted", "enqueued"):
-                                # agent 停下等输入 / 被排队，本次调用不会再产出答案，
-                                # 继续读只会阻塞到超时。收流走收尾逻辑。
+                                # 0.x agent 停下等输入 / 被排队，本次调用不会再产出答案。
+                                # v1 HTTP 入口已取消中断，但保留兼容读取旧服务。
                                 break
+                            continue
+                        protocol = self._detect_protocol_frame(obj)
+                        if protocol is not None:
+                            protocol_frames.append(protocol)
+                            if protocol["kind"] == "command_result":
+                                text = protocol.get("detail")
+                                if isinstance(text, str) and text:
+                                    full_text.append(text)
                             continue
                         if self._handle_langgraph_event(
                             obj, full_text, tool_calls, active_tools, usage_acc,
@@ -454,6 +463,15 @@ class SSEStreamAdapter:
                 )
             if kinds & {"interrupted", "enqueued"}:
                 raw["incomplete"] = True
+        if protocol_frames:
+            raw["protocol_frames"] = protocol_frames
+            structured = next(
+                (frame.get("detail") for frame in reversed(protocol_frames)
+                 if frame["kind"] == "structured_output"),
+                None,
+            )
+            if structured is not None:
+                raw["structured_output"] = structured
         if tool_calls:
             raw["tool_calls"] = tool_calls
         if steps:
@@ -509,6 +527,24 @@ class SSEStreamAdapter:
             return {"kind": "interrupted", "detail": obj.get("interrupt")}
         if event == "enqueued":
             return {"kind": "enqueued", "detail": obj.get("message")}
+        return None
+
+    @staticmethod
+    def _detect_protocol_frame(obj: dict[str, Any]) -> dict[str, Any] | None:
+        """识别 OmniAgent v1 的 HTTP SSE 协议帧，普通 LangGraph 事件返回 None。
+
+        v1 除原始 ``astream_events`` 外还会发送两种框架级结果：斜杠命令以
+        ``command_result.text`` 返回，结构化输出以 ``structured_output`` 返回。
+        两者都不应交给 ``_handle_langgraph_event``，否则会被静默丢弃。
+        """
+        event = obj.get("event")
+        if event == "command_result":
+            return {"kind": "command_result", "detail": obj.get("text")}
+        if event == "structured_output":
+            return {
+                "kind": "structured_output",
+                "detail": obj.get("structured_output"),
+            }
         return None
 
     @staticmethod

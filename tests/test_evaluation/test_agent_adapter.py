@@ -520,6 +520,50 @@ def test_detect_control_frame_ignores_normal_events():
         assert SSEStreamAdapter._detect_control_frame(obj) is None
 
 
+def test_detect_protocol_frame_recognizes_v1_frames():
+    """v1 的命令回执和结构化输出使用服务端实际键名。"""
+    assert SSEStreamAdapter._detect_protocol_frame(
+        {"event": "command_result", "text": "已完成"},
+    ) == {"kind": "command_result", "detail": "已完成"}
+
+    structured = {"score": 0.9, "reason": "符合要求"}
+    assert SSEStreamAdapter._detect_protocol_frame(
+        {"event": "structured_output", "structured_output": structured},
+    ) == {"kind": "structured_output", "detail": structured}
+
+
+def test_detect_protocol_frame_ignores_langgraph_and_legacy_control_frames():
+    """协议帧识别不能吞掉原始事件或 0.x 控制帧。"""
+    for obj in (
+        {"event": "on_chat_model_stream", "data": {"chunk": {}}},
+        {"event": "on_tool_start", "run_id": "r1", "name": "t"},
+        {"event": "interrupted", "interrupt": {}},
+        {"event": "enqueued", "message": "busy"},
+        {"status": "error", "error": "boom"},
+        {},
+    ):
+        assert SSEStreamAdapter._detect_protocol_frame(obj) is None
+
+
+def test_v1_protocol_frames_are_consumed_and_persisted():
+    """命令文本进入最终答案，结构化结果保留在 raw_response。"""
+    structured = {"score": 1, "reason": "ok"}
+    resp = _invoke_sse(_sse_body(
+        json.dumps({"event": "command_result", "text": "命令执行成功"}),
+        json.dumps({
+            "event": "structured_output",
+            "structured_output": structured,
+        }),
+    ))
+
+    assert resp.content == "命令执行成功"
+    assert resp.raw_response["protocol_frames"] == [
+        {"kind": "command_result", "detail": "命令执行成功"},
+        {"kind": "structured_output", "detail": structured},
+    ]
+    assert resp.raw_response["structured_output"] == structured
+
+
 def test_error_frame_marks_agent_error():
     """服务端异常帧要落成 agent_error（明细原样交回），且不算 incomplete。"""
     resp = _invoke_sse(_sse_body(
