@@ -515,6 +515,11 @@ async def list_samples(
         )
 
 
+def _feedback_sample_exists_statement(sample_id: uuid.UUID):
+    """只查询样例主键，避免反馈写路径读取内联图片等大字段。"""
+    return select(PortalSampleRow.id).where(PortalSampleRow.id == sample_id)
+
+
 @router.post("/samples/{sample_id}/feedback", response_model=FeedbackPayload)
 async def submit_feedback(
     sample_id: uuid.UUID,
@@ -523,9 +528,13 @@ async def submit_feedback(
 ) -> FeedbackPayload:
     """提交/更新打分 + 意见。upsert by (sample_id, rated_by)。"""
     async with async_session_factory() as session:
-        # 校验样例存在且在当前租户可见（监听器过滤）。
-        sample = await session.get(PortalSampleRow, sample_id)
-        if sample is None:
+        # 只取主键做存在性校验：PortalSampleRow.question_content 可能内联数 MB
+        # base64 图片，整行 get 会让一次轻量反馈写入承担无关的 detoast/反序列化成本。
+        # tenant 监听器仍会自动注入当前租户过滤。
+        sample_exists = await session.scalar(
+            _feedback_sample_exists_statement(sample_id)
+        )
+        if sample_exists is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="样例不存在或无权访问",
@@ -556,8 +565,9 @@ async def submit_feedback(
             feedback.expected_answer = req.expected_answer
 
         await session.commit()
-        await session.refresh(feedback)
 
+        # expire_on_commit=False，且时间字段由 Python default/onupdate 维护，提交后
+        # ORM 实例已是返回所需的权威值；不要为一条反馈再做一次无意义 SELECT。
         return FeedbackPayload(
             id=str(feedback.id),
             overall=feedback.overall,

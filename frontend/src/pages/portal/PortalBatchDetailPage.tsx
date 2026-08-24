@@ -9,6 +9,7 @@ import {
   portalApi,
   SCORE_DIMENSIONS,
   type PortalSample,
+  type PaginatedSamples,
   type FeedbackPayload,
 } from '@/services/portal'
 import { formatApiError, toToastMessage } from '@/lib/errors'
@@ -99,7 +100,15 @@ function hasFeedback(s: PortalSample): boolean {
 
 // 右侧详情 + 打分。state 局部维护，初值来自已提交 feedback；提交走 upsert。
 // key 绑定 sample.id，切换样例时组件重建，天然重置表单。
-function SampleDetail({ sample }: { sample: PortalSample }) {
+function SampleDetail({
+  sample,
+  batchId,
+  page,
+}: {
+  sample: PortalSample
+  batchId: string
+  page: number
+}) {
   const queryClient = useQueryClient()
   const toast = useToast()
 
@@ -110,9 +119,26 @@ function SampleDetail({ sample }: { sample: PortalSample }) {
   const [expectedAnswer, setExpectedAnswer] = useState(initial?.expected_answer ?? '')
 
   const submitMutation = useMutation({
-    mutationFn: (data: FeedbackPayload) => portalApi.submitFeedback(sample.id, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['portal-samples'] })
+    mutationFn: (data: FeedbackPayload) =>
+      portalApi.submitFeedback(sample.id, data).then((response) => response.data),
+    onSuccess: (savedFeedback) => {
+      // POST 已返回服务端权威 feedback，只替换当前页对应样例。不要 invalidate
+      // portal-samples：带图批次的一页可能内联几十 MB base64，保存后整页重拉会
+      // 把一次轻量写入放大成分钟级等待。
+      queryClient.setQueryData<PaginatedSamples>(
+        ['portal-samples', batchId, page],
+        (current) =>
+          current
+            ? {
+                ...current,
+                items: current.items.map((item) =>
+                  item.id === sample.id ? { ...item, feedback: savedFeedback } : item,
+                ),
+              }
+            : current,
+      )
+      // 仪表盘统计允许后台刷新；它不参与保存按钮的 pending 生命周期。
+      void queryClient.invalidateQueries({ queryKey: ['portal-stats'] })
       toast.success('反馈已保存')
     },
     onError: (err) => {
@@ -408,7 +434,12 @@ export default function PortalBatchDetailPage() {
           {/* 右侧详情 + 打分 */}
           <section className="min-h-0 card p-5">
             {selected ? (
-              <SampleDetail key={selected.id} sample={selected} />
+              <SampleDetail
+                key={selected.id}
+                sample={selected}
+                batchId={batchId!}
+                page={page}
+              />
             ) : (
               <div className="empty-state">← 从左侧选择一个样例</div>
             )}
