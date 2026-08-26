@@ -159,6 +159,9 @@ services:
       # Bitable 导入/导出走 app 身份（tenant_access_token，SDK 自动换取），
       # 无需 OAuth，故此处不再需要 REDIRECT_URI / SCOPES。
       FEISHU_NOTIFY_OPEN_IDS: ${FEISHU_NOTIFY_OPEN_IDS:-}
+      # 系统智能体前端入口只调用 backend；backend 再通过 Compose 服务 DNS 代理 SSE。
+      # 生产同 Pod 部署不覆盖时由后端默认走 127.0.0.1:8090。
+      OMNIAGENT_INTERNAL_URL: http://omniagent:8090/api/agent/langgraph
     ports:
       - "8000:8000"
     # 被测 agent 跑在 Windows 宿主上（SSH 隧道 0.0.0.0:18094）。本栈是
@@ -198,8 +201,9 @@ services:
   omniagent:
     image: ${OMNIAGENT_IMAGE:-agent-eval-omniagent}:${IMAGE_TAG:-latest}
     build:
+      # 上游 OmniAgent 仓库严格只读；Dockerfile 由 agent_eval 自己维护。
       context: ../OmniAgent
-      dockerfile: Dockerfile
+      dockerfile: ../agent_eval/deploy/omniagent/Dockerfile
     container_name: agent-eval-omniagent
     environment:
       DB_USER: ${DB_USER:-postgres}

@@ -84,6 +84,8 @@ frontend/*.cjs
 # 一次性 SQL 与 judge 参数快照（含 prompt 全文，属排查现场，不是产物）
 _q*.sql
 artifacts/
+# Reviewed Axi wheels are supplied to approved image builders, never committed.
+deploy/omniagent/execution-runtime/vendor/*.whl
 # 仓库根的一次性 patch/探针 mjs
 _*.mjs
 # 一次性 UI 探针：写死样例 id、只为定位当次问题。

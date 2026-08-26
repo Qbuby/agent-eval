@@ -28,9 +28,20 @@ done
 for file in \
   "$CONFIG_DIR/config.yaml" \
   "$CONFIG_DIR/mcp_server.json" \
+  "$CONFIG_DIR/overlay/sitecustomize.py" \
+  "$CONFIG_DIR/overlay/omniagent_overlay/__init__.py" \
+  "$CONFIG_DIR/overlay/omniagent_overlay/axi_bridge.py" \
+  "$CONFIG_DIR/overlay/omniagent_overlay/axi_tools.py" \
   "$CONFIG_DIR/prompts/SOUL.md" \
   "$CONFIG_DIR/prompts/GUARDRAILS.md" \
-  "$CONFIG_DIR/prompts/AGENTS.md"; do
+  "$CONFIG_DIR/prompts/AGENTS.md" \
+  "$CONFIG_DIR/skills/artifact-handling/SKILL.md" \
+  "$CONFIG_DIR/skills/controlled-analysis/SKILL.md" \
+  "$CONFIG_DIR/skills/data-investigation/SKILL.md" \
+  "$CONFIG_DIR/skills/delegation/SKILL.md" \
+  "$CONFIG_DIR/skills/governed-actions/SKILL.md" \
+  "$CONFIG_DIR/skills/personal-memory/SKILL.md" \
+  "$CONFIG_DIR/skills/scheduled-automation/SKILL.md"; do
   [ -f "$file" ] || { printf 'missing config file: %s\n' "$file" >&2; exit 1; }
 done
 
@@ -50,9 +61,20 @@ hash_files() {
 CONFIG_HASH=$(hash_files \
   "$CONFIG_DIR/config.yaml" \
   "$CONFIG_DIR/mcp_server.json" \
+  "$CONFIG_DIR/overlay/sitecustomize.py" \
+  "$CONFIG_DIR/overlay/omniagent_overlay/__init__.py" \
+  "$CONFIG_DIR/overlay/omniagent_overlay/axi_bridge.py" \
+  "$CONFIG_DIR/overlay/omniagent_overlay/axi_tools.py" \
   "$CONFIG_DIR/prompts/SOUL.md" \
   "$CONFIG_DIR/prompts/GUARDRAILS.md" \
-  "$CONFIG_DIR/prompts/AGENTS.md")
+  "$CONFIG_DIR/prompts/AGENTS.md" \
+  "$CONFIG_DIR/skills/artifact-handling/SKILL.md" \
+  "$CONFIG_DIR/skills/controlled-analysis/SKILL.md" \
+  "$CONFIG_DIR/skills/data-investigation/SKILL.md" \
+  "$CONFIG_DIR/skills/delegation/SKILL.md" \
+  "$CONFIG_DIR/skills/governed-actions/SKILL.md" \
+  "$CONFIG_DIR/skills/personal-memory/SKILL.md" \
+  "$CONFIG_DIR/skills/scheduled-automation/SKILL.md")
 
 escape_sed() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
@@ -83,9 +105,20 @@ kubectl create configmap "$CONFIGMAP_NAME" \
   --namespace "$NAMESPACE" \
   --from-file=config.yaml="$CONFIG_DIR/config.yaml" \
   --from-file=mcp_server.json="$CONFIG_DIR/mcp_server.json" \
+  --from-file=sitecustomize.py="$CONFIG_DIR/overlay/sitecustomize.py" \
+  --from-file=overlay-init.py="$CONFIG_DIR/overlay/omniagent_overlay/__init__.py" \
+  --from-file=axi_bridge.py="$CONFIG_DIR/overlay/omniagent_overlay/axi_bridge.py" \
+  --from-file=axi_tools.py="$CONFIG_DIR/overlay/omniagent_overlay/axi_tools.py" \
   --from-file=SOUL.md="$CONFIG_DIR/prompts/SOUL.md" \
   --from-file=GUARDRAILS.md="$CONFIG_DIR/prompts/GUARDRAILS.md" \
   --from-file=AGENTS.md="$CONFIG_DIR/prompts/AGENTS.md" \
+  --from-file=skill-artifact-handling.md="$CONFIG_DIR/skills/artifact-handling/SKILL.md" \
+  --from-file=skill-controlled-analysis.md="$CONFIG_DIR/skills/controlled-analysis/SKILL.md" \
+  --from-file=skill-data-investigation.md="$CONFIG_DIR/skills/data-investigation/SKILL.md" \
+  --from-file=skill-delegation.md="$CONFIG_DIR/skills/delegation/SKILL.md" \
+  --from-file=skill-governed-actions.md="$CONFIG_DIR/skills/governed-actions/SKILL.md" \
+  --from-file=skill-personal-memory.md="$CONFIG_DIR/skills/personal-memory/SKILL.md" \
+  --from-file=skill-scheduled-automation.md="$CONFIG_DIR/skills/scheduled-automation/SKILL.md" \
   --dry-run=client -o yaml > "$CONFIGMAP_FILE"
 
 if [ -n "${OMNIAGENT_API_KEY:-}" ] || [ -n "${DB_PASSWORD:-}" ]; then

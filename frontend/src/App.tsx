@@ -31,6 +31,7 @@ import TenantsPage from '@/pages/admin/TenantsPage'
 import EntryCodesPage from '@/pages/admin/EntryCodesPage'
 import FeedbackReviewPage from '@/pages/FeedbackReviewPage'
 import LangfuseMetricsPage from '@/pages/LangfuseMetricsPage'
+import OmniAgentPage from '@/pages/OmniAgentPage'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -103,6 +104,8 @@ export default function App() {
               <Route path="evaluation/runs/:runId" element={<InternalRoute><EvaluationRunDetailPage /></InternalRoute>} />
               <Route path="evaluators" element={<InternalRoute><EvaluatorsPage /></InternalRoute>} />
               <Route path="evaluators/compare" element={<InternalRoute><EvaluatorComparePage /></InternalRoute>} />
+              {/* 系统智能体对话（内部角色可见：admin + 内部普通 user） */}
+              <Route path="omniagent" element={<InternalRoute><OmniAgentPage /></InternalRoute>} />
               {/* 自动采集（内部 admin 专属，内部普通 user 不需要） */}
               <Route
                 path="auto-collect"

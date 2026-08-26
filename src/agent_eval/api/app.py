@@ -11,7 +11,8 @@ from agent_eval.api.routers import (
     admin, admin_entry_codes, admin_tenants, agent_replies, auth, benchmark, candidates,
     case_categories,
     cases, config, datasets, evaluation, evaluator_providers, feedback_review, feishu_oauth,
-    generate, governance, img_proxy, key_points, langfuse_metrics, portal, projects,
+    generate, governance, img_proxy, key_points, langfuse_metrics, omniagent, omniagent_data,
+    omniagent_internal, omniagent_product, portal, projects,
     routing, scheduled_tasks, scheduler, traces,
 )
 from agent_eval.config import settings
@@ -28,9 +29,25 @@ async def lifespan(app: FastAPI):
     from agent_eval.db import close_db
     from agent_eval.evaluation.langfuse_runner import sweep_orphaned_runs
     from agent_eval.langfuse_metrics.service import LangfuseMetricsService
+    from agent_eval.omniagent_data.catalog import validate_catalog_config
+    from agent_eval.omniagent_runtime.artifacts import ArtifactLifecycleWorker
+    from agent_eval.omniagent_runtime.notifications import OmniAgentOutboxDispatcher
+    from agent_eval.omniagent_runtime.schedules import OmniAgentScheduleDispatcher
+    from agent_eval.omniagent_runtime.worker import OmniAgentExecutionWorker
     from agent_eval.scheduler.service import SchedulerService
 
     await config_service.init_defaults()
+    validate_catalog_config()
+
+    # 收口上个进程遗留的系统智能体流，避免会话永久停在生成中。
+    try:
+        from agent_eval.services.omniagent_chat import clear_stale_active_messages
+
+        n = await clear_stale_active_messages()
+        if n:
+            logger.info("swept %d orphaned OmniAgent messages to 'cancelled'", n)
+    except Exception as e:
+        logger.warning("orphaned OmniAgent message sweep failed: %s", e)
 
     # Mark any test_runs left in 'running' from a previous process as 'interrupted'.
     try:
@@ -76,8 +93,45 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("eval scheduler start failed (continuing without it): %s", e)
 
+    omniagent_worker = OmniAgentExecutionWorker()
+    omniagent_outbox = OmniAgentOutboxDispatcher()
+    omniagent_schedules = OmniAgentScheduleDispatcher()
+    omniagent_artifacts = ArtifactLifecycleWorker()
+    try:
+        await omniagent_worker.start()
+    except Exception as e:
+        logger.warning("OmniAgent execution worker start failed: %s", e)
+    try:
+        await omniagent_outbox.start()
+    except Exception as e:
+        logger.warning("OmniAgent outbox dispatcher start failed: %s", e)
+    try:
+        await omniagent_schedules.start()
+    except Exception as e:
+        logger.warning("OmniAgent schedule dispatcher start failed: %s", e)
+    try:
+        await omniagent_artifacts.start()
+    except Exception as e:
+        logger.warning("OmniAgent artifact lifecycle start failed: %s", e)
+
     yield
 
+    try:
+        await omniagent_artifacts.stop()
+    except Exception as e:
+        logger.warning("OmniAgent artifact lifecycle stop failed: %s", e)
+    try:
+        await omniagent_schedules.stop()
+    except Exception as e:
+        logger.warning("OmniAgent schedule dispatcher stop failed: %s", e)
+    try:
+        await omniagent_outbox.stop()
+    except Exception as e:
+        logger.warning("OmniAgent outbox dispatcher stop failed: %s", e)
+    try:
+        await omniagent_worker.stop()
+    except Exception as e:
+        logger.warning("OmniAgent execution worker stop failed: %s", e)
     try:
         await eval_sched.stop()
     except Exception as e:
@@ -151,6 +205,11 @@ def create_app() -> FastAPI:
     app.include_router(scheduled_tasks.router)
     app.include_router(evaluation.router)
     app.include_router(evaluator_providers.router)
+    # 系统智能体：内部用户私有多会话 + 标准化 SSE 代理。
+    app.include_router(omniagent.router)
+    app.include_router(omniagent_product.router)
+    app.include_router(omniagent_internal.router)
+    app.include_router(omniagent_data.router)
     # 持久化 agent 回复：数据集页面预生成答案 + 版本回溯 + 作为评估数据来源。
     # router 自带 prefix(/api/agent-replies) 与 require_internal 门禁。见迁移 0035。
     app.include_router(agent_replies.router)

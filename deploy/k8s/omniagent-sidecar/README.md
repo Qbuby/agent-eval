@@ -8,12 +8,17 @@ http://127.0.0.1:8090/api/agent/langgraph
 
 本方案不创建 Service 或 Ingress，8090 不对 Pod 外暴露。本地 Docker Compose 仍使用独立 `omniagent` 服务和 `http://omniagent:8090/...`。
 
+系统智能体前端只访问 agent_eval 后端，由 backend 使用专用 `OMNIAGENT_INTERNAL_URL` 代理 OmniAgent；该配置不复用被测智能体的 `target_agent.endpoint_url`。同 Pod 默认值为 `http://127.0.0.1:8090/api/agent/langgraph`，Compose 显式覆盖为 `http://omniagent:8090/api/agent/langgraph`。
+
 ## 前提
 
 1. OmniAgent 镜像已推送到集群可拉取的 registry。不要依赖 agent_eval 仓库外的 `../OmniAgent` 构建上下文。
 2. 当前 Kubernetes 对象默认为 namespace `agent-eval`、Deployment `backend`。
 3. PostgreSQL 账号可访问独立数据库 `omniagent`；若不能自动建库，先由 DBA 创建。
 4. 本机有 `kubectl`，且生产应用时具有 patch Deployment、apply ConfigMap/Secret 的权限。
+5. 基础 sidecar patch 不改变 Pod 的 ServiceAccount。需要 analysis execution 时，再按
+   `deploy/k8s/omniagent-execution/README.md` 显式应用 executor identity patch；这样仅部署
+   聊天 sidecar 不会意外获得 SandboxClaim 权限。
 
 ## Secret
 

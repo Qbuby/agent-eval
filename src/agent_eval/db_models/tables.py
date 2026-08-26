@@ -4,10 +4,12 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
     Index,
+    Identity,
     Integer,
     LargeBinary,
     Numeric,
@@ -204,6 +206,361 @@ class FeishuConversationMessageRow(Base, TenantMixin):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
+
+class OmniAgentChatSessionRow(Base, TenantMixin):
+    """系统智能体的用户私有会话目录。
+
+    ``thread_id`` 是发给 OmniAgent 的稳定上下文键；软删除只隐藏目录，不删除
+    上游 checkpoint。``active_message_id`` 充当同会话单飞门禁。
+    """
+
+    __tablename__ = "omniagent_chat_sessions"
+    __table_args__ = (
+        Index(
+            "ix_omniagent_sessions_owner_recent",
+            "tenant_id",
+            "created_by",
+            "deleted_at",
+            "last_message_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    thread_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="新对话")
+    title_source: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")
+    active_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    last_message_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OmniAgentChatMessageRow(Base, TenantMixin):
+    """系统智能体会话的一条持久化消息。"""
+
+    __tablename__ = "omniagent_chat_messages"
+    __table_args__ = (
+        UniqueConstraint("session_id", "sequence", name="uq_omniagent_message_sequence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("omniagent_chat_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[object] = mapped_column(JSONB, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="completed")
+    tool_calls: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    structured_output: Mapped[object | None] = mapped_column(JSONB, nullable=True)
+    message_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_of_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentEventRow(Base, TenantMixin):
+    """Append-only product event. ``id`` is the reconnect cursor."""
+
+    __tablename__ = "omniagent_events"
+    __table_args__ = (
+        Index("ix_omniagent_events_owner_cursor", "tenant_id", "user_id", "id"),
+        Index("ix_omniagent_events_session_cursor", "tenant_id", "session_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_messages.id", ondelete="SET NULL")
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    entity_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    entity_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+
+
+class OmniAgentJobRow(Base, TenantMixin):
+    """Durable unit of work claimed through a time-limited database lease."""
+
+    __tablename__ = "omniagent_jobs"
+    __table_args__ = (
+        Index("ix_omniagent_jobs_claim", "status", "available_at", "priority", "created_at"),
+        Index("ix_omniagent_jobs_owner_recent", "tenant_id", "requested_by", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    kind: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued", index=True)
+    spec: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_sessions.id", ondelete="SET NULL"), index=True
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_messages.id", ondelete="SET NULL")
+    )
+    action_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    cost_estimate: Mapped[dict | None] = mapped_column(JSONB)
+    usage: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentJobAttemptRow(Base, TenantMixin):
+    __tablename__ = "omniagent_job_attempts"
+    __table_args__ = (
+        UniqueConstraint("job_id", "attempt_no", name="uq_omniagent_job_attempt_no"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_jobs.id", ondelete="CASCADE"), index=True
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    worker_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    runtime_ref: Mapped[str | None] = mapped_column(String(256))
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="running")
+    infrastructure_failure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OmniAgentActionRow(Base, TenantMixin):
+    """Immutable fixed capability request whose digest is approved by a user."""
+
+    __tablename__ = "omniagent_actions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_omniagent_action_idempotency"),
+        Index("ix_omniagent_actions_owner_state", "tenant_id", "requested_by", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    capability: Mapped[str] = mapped_column(String(96), nullable=False, index=True)
+    arguments: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    argument_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    risk: Mapped[str] = mapped_column(String(16), nullable=False)
+    impact_preview: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    cost_estimate: Mapped[dict | None] = mapped_column(JSONB)
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="prepared", index=True)
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_sessions.id", ondelete="SET NULL"), index=True
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_messages.id", ondelete="SET NULL")
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    denied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_jobs.id", ondelete="SET NULL"), index=True
+    )
+    terminal_summary: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentArtifactRow(Base, TenantMixin):
+    __tablename__ = "omniagent_artifacts"
+    __table_args__ = (
+        Index("ix_omniagent_artifacts_owner_state", "tenant_id", "owner_id", "state"),
+        Index("ix_omniagent_artifacts_expiry", "state", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_sessions.id", ondelete="SET NULL"), index=True
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_jobs.id", ondelete="SET NULL"), index=True
+    )
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="uploading", index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    extension: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
+    scan_result: Mapped[dict | None] = mapped_column(JSONB)
+    retention: Mapped[str] = mapped_column(String(16), nullable=False, default="temporary")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentMemoryRow(Base, TenantMixin):
+    __tablename__ = "omniagent_memories"
+    __table_args__ = (
+        Index("ix_omniagent_memories_owner_active", "tenant_id", "owner_id", "deleted_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_action_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_actions.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class OmniAgentScheduleRow(Base, TenantMixin):
+    __tablename__ = "omniagent_schedules"
+    __table_args__ = (
+        Index("ix_omniagent_schedules_due", "enabled", "next_run_at"),
+        Index("ix_omniagent_schedules_owner", "tenant_id", "owner_id", "enabled"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    capability: Mapped[str] = mapped_column(String(96), nullable=False)
+    arguments: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    argument_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    schedule: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="Asia/Shanghai")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    approved_action_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_actions.id"), nullable=False
+    )
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentNotificationRow(Base, TenantMixin):
+    __tablename__ = "omniagent_notifications"
+    __table_args__ = (
+        Index("ix_omniagent_notifications_owner_unread", "tenant_id", "user_id", "read_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("omniagent_events.id", ondelete="SET NULL"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(48), nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    link: Mapped[str | None] = mapped_column(String(1024))
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class OmniAgentOutboxRow(Base, TenantMixin):
+    __tablename__ = "omniagent_outbox"
+    __table_args__ = (
+        Index("ix_omniagent_outbox_delivery", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    notification_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_notifications.id", ondelete="CASCADE"), index=True
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    destination: Mapped[str] = mapped_column(String(256), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class OmniAgentQuotaLedgerRow(Base, TenantMixin):
+    __tablename__ = "omniagent_quota_ledger"
+    __table_args__ = (
+        Index("ix_omniagent_quota_owner_metric", "tenant_id", "user_id", "metric", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    metric: Mapped[str] = mapped_column(String(64), nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(18, 4), nullable=False)
+    entry_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    resource_type: Mapped[str | None] = mapped_column(String(32))
+    resource_id: Mapped[str | None] = mapped_column(String(128))
+    bucket_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    details: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 class TestResultRow(Base, TenantMixin):
     __tablename__ = "test_results"

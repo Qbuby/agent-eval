@@ -117,6 +117,7 @@ def test_patch_adds_sidecar_without_replacing_existing_pod_containers():
     template = merged["spec"]["template"]
     pod_spec = template["spec"]
 
+    assert "serviceAccountName" not in pod_spec
     assert {item["name"] for item in pod_spec["initContainers"]} == {
         "wait-for-postgres",
         "db-migrate",
@@ -132,6 +133,14 @@ def test_patch_adds_sidecar_without_replacing_existing_pod_containers():
         "existing-volume",
         "omniagent-config",
     }
+    config_items = {
+        item["path"] for item in next(
+            volume for volume in pod_spec["volumes"] if volume["name"] == "omniagent-config"
+        )["configMap"]["items"]
+    }
+    assert "overlay/sitecustomize.py" in config_items
+    assert "overlay/omniagent_overlay/axi_tools.py" in config_items
+    assert "skills/data-investigation/SKILL.md" in config_items
     assert template["metadata"]["annotations"][
         "kubectl.kubernetes.io/default-container"
     ] == "backend"

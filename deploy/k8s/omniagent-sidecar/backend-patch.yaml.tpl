@@ -86,3 +86,25 @@ spec:
                 path: prompts/GUARDRAILS.md
               - key: AGENTS.md
                 path: prompts/AGENTS.md
+              - key: sitecustomize.py
+                path: overlay/sitecustomize.py
+              - key: overlay-init.py
+                path: overlay/omniagent_overlay/__init__.py
+              - key: axi_bridge.py
+                path: overlay/omniagent_overlay/axi_bridge.py
+              - key: axi_tools.py
+                path: overlay/omniagent_overlay/axi_tools.py
+              - key: skill-artifact-handling.md
+                path: skills/artifact-handling/SKILL.md
+              - key: skill-controlled-analysis.md
+                path: skills/controlled-analysis/SKILL.md
+              - key: skill-data-investigation.md
+                path: skills/data-investigation/SKILL.md
+              - key: skill-delegation.md
+                path: skills/delegation/SKILL.md
+              - key: skill-governed-actions.md
+                path: skills/governed-actions/SKILL.md
+              - key: skill-personal-memory.md
+                path: skills/personal-memory/SKILL.md
+              - key: skill-scheduled-automation.md
+                path: skills/scheduled-automation/SKILL.md

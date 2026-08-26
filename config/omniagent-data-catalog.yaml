@@ -1,0 +1,20 @@
+schema_version: "2026-08-25.1"
+entities:
+  - name: datasets
+    fields: [id, name, source_project, dataset_type, status, created_at, updated_at]
+  - name: candidate_cases
+    fields: [id, dataset_name, source, question, category, status, created_at, updated_at]
+  - name: benchmark_cases
+    fields: [id, project_id, question, difficulty, source, status, created_at, updated_at]
+  - name: evaluation_runs
+    fields: [id, status, eval_mode, reply_source, started_at, finished_at, created_at]
+  - name: evaluation_results
+    fields: [id, run_id, status, error_type, error_message, latency_ms, total_tokens, prompt_tokens, completion_tokens, tool_call_count, reply_version_id, created_at]
+  - name: evaluation_scores
+    fields: [id, result_id, dimension, score, weight, weighted_score, scoring_method, created_at]
+  - name: reply_jobs
+    fields: [id, dataset_type, dataset_name, status, total_count, succeeded_count, failed_count, running_count, cancel_requested, finished_at, created_at, updated_at]
+  - name: reply_versions
+    fields: [id, dataset_type, case_ref, dataset_name, version_number, version_label, status, latency_ms, total_tokens, edited, job_id, created_at, updated_at]
+  - name: reply_case_states
+    fields: [id, dataset_type, case_ref, dataset_name, current_version_id, created_at, updated_at]
