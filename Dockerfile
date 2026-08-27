@@ -14,12 +14,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_RETRIES=5
 
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
         postgresql-client \
     && if [ "$INSTALL_KUBERNETES_RUNNER" = "1" ]; then \
-        apt-get install -y --no-install-recommends clamav; \
+        apt-get install -y --no-install-recommends clamav git; \
     fi \
     && rm -rf /var/lib/apt/lists/*
 
@@ -34,7 +35,9 @@ RUN pip install --upgrade pip && \
         pip install -e '.[kubernetes-runner]'; \
     else \
         pip install -e .; \
-    fi
+    fi && \
+    pip check && \
+    pip uninstall -y pip setuptools wheel
 
 COPY alembic.ini ./
 COPY alembic ./alembic

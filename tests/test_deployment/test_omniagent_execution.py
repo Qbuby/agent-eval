@@ -83,6 +83,24 @@ def _local_patch(deployment: str, patch: str) -> str:
         ).stdout
 
 
+def test_apply_reads_annotation_keys_with_go_template_index() -> None:
+    script = (EXECUTION / "apply.sh").read_text(encoding="utf-8")
+    annotation_keys = (
+        "agent-eval.aidong.ai/omniagent-previous-service-account",
+        "agent-eval.aidong.ai/omniagent-restored-service-account",
+        "agent-eval.aidong.ai/omniagent-execution",
+    )
+
+    for key in annotation_keys:
+        expected = (
+            'go-template={{with index .spec.template.metadata.annotations "'
+            + key
+            + '"}}{{.}}{{end}}'
+        )
+        assert expected in script
+        assert f"annotations['{key}']" not in script
+
+
 def test_execution_template_is_fail_closed_and_hardened() -> None:
     documents = _documents(
         "20-sandbox-template.yaml.tpl",
@@ -1044,5 +1062,15 @@ def test_backend_image_includes_governed_data_catalog() -> None:
 def test_backend_kubernetes_runner_dependency_is_opt_in() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "ARG INSTALL_KUBERNETES_RUNNER=0" in dockerfile
+    assert "apt-get upgrade -y" in dockerfile
     assert 'if [ "$INSTALL_KUBERNETES_RUNNER" = "1" ]' in dockerfile
+    assert "apt-get install -y --no-install-recommends clamav git" in dockerfile
     assert "pip install -e '.[kubernetes-runner]'" in dockerfile
+    assert "pip check" in dockerfile
+    assert "pip uninstall -y pip setuptools wheel" in dockerfile
+
+
+def test_backend_metadata_allows_pinned_kubernetes_runner_reference() -> None:
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "[tool.hatch.metadata]" in pyproject
+    assert "allow-direct-references = true" in pyproject

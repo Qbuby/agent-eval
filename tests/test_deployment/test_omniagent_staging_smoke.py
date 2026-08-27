@@ -52,6 +52,47 @@ def test_staging_smoke_rejects_unsafe_configuration_before_kubectl(monkeypatch) 
         module._validate_config(config)
 
 
+@pytest.mark.parametrize(
+    ("expected", "returncode", "stdout"),
+    (
+        (True, 0, "yes\n"),
+        (False, 0, "no\n"),
+        (False, 1, "no\n"),
+    ),
+)
+def test_expect_can_i_accepts_kubectl_boolean_exit_codes(
+    monkeypatch, expected, returncode, stdout
+) -> None:
+    module = _load()
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=returncode,
+            stdout=stdout,
+            stderr="",
+        ),
+    )
+
+    module._expect_can_i(expected, "create", "pods")
+
+
+def test_expect_can_i_rejects_command_errors(monkeypatch) -> None:
+    module = _load()
+    monkeypatch.setattr(
+        module,
+        "_run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="control plane unavailable",
+        ),
+    )
+
+    with pytest.raises(module.SmokeFailure, match="control plane unavailable"):
+        module._expect_can_i(False, "create", "pods")
+
+
 def test_live_staging_smoke_requires_exact_confirmation_before_claim_creation(
     monkeypatch,
 ) -> None:

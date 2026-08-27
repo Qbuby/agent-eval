@@ -348,11 +348,11 @@ omniagent
   current_service_account=$(kubectl get deployment "$DEPLOYMENT_NAME" --namespace "$NAMESPACE" \
     -o 'jsonpath={.spec.template.spec.serviceAccountName}')
   recorded_service_account=$(kubectl get deployment "$DEPLOYMENT_NAME" --namespace "$NAMESPACE" \
-    -o "jsonpath={.spec.template.metadata.annotations['agent-eval.aidong.ai/omniagent-previous-service-account']}")
+    -o 'go-template={{with index .spec.template.metadata.annotations "agent-eval.aidong.ai/omniagent-previous-service-account"}}{{.}}{{end}}')
   restored_service_account=$(kubectl get deployment "$DEPLOYMENT_NAME" --namespace "$NAMESPACE" \
-    -o "jsonpath={.spec.template.metadata.annotations['agent-eval.aidong.ai/omniagent-restored-service-account']}")
+    -o 'go-template={{with index .spec.template.metadata.annotations "agent-eval.aidong.ai/omniagent-restored-service-account"}}{{.}}{{end}}')
   execution_state=$(kubectl get deployment "$DEPLOYMENT_NAME" --namespace "$NAMESPACE" \
-    -o "jsonpath={.spec.template.metadata.annotations['agent-eval.aidong.ai/omniagent-execution']}")
+    -o 'go-template={{with index .spec.template.metadata.annotations "agent-eval.aidong.ai/omniagent-execution"}}{{.}}{{end}}')
 
   if [ -n "$current_service_account" ]; then
     validate_dns_subdomain current_service_account "$current_service_account"

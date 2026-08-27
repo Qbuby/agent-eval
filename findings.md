@@ -151,3 +151,41 @@
 - Axi 0.0.11 的 METADATA 没有 `License` 字段，只有内嵌 README 正文写 `MIT`；制品身份校验不能替代书面许可审批。Windows 直接加载还会因无条件导入 Unix `fcntl` 失败，因此 CLI PoC 必须在 Linux/Python 3.12 中完成。
 - Axi 0.0.11 从 `axi.native_tools` entry-point 自动发现原生工具；`agent-eval-axi-tools` 的 `data = agent_eval_axi_tools.data` 声明与该加载器契约一致，不需要在 `axi.json` 重复注册。
 - WSL Ubuntu 的 CPython 3.12.13 实测 `axi-cli 0.0.11`：`doctor` 仅发现三个 `data` 工具；`search`、`describe`、成功调用、`FIELD_DENIED`、客户端超时和 malformed JSON 均返回预期 JSON。Malformed 参数是退出码 0 加 `status=error`；canary token 未出现在 stdout/stderr 或请求正文。
+- GitHub `v0.0.11` 是指向未签名提交 `290b20e9d584d5d61cdf7bae47a83e142db569da` 的轻量 tag，没有对应 GitHub Release。官方 wheel 的 21 个 Python 模块与该提交 tree `5ddd9f7b9c7e2b3db6e43fb1f463bb231827bff3` 中的源文件逐个 Git blob 一致。
+- Axi tag 树与 PyPI 元数据均没有许可证文件或结构化许可证字段；README 的 MIT 文本不能替代组织的书面许可审批。制品来源审计已完成，但许可门禁仍必须保持关闭。
+- `python:3.12.11-slim` 固定镜像在 2026-08-26 的 Trivy 0.74.0 数据库下有 3 个 CRITICAL 和 64 个 HIGH 可修复 OS 漏洞；`python-multipart==0.0.21` 另有 3 个 HIGH。固定的 `python:3.12.13-slim-bookworm` 多架构 digest `sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2` 与 `python-multipart==0.0.32` 将最终 analysis runtime 降为 `0 HIGH / 0 CRITICAL`。
+- 本地 Docker manifest-list digest 只能证明本机构建产物；生产门禁要求推送到审核 registry 后取得远端不可变 digest，再用该 digest运行 staging smoke。
+
+## 本地 Kubernetes 环境发现（2026-08-26）
+- kind 集群 `agent-eval-exec` 的 API 暴露在 `127.0.0.1:32937`，节点镜像为 `kindest/node:v1.35.0`，默认 CNI 已禁用并安装 Calico v3.32.1，以便真实验证 NetworkPolicy。
+- Calico 的初始 `ImagePullBackOff` 由 `quay.io` TLS handshake timeout 引起；同一 Pod 后续事件显示镜像拉取成功，节点和全部系统 Pod Ready。因此不需要修改 Calico 清单或改用弱化网络策略的 CNI。
+- Windows Docker CLI 指向未运行的 Docker Desktop，而 WSL 内独立 Docker 29.5.3 正常；kind 集群和待加载镜像都属于 WSL Docker，后续必须从同一 WSL daemon 构建和加载。
+- GH 凭据存于宿主 keyring。受限进程会误报旧 token 无效；授权宿主上下文已确认 `Qbuby` 登录有效。GHCR 登录/推送也必须在能读取该 keyring 的上下文中完成，且不能输出 token。
+
+## 本地 Kubernetes 验收发现（2026-08-26）
+- kubectl JSONPath 的 bracket 形式不能可靠读取包含 `.` 与 `/` 的 annotation key；真实集群对象虽含 previous-ServiceAccount annotation，旧表达式仍返回空。使用 Go template `with index` 可安全读取，并让不存在的 key 输出空串而不是 `<no value>`。
+- `kubectl auth can-i` 对拒绝结果会因版本不同返回 `no/0` 或 `no/1`。验收器必须把 stdout 的 `yes|no` 与允许的退出码组合解释为布尔协议，同时拒绝空输出、其他文本和控制面错误。
+- kind 节点可按 OCI index digest 运行 analysis runtime，但 `crictl images` 的表格视图可能不展示该标签；`ctr images list` 与 `crictl inspecti <digest-ref>` 才是足够的可运行性证据。
+- Calico 管理的 NetworkPolicy 已在真实 Pod 上证明：sandbox 能访问 DNS 和 backend:8000，不能访问 `1.1.1.1:443`，也不能直接访问另一 sandbox 的 8888 端口。
+- controller 的 `DeleteForeground` lifecycle 已在短 TTL patch 后实际删除 Claim 与 Sandbox；剩余 Claim 也由验收器严格清理，没有遗留 smoke 资源。
+
+## 执行面发布发现（2026-08-26）
+- `gh auth status` 成功不等于可推 GHCR；默认 token 最初缺少 `write:packages`，registry 以 `permission_denied: token provided does not match expected scopes` 拒绝推送。设备授权补充最小 scope 后推送成功。
+- Hatch 对 `project.optional-dependencies` 中的固定 Git direct reference 默认 fail closed；必须显式设置 `[tool.hatch.metadata] allow-direct-references = true`，否则 `INSTALL_KUBERNETES_RUNNER=1` 的文档化构建路径无法生成 metadata。
+- Git direct reference 还要求 runner 专属镜像分支安装 Git。默认 backend 仍不安装 Kubernetes SDK、Git 或 ClamAV；只有 `INSTALL_KUBERNETES_RUNNER=1` 命中该分支。
+- 基础 `python:3.11-slim` 在扫描时有可修复 Debian HIGH，`apt-get upgrade -y` 会获取安全仓库中的 util-linux/OpenSSL 修复版本。运行镜像不需要 Python 构建工具；依赖安装后先 `pip check`，再移除 `pip/setuptools/wheel`，可消除其 vendored metadata 与内置 SBOM 造成的运行面漏洞库存。
+- OCI image scan 会读取历史层或第三方 SBOM，可能报告最终合并文件系统中已被替换/删除的包。发布门禁使用 `docker export` 后的合并 rootfs，并由 Trivy 0.74.0 以 `--detection-priority precise` 扫描 OS 与 library；最终报告为 `0 HIGH / 0 CRITICAL`。
+- 已发布的不可变制品为 analysis `sha256:fc93a846898c79df6dec13ca2028e54712eb604e5a00147b5b389ff9f3b8f6c4` 和 runner backend `sha256:fe886eb36f9549b9d2bf6bd65b5e8841e1b57ed6000d4c2316f701435ea31527`。Axi runtime 仍因书面许可门禁而未构建、未部署、未发布。
+
+## 浏览器双租户验收发现（2026-08-26）
+- 现有 OmniAgent E2E 脚本覆盖会话创建、切换、刷新、重命名和软删除，但使用单一 `auth.json`，不能证明 tenant/owner 边界。
+- 产品侧栏已经公开活动、任务、制品、记忆等本人范围视图；双租户验收应从这些真实 UI 面建立可见性证据，并从浏览器身份直接请求对方对象确认服务端返回 404。
+- Axi 未获书面许可时不能完成模型 -> Axi -> native tool 的浏览器链路；该外部门禁与不依赖 Axi 的 durable product plane 双租户验收必须分开记录。
+
+## 浏览器双租户验收完成（2026-08-27）
+- 独立 `oa-two-tenant-e2e` 栈通过 Alpha/Beta 双向验收；两个 browser context、JWT 与前端状态相互独立。
+- 每个租户的会话、活动、审批、制品、记忆、通知和计划 UI 只显示自身 marker；对方 marker 未出现。
+- 八类列表、四类直接读取、五类写操作、记忆查询、事件 `after` 游标及跨租户 `session_id` 过滤均 fail closed；写操作返回 404 后，对方资源仍由其所有者可见。
+- `pg_isready` 仅证明容器内就绪不足以保证同网络客户端已可连接；E2E 启动器现以独立 PostgreSQL 客户端从专用网络探测，并在 backend 提前退出时输出日志。
+- 脱敏证据在 `e2e/omniagent-two-tenant/evidence/`；明文口令 fixture、容器、网络、卷和临时镜像均已清理。
+- Durable product plane 的双租户门禁已完成；Axi 0.0.11 书面许可仍是执行面唯一外部门禁，Axi runtime 继续 fail closed。

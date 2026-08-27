@@ -32,6 +32,7 @@ frontend/*.tsbuildinfo
 Thumbs.db
 
 # Temp / probe files
+.codex_tmp/
 *.tmp
 *.tmp.json
 *.tmp.*

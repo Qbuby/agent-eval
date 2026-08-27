@@ -156,3 +156,58 @@
 - 从固定 PyPI URL 下载 45,989-byte 官方 wheel 到 Git 忽略的本地 `vendor/` 目录；验证器确认 SHA-256、25 个成员、元数据、入口点和 RECORD 全部通过。
 - 在 WSL Ubuntu 的 CPython 3.12.13 隔离环境安装官方 wheel 与 `agent-eval-axi-tools`；`axi doctor` 仅发现 `data/search`、`data/describe`、`data/query`。
 - 新增 loopback-only `scripts/axi-poc/run_smoke.py`。真实 CLI PoC 验证成功调用、`FIELD_DENIED`、`QUERY_TIMEOUT`、malformed `status=error` 和 token 不泄漏。M0 现在只剩书面许可审批与 reviewed upstream commit。
+
+## 2026-08-26 Axi 来源审计与 runtime 镜像收口
+- GitHub `v0.0.11` tag 指向未签名提交 `290b20e9d584d5d61cdf7bae47a83e142db569da`、tree `5ddd9f7b9c7e2b3db6e43fb1f463bb231827bff3`；官方 wheel 中 21 个 `axi/*.py` 与该提交 21 个 `src/axi/*.py` Git blob 全部一致，没有缺失、改写或额外 Python 模块。
+- tag 没有 GitHub Release；提交树和 PyPI 元数据均没有 `LICENSE`、`COPYING`、`License`、`license_expression` 或 `license_files`，只有 README 正文声明 MIT，因此书面许可审批继续独立阻断 Axi 镜像构建。
+- Axi runtime Dockerfile 的真实无确认构建在安装前 fail closed，并输出明确的书面许可确认错误；修正了 wheel 默认路径必须相对仓库根 build context 的问题。
+- WSL Docker 构建了非 Axi `agent-eval-analysis-runtime:codex-smoke`，并在只读根、drop-all capabilities、no-new-privileges、PIDs/内存限制和 tmpfs 下通过 UID/GID、健康、上传下载、命令级环境隔离、超时退出 124、进程组清理与路径逃逸 smoke。
+- 首次 Trivy 0.74.0 扫描旧 Debian 13.1/Python 3.12.11 镜像发现 `64 HIGH / 3 CRITICAL` OS 漏洞和 3 个 `python-multipart` HIGH。改用固定 `python:3.12.13-slim-bookworm@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2` 并升级到 `python-multipart==0.0.32` 后，最终报告为 `0 HIGH / 0 CRITICAL`。
+- 当前本地 analysis runtime manifest-list digest 为 `sha256:fc93a846898c79df6dec13ca2028e54712eb604e5a00147b5b389ff9f3b8f6c4`，仅是本机 smoke 标签，不得作为 registry 发布 digest。
+- 最新部署回归 `55 passed`；完整执行面回归 `118 passed, 1 skipped, 2 warnings`。Ruff、compileall、shell 语法、多文档 YAML/TOML 和 whitespace 均通过。
+- 工作区曾由外部流程切到 `codex/mirror-source-only`；执行面已安全提交在 `1cf3d39`。已无损切回 `feat/traces-model-fill`，没有重置、cherry-pick、rebase 或覆盖外部提交。
+
+## 2026-08-26 本地 Kubernetes 执行面续接
+- 新建隔离 kind 集群 `agent-eval-exec`，使用 Kubernetes v1.35.0 与独立 kubeconfig `.codex_tmp/kubeconfig-agent-eval-exec`；既有 `omniagent-sandbox` 未修改。
+- Calico v3.32.1 首次从 `quay.io` 拉取 `cni` 镜像时发生一次 TLS handshake timeout，随后 kubelet 自动重试成功；`calico-node`、`calico-kube-controllers`、CoreDNS、local-path-provisioner 与节点现均为 Ready。
+- 授权宿主上下文确认 WSL Docker 29.5.3 可用，所需本地镜像仍存在；Windows Docker Desktop daemon 未运行不影响 WSL Docker。
+- 授权宿主上下文确认 `gh auth status` 为用户 `Qbuby` 登录成功；先前失败输出来自读取不到 keyring/config 的受限进程视角。
+- 下一步构建固定 agent-sandbox 提交的 controller/router，加载至 `agent-eval-exec`，然后部署 execution fixture 并运行真实 staging smoke。
+
+## 2026-08-26 本地 Kubernetes 执行面验收完成
+- 从 agent-sandbox 固定提交 `a9db14672e77fbd15981fb2af9b73934e29b0cfe` 构建并加载 controller/router；部署四个 CRD、带 extensions 的 controller 和单副本 router，全部 Ready。
+- 将已扫描的 analysis runtime 加载到 `agent-eval-exec`，并通过节点 containerd 为不可变 digest 引用建立可解析别名。
+- 部署本地 `agent-eval/backend` 双容器 fixture、`backend-runtime` 原始身份及 execution Secret；server-side dry-run 与显式 `MODE=apply` 均成功，backend 切换到 `omniagent-executor` 后 `1/1 Ready`。
+- 真实只读验收通过：`READ_ONLY_ACCEPTANCE_OK context=kind-agent-eval-exec`、`STAGING_ACCEPTANCE_OK`。
+- 真实 live 验收通过：两只短期 Claim Ready，运行时 UID/安全上下文、backend `/health`、公网拒绝、横向拒绝、TTL 删除和 finally 清理全部成功；输出 `LIVE_CLAIM_ACCEPTANCE_OK`。
+- 验收发现并修复两个产品兼容缺口：annotation key 改用缺失时返回空串的 Go template `with index`；`kubectl auth can-i` 接受不同版本的 `no` 退出码 0/1，同时继续对控制面错误 fail closed。
+- 更新后的 execution/staging 部署测试为 `36 passed`，shell 语法、Python 编译和 whitespace 检查通过。
+- 旧 `omniagent-sandbox` 集群从未修改；Axi runtime 未构建、未部署、未解除许可门禁。
+
+## 2026-08-26 执行面制品发布完成
+- GH CLI 已补充最小 `write:packages` scope；凭据只通过 stdin 交给 WSL Docker，未写入项目文件或日志。
+- 非 Axi analysis runtime 已发布为 `ghcr.io/qbuby/agent-eval-analysis-runtime@sha256:fc93a846898c79df6dec13ca2028e54712eb604e5a00147b5b389ff9f3b8f6c4`，发布 digest 与本地受限容器/Trivy 验收制品一致。
+- runner-enabled backend 构建暴露并修复两处真实缺口：Hatch 未允许固定 Git direct reference，以及镜像缺少用于 checkout 固定 SDK 提交的 Git。构建实际解析到 `a9db14672e77fbd15981fb2af9b73934e29b0cfe`，安装包版本为 `0.1.dev512+ga9db14672`。
+- backend 镜像安装 Debian security 更新，并在依赖安装及 `pip check` 后移除运行时不需要的 `pip`、`setuptools`、`wheel`；真实应用导入和 `/health` smoke 通过。
+- runner backend 已发布为 `ghcr.io/qbuby/agent-eval-backend@sha256:fe886eb36f9549b9d2bf6bd65b5e8841e1b57ed6000d4c2316f701435ea31527`。Trivy 0.74.0 对合并 rootfs 的 OS 与 Python 包扫描为 `0 HIGH / 0 CRITICAL`。
+- 发布后的 analysis GHCR digest 再次通过隔离 kind 的 server-side dry-run、显式 apply、只读和 live Claim/NetworkPolicy/TTL 验收；终态为 `claims=0`、`sandboxes=0`、node Ready、backend `omniagent-executor/enabled/1/1`。
+- 最终执行面回归为 `124 passed, 1 skipped, 2 warnings`；两条 warning 仍只来自既有测试用 31-byte HMAC key。Ruff、compileall、shell 语法、TOML 与 `git diff --check` 通过。
+
+## 2026-08-26 浏览器双租户 E2E
+- 新增独立 `oa-two-tenant-e2e` 临时栈、ORM fixture、API 隔离检查和浏览器验收脚本；临时栈使用独立 PostgreSQL、网络、制品卷及 `18082/18083` 端口，不修改常规 Compose 或 kind。
+- 首次播种因 Tenant/User/Session/Action 没有 ORM relationship 可供 SQLAlchemy 推导插入顺序，action 在 user 之前 flush，触发 `omniagent_actions_requested_by_fkey`；启动脚本的失败 trap 已自动清理全部临时资源。
+- fixture 现在在 tenant、user、session 和 action 外键层之间显式 flush，确保可重复播种顺序。
+
+## 2026-08-26 浏览器双租户验收续接
+- 阶段 13 的本地集群、不可变镜像与发布验收已完成；当前唯一可自主推进的执行面门禁是浏览器双租户 E2E。
+- 现有 `verify-212-omniagent-chat.mjs` 只证明单用户会话隔离，不能证明 durable product plane 的租户隔离。
+- 双租户验收将使用两个独立浏览器上下文，验证活动、任务、制品、记忆的 UI 可见性以及对方对象直接访问返回 404；Axi 工具问答链继续受书面许可门禁。
+
+## 2026-08-27 浏览器双租户验收收口
+- 修复 fixture 的显式 flush 顺序，并把启动就绪门槛改为专用网络内 PostgreSQL 客户端探测；backend 提前退出时立即输出日志，失败路径继续自动清理。
+- API 双向验收通过：8 类列表隔离、4 类直接读取 404、5 类写操作 404、记忆查询隔离、事件游标与跨租户会话过滤隔离。
+- 系统 Chrome 双浏览器上下文验收通过：Alpha/Beta 各自 7 个 UI 面板只显示自身 marker；跨租户写操作后双方资源仍由所有者可见。
+- 脱敏 JSON、两张截图与 SHA-256 清单固化到 `e2e/omniagent-two-tenant/evidence/`；`.codex_tmp/` 已加入忽略规则。
+- `stop.sh` 后验证专用容器、网络、卷、临时前端镜像均不存在，明文 fixture 已删除。
+- 完整执行面回归：`124 passed, 1 skipped, 2 warnings`；两条 warning 仍来自既有 31-byte 测试 HMAC key。Ruff、compileall、shell 语法和 `git diff --check` 通过。
+- P6/M6 与阶段 14 已完成；Axi 0.0.11 书面许可是唯一剩余外部门禁，Axi runtime 继续 fail closed。

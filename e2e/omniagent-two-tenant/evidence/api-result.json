@@ -1,0 +1,21 @@
+{
+  "ok": true,
+  "alpha": {
+    "tenant": "a",
+    "marker": "TENANT_ALPHA_ONLY",
+    "list_isolation": true,
+    "direct_access_404": true,
+    "mutation_404": true,
+    "query_isolation": true,
+    "cursor_isolation": true
+  },
+  "beta": {
+    "tenant": "b",
+    "marker": "TENANT_BETA_ONLY",
+    "list_isolation": true,
+    "direct_access_404": true,
+    "mutation_404": true,
+    "query_isolation": true,
+    "cursor_isolation": true
+  }
+}

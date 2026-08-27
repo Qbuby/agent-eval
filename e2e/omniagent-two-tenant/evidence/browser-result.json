@@ -1,0 +1,43 @@
+{
+  "ok": true,
+  "alpha": {
+    "tenant": "a",
+    "marker": "TENANT_ALPHA_ONLY",
+    "ui": [
+      "session",
+      "activity",
+      "approval",
+      "artifact",
+      "memory",
+      "notification",
+      "schedule"
+    ],
+    "listIsolation": true,
+    "directAccess404": true,
+    "mutation404": true,
+    "queryIsolation": true,
+    "cursorIsolation": true
+  },
+  "beta": {
+    "tenant": "b",
+    "marker": "TENANT_BETA_ONLY",
+    "ui": [
+      "session",
+      "activity",
+      "approval",
+      "artifact",
+      "memory",
+      "notification",
+      "schedule"
+    ],
+    "listIsolation": true,
+    "directAccess404": true,
+    "mutation404": true,
+    "queryIsolation": true,
+    "cursorIsolation": true
+  },
+  "postMutationOwnership": {
+    "alpha": true,
+    "beta": true
+  }
+}

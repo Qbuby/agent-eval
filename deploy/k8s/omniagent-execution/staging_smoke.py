@@ -117,9 +117,18 @@ def _kubectl_json(*arguments: str) -> dict[str, Any]:
 
 
 def _expect_can_i(expected: bool, *arguments: str) -> None:
-    actual = _kubectl("auth", "can-i", *arguments).lower()
+    result = _run(
+        ["kubectl", "auth", "can-i", *arguments],
+        check=False,
+    )
+    actual = result.stdout.strip().lower()
     if actual not in {"yes", "no"}:
-        _fail(f"unexpected kubectl auth can-i response: {actual}")
+        detail = (result.stderr or result.stdout).strip()
+        _fail(f"unexpected kubectl auth can-i response: {detail}")
+    valid_return_codes = {0} if actual == "yes" else {0, 1}
+    if result.returncode not in valid_return_codes:
+        detail = (result.stderr or result.stdout).strip()
+        _fail(f"kubectl auth can-i failed: {detail}")
     if (actual == "yes") != expected:
         _fail(
             f"RBAC expectation failed for {' '.join(arguments)}: "

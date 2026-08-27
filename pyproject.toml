@@ -58,6 +58,9 @@ agent-eval = "agent_eval.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_eval"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

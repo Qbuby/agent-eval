@@ -76,7 +76,7 @@
 - 输出由沙箱内固定清单脚本枚举，再由 backend 按清单逐个 `read`，本地再次执行路径、文件数和总字节校验。
 - Kubernetes runner 需要显式确认门禁且 SDK 可导入；默认配置仍为 disabled，不自动 apply 集群资源。
 - backend 镜像仅在构建参数 `INSTALL_KUBERNETES_RUNNER=1` 时安装固定提交的 SDK；默认镜像不含集群客户端。
-- 本阶段代码与本地契约验收已完成；真实 staging 的 CRD、RBAC、NetworkPolicy、claim 生命周期和双租户 E2E 仍属于 P5/P6 外部门禁。
+- 本阶段代码、本地契约与隔离 kind 集群中的 CRD、RBAC、NetworkPolicy、Claim 生命周期验收均已完成；浏览器双租户 E2E 仍属于后续 P6 验收。
 
 ## 阶段 12：执行面发布与回滚收口
 - [x] 修正完整 cleanup 语义，关闭执行后继续启用产品平面读取与制品下载
@@ -90,13 +90,58 @@
 - [x] 参数化 backend namespace，并以非默认 namespace 固定渲染、executor 身份和 live `/health` FQDN 契约
 - [x] 固定 Axi 0.0.11 PyPI wheel 身份并增加构建时 wheel/RECORD/entry-point 审计；书面许可仍为独立门禁
 - [x] 下载并验证官方 Axi 0.0.11 wheel，在 WSL Linux/Python 3.12.13 完成三工具 CLI PoC
+- [x] 审计 Axi `v0.0.11` 上游提交，并逐文件证明官方 wheel 与 tag 源码一致
+- [x] 构建、受限运行并扫描非 Axi analysis runtime，修复基础镜像与上传依赖漏洞
 - [x] 运行完整执行面回归和静态检查
-- [ ] 解除 Axi 0.0.11 许可/制品、镜像发布和 staging 集群外部门禁
+- [ ] 解除 Axi 0.0.11 书面许可门禁；浏览器双租户 E2E、非 Axi 镜像发布和隔离集群验收已完成
 
 ## 阶段 12 验收
-- 部署测试集合：`43 passed`。
-- 执行面综合回归：`106 passed, 1 skipped`；两条 warning 为既有测试使用 31-byte HMAC key。
+- 部署测试集合：`60 passed`；Docker/Hatch 构建契约定向集合：`23 passed`。
+- 执行面综合回归：`124 passed, 1 skipped`；两条 warning 为既有测试使用 31-byte HMAC key。
 - Ruff、compileall、TOML 解析和 `git diff --check` 全部通过。
 - 非默认 `agent-eval-review` namespace 的清单标签、Service URL、executor ServiceAccount 主体和 live 健康探针均有本地契约覆盖。
-- staging smoke 本地契约已通过；当前机器没有 Kubernetes current-context，因此未创建 Claim、未执行真实 server dry-run/live 验收，也未执行生产 apply、集群变更、镜像构建或推送。
-- PyPI 0.0.11 wheel 的 SHA-256 为 `ab9473092cac37e4f00347cd92d9e629424bcba99731c8d082b8031a29d6fbdf`；原始 wheel、25 条 RECORD 和 Linux/Python 3.12.13 CLI PoC 均已验证。书面许可审批与 reviewed upstream commit 仍未完成。
+- 隔离 kind 集群 `agent-eval-exec` 已通过 server-side dry-run、显式 apply、只读与 live Claim/NetworkPolicy/TTL 验收；旧 `omniagent-sandbox` 与生产集群未修改。
+- PyPI 0.0.11 wheel 的 SHA-256 为 `ab9473092cac37e4f00347cd92d9e629424bcba99731c8d082b8031a29d6fbdf`；原始 wheel、25 条 RECORD、Linux/Python 3.12.13 CLI PoC 与上游提交 `290b20e9d584d5d61cdf7bae47a83e142db569da` 均已验证。该 tag 未签名且仓库/包元数据没有许可证文件或字段，书面许可审批仍未完成。
+- 非 Axi analysis runtime 使用固定 `python:3.12.13-slim-bookworm` digest 与 `python-multipart==0.0.32`；受限容器 smoke 与 Trivy 0.74.0 均通过，并发布为 `ghcr.io/qbuby/agent-eval-analysis-runtime@sha256:fc93a846898c79df6dec13ca2028e54712eb604e5a00147b5b389ff9f3b8f6c4`。
+
+## 阶段 13：本地 Kubernetes 执行面验收
+- [x] 创建隔离的 `agent-eval-exec` kind 集群，不触碰既有 `omniagent-sandbox`
+- [x] 安装 Calico v3.32.1，并确认节点、CoreDNS 与系统 Pod Ready
+- [x] 构建并加载固定提交 `a9db14672e77fbd15981fb2af9b73934e29b0cfe` 的 controller/router 镜像
+- [x] 部署 agent-sandbox CRD、核心/扩展控制器与 staging router
+- [x] 部署本地 backend/omniagent fixture 与 execution Secret
+- [x] 以 kind 可解析的不可变本地镜像引用执行 server dry-run 和显式 apply
+- [x] 运行只读 staging smoke 与显式确认的 live Claim/NetworkPolicy/TTL smoke
+- [x] 记录本地集群证据
+- [x] 发布 analysis runtime 与 Kubernetes-runner backend 审核镜像并记录 GHCR digest
+
+## 阶段 13 当前决策
+- 所有集群写操作只针对 kubeconfig `.codex_tmp/kubeconfig-agent-eval-exec`；旧集群保持不变。
+- 本地验收使用已扫描的 analysis runtime，不解除 Axi 许可门禁，也不构建或部署 Axi runtime。
+- Calico 初次镜像拉取因 `quay.io` TLS 握手超时失败，kubelet 重试后恢复；这不是清单错误。
+- 受限工具上下文中的 WSL `E_ACCESSDENIED` 与旧 GH 凭据视图不是宿主真实状态；授权宿主上下文已证明 WSL 可访问、GH 用户 `Qbuby` 已认证。
+- 固定 controller/router 标签分别为 `kind.local/agent-sandbox-controller:a9db14672` 与 `kind.local/sandbox-router:a9db14672`；两者和 analysis runtime 已由节点 containerd 解析。
+- 真实 apply 后 backend 使用 `omniagent-executor`，保留原身份 `backend-runtime` 的恢复 annotation，执行状态为 `enabled`。
+- 真实只读验收输出 `READ_ONLY_ACCEPTANCE_OK`；显式 live 验收输出 `LIVE_CLAIM_ACCEPTANCE_OK` 与 `STAGING_ACCEPTANCE_OK`。
+- 发布后的 analysis runtime 不可变引用再次通过 server dry-run、apply、只读和 live 验收，且最终 `claims=0`、`sandboxes=0`。
+- GHCR analysis runtime digest 为 `sha256:fc93a846898c79df6dec13ca2028e54712eb604e5a00147b5b389ff9f3b8f6c4`。
+- GHCR runner-enabled backend worktree digest 为 `sha256:fe886eb36f9549b9d2bf6bd65b5e8841e1b57ed6000d4c2316f701435ea31527`；镜像内 SDK 版本为 `0.1.dev512+ga9db14672`。
+- Runner backend 已安装 Debian security 更新、移除运行时不需要的 `pip/setuptools/wheel`，合并 rootfs 的 Trivy 0.74.0 报告为 `0 HIGH / 0 CRITICAL`。
+- Axi runtime 继续受书面许可门禁约束，不在本地集群部署或 registry 发布范围内。
+
+## 阶段 14：浏览器双租户执行面验收
+- [x] 定义双租户浏览器验收 fixture、可观察 UI 与跨租户拒绝矩阵
+- [x] 创建两个隔离租户/用户和可区分的事件、任务、制品、记忆数据
+- [x] 使用两个独立浏览器上下文验证产品面 UI 只显示本租户/本人数据
+- [x] 验证对另一租户对象的直接下载、删除、查询和游标访问均 fail closed
+- [x] 清理 fixture，记录截图/JSON/测试输出并更新 P6/M6 结论
+
+## 阶段 14 当前决策
+- 浏览器验收覆盖已实现且不依赖 Axi 的 durable product plane；不得用普通聊天成功冒充 Axi 工具链验收。
+- 两个用户必须位于不同 tenant，浏览器上下文、JWT 和查询缓存完全独立；每侧数据使用唯一 canary 名称。
+- 除 UI 可见性外，还要从浏览器身份发起对方对象的直接请求并期望 404，证明不是前端隐藏。
+- fixture 只创建本轮专用数据，验收结束严格清理；不修改生产集群或旧 `omniagent-sandbox` 集群。
+- 当前浏览器/API 双向验收覆盖 7 个 UI 面板、8 类列表、4 类直接读取、5 类写操作、记忆查询、事件游标和跨租户会话过滤；失败写操作后双方所有者仍可读取自己的资源。
+- 脱敏 JSON、Alpha/Beta 截图和 SHA-256 清单固化在 `e2e/omniagent-two-tenant/evidence/`；明文 fixture 未保留。
+- `oa-two-tenant-e2e-*` 容器、网络、卷、临时前端镜像和明文 fixture 均已验证不存在。
+- 阶段 14 完成后，执行面唯一外部门禁是 Axi 0.0.11 书面许可审批；Axi runtime 继续 fail closed。
