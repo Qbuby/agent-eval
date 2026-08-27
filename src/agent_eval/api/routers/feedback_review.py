@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -116,6 +117,9 @@ class FeedbackSampleRowItem(BaseModel):
     id: uuid.UUID
     row_index: int
     question: str
+    # 带附件样例的 canonical content blocks；纯文本样例为 None。
+    # question 恒为纯文本投影，列表页可只读 question。
+    question_content: list[dict[str, Any]] | None = None
     answer: str | None = None
     feedback_count: int
     avg_overall: float | None = None
@@ -158,6 +162,8 @@ class SampleFeedbackResponse(BaseModel):
     tenant_name: str | None = None
     row_index: int
     question: str
+    # 带附件样例的 canonical content blocks；纯文本样例为 None。
+    question_content: list[dict[str, Any]] | None = None
     answer: str | None = None
     extra: dict
     feedback_count: int
@@ -341,6 +347,7 @@ async def list_batch_samples(
             id=sample.id,
             row_index=sample.row_index,
             question=sample.question,
+            question_content=sample.question_content,
             answer=sample.answer,
             feedback_count=int(feedback_count or 0),
             avg_overall=_round(avg_overall),
@@ -422,6 +429,7 @@ async def get_sample_feedback(sample_id: uuid.UUID) -> SampleFeedbackResponse:
         tenant_name=tenant_name,
         row_index=sample.row_index,
         question=sample.question,
+        question_content=sample.question_content,
         answer=sample.answer,
         extra=sample.extra or {},
         feedback_count=len(feedbacks),

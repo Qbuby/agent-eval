@@ -1,0 +1,60 @@
+# OmniAgent v1 作为 agent-eval 系统智能体的最小运行配置。
+# skill、业务工具与提示词增强后续单独设计；当前只启用基础 HTTP 对话与 PG 会话持久化。
+postgres:
+  host: "${DB_HOST:-postgres}"
+  port: 5432
+  database: "omniagent"
+  user: "${DB_USER:-postgres}"
+  password: "${DB_PASSWORD:-postgres}"
+  sslmode: "${DB_SSLMODE:-disable}"
+
+agent:
+  default_model: "${OMNIAGENT_MODEL:-gpt-5.6-terra}"
+  # 空列表表示启用全部工具。各项默认是不可能命中的名字，保持零工具；只有执行面
+  # 部署显式设置对应环境变量后，overlay 才注册并白名单放行三个 Axi meta-tool。
+  tools:
+    - "${OMNIAGENT_TOOL_AXI_SEARCH:-__disabled_axi_search__}"
+    - "${OMNIAGENT_TOOL_AXI_DESCRIBE:-__disabled_axi_describe__}"
+    - "${OMNIAGENT_TOOL_AXI_RUN:-__disabled_axi_run__}"
+    - "${OMNIAGENT_TOOL_SKILL:-__disabled_skill__}"
+  disabled_tools: []
+  max_tokens: 8192
+  recursion_limit: 20
+  subagent_depth: 0
+  checkpointer: "postgres"
+  message_cache_enabled: false
+
+llm_params:
+  openai:
+    temperature: 0.2
+    timeout: 120
+    max_retries: 0
+
+schedule:
+  enabled: false
+
+channels:
+  feishu:
+    enabled: false
+  wecom:
+    enabled: false
+  gateway:
+    enabled: false
+
+dream:
+  auto_dream:
+    enabled: false
+  daily_dream:
+    enabled: false
+
+# 会话沙箱只在上述工具被显式启用后才会按需创建。Axi template 与 analysis job
+# template 分离；前者在 Axi 许可和镜像门禁解除前应保持不存在。
+sandbox:
+  executor: kubernetes
+  timeout: 120
+  idle_timeout: 900
+  kubernetes:
+    template_name: "${OMNIAGENT_AXI_SANDBOX_TEMPLATE:-agent-eval-axi-v1}"
+    namespace: "${OMNIAGENT_SANDBOX_NAMESPACE:-omniagent-sandbox-staging}"
+    server_port: 8888
+    sandbox_ready_timeout: 180

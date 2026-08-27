@@ -32,6 +32,7 @@ frontend/*.tsbuildinfo
 Thumbs.db
 
 # Temp / probe files
+.codex_tmp/
 *.tmp
 *.tmp.json
 *.tmp.*
@@ -48,3 +49,89 @@ deploy/seed/*.sql
 # Local experiments — prompt tuning harness, dimension alignment drafts
 _prompt_tuning/
 scripts/_aligned/
+
+# Probe / verify scratch (task #119/#120)
+# Local probe scratch: auth material and one-off dumps. Never commit.
+# _tok.txt holds a live JWT; probe-user.json / auth.json hold a plaintext
+# probe password. Keep the files on disk for reruns, keep them out of git.
+e2e/_tok.txt
+e2e/probe-user.json
+probe-user.json
+e2e/auth.json
+auth.json
+# One-off verify dumps and extracted xlsx parts
+e2e/export-out/
+e2e/export-out-*/
+e2e/xlsx-dump/
+e2e/_*.txt
+e2e/_diag_*.mjs
+# Repo-root scratch from interactive debugging
+_*.cjs
+_*.diff
+_*.txt
+_*.tsx
+_split/
+_mock_agent.py
+_verify*.py
+_*.sh
+_*.tar
+_headcheck/
+# Bundle-hash 核验脚本与抓下来的 bundle 副本（前端构建幻影排查用，见 #131）。
+# .served_bundle.js 是 localhost 实际返回的 1.4MB 产物，不入库。
+.check_bundle.js
+.served_bundle.js
+# 交互调试时在 frontend/ 下临时写的 node 脚本（DOM 探测、compose 转储、打补丁）
+frontend/*.cjs
+# 一次性 SQL 与 judge 参数快照（含 prompt 全文，属排查现场，不是产物）
+_q*.sql
+artifacts/
+# Reviewed Axi wheels are supplied to approved image builders, never committed.
+deploy/omniagent/execution-runtime/vendor/*.whl
+# 仓库根的一次性 patch/探针 mjs
+_*.mjs
+# 一次性 UI 探针：写死样例 id、只为定位当次问题。
+# 验收脚本 e2e/verify-*.mjs 照旧入库；probe-131-db-check 是 #131 验收的 DB 侧一半，保留。
+e2e/diag-*.mjs
+e2e/find-*.mjs
+e2e/probe-131-*.mjs
+!e2e/probe-131-db-check.mjs
+# scripts/ 下的排查用一次性脚本与 SQL（inspect/verify/probe/dump 现场），
+# 可复用的工具（psql_q.sh、extract_key_points.py、patch_judge_criteria.py）照旧入库。
+scripts/dump_judge_prompts.py
+scripts/inspect_*.py
+scripts/inspect_*.sql
+scripts/probe_*.py
+scripts/verify_*.py
+scripts/verify_*.sql
+scripts/sample_answers.sql
+# 一次性探针与其产物（#135/#136/#142/#143 排查现场）。
+# 沿用 #131 的约定：verify-*.mjs 入库，probe-*/scan-*/一次性 SQL 不入库。
+e2e/probe-135-*.mjs
+e2e/probe-136-*.sql
+e2e/probe-142-*.mjs
+e2e/probe-143-*.mjs
+e2e/probe-projects-dump.mjs
+e2e/probe-smoke-after-delete.mjs
+e2e/scan-*.mjs
+e2e/q*.sql
+e2e/_out_*.json
+e2e/_run_*.log
+# 带图链路排查现场（#148-#159）。沿用既有约定：verify-*.mjs 入库，
+# probe-*/一次性产物/凭据不入库。portal-ext-user.json 是明文口令，务必挡住。
+e2e/portal-ext-user.json
+e2e/probe-multiturn-*.mjs
+e2e/result-*.json
+e2e/_build_*.log
+e2e/_make_fixtures_*.py
+e2e/_fixture_*.xlsx
+frontend/tsc_out.txt
+# 成本区可视化排查现场（#169-#173）。沿用既有约定：verify-*.mjs / expect-*.mjs
+# 生成器 / check-*.mjs 入库；日志、报告、按本机数据算出的期望值 JSON 不入库。
+# 注意连字符与下划线的分工：expect-173-crossrun-cost.mjs 是生成器（入库），
+# expect_173_crossrun.json 是它的产物（不入库）。
+e2e/build-frontend.log
+e2e/out-173.txt
+e2e/run_173.log
+e2e/report_*.json
+e2e/expect_*.json
+e2e/probe-cost-tier-colors.mjs

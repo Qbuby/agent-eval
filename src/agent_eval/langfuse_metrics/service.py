@@ -1,7 +1,7 @@
 """Langfuse 指标轮询服务（asyncio 后台任务 + 幂等 upsert）。
 
-进程内常驻单任务，周期（默认 24h）拉取近 30 天窗口内若干 environment 的
-trace + observations，调 compute.py 算指标，按业务键幂等 upsert 进
+进程内常驻单任务，周期（默认 24h）拉取近 30 天窗口内的 trace + observations
+（默认**不按 environment 收窄**，即该 project 下全部环境），调 compute.py 算指标，按业务键幂等 upsert 进
 ``langfuse_trace_metrics`` / ``langfuse_observation_metrics``，并清理窗口外旧数据。
 轮询状态 / 游标记录在 ``langfuse_metrics_cursors`` 的单例行（scope="global"）。
 
@@ -36,8 +36,16 @@ from agent_eval.langfuse_metrics.compute import _parse_dt, compute_trace_metrics
 
 logger = logging.getLogger(__name__)
 
-# 拉取的目标环境列表默认值（可被 config 覆盖，见 _get_environments）。
-ENVIRONMENTS = ["saas-prod", "xinchai-prod", "smartlink-hc-dev"]
+# 拉取的目标环境列表默认值：**空 = 不带 environment 过滤**，拉该 project 下全部
+# 环境。这样 Langfuse 新增环境无需改配置就能自动入库（否则筛选下拉里只会出现这个
+# 列表里写死的那几个环境，即「环境下拉不全」的根因）。仅在需要刻意收窄拉取范围时
+# 才在系统配置里显式填逗号分隔的环境名，见 _get_environments。
+ENVIRONMENTS: list[str] = []
+
+# trace 自报 environment 缺失、且本轮又没带过滤值时的兜底。两张表的 environment
+# 列都是 NOT NULL，写 None 会违反约束、把整条 trace 静默跳过（只留一行 warning），
+# 所以这里落一个可见的占位值，让数据进得去、下拉里也能看出「有一批 env 没上报」。
+_UNKNOWN_ENV = "unknown"
 
 # 默认轮询间隔（秒）与回看天数（首次回填窗口 + 数据保留期），均可被 config 覆盖。
 DEFAULT_INTERVAL_SECONDS = 86400
@@ -147,18 +155,24 @@ class LangfuseMetricsService:
             pass
         return DEFAULT_LOOKBACK_DAYS
 
-    async def _get_environments(self) -> list[str]:
-        """读拉取的目标环境列表。config 存逗号分隔串或 list；缺失回退默认。"""
+    async def _get_environments(self) -> list[str | None]:
+        """读拉取的目标环境列表。config 存逗号分隔串或 list。
+
+        返回值语义：非空 list[str] = 逐个环境带 ``environment`` 过滤拉取；
+        ``[None]`` = 只拉一遍且**不带过滤**，即该 project 下全部环境。
+        config 留空 / 缺失时按 ENVIRONMENTS 默认（当前为空 → 全部环境）。
+        """
         val = await config_service.get(_CFG_ENVIRONMENTS)
         if isinstance(val, list):
             envs = [str(e).strip() for e in val if str(e).strip()]
             if envs:
-                return envs
+                return list(envs)
         if isinstance(val, str) and val.strip():
             envs = [e.strip() for e in val.split(",") if e.strip()]
             if envs:
-                return envs
-        return list(ENVIRONMENTS)
+                return list(envs)
+        # 默认常量也为空 → 用单个 None 走「不带过滤，拉全部环境」这一轮
+        return list(ENVIRONMENTS) or [None]
 
     def _on_config_change(self, key: str, value: Any) -> None:
         """config 热更新：间隔变化即时生效（下一轮 sleep 用新值）。"""
@@ -246,10 +260,16 @@ class LangfuseMetricsService:
             for env in environments:
                 async for trace in self._client.iter_traces(env, window_start, window_end):
                     try:
+                        # env 一律以 trace 自身的 environment 字段为准（env 为 None
+                        # 时拉的是全部环境，只能这么取；即便按 env 过滤拉取，回写
+                        # trace 自报的值也更可靠）。缺失才回退到本轮过滤值；两者都
+                        # 空时用兜底常量——两表 environment 列是 NOT NULL，写 None
+                        # 会让整条 trace 在 upsert 处抛异常被静默跳过。
+                        row_env = trace.get("environment") or env or _UNKNOWN_ENV
                         observations = await self._client.get_trace_observations(trace["id"])
                         metrics = compute_trace_metrics(trace, observations)
-                        await self._upsert_trace(trace, metrics, env)
-                        await self._upsert_observations(trace, observations, env)
+                        await self._upsert_trace(trace, metrics, row_env)
+                        await self._upsert_observations(trace, observations, row_env)
                         n_tr += 1
                         n_ob += len(observations)
                     except Exception as e:
@@ -297,7 +317,9 @@ class LangfuseMetricsService:
             await session.execute(stmt)
             await session.commit()
 
-    async def _upsert_observations(self, trace: dict, observations: list[dict], env: str) -> None:
+    async def _upsert_observations(
+        self, trace: dict, observations: list[dict], env: str
+    ) -> None:
         """按 langfuse_observation_id 幂等批量 upsert observation 明细。"""
         if not observations:
             return

@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: omniagent-sandbox-staging
+  labels:
+    agent-eval.aidong.ai/purpose: omniagent-sandbox-staging
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: omniagent-executor
+  namespace: "${NAMESPACE}"
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: omniagent-sandbox-claims
+  namespace: omniagent-sandbox-staging
+rules:
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: omniagent-sandbox-claims
+  namespace: omniagent-sandbox-staging
+subjects:
+  - kind: ServiceAccount
+    name: omniagent-executor
+    namespace: "${NAMESPACE}"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: omniagent-sandbox-claims

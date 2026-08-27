@@ -4,10 +4,12 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
     Index,
+    Identity,
     Integer,
     LargeBinary,
     Numeric,
@@ -133,6 +135,11 @@ class TestRunRow(Base, TenantMixin):
     # role for LangSmith. Distinct from langfuse_run_name (display/search only).
     langfuse_trace_name: Mapped[str | None] = mapped_column(Text)
     evaluator_configs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # 回复数据来源：'live'（实时调用 agent，历史默认）| 'persisted'（消费预生成的
+    # AgentReplyVersionRow，全程不建 SSE、不调 agent）。见迁移 0035。
+    reply_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="live", server_default="live"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     # Soft-delete: list endpoints filter out non-null deleted_at by default;
     # the row stays in DB so historical reports / langfuse links still work.
@@ -200,6 +207,361 @@ class FeishuConversationMessageRow(Base, TenantMixin):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class OmniAgentChatSessionRow(Base, TenantMixin):
+    """系统智能体的用户私有会话目录。
+
+    ``thread_id`` 是发给 OmniAgent 的稳定上下文键；软删除只隐藏目录，不删除
+    上游 checkpoint。``active_message_id`` 充当同会话单飞门禁。
+    """
+
+    __tablename__ = "omniagent_chat_sessions"
+    __table_args__ = (
+        Index(
+            "ix_omniagent_sessions_owner_recent",
+            "tenant_id",
+            "created_by",
+            "deleted_at",
+            "last_message_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    thread_id: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="新对话")
+    title_source: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")
+    active_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    last_message_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OmniAgentChatMessageRow(Base, TenantMixin):
+    """系统智能体会话的一条持久化消息。"""
+
+    __tablename__ = "omniagent_chat_messages"
+    __table_args__ = (
+        UniqueConstraint("session_id", "sequence", name="uq_omniagent_message_sequence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("omniagent_chat_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[object] = mapped_column(JSONB, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="completed")
+    tool_calls: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    structured_output: Mapped[object | None] = mapped_column(JSONB, nullable=True)
+    message_metadata: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_of_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentEventRow(Base, TenantMixin):
+    """Append-only product event. ``id`` is the reconnect cursor."""
+
+    __tablename__ = "omniagent_events"
+    __table_args__ = (
+        Index("ix_omniagent_events_owner_cursor", "tenant_id", "user_id", "id"),
+        Index("ix_omniagent_events_session_cursor", "tenant_id", "session_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_messages.id", ondelete="SET NULL")
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    entity_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    entity_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+
+
+class OmniAgentJobRow(Base, TenantMixin):
+    """Durable unit of work claimed through a time-limited database lease."""
+
+    __tablename__ = "omniagent_jobs"
+    __table_args__ = (
+        Index("ix_omniagent_jobs_claim", "status", "available_at", "priority", "created_at"),
+        Index("ix_omniagent_jobs_owner_recent", "tenant_id", "requested_by", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    kind: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued", index=True)
+    spec: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_sessions.id", ondelete="SET NULL"), index=True
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_messages.id", ondelete="SET NULL")
+    )
+    action_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), index=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(128), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    cost_estimate: Mapped[dict | None] = mapped_column(JSONB)
+    usage: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentJobAttemptRow(Base, TenantMixin):
+    __tablename__ = "omniagent_job_attempts"
+    __table_args__ = (
+        UniqueConstraint("job_id", "attempt_no", name="uq_omniagent_job_attempt_no"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_jobs.id", ondelete="CASCADE"), index=True
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    worker_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    runtime_ref: Mapped[str | None] = mapped_column(String(256))
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="running")
+    infrastructure_failure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OmniAgentActionRow(Base, TenantMixin):
+    """Immutable fixed capability request whose digest is approved by a user."""
+
+    __tablename__ = "omniagent_actions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "idempotency_key", name="uq_omniagent_action_idempotency"),
+        Index("ix_omniagent_actions_owner_state", "tenant_id", "requested_by", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    capability: Mapped[str] = mapped_column(String(96), nullable=False, index=True)
+    arguments: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    argument_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    risk: Mapped[str] = mapped_column(String(16), nullable=False)
+    impact_preview: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    cost_estimate: Mapped[dict | None] = mapped_column(JSONB)
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="prepared", index=True)
+    requested_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_sessions.id", ondelete="SET NULL"), index=True
+    )
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_messages.id", ondelete="SET NULL")
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    approved_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    denied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_jobs.id", ondelete="SET NULL"), index=True
+    )
+    terminal_summary: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentArtifactRow(Base, TenantMixin):
+    __tablename__ = "omniagent_artifacts"
+    __table_args__ = (
+        Index("ix_omniagent_artifacts_owner_state", "tenant_id", "owner_id", "state"),
+        Index("ix_omniagent_artifacts_expiry", "state", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_chat_sessions.id", ondelete="SET NULL"), index=True
+    )
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_jobs.id", ondelete="SET NULL"), index=True
+    )
+    state: Mapped[str] = mapped_column(String(24), nullable=False, default="uploading", index=True)
+    filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    extension: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    sha256: Mapped[str | None] = mapped_column(String(64), index=True)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
+    scan_result: Mapped[dict | None] = mapped_column(JSONB)
+    retention: Mapped[str] = mapped_column(String(16), nullable=False, default="temporary")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    pinned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentMemoryRow(Base, TenantMixin):
+    __tablename__ = "omniagent_memories"
+    __table_args__ = (
+        Index("ix_omniagent_memories_owner_active", "tenant_id", "owner_id", "deleted_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_action_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_actions.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class OmniAgentScheduleRow(Base, TenantMixin):
+    __tablename__ = "omniagent_schedules"
+    __table_args__ = (
+        Index("ix_omniagent_schedules_due", "enabled", "next_run_at"),
+        Index("ix_omniagent_schedules_owner", "tenant_id", "owner_id", "enabled"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    capability: Mapped[str] = mapped_column(String(96), nullable=False)
+    arguments: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    argument_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    schedule: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="Asia/Shanghai")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    approved_action_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_actions.id"), nullable=False
+    )
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class OmniAgentNotificationRow(Base, TenantMixin):
+    __tablename__ = "omniagent_notifications"
+    __table_args__ = (
+        Index("ix_omniagent_notifications_owner_unread", "tenant_id", "user_id", "read_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    event_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("omniagent_events.id", ondelete="SET NULL"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(48), nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    link: Mapped[str | None] = mapped_column(String(1024))
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class OmniAgentOutboxRow(Base, TenantMixin):
+    __tablename__ = "omniagent_outbox"
+    __table_args__ = (
+        Index("ix_omniagent_outbox_delivery", "status", "next_attempt_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    notification_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("omniagent_notifications.id", ondelete="CASCADE"), index=True
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    destination: Mapped[str] = mapped_column(String(256), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class OmniAgentQuotaLedgerRow(Base, TenantMixin):
+    __tablename__ = "omniagent_quota_ledger"
+    __table_args__ = (
+        Index("ix_omniagent_quota_owner_metric", "tenant_id", "user_id", "metric", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    metric: Mapped[str] = mapped_column(String(64), nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(18, 4), nullable=False)
+    entry_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    resource_type: Mapped[str | None] = mapped_column(String(32))
+    resource_id: Mapped[str | None] = mapped_column(String(128))
+    bucket_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    details: Mapped[dict | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
 class TestResultRow(Base, TenantMixin):
     __tablename__ = "test_results"
 
@@ -216,11 +578,19 @@ class TestResultRow(Base, TenantMixin):
     )
 
     question: Mapped[str | None] = mapped_column(Text)
+    # 评估启动时冻结的原始问题 content blocks；仅带附件样例非空。
+    # question 继续存纯文本投影，搜索/导出/judge 等既有消费方不受影响。
+    question_content: Mapped[list | None] = mapped_column(JSONB)
     # Expected/reference answer, snapshotted at run time from the case source
     # (benchmark reference_answer or uploaded expected_output). Persisted here
     # so the export/detail view always has it, independent of whether the
     # originating case still exists. NULL on rows created before 0016.
     expected_output: Mapped[str | None] = mapped_column(Text)
+    # 本次运行启动时冻结的答案关键点，独立于源样例保存。
+    # 后续补评只复用这份快照，不跟随源数据修改而漂移。
+    expected_output_criteria: Mapped[list] = mapped_column(
+        JSONB, default=list,
+    )
     thread_id: Mapped[str | None] = mapped_column(Text)
     langsmith_run_id: Mapped[str | None] = mapped_column(Text)
 
@@ -232,6 +602,14 @@ class TestResultRow(Base, TenantMixin):
     # A/B 分与 winner + 整体 winner）+ position_swapped 审计。单模恒 NULL。
     # A 侧回复/指标仍存本行原有列（主侧），单模消费方零改动。见迁移 0033。
     comparison: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # 本行实际消费的预生成回复版本（reply_source='persisted' 时非空）。固定记录
+    # 而非"当前版本"，以便当前版本切走后历史结果仍可复现。见迁移 0035。
+    reply_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_reply_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     total_tokens: Mapped[int | None] = mapped_column(Integer)
@@ -609,6 +987,10 @@ class BenchmarkCaseRow(Base, TenantMixin):
         UUID(as_uuid=True), ForeignKey("benchmark_versions.id", ondelete="SET NULL"), index=True
     )
     question: Mapped[str] = mapped_column(Text, nullable=False)
+    # 带附件样例的 canonical content blocks；纯文本样例为 None，此时 question
+    # 就是全部输入。question 恒为纯文本投影（去重/搜索/导出/judge 都吃它），
+    # 见 data/content_blocks.py 的 split_question_content。
+    question_content: Mapped[list | None] = mapped_column(JSONB)
     reference_answer: Mapped[str | None] = mapped_column(Text)
     key_points: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     negative_points: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
@@ -633,6 +1015,9 @@ class CandidateCaseRow(Base, TenantMixin):
     dataset_name: Mapped[str | None] = mapped_column(String(256), index=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
     question: Mapped[str] = mapped_column(Text, nullable=False)
+    # 带附件样例的 canonical content blocks，语义同 BenchmarkCaseRow.question_content。
+    # promote 到 benchmark 时整列搬过去（见 candidates.promote）。
+    question_content: Mapped[list | None] = mapped_column(JSONB)
     answer: Mapped[str | None] = mapped_column(Text)
     # 自由文本类别名（不绑 project 的 CategoryRow）。promote 时按名同步到目标
     # project 的 categories（有则复用、无则新增），见 candidates.promote。
@@ -835,6 +1220,9 @@ class PortalSampleRow(Base, TenantMixin):
     )
     row_index: Mapped[int] = mapped_column(Integer, nullable=False)
     question: Mapped[str] = mapped_column(Text, nullable=False)
+    # 带附件样例的 canonical content blocks，语义同 BenchmarkCaseRow.question_content。
+    # 上传 xlsx 时从内嵌图提取（见 data/xlsx_images.py），纯文本样例为 None。
+    question_content: Mapped[list | None] = mapped_column(JSONB)
     answer: Mapped[str | None] = mapped_column(Text)
     extra: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
@@ -1046,6 +1434,175 @@ class LangfuseMetricsCursorRow(Base, TenantMixin):
     consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="idle")
     last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+# ---------------------------------------------------------------------------
+# 持久化 agent 回复（预生成 + 版本回溯 + 作为评估数据来源）。见迁移 0035。
+#
+# 样例引用是 (dataset_type, case_ref) 多态键，不建外键：
+#   candidate    -> candidate_cases.id 的字符串形式
+#   benchmark    -> benchmark_cases.id 的字符串形式
+#   conversation -> Langfuse dataset item id（样例真身不在 PG）
+# ---------------------------------------------------------------------------
+
+REPLY_DATASET_TYPES = ("candidate", "benchmark", "conversation")
+
+
+class AgentReplyJobRow(Base, TenantMixin):
+    """批量「agent 生成答案」任务。
+
+    状态落库（而非只留内存）是刻意的：进程重启 / 页面刷新后仍要能看到进度，
+    并支持取消剩余、重试失败项。启动时由 sweep 把残留 running 改 interrupted。
+    """
+
+    __tablename__ = "agent_reply_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    dataset_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    dataset_name: Mapped[str | None] = mapped_column(String(256))
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    # 完整 EvalAgentConfig 快照——本仓库没有 agent 配置表，只能整体快照。
+    agent_config: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # agent_config 归一化后的 sha256，用于「同样例 + 同配置已有在途任务」去重。
+    config_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # 用户自定义版本号；agent 配置差异由它体现，不额外建按配置划分的版本链。
+    version_label: Mapped[str | None] = mapped_column(String(64))
+    # running | completed | failed | cancelled | interrupted
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running", index=True)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    succeeded_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    running_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class AgentReplyVersionRow(Base, TenantMixin):
+    """样例的一条 agent 回复版本（append-only）。
+
+    ``version_number`` 是 per-(dataset_type, case_ref) 的单调计数，从 1 开始，
+    靠唯一约束容错并发——与 ``evaluator_versions`` 同一范式。
+
+    多轮对话集的 ``turns`` 与 ``multiturn.replay_conversation`` 返回的 turns
+    同构，这样评估侧复用已生成回复时可以无改动喂给 ``score_conversation`` /
+    ``build_transcript``。
+    """
+
+    __tablename__ = "agent_reply_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_type", "case_ref", "version_number",
+            name="uq_agent_reply_versions_case_version",
+        ),
+        Index("ix_agent_reply_versions_case", "dataset_type", "case_ref"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    dataset_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    case_ref: Mapped[str] = mapped_column(String(256), nullable=False)
+    dataset_name: Mapped[str | None] = mapped_column(String(256))
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    version_label: Mapped[str | None] = mapped_column(String(64))
+    # 单轮：回复正文。多轮：build_transcript(turns) 的整段文本。
+    content: Mapped[str | None] = mapped_column(Text)
+    turns: Mapped[list | None] = mapped_column(JSONB)
+    raw_trace: Mapped[dict | None] = mapped_column(JSONB)
+    agent_config: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    config_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    # pending | running | succeeded | failed
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="succeeded")
+    error_message: Mapped[str | None] = mapped_column(Text)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    # 人工编辑过的版本；用于 UI 区分「agent 原始产出」与「人工修订」。
+    edited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_reply_jobs.id", ondelete="SET NULL"),
+        index=True,
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class AgentReplyCaseStateRow(Base, TenantMixin):
+    """每个样例一行，指向该样例「当前生效」的回复版本。
+
+    单独成表而非在样例表上加列：三类数据集落地不对称，多轮对话集的样例真身在
+    Langfuse，PG 里根本没有 case 表可加列。
+    """
+
+    __tablename__ = "agent_reply_case_states"
+    __table_args__ = (
+        UniqueConstraint("dataset_type", "case_ref", name="uq_agent_reply_case_states_case"),
+        Index("ix_agent_reply_case_states_dataset", "dataset_type", "dataset_name"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    dataset_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    case_ref: Mapped[str] = mapped_column(String(256), nullable=False)
+    dataset_name: Mapped[str | None] = mapped_column(String(256))
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL")
+    )
+    current_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_reply_versions.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+
+class AgentReplyJobItemRow(Base, TenantMixin):
+    """生成任务的逐样例项：进度统计、单条重试、在途去重都靠它。"""
+
+    __tablename__ = "agent_reply_job_items"
+    __table_args__ = (
+        UniqueConstraint("job_id", "case_ref", name="uq_agent_reply_job_items_job_case"),
+        Index("ix_agent_reply_job_items_case_status", "case_ref", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_new_uuid)
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_reply_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    case_ref: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    question: Mapped[str | None] = mapped_column(Text)
+    # pending | running | succeeded | failed | cancelled
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_reply_versions.id", ondelete="SET NULL")
+    )
+    error_message: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

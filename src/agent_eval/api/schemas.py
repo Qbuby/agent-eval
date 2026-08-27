@@ -5,6 +5,11 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from agent_eval.data.content_blocks import (
+    ContentValidationError,
+    normalize_content,
+)
+
 
 # 数据集类型：区分用途不同的两类数据集，避免在各自页面里互相串。
 # - candidate    备选数据集（单轮问答样例，老数据无标记一律按此处理，向后兼容）
@@ -99,8 +104,14 @@ class TestCaseInput(BaseModel):
                 raise ValueError(
                     f"消息 #{i + 1} role 非法：{role!r}，须为 {sorted(_ALLOWED_ROLES)} 之一"
                 )
-            if not isinstance(m.get("content"), str):
-                raise ValueError(f"消息 #{i + 1} content 必须是字符串")
+            # content 允许两种形态：纯文本字符串，或多模态 content 数组
+            # （text/image/document/video 块）。这里就地归一成 canonical 形状，
+            # 后续链路（落库、judge prompt、adapter payload）拿到的都是同一形状。
+            # 纯文本经 normalize_content 后与改造前逐字节一致，存量数据零影响。
+            try:
+                m["content"] = normalize_content(m.get("content"))
+            except ContentValidationError as e:
+                raise ValueError(f"消息 #{i + 1} content 非法：{e}") from e
         return v
 
 
@@ -321,6 +332,16 @@ class StartEvalRequest(BaseModel):
     # 飞书完成通知目标 open_id 列表（机器人触发评估时注入触发者；与全局固定
     # 接收者合并去重）。HTTP/UI 触发通常留空——UI 用户无飞书身份。
     notify_open_ids: list[str] = Field(default_factory=list)
+    # 回复来源：live（缺省，实时连 agent 跑）| persisted（消费已生成的持久化
+    # 回复，不建 SSE 连接）。persisted 时所选样例必须都有可用回复版本，否则
+    # 开跑前直接报错并列出缺失样例，绝不静默跳过。
+    reply_source: str = "live"
+    # 显式指定每个样例用哪个回复版本：{case_ref: version_id}。未列出的样例回落
+    # 到 agent_reply_case_states.current_version_id（即“当前版本”）。
+    reply_version_ids: dict[str, str] = Field(default_factory=dict)
+    # 双模对比 B 侧的回复来源/版本，与 A 侧独立（可 A 实时 B 持久化，或反之）。
+    reply_source_b: str = "live"
+    reply_version_ids_b: dict[str, str] = Field(default_factory=dict)
 
 
 class EvalRunSummary(BaseModel):
@@ -363,6 +384,11 @@ class EvalResultRow(BaseModel):
     criterion_results: list[dict[str, Any]] = []
     actual_output: str | None = None
     question: str | None = None
+    # 评估启动时冻结的原始问题 blocks；纯文本/旧结果为 None。
+    question_content: list[dict[str, Any]] | None = None
+    expected_output: str | None = None
+    # 评估启动时冻结的答案关键点；首评与补评均以此为准。
+    expected_output_criteria: list[str] = []
     latency_ms: int | None = None
     total_tokens: int | None = None
     prompt_tokens: int | None = None

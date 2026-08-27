@@ -8,6 +8,10 @@ from sqlalchemy import Float, Text, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_eval.db_models.tables import (
+    AgentReplyCaseStateRow,
+    AgentReplyJobItemRow,
+    AgentReplyJobRow,
+    AgentReplyVersionRow,
     DatasetVersionRow,
     EvalCaseSourceRow,
     EvaluationScoreRow,
@@ -78,6 +82,7 @@ class Repository:
         acceptance_policy: dict | None = None,
         eval_mode: str = "single",
         agent_config_b: dict | None = None,
+        reply_source: str = "live",
         status: str = "running",
         eval_started_at: datetime | None = None,
     ) -> TestRunRow:
@@ -95,6 +100,7 @@ class Repository:
             acceptance_policy=acceptance_policy,
             eval_mode=eval_mode,
             agent_config_b=agent_config_b,
+            reply_source=reply_source,
             status=status,
             started_at=datetime.now(timezone.utc),
             eval_started_at=eval_started_at or datetime.now(timezone.utc),
@@ -719,3 +725,410 @@ class Repository:
         rows = list(result.scalars().all())
         rows.reverse()
         return rows
+
+    # ── 持久化 agent 回复（版本 / 当前指针 / 批量生成任务） ──────────────────
+    # 四张表都挂 TenantMixin，读写靠 db.py 的监听器过滤/盖章，这里不手写
+    # tenant_id。样例引用是 (dataset_type, case_ref) 多态键，无外键。
+
+    async def create_agent_reply_version(
+        self,
+        *,
+        dataset_type: str,
+        case_ref: str,
+        agent_config: dict,
+        dataset_name: str | None = None,
+        project_id: uuid.UUID | None = None,
+        version_label: str | None = None,
+        content: str | None = None,
+        turns: list | None = None,
+        raw_trace: dict | None = None,
+        config_fingerprint: str | None = None,
+        status: str = "succeeded",
+        error_message: str | None = None,
+        latency_ms: int | None = None,
+        total_tokens: int | None = None,
+        edited: bool = False,
+        job_id: uuid.UUID | None = None,
+        created_by: uuid.UUID | None = None,
+    ) -> AgentReplyVersionRow:
+        """追加一条回复版本，``version_number`` 是 per-(dataset_type, case_ref)
+        单调计数。并发容错方式同 ``create_evaluator_version``：靠唯一约束让
+        后到者 IntegrityError，调用方自行重试。"""
+        existing = (await self.session.execute(
+            select(AgentReplyVersionRow.version_number)
+            .where(
+                AgentReplyVersionRow.dataset_type == dataset_type,
+                AgentReplyVersionRow.case_ref == case_ref,
+            )
+            .order_by(AgentReplyVersionRow.version_number.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        row = AgentReplyVersionRow(
+            dataset_type=dataset_type,
+            case_ref=case_ref,
+            dataset_name=dataset_name,
+            project_id=project_id,
+            version_number=(existing or 0) + 1,
+            version_label=version_label,
+            content=content,
+            turns=turns,
+            raw_trace=raw_trace,
+            agent_config=agent_config or {},
+            config_fingerprint=config_fingerprint,
+            status=status,
+            error_message=error_message,
+            latency_ms=latency_ms,
+            total_tokens=total_tokens,
+            edited=edited,
+            job_id=job_id,
+            created_by=created_by,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_agent_reply_version(
+        self, version_id: uuid.UUID,
+    ) -> AgentReplyVersionRow | None:
+        return (await self.session.execute(
+            select(AgentReplyVersionRow).where(AgentReplyVersionRow.id == version_id)
+        )).scalar_one_or_none()
+
+    async def list_agent_reply_versions(
+        self, dataset_type: str, case_ref: str,
+    ) -> list[AgentReplyVersionRow]:
+        rows = (await self.session.execute(
+            select(AgentReplyVersionRow)
+            .where(
+                AgentReplyVersionRow.dataset_type == dataset_type,
+                AgentReplyVersionRow.case_ref == case_ref,
+            )
+            .order_by(AgentReplyVersionRow.version_number.desc())
+        )).scalars().all()
+        return list(rows)
+
+    async def update_agent_reply_version(
+        self, version_id: uuid.UUID, **fields: Any,
+    ) -> AgentReplyVersionRow | None:
+        row = await self.get_agent_reply_version(version_id)
+        if row is None:
+            return None
+        for k, v in fields.items():
+            if hasattr(row, k) and k not in ("id", "dataset_type", "case_ref", "version_number"):
+                setattr(row, k, v)
+        row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    async def delete_agent_reply_version(self, version_id: uuid.UUID) -> bool:
+        """删一条版本。若它是当前版本，把指针改指剩余版本里 version_number
+        最大的那条；一条都不剩时把整个 case_state 行删掉（等价于「该样例无
+        持久化回复」）。已被评估引用的版本由调用方先行拦截。"""
+        row = await self.get_agent_reply_version(version_id)
+        if row is None:
+            return False
+        dataset_type, case_ref = row.dataset_type, row.case_ref
+        state = await self.get_agent_reply_case_state(dataset_type, case_ref)
+        await self.session.delete(row)
+        await self.session.flush()
+        if state is not None and state.current_version_id == version_id:
+            remaining = await self.list_agent_reply_versions(dataset_type, case_ref)
+            if remaining:
+                state.current_version_id = remaining[0].id
+                state.updated_at = datetime.now(timezone.utc)
+            else:
+                await self.session.delete(state)
+            await self.session.flush()
+        return True
+
+    async def count_results_using_reply_version(self, version_id: uuid.UUID) -> int:
+        """有多少 test_results 固定引用了这个版本（删除保护用）。"""
+        from sqlalchemy import func
+        return int((await self.session.execute(
+            select(func.count(TestResultRow.id))
+            .where(TestResultRow.reply_version_id == version_id)
+        )).scalar_one())
+
+    async def get_agent_reply_case_state(
+        self, dataset_type: str, case_ref: str,
+    ) -> AgentReplyCaseStateRow | None:
+        return (await self.session.execute(
+            select(AgentReplyCaseStateRow).where(
+                AgentReplyCaseStateRow.dataset_type == dataset_type,
+                AgentReplyCaseStateRow.case_ref == case_ref,
+            )
+        )).scalar_one_or_none()
+
+    async def set_current_agent_reply_version(
+        self,
+        *,
+        dataset_type: str,
+        case_ref: str,
+        version_id: uuid.UUID,
+        dataset_name: str | None = None,
+        project_id: uuid.UUID | None = None,
+    ) -> AgentReplyCaseStateRow | None:
+        """把某样例的当前版本指针指向 version_id，行不存在时创建。
+        版本与样例不匹配时返回 None。"""
+        version = await self.get_agent_reply_version(version_id)
+        if version is None:
+            return None
+        if version.dataset_type != dataset_type or version.case_ref != case_ref:
+            return None
+        state = await self.get_agent_reply_case_state(dataset_type, case_ref)
+        if state is None:
+            state = AgentReplyCaseStateRow(
+                dataset_type=dataset_type,
+                case_ref=case_ref,
+                dataset_name=dataset_name or version.dataset_name,
+                project_id=project_id or version.project_id,
+                current_version_id=version_id,
+            )
+            self.session.add(state)
+        else:
+            state.current_version_id = version_id
+            if dataset_name:
+                state.dataset_name = dataset_name
+            state.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return state
+
+    async def list_agent_reply_case_states(
+        self, dataset_type: str, case_refs: list[str],
+    ) -> list[AgentReplyCaseStateRow]:
+        """批量取一批样例的当前版本指针（列表页打标 / 评估创建前的缺失检查）。"""
+        if not case_refs:
+            return []
+        rows = (await self.session.execute(
+            select(AgentReplyCaseStateRow).where(
+                AgentReplyCaseStateRow.dataset_type == dataset_type,
+                AgentReplyCaseStateRow.case_ref.in_(case_refs),
+            )
+        )).scalars().all()
+        return list(rows)
+
+    async def count_agent_reply_versions_by_case(
+        self, dataset_type: str, case_refs: list[str],
+    ) -> dict[str, int]:
+        """每个样例有多少个版本（列表页显示版本数）。"""
+        if not case_refs:
+            return {}
+        from sqlalchemy import func
+        rows = (await self.session.execute(
+            select(AgentReplyVersionRow.case_ref, func.count(AgentReplyVersionRow.id))
+            .where(
+                AgentReplyVersionRow.dataset_type == dataset_type,
+                AgentReplyVersionRow.case_ref.in_(case_refs),
+            )
+            .group_by(AgentReplyVersionRow.case_ref)
+        )).all()
+        return {r[0]: int(r[1]) for r in rows}
+
+    async def list_agent_reply_versions_by_cases(
+        self, dataset_type: str, case_refs: list[str],
+    ) -> dict[str, list[AgentReplyVersionRow]]:
+        """批量取一批样例的全部版本，按 case_ref 分组，每组 version_number 降序。
+
+        「批量切换版本」用：同一个批量意图（最新 / vN / 某个版本备注）要在每个
+        样例各自的版本链里各自解析出一条版本，故一次查全再内存分组，避免 N 次
+        往返。没有任何版本的样例不出现在结果里。
+        """
+        if not case_refs:
+            return {}
+        rows = (await self.session.execute(
+            select(AgentReplyVersionRow)
+            .where(
+                AgentReplyVersionRow.dataset_type == dataset_type,
+                AgentReplyVersionRow.case_ref.in_(case_refs),
+            )
+            .order_by(
+                AgentReplyVersionRow.case_ref,
+                AgentReplyVersionRow.version_number.desc(),
+            )
+        )).scalars().all()
+        grouped: dict[str, list[AgentReplyVersionRow]] = {}
+        for r in rows:
+            grouped.setdefault(r.case_ref, []).append(r)
+        return grouped
+
+    async def get_current_agent_replies(
+        self, dataset_type: str, case_refs: list[str],
+    ) -> dict[str, AgentReplyVersionRow]:
+        """批量取一批样例「当前生效」的回复版本行（导出用），按 case_ref 索引。
+
+        只返回 case_state 指针命中的当前版本；指针悬空 / 未生成过回复的样例不
+        出现在结果里，由调用方按缺失处理（导出留空）。一次 join 查询，避免逐样
+        例往返。
+        """
+        if not case_refs:
+            return {}
+        state = AgentReplyCaseStateRow
+        ver = AgentReplyVersionRow
+        rows = (await self.session.execute(
+            select(state.case_ref, ver)
+            .join(ver, state.current_version_id == ver.id)
+            .where(
+                state.dataset_type == dataset_type,
+                state.case_ref.in_(case_refs),
+            )
+        )).all()
+        return {r[0]: r[1] for r in rows}
+
+    # ---- 生成任务 ----
+
+    async def create_agent_reply_job(
+        self,
+        *,
+        dataset_type: str,
+        agent_config: dict,
+        config_fingerprint: str,
+        dataset_name: str | None = None,
+        project_id: uuid.UUID | None = None,
+        version_label: str | None = None,
+        total_count: int = 0,
+        created_by: uuid.UUID | None = None,
+    ) -> AgentReplyJobRow:
+        row = AgentReplyJobRow(
+            dataset_type=dataset_type,
+            dataset_name=dataset_name,
+            project_id=project_id,
+            agent_config=agent_config or {},
+            config_fingerprint=config_fingerprint,
+            version_label=version_label,
+            status="running",
+            total_count=total_count,
+            running_count=total_count,
+        )
+        if created_by is not None:
+            row.created_by = created_by
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_agent_reply_job(self, job_id: uuid.UUID) -> AgentReplyJobRow | None:
+        return (await self.session.execute(
+            select(AgentReplyJobRow).where(AgentReplyJobRow.id == job_id)
+        )).scalar_one_or_none()
+
+    async def list_agent_reply_jobs(
+        self,
+        *,
+        dataset_type: str | None = None,
+        dataset_name: str | None = None,
+        project_id: uuid.UUID | None = None,
+        active_only: bool = False,
+        limit: int = 20,
+    ) -> list[AgentReplyJobRow]:
+        q = select(AgentReplyJobRow).order_by(AgentReplyJobRow.created_at.desc())
+        if dataset_type is not None:
+            q = q.where(AgentReplyJobRow.dataset_type == dataset_type)
+        if dataset_name is not None:
+            q = q.where(AgentReplyJobRow.dataset_name == dataset_name)
+        if project_id is not None:
+            q = q.where(AgentReplyJobRow.project_id == project_id)
+        if active_only:
+            q = q.where(AgentReplyJobRow.status == "running")
+        rows = (await self.session.execute(q.limit(limit))).scalars().all()
+        return list(rows)
+
+    async def update_agent_reply_job(
+        self, job_id: uuid.UUID, **fields: Any,
+    ) -> AgentReplyJobRow | None:
+        row = await self.get_agent_reply_job(job_id)
+        if row is None:
+            return None
+        for k, v in fields.items():
+            if hasattr(row, k) and k != "id":
+                setattr(row, k, v)
+        row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    async def create_agent_reply_job_item(
+        self,
+        *,
+        job_id: uuid.UUID,
+        case_ref: str,
+        question: str | None = None,
+    ) -> AgentReplyJobItemRow:
+        row = AgentReplyJobItemRow(job_id=job_id, case_ref=case_ref, question=question)
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def get_agent_reply_job_item(
+        self, item_id: uuid.UUID,
+    ) -> AgentReplyJobItemRow | None:
+        return (await self.session.execute(
+            select(AgentReplyJobItemRow).where(AgentReplyJobItemRow.id == item_id)
+        )).scalar_one_or_none()
+
+    async def list_agent_reply_job_items(
+        self, job_id: uuid.UUID, *, status: str | None = None,
+    ) -> list[AgentReplyJobItemRow]:
+        q = select(AgentReplyJobItemRow).where(AgentReplyJobItemRow.job_id == job_id)
+        if status is not None:
+            q = q.where(AgentReplyJobItemRow.status == status)
+        rows = (await self.session.execute(
+            q.order_by(AgentReplyJobItemRow.created_at.asc())
+        )).scalars().all()
+        return list(rows)
+
+    async def update_agent_reply_job_item(
+        self, item_id: uuid.UUID, **fields: Any,
+    ) -> AgentReplyJobItemRow | None:
+        row = await self.get_agent_reply_job_item(item_id)
+        if row is None:
+            return None
+        for k, v in fields.items():
+            if hasattr(row, k) and k != "id":
+                setattr(row, k, v)
+        row.updated_at = datetime.now(timezone.utc)
+        await self.session.flush()
+        return row
+
+    async def find_inflight_job_items(
+        self, *, dataset_type: str, case_refs: list[str], config_fingerprint: str,
+    ) -> list[AgentReplyJobItemRow]:
+        """找「同一样例 + 同一 agent 配置」仍在途的任务项。
+
+        在途 = item.status in (pending, running) 且所属 job.status == 'running'
+        且 job.config_fingerprint 相同。不同配置可并行，故指纹必须参与匹配。
+        """
+        if not case_refs:
+            return []
+        rows = (await self.session.execute(
+            select(AgentReplyJobItemRow)
+            .join(AgentReplyJobRow, AgentReplyJobItemRow.job_id == AgentReplyJobRow.id)
+            .where(
+                AgentReplyJobItemRow.case_ref.in_(case_refs),
+                AgentReplyJobItemRow.status.in_(("pending", "running")),
+                AgentReplyJobRow.status == "running",
+                AgentReplyJobRow.dataset_type == dataset_type,
+                AgentReplyJobRow.config_fingerprint == config_fingerprint,
+            )
+        )).scalars().all()
+        return list(rows)
+
+    async def sweep_orphaned_agent_reply_jobs(self) -> int:
+        """进程重启后把残留 running 的生成任务标 interrupted（在途 item 标
+        failed），避免 UI 永远显示「运行中」。返回被改的 job 数。"""
+        jobs = (await self.session.execute(
+            select(AgentReplyJobRow).where(AgentReplyJobRow.status == "running")
+        )).scalars().all()
+        now = datetime.now(timezone.utc)
+        for job in jobs:
+            items = await self.list_agent_reply_job_items(job.id)
+            stuck = [i for i in items if i.status in ("pending", "running")]
+            for item in stuck:
+                item.status = "failed"
+                item.error_message = "服务重启，任务中断"
+                item.finished_at = now
+                item.updated_at = now
+            job.failed_count = int(job.failed_count or 0) + len(stuck)
+            job.running_count = 0
+            job.status = "interrupted"
+            job.finished_at = now
+            job.updated_at = now
+        await self.session.flush()
+        return len(jobs)

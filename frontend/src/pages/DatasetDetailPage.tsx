@@ -1,10 +1,21 @@
-import { useId, useState, useRef } from 'react'
+import { useId, useMemo, useState, useRef } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/ui'
-import { datasetsApi, candidatesApi, projectsApi } from '@/services'
+import { datasetsApi, candidatesApi, projectsApi, agentRepliesApi, keyPointsApi } from '@/services'
+import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
+import CaseCategoryBatchDialog from '@/components/CaseCategoryBatchDialog'
+import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
+import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
+import { SelectionBar } from '@/components/SelectionBar'
+import QuestionContentEditor, { questionFilled } from '@/components/QuestionContentEditor'
+import { AttachmentStrip } from '@/components/MessageContentView'
 import type { CandidateCase, ImportPreview } from '@/services/benchmark'
+import { contentToText } from '@/lib/contentBlocks'
+import type { MessageContent } from '@/lib/contentBlocks'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import { addIds, collectAllIds, pageSelectionState, togglePageIds } from '@/lib/batchSelection'
 
 const STATUS_BADGE: Record<string, { label: string; cls: string }> = {
   pending: { label: '暂存', cls: 'badge badge-warning' },
@@ -19,6 +30,7 @@ export default function DatasetDetailPage() {
   const confirm = useConfirm()
   const toast = useToast()
   const reactId = useId()
+  const editQuestionId = `${reactId}-edit-question`
   const editAnswerId = `${reactId}-edit-answer`
   const editKeyPointsId = `${reactId}-edit-key-points`
   const editNegativePointsId = `${reactId}-edit-negative-points`
@@ -34,16 +46,33 @@ export default function DatasetDetailPage() {
   const [showPromote, setShowPromote] = useState(false)
   const [promoteProjectId, setPromoteProjectId] = useState('')
   const [editingCase, setEditingCase] = useState<CandidateCase | null>(null)
+  // 问题从「只读展示」改成可编辑的 canonical content：带附件样例要能改图，
+  // 纯文本样例 buildContent 回落成字符串，提交 payload 与改造前一致。
+  const [editQuestion, setEditQuestion] = useState<MessageContent>('')
   const [editAnswer, setEditAnswer] = useState('')
   const [editCategory, setEditCategory] = useState('')
   const [editKeyPoints, setEditKeyPoints] = useState('')
   const [editNegativePoints, setEditNegativePoints] = useState('')
   const [showAddModal, setShowAddModal] = useState(false)
-  const [addQuestion, setAddQuestion] = useState('')
+  const [addQuestion, setAddQuestion] = useState<MessageContent>('')
+  // 编辑器内部存着「空附件行」草稿，无法从 addQuestion 派生；提交成功后靠换 key 重挂来清空。
+  const [addAttachKey, setAddAttachKey] = useState(0)
   const [addAnswer, setAddAnswer] = useState('')
   const [addCategory, setAddCategory] = useState('')
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [importCategory, setImportCategory] = useState('')
+  // agent 生成答案：genSingleId 非空 = 只重跑这一条，否则用当前勾选集
+  const [genOpen, setGenOpen] = useState(false)
+  const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  // 批量切换当前版本：按「最新 / vN / 版本备注」在每个样例各自的版本链里解析
+  const [batchVerOpen, setBatchVerOpen] = useState(false)
+  // 批量改类别：备选集的 category 是自由文本，弹窗允许填新名
+  const [batchCatOpen, setBatchCatOpen] = useState(false)
+  const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
+  // 提炼关键点：勾选了就只提炼勾选的，没勾选就全量扫待提炼样例。
+  const [extractOpen, setExtractOpen] = useState(false)
+  // 编辑弹窗里的单条 AI 提炼：结果只回填输入框，用户可改后再保存。
+  const [extractingOne, setExtractingOne] = useState(false)
   // 两步式文件导入：选文件 → 预览（识别列 + 建议问题/答案列 + 样例）→ 确认导入。
   const fileRef = useRef<HTMLInputElement>(null)
   const importFileId = `${reactId}-import-file`
@@ -55,7 +84,9 @@ export default function DatasetDetailPage() {
   // <input type=file> 在切到预览步骤后被卸载，故把 File 存进 state 保证确认时可用。
   const [importFile, setImportFile] = useState<File | null>(null)
 
-  const pageSize = 20
+  const [pageSize, setPageSize] = useState(20)
+  // 跨页全选（逐页拉 id）进行中
+  const [selectingAll, setSelectingAll] = useState(false)
 
   const { data: dataset, isLoading: datasetLoading } = useQuery({
     queryKey: ['dataset', name],
@@ -64,7 +95,7 @@ export default function DatasetDetailPage() {
   })
 
   const { data: casesData, isLoading } = useQuery({
-    queryKey: ['dataset-candidates', name, page, statusFilter, categoryFilter, search],
+    queryKey: ['dataset-candidates', name, page, pageSize, statusFilter, categoryFilter, search],
     queryFn: () => candidatesApi.list({
       page,
       page_size: pageSize,
@@ -110,6 +141,7 @@ export default function DatasetDetailPage() {
       queryClient.invalidateQueries({ queryKey: ['dataset-candidate-categories'] })
       setShowAddModal(false)
       setAddQuestion('')
+      setAddAttachKey(k => k + 1)
       setAddAnswer('')
       setAddCategory('')
     },
@@ -190,8 +222,26 @@ export default function DatasetDetailPage() {
   const total = casesData?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
+  // 当前页样例的「agent 生成答案」状态，一次批量查，给每行打标记。
+  const caseIdsOnPage = useMemo(() => cases.map(c => c.id), [cases])
+  const { data: replyStates } = useQuery({
+    queryKey: ['agent-reply-states', 'candidate', caseIdsOnPage],
+    queryFn: () => agentRepliesApi.listStates('candidate', caseIdsOnPage).then(r => r.data),
+    enabled: caseIdsOnPage.length > 0,
+  })
+  const replyStateMap = new Map((replyStates ?? []).map(s => [s.case_ref, s]))
+
+  // 表头 checkbox 只反映当页；跨页累积的总数走 SelectionBar。
+  const pageSel = pageSelectionState(selectedIds, caseIdsOnPage)
+
+  function refreshReplyStates() {
+    queryClient.invalidateQueries({ queryKey: ['agent-reply-states'] })
+  }
+
   function openEdit(c: CandidateCase) {
     setEditingCase(c)
+    // 带附件样例回填 blocks（question_content），纯文本样例回填 question 字符串。
+    setEditQuestion(c.question_content ?? c.question ?? '')
     setEditAnswer(c.answer || '')
     setEditCategory(c.category || '')
     setEditKeyPoints((c.key_points || []).join(', '))
@@ -203,6 +253,8 @@ export default function DatasetDetailPage() {
     updateMutation.mutate({
       id: editingCase.id,
       data: {
+        // 后端 split_question_content 会把它拆成 question 文本投影 + question_content
+        question: editQuestion,
         answer: editAnswer || null,
         category: editCategory.trim() || null,
         key_points: editKeyPoints ? editKeyPoints.split(',').map(s => s.trim()).filter(Boolean) : null,
@@ -211,8 +263,51 @@ export default function DatasetDetailPage() {
     })
   }
 
+  // 编辑弹窗里的单条提炼：只回填输入框，用户确认（可改）后随表单一起保存，不落库。
+  async function extractOneKeyPoints() {
+    if (!editAnswer.trim()) {
+      toast.error('请先填写参考答案')
+      return
+    }
+    setExtractingOne(true)
+    try {
+      const res = await keyPointsApi.extractOne({
+        answer: editAnswer,
+        question: editingCase?.question || undefined,
+      })
+      setEditKeyPoints(res.data.points.join(', '))
+      toast.success(`提炼出 ${res.data.points.length} 个关键点，确认后点保存`)
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '提炼失败' })))
+    } finally {
+      setExtractingOne(false)
+    }
+  }
+
   function toggleSelect(id: string) {
     setSelectedIds(prev => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n })
+  }
+
+  // 「选择全部 N 条」：按当前筛选逐页拉 id 并入选中集合。
+  async function selectAllMatching() {
+    setSelectingAll(true)
+    try {
+      const ids = await collectAllIds(async (p, size) => {
+        const r = await candidatesApi.list({
+          page: p, page_size: size,
+          dataset_name: name,
+          status: statusFilter || undefined,
+          category: categoryFilter || undefined,
+          search: search || undefined,
+        })
+        return { ids: r.data.items.map(c => c.id), total: r.data.total }
+      })
+      setSelectedIds(prev => addIds(prev, ids))
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '全选失败' })))
+    } finally {
+      setSelectingAll(false)
+    }
   }
 
   if (datasetLoading) {
@@ -301,6 +396,45 @@ export default function DatasetDetailPage() {
         >
           从 LangSmith 同步
         </Button>
+        {/* 勾选样例后先让 agent 跑出答案存成版本，评估时可直接消费、不再实时连 agent。 */}
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => { setGenSingleId(null); setGenOpen(true) }}
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : undefined}
+        >
+          agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 批量切换这些样例的当前版本：评估「使用已有回复」消费的就是当前版本 */}
+        <Button
+          onClick={() => setBatchVerOpen(true)}
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的当前版本批量切到同一标识'}
+        >
+          批量切换版本{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 批量改类别：备选集的类别是自由文本，允许直接写一个新名字 */}
+        <Button
+          onClick={() => setBatchCatOpen(true)}
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的类别批量改成同一个，或清空'}
+        >
+          批量改类别{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 从参考答案提炼关键点：勾选了就只提炼这几条，没勾选就全量扫「有答案但关键点为空」的。 */}
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => setExtractOpen(true)}
+          title="用大模型从参考答案提炼关键点，供 judge 逐条核对"
+        >
+          提炼关键点{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
         {selectedIds.size > 0 && (statusFilter === '' || statusFilter === 'ready') && (
           <Button variant="primary" size="sm" onClick={() => setShowPromote(true)}>
             导入基准 ({selectedIds.size})
@@ -318,6 +452,18 @@ export default function DatasetDetailPage() {
         )}
       </div>
 
+      <SelectionBar
+        selectedCount={selectedIds.size}
+        total={total}
+        pageCount={cases.length}
+        pageSelectedCount={pageSel.count}
+        onSelectAll={selectAllMatching}
+        onClear={() => setSelectedIds(new Set())}
+        selectingAll={selectingAll}
+        pageSize={pageSize}
+        onPageSizeChange={size => { setPageSize(size); setPage(1) }}
+      />
+
       <div className="table-card">
         <table className="table-base">
           <thead>
@@ -325,11 +471,10 @@ export default function DatasetDetailPage() {
               <th className="w-10 text-center">
                 <input
                   type="checkbox"
-                  checked={cases.length > 0 && selectedIds.size === cases.length}
-                  onChange={() => {
-                    if (selectedIds.size === cases.length) setSelectedIds(new Set())
-                    else setSelectedIds(new Set(cases.map(c => c.id)))
-                  }}
+                  checked={pageSel.all}
+                  ref={el => { if (el) el.indeterminate = pageSel.some }}
+                  onChange={() => setSelectedIds(prev => togglePageIds(prev, caseIdsOnPage))}
+                  aria-label="全选当前页"
                   className="accent-accent"
                 />
               </th>
@@ -338,6 +483,7 @@ export default function DatasetDetailPage() {
               <th className="w-20">有答案</th>
               <th className="w-24">状态</th>
               <th className="w-24">来源</th>
+              <th className="w-28">agent回复</th>
               <th className="w-28 text-right">操作</th>
             </tr>
           </thead>
@@ -348,7 +494,10 @@ export default function DatasetDetailPage() {
                   <input type="checkbox" checked={selectedIds.has(c.id)} onChange={() => toggleSelect(c.id)} className="accent-accent" />
                 </td>
                 <td className="max-w-[460px]">
-                  <div className="truncate">{c.question}</div>
+                  {/* 带附件时问题文本用后端的纯文本投影（含 [图片] 占位），
+                      再挂一排缩略图，列表里也能一眼看出这条是带图样例。 */}
+                  <div className="truncate">{contentToText(c.question_content ?? c.question)}</div>
+                  <AttachmentStrip content={c.question_content ?? undefined} />
                   {c.answer && <div className="text-[11px] text-text-tertiary mt-0.5 truncate">答：{c.answer.slice(0, 80)}</div>}
                 </td>
                 <td>
@@ -367,6 +516,25 @@ export default function DatasetDetailPage() {
                   </span>
                 </td>
                 <td className="text-text-tertiary text-[11px]">{c.source}</td>
+                <td>
+                  {/* 点开版本抽屉：可切换当前版本 / 手工修订 / 删除 / 重新生成 */}
+                  {(() => {
+                    const st = replyStateMap.get(c.id)
+                    if (!st?.has_reply) {
+                      return <span className="text-[11px] text-text-tertiary">未生成</span>
+                    }
+                    return (
+                      <button
+                        onClick={() => setVersionsCaseRef(c.id)}
+                        className="text-action text-[11px]"
+                        title="查看 / 回溯 agent 生成的回复版本"
+                      >
+                        v{st.current_version_number ?? '—'}
+                        {st.version_count > 1 ? ` · 共${st.version_count}版` : ''}
+                      </button>
+                    )
+                  })()}
+                </td>
                 <td className="text-right">
                   <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
                     <button onClick={() => openEdit(c)} className="text-action">
@@ -435,8 +603,15 @@ export default function DatasetDetailPage() {
         {editingCase && (
           <div className="space-y-4">
             <div>
-              <label className="field-label">问题</label>
-              <div className="py-2 px-3 text-[12px] border border-border rounded-md bg-fill/5 text-text-secondary">{editingCase.question}</div>
+              <label htmlFor={editQuestionId} className="field-label">问题</label>
+              {/* key 绑样例 id：切换样例时重置编辑器内部的空附件行 draft */}
+              <QuestionContentEditor
+                key={editingCase.id}
+                textareaId={editQuestionId}
+                value={editQuestion}
+                onChange={setEditQuestion}
+                rows={3}
+              />
             </div>
             <div>
               <label htmlFor={editAnswerId} className="field-label">参考答案</label>
@@ -453,7 +628,19 @@ export default function DatasetDetailPage() {
               />
             </div>
             <div>
-              <label htmlFor={editKeyPointsId} className="field-label">关键点（逗号分隔）</label>
+              <div className="flex items-center justify-between">
+                <label htmlFor={editKeyPointsId} className="field-label">关键点（逗号分隔）</label>
+                {/* 提炼结果只回填输入框，用户核对（可改）后随表单一起保存 */}
+                <button
+                  type="button"
+                  onClick={extractOneKeyPoints}
+                  disabled={extractingOne || !editAnswer.trim()}
+                  className="text-action text-[11px] disabled:opacity-40"
+                  title={editAnswer.trim() ? '用大模型从参考答案提炼关键点' : '请先填写参考答案'}
+                >
+                  {extractingOne ? '提炼中…' : 'AI 提炼'}
+                </button>
+              </div>
               <input id={editKeyPointsId} value={editKeyPoints} onChange={e => setEditKeyPoints(e.target.value)} placeholder="要点1, 要点2" className="input" />
             </div>
             <div>
@@ -505,7 +692,7 @@ export default function DatasetDetailPage() {
             <Button
               variant="primary"
               size="md"
-              disabled={!addQuestion.trim()}
+              disabled={!questionFilled(addQuestion)}
               loading={addMutation.isPending}
               onClick={() => addMutation.mutate()}
             >
@@ -517,13 +704,14 @@ export default function DatasetDetailPage() {
         <div className="space-y-4">
           <div>
             <label htmlFor={addQuestionId} className="field-label">问题</label>
-            <textarea
-              id={addQuestionId}
+            {/* key 随每次提交自增：控件内部的空附件行 draft 无法从 value 派生，
+                靠重挂载来清空，否则下一条新增会带着上一条的空行。 */}
+            <QuestionContentEditor
+              key={addAttachKey}
+              textareaId={addQuestionId}
               value={addQuestion}
-              onChange={e => setAddQuestion(e.target.value)}
+              onChange={setAddQuestion}
               rows={3}
-              placeholder="输入测试问题…"
-              className="input resize-y"
             />
           </div>
           <div>
@@ -672,6 +860,57 @@ export default function DatasetDetailPage() {
       <datalist id="candidate-category-options">
         {(categoryOptions ?? []).map(cat => <option key={cat} value={cat} />)}
       </datalist>
+
+      {/* agent 生成答案：genSingleId 非空 = 只重跑这一条，否则用当前勾选集 */}
+      <AgentReplyGenerateDialog
+        open={genOpen}
+        onClose={() => { setGenOpen(false); setGenSingleId(null) }}
+        datasetType="candidate"
+        caseIds={genSingleId ? [genSingleId] : Array.from(selectedIds)}
+        onFinished={refreshReplyStates}
+      />
+
+      <AgentReplyBatchVersionDialog
+        open={batchVerOpen}
+        onClose={() => setBatchVerOpen(false)}
+        datasetType="candidate"
+        caseRefs={Array.from(selectedIds)}
+        onDone={refreshReplyStates}
+      />
+
+      {/* 批量改类别：备选集的类别是自由文本，允许直接写一个新名字 */}
+      <CaseCategoryBatchDialog
+        open={batchCatOpen}
+        onClose={() => setBatchCatOpen(false)}
+        datasetType="candidate"
+        caseRefs={Array.from(selectedIds)}
+        datasetName={name}
+        onDone={() => {
+          queryClient.invalidateQueries({ queryKey: ['dataset-candidates'] })
+          queryClient.invalidateQueries({ queryKey: ['candidates'] })
+          // 自由文本类别可能是刚新建的，筛选下拉与类别建议 datalist 都要跟着刷。
+          queryClient.invalidateQueries({ queryKey: ['dataset-candidate-categories'] })
+        }}
+      />
+
+      {/* 批量提炼关键点：勾选集为空则由弹窗全量扫待提炼样例 */}
+      <KeyPointsExtractDialog
+        open={extractOpen}
+        onClose={() => setExtractOpen(false)}
+        target="candidate"
+        caseIds={Array.from(selectedIds)}
+        onFinished={() => queryClient.invalidateQueries({ queryKey: ['dataset-candidates'] })}
+      />
+
+      <AgentReplyVersionsDrawer
+        open={!!versionsCaseRef}
+        onClose={() => setVersionsCaseRef(null)}
+        datasetType="candidate"
+        caseRef={versionsCaseRef}
+        caseTitle={cases.find(c => c.id === versionsCaseRef)?.question?.slice(0, 60) ?? null}
+        onRetryCase={ref => { setVersionsCaseRef(null); setGenSingleId(ref); setGenOpen(true) }}
+        onChanged={refreshReplyStates}
+      />
     </div>
   )
 }

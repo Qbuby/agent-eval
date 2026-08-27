@@ -1,3 +1,7 @@
+import type { MessageContent } from '@/lib/contentBlocks'
+
+export type { MessageContent }
+
 export interface LoginRequest {
   username: string
   password: string
@@ -76,7 +80,10 @@ export interface TestCase {
   // 受管单值类别（对齐基准测试集）：类别名字符串，存进 Langfuse item metadata.category。
   category?: string | null
   source?: string
-  input_messages: Array<{ role: string; content: string }>
+  // content 为「字符串 或 canonical blocks 数组」：带图/带附件的样例走数组形态
+  // （见 @/lib/contentBlocks 与后端 data/content_blocks.py）。无附件时后端降级
+  // 回字符串，故纯文本样例的形状与改造前一致。
+  input_messages: Array<{ role: string; content: MessageContent }>
   agent_config_override?: Record<string, unknown>
   expected_output?: string
   expected_output_criteria?: string[]
@@ -475,6 +482,12 @@ export interface StartEvalRequest {
   // 样例，评估器单次对比打分）。comparative 时 agent_b 必填、仅支持单轮数据集。
   eval_mode?: 'single' | 'comparative'
   agent_b?: EvalAgentConfig | null
+  // A / B 两侧可独立选择实时调用或消费预生成回复。版本映射未覆盖的样例
+  // 自动使用该样例的当前版本。
+  reply_source?: 'live' | 'persisted'
+  reply_version_ids?: Record<string, string>
+  reply_source_b?: 'live' | 'persisted'
+  reply_version_ids_b?: Record<string, string>
 }
 
 // run 级对比汇总（落在 summary_scores.comparison_summary）。新数据按 evaluator
@@ -635,12 +648,23 @@ export interface CotStep {
 export interface ConversationTurn {
   turn_index: number
   turn_no?: number
-  user: string
+  // 带附件轮保留 canonical blocks，纯文本轮仍为 string。
+  user: MessageContent
   assistant: string
   tool_calls?: Array<Record<string, unknown>>
   steps?: CotStep[]
   latency_ms?: number | null
   attempts?: number
+  // 本轮 token 用量。agent 未报 token 时为 null（而非补零），据此可区分
+  // 「这轮没花 token」和「这轮拿不到 token 数」。字段名与会话级/单轮同构，
+  // 可直接喂 pricing 的 TokenUsage 算本轮成本。
+  usage?: {
+    prompt_tokens?: number | null
+    completion_tokens?: number | null
+    total_tokens?: number | null
+    cache_creation_tokens?: number | null
+    cache_read_tokens?: number | null
+  } | null
 }
 
 // 多轮评估结果的会话级上下文（落在 full_trace.conversation）。
@@ -742,6 +766,11 @@ export interface EvalResultRow {
   criterion_results?: Array<Record<string, unknown>>
   actual_output: string | null
   question?: string | null
+  // 评估启动时冻结的原始问题 blocks；纯文本/旧结果为 null。
+  question_content?: MessageContent | null
+  // 评估启动时冻结的答案关键点（后端 0036 起持久化到 test_results）。
+  // 源样例后续被改也不影响本次评估的参考依据，详情页据此展示"按什么标准打分"。
+  expected_output_criteria?: string[]
   latency_ms: number | null
   total_tokens: number | null
   prompt_tokens: number | null
@@ -910,3 +939,228 @@ export interface RequestLogResponse {
   returned: number
   entries: RequestLogEntry[]
 }
+
+// ─── OmniAgent 对话（内部人员直接与 OmniAgent 对话，边聊边攒样例） ───
+
+/** 一个会话 = 一串消息。title 由首条 user 消息自动摘要，可手动改。 */
+export interface OmniAgentSession {
+  id: string
+  thread_id: string
+  title: string
+  title_source: 'auto' | 'manual'
+  message_count: number
+  active_message_id?: string | null
+  last_message_at: string
+  created_at: string
+  updated_at: string
+}
+
+export interface OmniAgentSessionPage {
+  items: OmniAgentSession[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** assistant 消息的生命周期。streaming 表示正在逐 token 追加。 */
+export type OmniAgentMessageStatus = 'completed' | 'streaming' | 'failed' | 'cancelled'
+
+/** agent 一次工具调用的记录，随 tool_start / tool_end 事件成形。 */
+export interface OmniAgentToolCall {
+  id: string
+  name: string
+  // 入参与结果都可能是任意 JSON；仅做折叠展示，不解读结构。
+  input?: unknown
+  output?: unknown
+  error?: string | null
+  duration_ms?: number | null
+}
+
+export interface OmniAgentMessage {
+  id: string
+  session_id: string
+  sequence: number
+  role: 'user' | 'assistant'
+  content: string
+  status: OmniAgentMessageStatus
+  retry_of_message_id?: string | null
+  // agent 侧结构化产物（如抽取出的样例字段），有则在气泡下方折叠展示。
+  structured_output?: unknown
+  tool_calls?: OmniAgentToolCall[]
+  error?: string | null
+  created_at: string
+  updated_at?: string
+}
+
+export interface OmniAgentMessagePage {
+  items: OmniAgentMessage[]
+  next_before_sequence: number | null
+}
+
+export interface SendMessageRequest {
+  content: string
+}
+
+export interface UpdateSessionRequest {
+  title: string
+}
+
+// ─── OmniAgent 持久产品面 ───
+
+export interface OmniAgentDurableEvent {
+  cursor: number
+  type: string
+  entity_type?: string | null
+  entity_id?: string | null
+  session_id?: string | null
+  message_id?: string | null
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface OmniAgentJob {
+  id: string
+  kind: string
+  status: 'queued' | 'provisioning' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'expired'
+  result?: Record<string, unknown> | null
+  error?: { code?: string | null; message?: string | null } | null
+  attempt_count: number
+  max_attempts: number
+  session_id?: string | null
+  action_id?: string | null
+  usage?: Record<string, unknown> | null
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export interface OmniAgentAction {
+  id: string
+  capability: string
+  arguments: Record<string, unknown>
+  argument_digest: string
+  risk: string
+  impact_preview: Record<string, unknown>
+  cost_estimate?: Record<string, unknown> | null
+  state: 'prepared' | 'approved' | 'denied' | 'expired' | 'executing' | 'succeeded' | 'failed' | 'cancelled'
+  session_id?: string | null
+  message_id?: string | null
+  expires_at: string
+  job_id?: string | null
+  terminal_summary?: Record<string, unknown> | null
+  created_at: string
+}
+
+export interface OmniAgentArtifact {
+  id: string
+  session_id?: string | null
+  job_id?: string | null
+  state: 'uploading' | 'scanning' | 'available' | 'quarantined' | 'expired' | 'deleted'
+  filename: string
+  mime_type: string
+  extension: string
+  size_bytes: number
+  sha256?: string | null
+  retention: 'temporary' | 'pinned'
+  expires_at: string
+  created_at: string
+}
+
+export interface OmniAgentMemory {
+  id: string
+  title: string
+  content: string
+  tags: string[]
+  created_at: string
+  updated_at: string
+}
+
+export interface OmniAgentNotification {
+  id: string
+  kind: string
+  title: string
+  body: string
+  link?: string | null
+  read_at?: string | null
+  created_at: string
+}
+
+export interface OmniAgentSchedule {
+  id: string
+  name: string
+  capability: string
+  arguments: Record<string, unknown>
+  schedule: Record<string, unknown>
+  timezone: string
+  version: number
+  enabled: boolean
+  next_run_at?: string | null
+  last_run_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+// ─── OmniAgent SSE 事件（POST /sessions/{id}/messages/stream 的下发帧） ───
+// 判别联合，以 type 分派。后端每帧一条 `data: {...}` JSON。
+
+/** 服务端已落库 user 消息、并给出待填充的 assistant 消息 id。 */
+export interface SseMessageStart {
+  type: 'message_start'
+  message_id: string
+  // 首帧同时回传 user 消息 id，便于前端把乐观插入的占位替换成真 id。
+  user_message_id?: string
+}
+
+/** 一段回复增量，按到达顺序拼接。 */
+export interface SseContentDelta {
+  type: 'content_delta'
+  message_id: string
+  delta: string
+}
+
+export interface SseToolStart {
+  type: 'tool_start'
+  message_id: string
+  tool_call_id: string
+  name: string
+  input?: unknown
+}
+
+export interface SseToolEnd {
+  type: 'tool_end'
+  message_id: string
+  tool_call_id: string
+  output?: unknown
+  error?: string | null
+  duration_ms?: number | null
+}
+
+export interface SseStructuredOutput {
+  type: 'structured_output'
+  message_id: string
+  data: unknown
+}
+
+/** agent 侧失败。流随后结束，这条 assistant 消息落 error 状态。 */
+export interface SseError {
+  type: 'error'
+  message_id?: string
+  message: string
+}
+
+/** 正常收尾。final_content 为服务端落库的完整文本，用于校正增量拼接。 */
+export interface SseDone {
+  type: 'done'
+  message_id: string
+  final_content?: string
+  status?: OmniAgentMessageStatus
+}
+
+export type OmniAgentSseEvent =
+  | SseMessageStart
+  | SseContentDelta
+  | SseToolStart
+  | SseToolEnd
+  | SseStructuredOutput
+  | SseError
+  | SseDone

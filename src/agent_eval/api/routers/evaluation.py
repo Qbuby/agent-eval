@@ -34,6 +34,7 @@ from agent_eval.api.schemas import (
     UpdateEvaluatorRequest,
     UploadCasesResponse,
 )
+from agent_eval.data.content_blocks import merge_question_content
 from agent_eval.data.trace_extractor import TraceExtractor
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
@@ -61,6 +62,13 @@ from agent_eval.evaluation.langfuse_runner import (
     rescore_missing_dimensions,
     start_run,
 )
+# 空输入 / 空回复判定与生成侧共用同一实现，避免两处口径漂移。
+# reply_generator 顶层只依赖 data / db 层（langfuse_runner 是函数内延迟导入），
+# 故这里可以顶层 import 而不成环。
+from agent_eval.evaluation.reply_generator import (
+    is_empty_input_messages,
+    is_empty_question,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/eval", tags=["eval"], dependencies=[Depends(require_internal())])
@@ -80,6 +88,7 @@ async def list_builtin_evaluators():
 
 async def resolve_eval_start_args(
     req: StartEvalRequest, session, repo,
+    excluded_out: list[str] | None = None,
 ) -> dict[str, Any]:
     """把 ``StartEvalRequest`` 解析成 ``start_run`` 的 kwargs（不含 notify）。
 
@@ -112,6 +121,28 @@ async def resolve_eval_start_args(
         )
 
     cases: list[dict[str, Any]] = []
+    # 输入为空（没有问题内容）的样例：三类来源统一在此收集并排除，不送去跑。
+    # 空输入根本问不出东西，agent 只会回一句无意义的话，judge 却照样给分，
+    # 于是"评了但毫无意义的样例"混进统计里拉偏结果。排除而非报错，是因为这类
+    # 样例通常是导入时的空行/脏数据，不该让整次评估起不来；被排除的 id 汇总
+    # 进 excluded_case_refs 让调用方能在 UI 上说清楚。
+    skipped_empty_input: list[str] = []
+
+    def _criteria(value: Any) -> list[str]:
+        """把各数据源的 key_points / criteria / keywords 统一成非空文本列表。"""
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _metadata_with_criteria(
+        metadata: dict[str, Any] | None, criteria: list[str],
+    ) -> dict[str, Any]:
+        """将冻结关键点同步进 judge metadata，同时保留来源自带元数据。"""
+        result = dict(metadata or {})
+        result["reference_criteria"] = list(criteria)
+        return result
 
     if req.conversation_dataset:
         # ── 多轮对话数据集（直读 LangSmith dataset，保留多轮字段）──
@@ -158,8 +189,11 @@ async def resolve_eval_start_args(
             if wanted_category is not None and (c.category or "") != wanted_category:
                 continue
             msgs = c.input_messages or []
-            if not any(m.get("role") == "user" and m.get("content") for m in msgs):
-                # 没有任何 user 消息的样例无法回放，跳过。
+            if is_empty_input_messages(msgs):
+                # 没有任何非空 user 消息的样例无法回放，跳过。判定与生成侧共用
+                # 同一口径（reply_generator.is_empty_input_messages）：只有空白
+                # 字符的 user 消息也算空，带附件的算有输入。
+                skipped_empty_input.append(str(c.id))
                 continue
             # 内存筛选路径下 limit 未下推给 provider，在此按"将跑样例数"截断。
             if load_limit is None and req.limit and len(cases) >= req.limit:
@@ -168,13 +202,17 @@ async def resolve_eval_start_args(
             first_user = next(
                 (m.get("content", "") for m in msgs if m.get("role") == "user"), ""
             )
+            reference_criteria = _criteria(c.expected_output_criteria)
             cases.append({
                 "id": c.id,
                 "name": c.name or c.id,
                 "question": first_user,
                 "expected_output": c.expected_output or "",
+                "expected_output_criteria": reference_criteria,
                 "expected_tool_calls": [],
-                "metadata": {"tags": list(c.tags or [])},
+                "metadata": _metadata_with_criteria(
+                    {"tags": list(c.tags or [])}, reference_criteria,
+                ),
                 "source": "conversation",
                 # 多轮标记 + 完整回放/打分输入：runner 据此走 multiturn 分支。
                 "multi_turn": True,
@@ -195,14 +233,26 @@ async def resolve_eval_start_args(
         raw_cases = src.cases or []
         if req.limit:
             raw_cases = raw_cases[: req.limit]
-        for c in raw_cases:
+        for idx, c in enumerate(raw_cases):
+            if is_empty_question(c.get("question")):
+                # 上传文件常见空行/占位行：没有问题内容，排除。
+                skipped_empty_input.append(str(c.get("name") or f"case-{idx+1}"))
+                continue
+            reference_criteria = _criteria(
+                c.get("expected_output_criteria")
+                or c.get("key_points")
+                or c.get("expected_keywords")
+            )
             cases.append({
                 "id": c.get("name") or f"case-{len(cases)+1}",
                 "name": c.get("name") or f"case-{len(cases)+1}",
                 "question": c.get("question") or "",
                 "expected_output": c.get("expected_output") or "",
+                "expected_output_criteria": reference_criteria,
                 "expected_tool_calls": [],
-                "metadata": c.get("metadata") or {},
+                "metadata": _metadata_with_criteria(
+                    c.get("metadata"), reference_criteria,
+                ),
                 "source": "file",
             })
     else:
@@ -222,23 +272,47 @@ async def resolve_eval_start_args(
             stmt = stmt.limit(req.limit)
         bench_rows = (await session.execute(stmt)).scalars().all()
         for b in bench_rows:
+            merged_question = merge_question_content(b.question, b.question_content)
+            if is_empty_question(merged_question):
+                # 只有空白字符 / 完全没录问题的基准样例，排除；带附件的不算空。
+                skipped_empty_input.append(str(b.id))
+                continue
             expected_tool_calls = []
             if isinstance(b.extra_fields, dict):
                 for t in (b.extra_fields.get("expected_tool_calls") or []):
                     nm = t.get("tool_name") or t.get("name") if isinstance(t, dict) else None
                     if nm:
                         expected_tool_calls.append({"tool_name": nm})
+            reference_criteria = _criteria(b.key_points)
             cases.append({
                 "id": str(b.id),
                 "name": str(b.id)[:8],
-                "question": b.question,
+                # 带附件样例送 canonical blocks（adapter 原样透传给 agent），
+                # 纯文本样例回落成字符串，与改造前逐字节一致。
+                "question": merged_question,
                 "expected_output": b.reference_answer or "",
+                "expected_output_criteria": reference_criteria,
                 "expected_tool_calls": expected_tool_calls,
-                "metadata": {"tags": list(b.tags or [])},
+                "metadata": _metadata_with_criteria(
+                    {"tags": list(b.tags or [])}, reference_criteria,
+                ),
                 "source": "benchmark",
             })
 
     if not cases:
+        # 区分「筛选条件没命中」与「命中了但全是空输入」——后者报 no cases match
+        # 会把人引向去查筛选条件，实际该去查数据。
+        if skipped_empty_input:
+            n = len(skipped_empty_input)
+            shown = "、".join(skipped_empty_input[:5])
+            more = f" 等 {n} 个" if n > 5 else ""
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"所选样例全部没有输入内容（{n} 条），无法评估：{shown}{more}。"
+                    "请检查数据集里这些样例的问题字段是否为空。"
+                ),
+            )
         raise HTTPException(status_code=400, detail="no cases match the selection")
 
     # ── 2. resolve evaluator instances ──
@@ -299,22 +373,92 @@ async def resolve_eval_start_args(
                 status_code=400,
                 detail="双模对比评估基于相对胜负，不使用验收策略（acceptance_policy）",
             )
-        provider_rows: dict[str, Any] = {}
-        for spec in evaluator_specs:
-            provider_id = (spec.get("params") or {}).get("provider_id")
-            if not provider_id or provider_id in provider_rows:
-                continue
-            try:
-                provider_rows[provider_id] = await repo.get_evaluator_provider(
-                    uuid.UUID(str(provider_id))
-                )
-            except (TypeError, ValueError):
-                provider_rows[provider_id] = None
+        # 确定性配置错误（evaluator 不是 configurable_judge / provider 缺失失效 /
+        # variable_mapping 没接 output_a·output_b）必须在这里变成 400 带原因返回。
+        # 注意：该校验是 async 且吃 Repository —— 漏 await 或错传 dict 会让整段成为
+        # 死代码，错误一路漏到 start_run 再被包成不透明的「500 failed to start run」。
         try:
-            _validate_comparative_evaluator_specs(evaluator_specs, provider_rows)
+            await _validate_comparative_evaluator_specs(evaluator_specs, repo)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         agent_cfg_b = req.agent_b.model_dump()
+
+    # ── 4. 预生成回复（reply_source='persisted'）──
+    # 选了「使用已有回复」的一侧不连 agent：把解析出的版本行挂到 case 上，
+    # runner 的 _make_adapter 见到 _reply_version 就换成假 adapter 直接回放，
+    # 打分/聚合/落库全链路零改动。A / B 两侧各自独立选（可一侧实跑一侧回放）。
+    reply_source = (req.reply_source or "live").lower()
+    reply_source_b = (req.reply_source_b or "live").lower()
+    for name, val in (("reply_source", reply_source), ("reply_source_b", reply_source_b)):
+        if val not in ("live", "persisted"):
+            raise HTTPException(
+                status_code=400, detail=f"{name} 只能是 live 或 persisted，收到 {val!r}",
+            )
+    if reply_source_b == "persisted" and eval_mode != "comparative":
+        raise HTTPException(
+            status_code=400, detail="reply_source_b 仅在双模对比评估（comparative）下有意义",
+        )
+
+    if reply_source == "persisted" or reply_source_b == "persisted":
+        from agent_eval.evaluation.reply_generator import resolve_reply_versions
+
+        # 数据集类型由来源推断：上传文件来源的样例没有稳定的 case_ref，
+        # 无法与预生成回复对应，直接拒绝而不是静默退回实跑。
+        if req.conversation_dataset:
+            reply_dataset_type = "conversation"
+        elif req.benchmark_version_id or req.project_id:
+            reply_dataset_type = "benchmark"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="上传文件来源的样例不支持「使用已有回复」，请改用基准测试集或多轮对话集",
+            )
+
+        case_refs = [str(c["id"]) for c in cases]
+        for side, src, vids in (
+            ("A", reply_source, req.reply_version_ids),
+            ("B", reply_source_b, req.reply_version_ids_b),
+        ):
+            if src != "persisted":
+                continue
+            resolved, missing, empty = await resolve_reply_versions(
+                dataset_type=reply_dataset_type,
+                case_refs=case_refs,
+                version_ids=vids or None,
+            )
+            if missing:
+                shown = "、".join(missing[:5])
+                more = f" 等 {len(missing)} 个" if len(missing) > 5 else ""
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{side} 侧选择了「使用已有回复」，但以下样例没有可用的已生成回复"
+                        f"（未生成 / 生成失败 / 版本不匹配）：{shown}{more}。"
+                        "请先在数据集页面用「agent生成答案」生成，或改回实时调用 agent。"
+                    ),
+                )
+            # 空回复（历史遗留的 succeeded 空版本）同样拒绝而不是静默评估：
+            # 空回复被 judge 打出的分是凭空分数，会污染整轮结果。前端可用
+            # /api/agent-replies/filter-empty 一键把这些样例从勾选里剔掉后重跑。
+            if empty:
+                shown = "、".join(empty[:5])
+                more = f" 等 {len(empty)} 个" if len(empty) > 5 else ""
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{side} 侧选择了「使用已有回复」，但以下样例的已有回复是空回复"
+                        f"（agent 没有返回任何文本）：{shown}{more}。"
+                        "请用「排除空回复样例」一键剔除这些样例，或重新生成回复。"
+                    ),
+                )
+            key = "_reply_version" if side == "A" else "_reply_version_b"
+            for c in cases:
+                c[key] = resolved[str(c["id"])]
+
+    # 被排除的空输入样例经 out 参数回传（不能进返回 dict——它是 start_run 的
+    # kwargs，多一个键会 TypeError）。调度器不传这个参数，行为与改造前一致。
+    if excluded_out is not None:
+        excluded_out.extend(skipped_empty_input)
 
     # start_run 的 kwargs（notify_open_ids 由调用方按触发来源另行注入）。
     return {
@@ -330,6 +474,12 @@ async def resolve_eval_start_args(
         "langfuse_trace_name": req.langfuse_trace_name,
         "benchmark_version_id": req.benchmark_version_id,
         "eval_case_source_id": req.case_source_id,
+        # 双模一侧用 persisted 也算 persisted 运行（详情页据此标注数据来源）。
+        "reply_source": (
+            "persisted"
+            if "persisted" in (reply_source, reply_source_b)
+            else "live"
+        ),
     }
 
 
@@ -337,16 +487,24 @@ async def resolve_eval_start_args(
 async def start_eval(req: StartEvalRequest):
     """HTTP 发起一次评估：解析 → start_run。解析主体见
     ``resolve_eval_start_args``（与定时调度器共用）。"""
+    excluded: list[str] = []
     async with async_session_factory() as session:
         repo = Repository(session)
-        args = await resolve_eval_start_args(req, session, repo)
+        args = await resolve_eval_start_args(req, session, repo, excluded_out=excluded)
     try:
         # notify_open_ids 由调用方（机器人经 body 注入触发者 open_id）透传给
         # 完成通知；resolve 不含 notify，避免与调度器的显式透传冲突。
         run_id = await start_run(**args, notify_open_ids=req.notify_open_ids or None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"failed to start run: {e}") from e
-    return {"run_id": run_id, "status": "running", "case_count": len(args["cases"])}
+    # excluded_empty_input_case_refs：被自动排除的空输入样例，前端据此提示
+    # 「已排除 N 条无输入样例」，避免用户以为勾了 100 条却只跑了 97 条是 bug。
+    return {
+        "run_id": run_id,
+        "status": "running",
+        "case_count": len(args["cases"]),
+        "excluded_empty_input_case_refs": excluded,
+    }
 
 
 def _row_to_summary(row: Any, progress: dict[str, int] | None = None) -> EvalRunSummary:
@@ -481,25 +639,15 @@ async def get_run_results(
     for r in rows:
         scores = score_index.get(r.id, {})
         comparison = getattr(r, "comparison", None)
-        if comparison is not None:
-            # 对比样例不走 scores/acceptance 投影（相对胜负，非通过/失败）——
-            # 直接按行 status 映射执行/评分事实，acceptance_decision 恒 None。
-            projection = {
-                "execution_status": "abnormal" if r.status == "execution_error" else "success",
-                "evaluation_status": "completed" if r.status == "scored" else (
-                    "error" if r.status == "evaluation_error" else "unknown"
-                ),
-                "acceptance_decision": None,
-                "decision_source": "current",
-                "criterion_results": [],
-            }
-        else:
-            projection = project_case(
-                stored_status=r.status,
-                error_type=r.error_type,
-                scores=scores,
-                acceptance_policy=acceptance_policy,
-            )
+        # 对比样例的投影口径由 project_case 统一承担（相对胜负、不参与阈值验收），
+        # 与 run 级 aggregate_semantics 走同一条分支，避免两边算出不同的 facts。
+        projection = project_case(
+            stored_status=r.status,
+            error_type=r.error_type,
+            scores=scores,
+            acceptance_policy=acceptance_policy,
+            comparison=comparison,
+        )
         items.append(EvalResultRow(
             id=str(r.id),
             benchmark_case_id=str(r.benchmark_case_id) if r.benchmark_case_id else None,
@@ -513,6 +661,9 @@ async def get_run_results(
             comparison=comparison,
             actual_output=r.actual_output,
             question=r.question,
+            question_content=getattr(r, "question_content", None),
+            expected_output=r.expected_output,
+            expected_output_criteria=list(r.expected_output_criteria or []),
             latency_ms=r.latency_ms,
             total_tokens=r.total_tokens,
             prompt_tokens=r.prompt_tokens,
@@ -568,11 +719,13 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
     rows: list[dict[str, Any]] = []
     for r in sorted(results, key=lambda x: x.created_at or x.id.hex):
         score_map = {s.dimension: float(s.score) for s in scores_by_result.get(r.id, [])}
+        comparison = getattr(r, "comparison", None)
         projection = project_case(
             stored_status=r.status,
             error_type=getattr(r, "error_type", None),
             scores=score_map,
             acceptance_policy=acceptance_policy,
+            comparison=comparison,
         )
         dims.update(score_map.keys())
         rows.append({
@@ -593,6 +746,9 @@ async def _collect_run_results(run_uuid: uuid.UUID) -> tuple[Any, list[dict[str,
             "acceptance_decision": projection["acceptance_decision"],
             "decision_source": projection["decision_source"],
             "criterion_results": projection["criterion_results"],
+            # 对比矩阵按列展开后拿不到 comparison 原文，这里带一个标记，
+            # 让子集重算能声明「这是对比样例」而不退回单模口径。
+            "is_comparative": comparison is not None,
             "actual_output": r.actual_output,
             "latency_ms": r.latency_ms,
             "prompt_tokens": r.prompt_tokens,
@@ -685,6 +841,8 @@ _COMPARE_PERF_FIELDS = {
     "status", "execution_status", "evaluation_status", "acceptance_decision",
     "decision_source", "error_type", "latency_ms", "total_tokens",
     "prompt_tokens", "completion_tokens", "tool_call_count",
+    # 对比模式标记：随矩阵一起展开，供子集重算声明模式，不是评分维度。
+    "is_comparative",
 }
 
 
@@ -723,6 +881,9 @@ def _subset_run_summary(
             "error_type": slot.get(f"{run_id}::error_type"),
             "scores": _score_values(slot, run_id),
             "decision_source": slot.get(f"{run_id}::decision_source"),
+            # 矩阵按列展开后没有 comparison 原文，靠这个标记让对比样例走相对胜负
+            # 分支，否则 score_map 恒空会被算成 skipped。
+            "is_comparative": bool(slot.get(f"{run_id}::is_comparative")),
         }
         for slot in present
     ]
@@ -939,6 +1100,9 @@ async def _build_compare_matrix(
             for semantic_key in (
                 "status", "execution_status", "evaluation_status",
                 "acceptance_decision", "decision_source", "error_type",
+                # 带上对比模式标记：矩阵按列展开后拿不到 comparison 原文，
+                # 子集重算靠它声明模式，否则对比样例会被按单模口径算成 skipped。
+                "is_comparative",
             ):
                 slot[f"{run_id}::{semantic_key}"] = r.get(semantic_key)
             for perf_key in (
@@ -1238,6 +1402,7 @@ async def rescore_run(run_id: str):
         "run_id": run_id, "status": "running", "started_at": time.time(),
         "results_scanned": 0, "dimensions_recovered": 0,
         "results_completed": 0, "results_still_missing": 0,
+        "failures_transient": 0, "failures_config": 0, "failures": [],
     }
     asyncio.create_task(_run_rescore_job(run_id))
     return {"run_id": run_id, "status": "running"}
@@ -1351,6 +1516,9 @@ async def reaggregate_run(run_id: str):
                 "status": r.status,
                 "error_type": getattr(r, "error_type", None),
                 "scores": scores_by_result.get(r.id, {}),
+                # 对比样例的分数在 comparison JSONB 而非 evaluation_scores 表，
+                # 不带上它重算会把已出分的对比样例算成 skipped。
+                "comparison": getattr(r, "comparison", None),
             }
             for r in results
         ]
@@ -2041,7 +2209,7 @@ def _parse_cases_payload(raw: bytes, filename: str) -> tuple[list[dict[str, Any]
 
 
 def _normalize_cases(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Coerce each entry into {name, question, expected_keywords} shape."""
+    """Coerce uploaded entries into the canonical evaluation-case shape."""
     out = []
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
@@ -2061,9 +2229,22 @@ def _normalize_cases(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     break
         if not question:
             continue
+        criteria = (
+            item.get("expected_output_criteria")
+            or item.get("key_points")
+            or item.get("expected_keywords")
+            or []
+        )
+        if isinstance(criteria, str):
+            criteria = [criteria]
+        if not isinstance(criteria, list):
+            criteria = []
+        criteria = [str(value).strip() for value in criteria if str(value).strip()]
         out.append({
             "name": str(item.get("name") or item.get("id") or f"case-{i+1}"),
             "question": question,
+            # canonical 字段供评估冻结快照；旧字段保留，兼容历史上传消费方。
+            "expected_output_criteria": criteria,
             "expected_keywords": item.get("expected_keywords") or [],
             "expected_output": item.get("expected_output") or item.get("reference_answer") or "",
             "metadata": item.get("metadata") or {},

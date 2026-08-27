@@ -31,6 +31,7 @@ import json
 import logging
 from typing import Any, Awaitable, Callable
 
+from agent_eval.data.content_blocks import content_attachments, content_to_text
 from agent_eval.evaluation.configurable_judge import run_configurable_judge
 
 logger = logging.getLogger(__name__)
@@ -52,11 +53,17 @@ def _user_turn_indices(messages: list[dict[str, Any]]) -> list[int]:
 
 
 def build_transcript(turns: list[dict[str, Any]]) -> str:
-    """把回放出的逐轮记录拼成可读 transcript，供会话级 judge 当 output。"""
+    """把回放出的逐轮记录拼成可读 transcript，供会话级 judge 当 output。
+
+    ``turns[].user`` 在带图轮里是 content blocks 数组（``replay_conversation``
+    原样取 ``input_messages[idx]["content"]`` 存入，以便附件原样送 agent），
+    故这里走 ``content_to_text`` 取纯文本投影——附件渲染成 ``[图片]`` 占位。
+    直接 ``.strip()`` 会在带图样例上 AttributeError。
+    """
     lines: list[str] = []
     for t in turns:
-        u = (t.get("user") or "").strip()
-        a = (t.get("assistant") or "").strip()
+        u = content_to_text(t.get("user")).strip()
+        a = content_to_text(t.get("assistant")).strip()
         if u:
             lines.append(f"用户：{u}")
         if a:
@@ -147,6 +154,10 @@ async def replay_conversation(
         # 从 raw_response 抽 tool_calls / steps / usage（与单轮同结构）。
         turn_tool_calls: list[dict[str, Any]] = []
         turn_steps: list[dict[str, Any]] = []
+        # 本轮 usage 单独留一份存进 turn，供详情页逐轮展示 token/成本；
+        # 与 usage_acc 的会话级累加同源但互不覆盖（某轮缺 usage 时该轮为 None，
+        # 不影响其余轮，也不会让会话级合计凭空补零）。
+        turn_usage: dict[str, int | None] | None = None
         raw = getattr(resp, "raw_response", None)
         if isinstance(raw, dict):
             tcs = raw.get("tool_calls")
@@ -160,14 +171,18 @@ async def replay_conversation(
                 inp = u.get("input_tokens") or u.get("prompt_tokens")
                 outp = u.get("output_tokens") or u.get("completion_tokens")
                 tot = u.get("total_tokens")
+                t_prompt = t_completion = t_total = None
+                t_cc = t_cr = None
                 if isinstance(inp, int):
                     usage_acc["prompt_tokens"] += inp
+                    t_prompt = inp
                     usage_seen = True
                 if isinstance(outp, int):
                     usage_acc["completion_tokens"] += outp
+                    t_completion = outp
                     usage_seen = True
                 if isinstance(tot, int):
-                    usage_acc["total_tokens"] += tot
+                    t_total = tot
                     usage_seen = True
                 details = u.get("input_token_details") or {}
                 if isinstance(details, dict):
@@ -175,8 +190,29 @@ async def replay_conversation(
                     cr = details.get("cache_read")
                     if isinstance(cc, int):
                         usage_acc["cache_creation_tokens"] += cc
+                        t_cc = cc
                     if isinstance(cr, int):
                         usage_acc["cache_read_tokens"] += cr
+                        t_cr = cr
+                # total 缺失时按本轮 输入+输出 兜底，口径与单轮 _extract_usage 一致。
+                if t_total is None and (t_prompt is not None or t_completion is not None):
+                    t_total = (t_prompt or 0) + (t_completion or 0)
+                # 会话级 total 累加**兜底后**的逐轮 total：agent 只报 input/output
+                # 不报 total 时（LangChain usage_metadata 的常见形状），若只累加
+                # 原样上报的 total，会话级 total_tokens 会退成 None —— 而它正是
+                # 落库主列 total_tokens 与列表/详情页 token 计数展示的输入。
+                # （成本金额不走这里：前端 splitBillableTokens 只按 prompt/
+                # completion/cache_read/cache_creation 分三档计价，不读 total。）
+                if t_total is not None:
+                    usage_acc["total_tokens"] += t_total
+                if any(v is not None for v in (t_prompt, t_completion, t_total, t_cc, t_cr)):
+                    turn_usage = {
+                        "prompt_tokens": t_prompt,
+                        "completion_tokens": t_completion,
+                        "total_tokens": t_total,
+                        "cache_creation_tokens": t_cc,
+                        "cache_read_tokens": t_cr,
+                    }
 
         total_latency += float(getattr(resp, "latency_ms", 0) or 0)
         merged_tool_calls.extend(turn_tool_calls)
@@ -195,6 +231,9 @@ async def replay_conversation(
             "steps": turn_steps,
             "latency_ms": int(getattr(resp, "latency_ms", 0) or 0),
             "attempts": attempts,
+            # agent 未报 token 时为 None（而非补零），让详情页能区分
+            # 「这轮没花 token」和「这轮拿不到 token 数」。
+            "usage": turn_usage,
         })
 
     usage = {
@@ -328,11 +367,16 @@ async def score_conversation(
                 res = await run_configurable_judge(
                     params=params,
                     provider=provider_row,
-                    input_text=turn.get("user", ""),
+                    # 带图轮的 user 是 canonical blocks 数组（回放原样存下以便
+                    # 送给 agent）。prompt 文本仍走投影（[图片] 占位、可落库回显），
+                    # 真实图片经 attachments 旁路在 client 层按方言转形状挂到用户
+                    # 消息上，让 judge 真看到这一轮的图。
+                    input_text=content_to_text(turn.get("user")),
                     output_text=turn.get("assistant", ""),
                     expected_output=expected,
                     metadata=turn_meta,
                     evaluator_name=f"{label}.turn{ti}",
+                    attachments=content_attachments(turn.get("user")),
                 )
             except Exception as e:
                 logger.warning(
@@ -376,6 +420,10 @@ async def score_conversation(
                 res = await run_configurable_judge(
                     params=params,
                     provider=provider_row,
+                    # 会话级不带图（与双模会话级同一判断）：input 是纯文本 goal，
+                    # output 是 build_transcript 产物（各轮图已成 [图片] 占位）。
+                    # 各轮附件聚合易越过 JUDGE_MAX_ATTACHMENTS 被静默截断，且聚合
+                    # 视图里图与轮次的对应已丢失。图只在逐轮维度真送。
                     input_text=conversation_goal,
                     output_text=transcript,
                     expected_output=conversation_goal,

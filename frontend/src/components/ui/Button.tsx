@@ -33,7 +33,9 @@ const VARIANT: Record<ButtonVariant, string> = {
   secondary:
     'bg-surface text-text-primary border-border ' +
     'hover:bg-surface-hover active:bg-fill/10 ' +
-    'disabled:text-text-tertiary disabled:bg-surface',
+    // disabled 用「浅填充 + 二级文字」而非纯白底 + 三级文字：后者在白色工具栏里
+    // 文字仅 ~2.6:1、边框 1.2:1，整颗按钮读起来像不存在（用户实测反馈看不到）。
+    'disabled:bg-fill/[0.12] disabled:text-text-secondary disabled:border-border-strong',
   tinted:
     'bg-accent/10 text-accent border-transparent ' +
     'hover:bg-accent/20 active:bg-accent/25 ' +

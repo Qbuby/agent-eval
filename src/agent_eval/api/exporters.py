@@ -160,3 +160,27 @@ def build_export_response(
 
 def _disposition(filename_base: str, ext: str) -> dict[str, str]:
     return {"Content-Disposition": f'attachment; filename="{filename_base}.{ext}"'}
+
+
+def attach_agent_replies(
+    rows: list[dict[str, Any]],
+    replies_by_ref: dict[str, Any],
+    *,
+    id_key: str = "id",
+) -> None:
+    """Fill ``agent_reply`` / ``agent_reply_version`` on each row in place.
+
+    ``replies_by_ref`` maps case_ref → AgentReplyVersionRow (current version),
+    as returned by ``Repository.get_current_agent_replies``. A row whose id has
+    no persisted current reply gets empty strings so the columns stay aligned.
+    The version cell prefers the human label, falling back to ``v{number}``.
+    """
+    for row in rows:
+        reply = replies_by_ref.get(str(row.get(id_key)))
+        if reply is None:
+            row["agent_reply"] = ""
+            row["agent_reply_version"] = ""
+            continue
+        row["agent_reply"] = reply.content or ""
+        label = reply.version_label or f"v{reply.version_number}"
+        row["agent_reply_version"] = label

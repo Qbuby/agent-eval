@@ -1,3 +1,5 @@
+import type { ContentBlock } from '@/lib/contentBlocks'
+
 import api from './client'
 
 // Portal（外部客户）数据层。对接 routers/portal.py 的端点（见共享设计 §6.2）。
@@ -30,6 +32,9 @@ export interface PortalSample {
   id: string
   row_index: number
   question: string
+  // 带附件（图片等）样例的 canonical content blocks；纯文本样例为 null。
+  // question 恒为纯文本投影（含 [图片] 占位），列表页搜索仍读 question。
+  question_content?: ContentBlock[] | null
   answer: string | null
   // xlsx 其余列原样透出，渲染为附加字段
   extra?: Record<string, unknown> | null

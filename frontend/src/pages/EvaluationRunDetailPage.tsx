@@ -6,11 +6,13 @@ import {
   RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend,
 } from 'recharts'
 import { evaluationApi, tracesApi } from '@/services'
-import type { EvalResultRow, EvalRunDetail, RunDetail, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail, Comparison, ComparisonVerdict, ComparisonAnswerCounts } from '@/types'
+import type { EvalResultRow, EvalRunDetail, RunDetail, ConversationTrace, TurnExpectation, ChecklistItem, ScoreDetail, Comparison, ComparisonVerdict, ComparisonAnswerCounts, MessageContent } from '@/types'
 import { RunNodeRow, RunDetailBody, type NodeCache } from '@/components/RunTreeView'
 import { CotTimeline, ToolCallsTable } from '@/components/TraceTimeline'
 import MarkdownView from '@/components/MarkdownView'
+import MessageContentView from '@/components/MessageContentView'
 import { Button, Drawer, ErrorCard, ExportMenu } from '@/components/ui'
+import { RunCostSection } from '@/components/CostPanel'
 import {
   getScoreMeta, isPassing, directionMark, tone,
 } from '@/lib/scoreSemantics'
@@ -21,7 +23,8 @@ import { exportRunReport } from '@/lib/reportExport'
 import { collapseScoreKey, collapseDimAvg } from '@/lib/dimensionCollapse'
 import {
   deriveFacts, deriveAcceptance, deriveCostScored, deriveCostAbnormal,
-  acceptancePassRateText, runDecisionLabel, type EvalFacts, type EvalAcceptance,
+  acceptancePassRateText, runDecisionLabel, rowIsAbnormal, rowHasBlankReply,
+  type EvalFacts, type EvalAcceptance,
 } from '@/lib/evalSemantics'
 import {
   aggregateComparativeResources,
@@ -571,8 +574,8 @@ function ScopedVerdictBody({ verdict, status, error }: {
   )
 }
 
-function ComparisonMessageBubble({ role, side, text }: {
-  role: 'user' | 'assistant'; side?: 'A' | 'B'; text: string
+function ComparisonMessageBubble({ role, side, content }: {
+  role: 'user' | 'assistant'; side?: 'A' | 'B'; content: MessageContent
 }) {
   const isUser = role === 'user'
   const labelTone = side === 'A' ? 'text-accent' : side === 'B' ? 'text-info' : 'text-text-tertiary'
@@ -585,7 +588,7 @@ function ComparisonMessageBubble({ role, side, text }: {
           {isUser ? '用户' : `助手 ${side}`}
         </div>
         <div className="text-[12px] text-text-primary">
-          <MarkdownView text={text} />
+          <MessageContentView content={content} />
         </div>
       </div>
     </div>
@@ -604,8 +607,8 @@ function MultiTurnAnswers({ row, comparison }: { row: EvalResultRow; comparison:
   if (turnIndexes.length === 0) {
     return (
       <div className="grid grid-cols-2 gap-3">
-        <ComparisonMessageBubble role="assistant" side="A" text={row.actual_output || '（无输出）'} />
-        <ComparisonMessageBubble role="assistant" side="B" text={comparison.agent_b?.output || '（无输出）'} />
+        <ComparisonMessageBubble role="assistant" side="A" content={row.actual_output || '（无输出）'} />
+        <ComparisonMessageBubble role="assistant" side="B" content={comparison.agent_b?.output || '（无输出）'} />
       </div>
     )
   }
@@ -619,17 +622,17 @@ function MultiTurnAnswers({ row, comparison }: { row: EvalResultRow; comparison:
         return (
           <div key={turnIndex} className="rounded-lg border border-border p-3 space-y-3">
             <div className="text-[11px] font-medium text-text-secondary">第 {turnIndex + 1} 轮</div>
-            {user && <ComparisonMessageBubble role="user" text={user} />}
+            {user && <ComparisonMessageBubble role="user" content={user} />}
             <div className="grid grid-cols-2 gap-3">
               <ComparisonMessageBubble
                 role="assistant"
                 side="A"
-                text={aTurn ? (aTurn.assistant || '（无输出）') : '（该侧无此轮）'}
+                content={aTurn ? (aTurn.assistant || '（无输出）') : '（该侧无此轮）'}
               />
               <ComparisonMessageBubble
                 role="assistant"
                 side="B"
-                text={bTurn ? (bTurn.assistant || '（无输出）') : '（该侧无此轮）'}
+                content={bTurn ? (bTurn.assistant || '（无输出）') : '（该侧无此轮）'}
               />
             </div>
           </div>
@@ -801,14 +804,31 @@ export default function EvaluationRunDetailPage() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['eval-run', runId] })
       qc.invalidateQueries({ queryKey: ['eval-results', runId] })
+      qc.invalidateQueries({ queryKey: ['eval-rescore-status', runId] })
     },
   })
+
+  // 补评改为异步后台任务（避免 504），这里轮询任务状态；running 时 2.5s 一次，终态停轮询。
+  const rescoreStatusQuery = useQuery({
+    queryKey: ['eval-rescore-status', runId],
+    queryFn: () => evaluationApi.rescoreStatus(runId!).then(r => r.data),
+    enabled: !!runId,
+    refetchInterval: (q) => (q.state.data?.status === 'running' ? 2500 : false),
+  })
+
+  // 补评跑完后刷新明细与汇总，让新补回的分数立刻可见。
+  const rescoreStatus = rescoreStatusQuery.data?.status
+  useEffect(() => {
+    if (rescoreStatus !== 'completed') return
+    qc.invalidateQueries({ queryKey: ['eval-run', runId] })
+    qc.invalidateQueries({ queryKey: ['eval-results', runId] })
+  }, [rescoreStatus, qc, runId])
 
   const run = runQuery.data
   const langfuseHost = deriveLangfuseHost(run)
 
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
-  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，仅指执行异常）+ 分数低于阈值（阈值 + 指定维度）。
+  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，含执行异常与空回复）+ 分数低于阈值（阈值 + 指定维度）。
   const [abnormalMode, setAbnormalMode] = useState<'all' | 'only' | 'exclude'>('all')
   const [threshold, setThreshold] = useState('')
   const [thresholdDim, setThresholdDim] = useState('')
@@ -852,11 +872,11 @@ export default function EvaluationRunDetailPage() {
   const allItems = resultsQuery.data?.items ?? []
   // 供「低分维度」下拉：折叠逐轮后的评估器维度全集（跨所有样例）。
   const filterDims = collectFilterDims(allItems)
-  // 执行异常状态集合（仅执行异常，不含 fail —— fail 是判分未过而非跑挂）。
+  // 异常样例 = 执行状态异常（跑挂/不可达/超时）或空回复；均不含 fail。
   const thr = threshold.trim() === '' ? null : Number(threshold)
   const thrValid = thr != null && !Number.isNaN(thr)
   const items = allItems.filter((r: EvalResultRow) => {
-    const isAbnormal = ABNORMAL_STATUSES.has(r.status)
+    const isAbnormal = rowIsAbnormal(r)
     if (abnormalMode === 'only' && !isAbnormal) return false
     if (abnormalMode === 'exclude' && isAbnormal) return false
     if (thrValid && !rowBelowThreshold(r, thr, thresholdDim)) return false
@@ -1008,11 +1028,36 @@ export default function EvaluationRunDetailPage() {
         </div>
       )}
       {rescoreStatusQuery.data?.status === 'completed' && (
-        <div className="mb-3 text-[12px] text-positive border border-border bg-fill/5 rounded-md px-3 py-2">
-          已补评：扫描 {rescoreStatusQuery.data.results_scanned ?? 0} 条缺分样例，
-          补回维度 {rescoreStatusQuery.data.dimensions_recovered ?? 0} 个，
-          恢复完整 {rescoreStatusQuery.data.results_completed ?? 0} 条
-          {(rescoreStatusQuery.data.results_still_missing ?? 0) > 0 ? `，仍缺 ${rescoreStatusQuery.data.results_still_missing} 条（上游 judge 仍未出分，可稍后再点）` : ''}
+        <div className="mb-3 text-[12px] border border-border bg-fill/5 rounded-md px-3 py-2 space-y-1">
+          <div
+            className={
+              (rescoreStatusQuery.data.results_still_missing ?? 0) > 0
+                ? 'text-text-secondary'
+                : 'text-positive'
+            }
+          >
+            已补评：扫描 {rescoreStatusQuery.data.results_scanned ?? 0} 条缺分样例，
+            补回维度 {rescoreStatusQuery.data.dimensions_recovered ?? 0} 个，
+            恢复完整 {rescoreStatusQuery.data.results_completed ?? 0} 条
+            {(rescoreStatusQuery.data.results_still_missing ?? 0) > 0 ? `，仍缺 ${rescoreStatusQuery.data.results_still_missing} 条` : ''}
+          </div>
+          {(rescoreStatusQuery.data.results_still_missing ?? 0) > 0 && (
+            <div className="text-text-secondary">
+              {(rescoreStatusQuery.data.failures_config ?? 0) > 0
+                ? '有维度是上游 judge 拒收了本次输入（例如带图样例配了纯文本模型），再点重试仍是同样结果 —— 需先把该评估器换成支持这类输入的 provider / 模型。'
+                : '失败原因多为超时、断流等暂时性问题，可稍后再点重试。'}
+            </div>
+          )}
+          {(rescoreStatusQuery.data.failures?.length ?? 0) > 0 && (
+            <ul className="list-disc pl-4 space-y-0.5 text-text-secondary">
+              {rescoreStatusQuery.data.failures!.map((f, i) => (
+                <li key={i}>
+                  <span className="font-mono">{f.dimension}</span>
+                  {f.kind === 'config' ? '（配置）' : '（暂时性）'}：{f.error}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
       {rescoreStatusQuery.data?.status === 'error' && (
@@ -1262,6 +1307,14 @@ export default function EvaluationRunDetailPage() {
         </section>
       )}
 
+      {/* 实算成本：按本地配价 + 本 run 真实 token 实时计算，与上方 token 均值卡并列。 */}
+      <RunCostSection
+        items={allItems}
+        modelA={(run.agent_config as { model?: string } | null)?.model ?? null}
+        modelB={isComparative ? ((run.agent_config_b as { model?: string } | null)?.model ?? null) : null}
+        comparative={isComparative}
+      />
+
       <RetryStatsCard stats={run.summary_scores?.retry_stats} />
 
       <section>
@@ -1285,7 +1338,7 @@ export default function EvaluationRunDetailPage() {
         <div className="toolbar mb-2">
           <div className="flex items-center gap-1.5 text-[12px]">
             <span className="text-text-tertiary">异常样例</span>
-            <span className="text-[10px] text-text-tertiary">(error / 不可达 / 超时)</span>
+            <span className="text-[10px] text-text-tertiary">(error / 不可达 / 超时 / 空回复)</span>
             <div className="inline-flex rounded-md border border-border overflow-hidden text-[11px]">
               {([
                 ['all', '不筛'],
@@ -1537,7 +1590,12 @@ function ResultRow({ row, langfuseHost, selected, onSelect, comparative }: {
             {row.question || '—'}
           </div>
         </td>
-        <td><RunStatusBadge status={row.status} /></td>
+        <td>
+          <div className="flex flex-col items-start gap-0.5">
+            <RunStatusBadge status={row.status} />
+            {rowHasBlankReply(row) && <BlankReplyTag />}
+          </div>
+        </td>
         <td>
           {verdicts.length > 0 ? (
             <div className="flex flex-col items-start gap-1">
@@ -1588,7 +1646,12 @@ function ResultRow({ row, langfuseHost, selected, onSelect, comparative }: {
           {row.question || '—'}
         </div>
       </td>
-      <td><RunStatusBadge status={row.status} /></td>
+      <td>
+        <div className="flex flex-col items-start gap-0.5">
+          <RunStatusBadge status={row.status} />
+          {rowHasBlankReply(row) && <BlankReplyTag />}
+        </div>
+      </td>
       <td className="tabular-nums">{row.latency_ms != null ? `${row.latency_ms}ms` : '—'}</td>
       <td className="tabular-nums">{row.prompt_tokens ?? '—'}</td>
       <td className="tabular-nums">{row.completion_tokens ?? '—'}</td>
@@ -1684,6 +1747,27 @@ function ResultDetailPanel({ row, langfuseHost, project }: {
           </div>
         </div>
       </div>
+
+      {(row.question_content || row.question) && (
+        <div className="mb-4" data-testid="result-question-content">
+          <div className="field-label">问题</div>
+          <div className="rounded-md border border-border bg-fill/5 px-3 py-2 text-[12px] text-text-primary">
+            <MessageContentView content={row.question_content ?? row.question ?? ''} />
+          </div>
+        </div>
+      )}
+
+      {/* 评估参考依据：首评时冻结的答案关键点，对比 run 亦适用（A/B 同一套标准）。 */}
+      {(row.expected_output_criteria?.length ?? 0) > 0 && (
+        <div className="mb-4">
+          <div className="field-label" title="评估启动时冻结的样例答案关键点；源样例之后被修改也不影响本次评分依据">
+            评估参考依据 ({row.expected_output_criteria!.length})
+          </div>
+          <ul className="list-disc list-inside space-y-0.5 rounded-md border border-border bg-fill/5 px-3 py-2 text-[11px] text-text-secondary">
+            {row.expected_output_criteria!.map((c, i) => <li key={i}>{c}</li>)}
+          </ul>
+        </div>
+      )}
 
       {!row.comparison && scoreEntries.length > 0 && (
         <div className="mb-4">
@@ -1943,6 +2027,16 @@ function RunStatusBadge({ status }: { status: string }) {
   )
 }
 
+// 空回复标记：状态徽章仍是 scored（judge 跑完了），但 agent 没吐出内容。
+// 单挂一枚标记，让「仅异常」筛出来的行能自证为什么算异常。
+function BlankReplyTag() {
+  return (
+    <span className="badge badge-warning" title="agent 跑通了但没有回复内容（多轮为某轮空白）">
+      空回复
+    </span>
+  )
+}
+
 function fmtDuration(start: string | null, end: string | null): string {
   if (!start) return '—'
   const s = new Date(start).getTime()
@@ -2197,6 +2291,13 @@ function ConversationResultView({
         const criteria = exp?.criteria ?? []
         const turnSteps = t.steps ?? []
         const turnToolCalls = t.tool_calls ?? []
+        // 本轮 token：后端按轮单独留存（会话级合计仍在结果行的 token 列）。
+        // 全为 null 表示 agent 没报用量，此时整行不渲染，不显示误导性的 0。
+        const tu = t.usage
+        const hasTurnUsage = !!tu && [
+          tu.prompt_tokens, tu.completion_tokens, tu.total_tokens,
+          tu.cache_creation_tokens, tu.cache_read_tokens,
+        ].some(v => typeof v === 'number')
         return (
           <div key={i} className="space-y-1.5">
             {/* user 气泡（右） */}
@@ -2206,7 +2307,7 @@ function ConversationResultView({
                   用户 · 第 {i + 1} 轮
                 </div>
                 <div className="text-[12px] text-text-primary">
-                  <MarkdownView text={t.user} />
+                  <MessageContentView content={t.user} />
                 </div>
               </div>
               {/* 该轮期望（评判要点 / 期望输出）——按什么标准打分 */}
@@ -2271,6 +2372,15 @@ function ConversationResultView({
                   本轮工具调用：{turnToolCalls.length} 次
                 </div>
               )}
+              {/* 本轮 token 用量：逐轮之和即结果行的会话级合计，便于定位哪轮最贵。 */}
+              {hasTurnUsage && (
+                <div className="max-w-[85%] mt-1 text-[11px] text-text-tertiary tabular-nums">
+                  本轮 token：入 {tu!.prompt_tokens ?? '—'} / 出 {tu!.completion_tokens ?? '—'}
+                  {typeof tu!.total_tokens === 'number' && <> · 合计 {tu!.total_tokens}</>}
+                  {typeof tu!.cache_read_tokens === 'number' && <> · 缓存命中 {tu!.cache_read_tokens}</>}
+                  {typeof tu!.cache_creation_tokens === 'number' && <> · 缓存写入 {tu!.cache_creation_tokens}</>}
+                </div>
+              )}
             </div>
           </div>
         )
@@ -2318,9 +2428,8 @@ function ConversationResultView({
 
 // collapseScoreKey / collapseDimAvg 已抽到 @/lib/dimensionCollapse（与 reportExport 共用）。
 
-// 「执行异常」状态：agent 跑挂 / 不可达 / 超时 / 报错。不含 fail —— fail 是判分
-// 未达合格线（跑通了但没答好），不是执行异常，快筛「异常样例」时不纳入。
-const ABNORMAL_STATUSES = new Set(['error', 'agent_unreachable', 'agent_timeout'])
+// 「异常样例」判定已抽到 @/lib/evalSemantics（与对比页共用）：执行状态异常
+// （error / 不可达 / 超时）或空回复。不含 fail —— fail 是判分未达合格线而非跑挂。
 
 // 收集所有样例出现过的评估器维度（折叠 .turnN / .conversation），供「低分维度」
 // 下拉选择。按名排序，稳定展示。

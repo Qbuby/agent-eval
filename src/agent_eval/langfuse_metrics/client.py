@@ -106,8 +106,14 @@ class LangfuseMetricsClient:
         assert last_exc is not None
         raise last_exc
 
-    async def iter_traces(self, environment: str, from_ts: datetime, to_ts: datetime):
-        """翻页拉取指定环境与时间窗内的 trace，逐个 yield trace dict。
+    async def iter_traces(
+        self, environment: str | None, from_ts: datetime, to_ts: datetime
+    ):
+        """翻页拉取时间窗内的 trace，逐个 yield trace dict。
+
+        ``environment`` 为 None / 空串时**不带该 query param**，即拉取该 project
+        下全部环境的 trace（Langfuse 的 environment 是可选过滤参数，而每条 trace
+        自身必带 ``environment`` 字段，调用方应从 trace 里读真实 env）。
 
         GET ``/api/public/traces``，按 ``meta.totalPages`` 从 page=1 翻到末页。
         响应形如 ``{"data": [...], "meta": {"page","limit","totalItems","totalPages"}}``。
@@ -116,17 +122,16 @@ class LangfuseMetricsClient:
             page = 1
             total_pages = 1  # 拿到首页 meta 后更新
             while page <= total_pages:
-                body = await self._get(
-                    c,
-                    "/api/public/traces",
-                    params={
-                        "environment": environment,
-                        "fromTimestamp": from_ts.isoformat(),
-                        "toTimestamp": to_ts.isoformat(),
-                        "page": page,
-                        "limit": _PAGE_LIMIT,
-                    },
-                )
+                params = {
+                    "fromTimestamp": from_ts.isoformat(),
+                    "toTimestamp": to_ts.isoformat(),
+                    "page": page,
+                    "limit": _PAGE_LIMIT,
+                }
+                # 只在明确指定 env 时才带过滤参数；否则拉全部环境
+                if environment:
+                    params["environment"] = environment
+                body = await self._get(c, "/api/public/traces", params=params)
                 meta = body.get("meta", {})
                 total_pages = meta.get("totalPages", 0) or 0
                 for trace in body.get("data", []):

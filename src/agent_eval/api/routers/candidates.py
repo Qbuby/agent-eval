@@ -9,13 +9,19 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from agent_eval.governance.helpers import log_audit
-from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.api.exporters import (
+    ExportColumn,
+    attach_agent_replies,
+    build_export_response,
+    validate_format,
+)
 from agent_eval.auth.dependencies import (
     ROLE_ADMIN,
     require_internal,
     require_role,
 )
 from agent_eval.db import async_session_factory
+from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import BenchmarkCaseRow, CandidateCaseRow, CategoryRow
 from agent_eval.data.benchmark_import import (
     auto_detect_field_mapping,
@@ -23,7 +29,13 @@ from agent_eval.data.benchmark_import import (
     iter_upload_rows,
     parse_upload_file,
     resolve_question_answer,
+    row_excel_index,
 )
+from agent_eval.data.content_blocks import (
+    ContentValidationError,
+    split_question_content,
+)
+from agent_eval.data.xlsx_images import row_images_for_upload
 
 # Router-level login gate: every endpoint requires an authenticated user.
 # Preserves the auth.enabled bypass; destructive candidate deletion requires admin.
@@ -34,10 +46,13 @@ router = APIRouter(
 )
 
 
+# question 接受纯文本字符串（既有写法）或带附件的 canonical content blocks
+# 数组（带图样例）。落库由 split_question_content 拆成 question（纯文本投影）
+# + question_content（blocks），见 data/content_blocks.py。
 class CandidateCreate(BaseModel):
     project_id: str | None = None
     dataset_name: str | None = None
-    question: str
+    question: str | list[dict[str, Any]]
     answer: str | None = None
     key_points: list[str] | None = None
     negative_points: list[str] | None = None
@@ -49,7 +64,7 @@ class CandidateCreate(BaseModel):
 class CandidateBatchItem(BaseModel):
     # 单条备选样例（批量入库用）。字段与 CandidateCreate 同构，但 dataset_name
     # 统一在批量请求顶层给定，逐条不再重复。
-    question: str
+    question: str | list[dict[str, Any]]
     answer: str | None = None
     key_points: list[str] | None = None
     negative_points: list[str] | None = None
@@ -68,7 +83,7 @@ class CandidateBatchCreate(BaseModel):
 
 
 class CandidateUpdate(BaseModel):
-    question: str | None = None
+    question: str | list[dict[str, Any]] | None = None
     answer: str | None = None
     key_points: list[str] | None = None
     negative_points: list[str] | None = None
@@ -178,11 +193,17 @@ async def export_candidates(
         result = await session.execute(stmt)
         cases = result.scalars().all()
 
-    rows = [_candidate_to_dict(c) for c in cases]
+        rows = [_candidate_to_dict(c) for c in cases]
+        replies = await Repository(session).get_current_agent_replies(
+            "candidate", [r["id"] for r in rows],
+        )
+        attach_agent_replies(rows, replies)
     columns = [
         ExportColumn("id", "ID"),
         ExportColumn("question", "问题"),
         ExportColumn("answer", "答案"),
+        ExportColumn("agent_reply", "Agent 回复"),
+        ExportColumn("agent_reply_version", "Agent 回复版本"),
         ExportColumn("key_points", "关键点"),
         ExportColumn("negative_points", "负向点"),
         ExportColumn("tags", "标签"),
@@ -202,13 +223,21 @@ async def create_candidate(req: CandidateCreate):
     has_answer = bool(req.answer and req.answer.strip())
     status = "ready" if has_answer else "pending"
 
+    try:
+        question_text, question_content = split_question_content(req.question)
+    except ContentValidationError as e:
+        raise HTTPException(status_code=400, detail=f"问题内容非法：{e}") from e
+    if not question_text and not question_content:
+        raise HTTPException(status_code=400, detail="问题不能为空")
+
     async with async_session_factory() as session:
         row = CandidateCaseRow(
             project_id=req.project_id,
             dataset_name=req.dataset_name,
             category=req.category,
             source=req.source,
-            question=req.question,
+            question=question_text,
+            question_content=question_content,
             answer=req.answer,
             key_points=req.key_points,
             negative_points=req.negative_points,
@@ -229,9 +258,17 @@ async def create_candidates_batch(req: CandidateBatchCreate):
     无→pending），一次事务提交。返回 {added, ids}。question 为空的条目跳过。
     """
     rows: list[CandidateCaseRow] = []
-    for item in req.cases:
-        question = (item.question or "").strip()
-        if not question:
+    for idx, item in enumerate(req.cases):
+        try:
+            question, question_content = split_question_content(item.question)
+        except ContentValidationError as e:
+            raise HTTPException(
+                status_code=400, detail=f"第 {idx + 1} 条问题内容非法：{e}",
+            ) from e
+        # 带附件样例的纯文本投影可能自带占位标记（如 "[图片]"），strip 只作用于
+        # 文本投影；question_content 非空即视为有内容，不因文本为空而跳过。
+        question = question.strip()
+        if not question and not question_content:
             continue
         has_answer = bool(item.answer and item.answer.strip())
         rows.append(CandidateCaseRow(
@@ -239,6 +276,7 @@ async def create_candidates_batch(req: CandidateBatchCreate):
             category=item.category,
             source=item.source,
             question=question,
+            question_content=question_content,
             answer=item.answer,
             key_points=item.key_points,
             negative_points=item.negative_points,
@@ -272,7 +310,10 @@ async def update_candidate(case_id: str, req: CandidateUpdate):
             raise HTTPException(status_code=404, detail="Candidate not found")
 
         if req.question is not None:
-            row.question = req.question
+            try:
+                row.question, row.question_content = split_question_content(req.question)
+            except ContentValidationError as e:
+                raise HTTPException(status_code=400, detail=f"问题内容非法：{e}") from e
         if req.answer is not None:
             row.answer = req.answer
         if req.key_points is not None:
@@ -380,6 +421,8 @@ async def promote_to_benchmark(req: PromoteRequest):
                 project_id=req.project_id,
                 category_id=category_id,
                 question=candidate.question,
+                # 带图样例 promote 到基准测试集时附件不能丢。
+                question_content=candidate.question_content,
                 reference_answer=candidate.answer,
                 key_points=candidate.key_points or [],
                 negative_points=candidate.negative_points or [],
@@ -409,6 +452,9 @@ def _candidate_to_dict(c: CandidateCaseRow) -> dict[str, Any]:
         "category": c.category,
         "source": c.source,
         "question": c.question,
+        # 带附件时前端拿 question_content 渲染缩略图并回填编辑器；纯文本样例为
+        # None，前端只用 question。
+        "question_content": c.question_content,
         "answer": c.answer,
         "key_points": c.key_points,
         "negative_points": c.negative_points,
@@ -615,11 +661,17 @@ async def import_candidate_file(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # xlsx 内嵌图片：drawing 锚点只记行号，故按 Excel 行号取图，再靠行迭代器
+    # 注入的保留键贴回对应样例（见 benchmark_import.ROW_INDEX_KEY）。非 xlsx
+    # 或无图时是空 dict，整条链路退化为纯文本导入。
+    row_images = row_images_for_upload(content, filename)
+
     BATCH_SIZE = 500
     ready = 0
     pending = 0
     skipped = 0
     duplicates = 0
+    with_images = 0
     pending_batch: list[Any] = []
 
     async with async_session_factory() as session:
@@ -653,6 +705,22 @@ async def import_candidate_file(
                 skipped += 1
                 continue
 
+            # 本行的内嵌图片贴到 question 前面之后，question 落库为纯文本投影
+            # （图片渲染成占位符），blocks 落 question_content。去重必须用投影
+            # 后的文本，否则重复上传时库里的带占位文本对不上原始文本，会漏判。
+            images = row_images.get(row_excel_index(row_data) or -1)
+            question_content = None
+            if images:
+                try:
+                    question, question_content = split_question_content(
+                        [{"type": "text", "text": question}, *images]
+                    )
+                except ContentValidationError:
+                    # 读图是增强，不该让整行导入失败；退化为纯文本样例。
+                    question_content = None
+                else:
+                    with_images += 1
+
             if question in seen:
                 duplicates += 1
                 continue
@@ -673,6 +741,7 @@ async def import_candidate_file(
                 category=row_category,
                 source="file_imported",
                 question=question,
+                question_content=question_content,
                 answer=answer or None,
                 key_points=key_points or None,
                 negative_points=negative_points or None,
@@ -714,5 +783,7 @@ async def import_candidate_file(
         "pending_in_staging": pending,
         "skipped": skipped,
         "duplicates": duplicates,
+        # 带内嵌图片的样例数；非 xlsx / 无图恒为 0，前端据此提示「含 N 张图」。
+        "with_images": with_images,
         "field_mapping": used_mapping or None,
     }

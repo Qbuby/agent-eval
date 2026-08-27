@@ -152,14 +152,16 @@ async function main() {
       && hasHeader(/^Δ 总量（B-A）$/)
       && hasHeader(/^Δ 均值（B-A）$/)
       && hasHeader(/^覆盖 n（A\/B）$/),
-    comparativeRescoreHidden: !bodyText.includes('补评缺分维度'),
+    // #96 起补评已支持对比模式（后端 _rescore_comparison_result 重打失败 scoped
+    // verdict，前端按钮去掉 !isComparative 门禁），故对比 run 应当出现该入口。
+    comparativeRescoreVisible: bodyText.includes('补评缺分维度'),
   }
   assert(result.detail.headingVisible, '详情页缺少按评估器裁决区')
   assert(missingEvaluatorNames.length === 0, `详情页缺少 evaluator：${missingEvaluatorNames.join(', ')}`)
   assert(result.detail.resourceHeadingVisible, '详情页缺少完整 A/B 资源成本区')
   assert(missingMetrics.length === 0, `详情页缺少资源指标：${missingMetrics.join(', ')}`)
   assert(result.detail.hasTotalAndMeanColumns, '详情页缺少总量/均值/差值/覆盖数列')
-  assert(result.detail.comparativeRescoreHidden, 'comparative run 错误显示了补评缺分维度入口')
+  assert(result.detail.comparativeRescoreVisible, 'comparative run 缺少补评缺分维度入口')
 
   // 三个新增图表：胜负占比条（自绘 flex 堆叠）、各维度 A/B 均分（recharts）、成本相对差异（recharts）。
   // 断言实际渲染出 DOM/SVG 节点，而非仅文本命中——图表挂了但标题在，文本检查会假绿。

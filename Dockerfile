@@ -1,33 +1,43 @@
 FROM python:3.11-slim AS base
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG INSTALL_KUBERNETES_RUNNER=0
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # 默认走清华 PyPI 镜像，避开构建期解析/连到 pypi.org 的间歇性 DNS 失败
-    # （"Temporary failure in name resolution"）。可在 build 时用
-    # --build-arg PIP_INDEX_URL=https://pypi.org/simple 覆盖回官方源或私服。
+    # 默认使用官方 PyPI 源；可在 build 时通过 PIP_INDEX_URL 覆盖为私服。
     PIP_INDEX_URL=${PIP_INDEX_URL} \
-    PIP_EXTRA_INDEX_URL=https://pypi.org/simple \
     # 单次连接超时 + 多次重试，吸收瞬时网络/DNS 抖动而非直接失败。
     PIP_DEFAULT_TIMEOUT=60 \
     PIP_RETRIES=5
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
         build-essential \
         curl \
         postgresql-client \
+    && if [ "$INSTALL_KUBERNETES_RUNNER" = "1" ]; then \
+        apt-get install -y --no-install-recommends clamav git; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY config ./config
 
 RUN pip install --upgrade pip && \
-    pip install -e .
+    if [ "$INSTALL_KUBERNETES_RUNNER" = "1" ]; then \
+        pip install -e '.[kubernetes-runner]'; \
+    else \
+        pip install -e .; \
+    fi && \
+    pip check && \
+    pip uninstall -y pip setuptools wheel
 
 COPY alembic.ini ./
 COPY alembic ./alembic
@@ -39,9 +49,14 @@ RUN find /app/alembic -type d -name __pycache__ -prune -exec rm -rf {} + && \
 # Windows host (see scripts/docker-entrypoint.sh for the full rationale).
 COPY scripts/docker-entrypoint.sh /app/scripts/docker-entrypoint.sh
 COPY scripts/migrate-and-restore.sh /app/scripts/migrate-and-restore.sh
+COPY scripts/sync_evaluator_reference_criteria.py /app/scripts/sync_evaluator_reference_criteria.py
+COPY deploy/evaluator-migrations /app/deploy/evaluator-migrations
 RUN sed -i 's/\r$//' /app/scripts/docker-entrypoint.sh && \
     sed -i 's/\r$//' /app/scripts/migrate-and-restore.sh && \
-    chmod +x /app/scripts/docker-entrypoint.sh /app/scripts/migrate-and-restore.sh
+    sed -i 's/\r$//' /app/scripts/sync_evaluator_reference_criteria.py && \
+    chmod +x /app/scripts/docker-entrypoint.sh \
+        /app/scripts/migrate-and-restore.sh \
+        /app/scripts/sync_evaluator_reference_criteria.py
 
 # NOTE: the production data seed (deploy/seed/seed.sql) is deliberately NOT
 # baked into the image — it carries password hashes, Fernet-encrypted provider

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime
 
@@ -153,6 +152,45 @@ async def _candidate_count(dataset_name: str) -> int:
     return counts.get(dataset_name, 0)
 
 
+async def _list_local_datasets(
+    name_filter: str | None, dataset_type: str | None
+) -> list[DatasetResponse]:
+    """Langfuse 冷启动超时/不可用时，用本地 metadata 快速返回已登记数据集。
+
+    老数据集若从未产生本地 metadata 行，在上游恢复前暂时不可见；已创建、分类或
+    软删除过的数据集均有本地行。这里宁可返回可用的降级列表，也不让页面卡 5–10 秒
+    后落入 500。conversation 的远端样例数无法从本地推导，降级时显示 0。
+    """
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(DatasetMetadataRow).where(DatasetMetadataRow.status == "active")
+        )
+        rows = list(result.scalars().all())
+
+    if name_filter:
+        rows = [row for row in rows if name_filter in row.dataset_name]
+    if dataset_type:
+        rows = [row for row in rows if row.dataset_type == dataset_type]
+
+    candidate_names = [
+        row.dataset_name for row in rows if row.dataset_type == DEFAULT_DATASET_TYPE
+    ]
+    counts = await _candidate_counts(candidate_names)
+    return [
+        DatasetResponse(
+            id=str(row.id),
+            name=row.dataset_name,
+            description="",
+            example_count=counts.get(row.dataset_name, 0),
+            created_at=row.created_at,
+            metadata={},
+            source_project=row.source_project,
+            dataset_type=row.dataset_type,
+        )
+        for row in rows
+    ]
+
+
 async def _set_source_project(dataset_name: str, source_project: str | None) -> None:
     if source_project is None:
         return
@@ -196,7 +234,12 @@ async def list_datasets(
     ),
     mgr: DatasetManager = Depends(get_manager),
 ):
-    datasets = await mgr.list_datasets(filter)
+    try:
+        datasets = await mgr.list_datasets(filter)
+    except Exception as e:
+        logger.warning("Langfuse 数据集列表不可用，回退本地 metadata：%s", e)
+        return await _list_local_datasets(filter, type)
+
     # 软删除：Langfuse 删不掉整库，被删数据集在本地标 status=deleted，这里过滤掉。
     deleted = await _get_deleted_names([ds.name for ds in datasets])
     datasets = [ds for ds in datasets if ds.name not in deleted]
@@ -204,34 +247,25 @@ async def list_datasets(
     counts = await _candidate_counts(names)
     sources = await _get_source_projects(names)
     types = await _get_dataset_types(names)
-    items = [
-        DatasetResponse(
+    items = []
+    for ds in datasets:
+        dataset_type = types.get(ds.name, DEFAULT_DATASET_TYPE)
+        items.append(DatasetResponse(
             id=ds.id, name=ds.name, description=ds.description,
-            example_count=counts.get(ds.name, 0), created_at=ds.created_at,
-            metadata=ds.metadata, source_project=sources.get(ds.name),
-            dataset_type=types.get(ds.name, DEFAULT_DATASET_TYPE),
-        )
-        for ds in datasets
-    ]
+            # candidate 的权威计数在本地表；conversation 只复用 provider 已缓存的
+            # 计数，绝不为了列表逐库拉取全部 items。进入详情后分页请求会更新缓存。
+            example_count=(
+                counts.get(ds.name, 0)
+                if dataset_type == DEFAULT_DATASET_TYPE
+                else ds.example_count
+            ),
+            created_at=ds.created_at, metadata=ds.metadata,
+            source_project=sources.get(ds.name), dataset_type=dataset_type,
+        ))
+
     # type 过滤在本地表权威映射之上做（老数据集无行 → DEFAULT_DATASET_TYPE）。
     if type:
-        items = [d for d in items if d.dataset_type == type]
-
-    # conversation 样例存在 provider（Langfuse/LangSmith dataset items），不落
-    # candidate_cases 本地表，故 _candidate_counts 对其恒为 0。这里对 conversation
-    # 数据集改用 provider 真实 item 计数。逐个 load 有开销，但 conversation 列表
-    # 通常远少于 candidate，且仅在按 conversation 过滤或混合列表里命中。
-    conv_items = [d for d in items if d.dataset_type == "conversation"]
-    if conv_items:
-        async def _real_count(ds_name: str) -> int:
-            try:
-                cases = await mgr.load_cases(ds_name)
-                return len(cases)
-            except Exception:
-                return 0
-        real_counts = await asyncio.gather(*[_real_count(d.name) for d in conv_items])
-        for d, c in zip(conv_items, real_counts):
-            d.example_count = c
+        items = [item for item in items if item.dataset_type == type]
     return items
 
 

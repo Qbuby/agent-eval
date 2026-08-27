@@ -6,3 +6,4 @@ playwright-report/
 
 # Verify script artifacts (screenshots only; verify-*.mjs scripts are tracked)
 *.png
+!omniagent-two-tenant/evidence/*.png

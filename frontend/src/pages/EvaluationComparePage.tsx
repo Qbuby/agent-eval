@@ -6,12 +6,14 @@ import {
 } from 'recharts'
 import { evaluationApi } from '@/services'
 import { Drawer, ExportMenu } from '@/components/ui'
+import { CrossRunCostSection, type CrossRunCostEntry } from '@/components/CostPanel'
 import { directionMark, getScoreMeta, isPassing, tone } from '@/lib/scoreSemantics'
 import { formatApiError, toToastMessage } from '@/lib/errors'
 import { exportCompareReport } from '@/lib/reportExport'
 import {
   deriveFacts, deriveAcceptance, deriveCostScored, aggregateProjectedRows,
-  acceptancePassRateText, runDecisionLabel, type EvalFacts, type EvalAcceptance,
+  acceptancePassRateText, runDecisionLabel, rowIsAbnormal,
+  type EvalFacts, type EvalAcceptance,
 } from '@/lib/evalSemantics'
 import type { EvalResultRow, EvalRunDetail, EvalResultsPage } from '@/types'
 
@@ -26,6 +28,21 @@ const BAR_COLORS = [
   'rgb(var(--positive) / 0.7)',
   'rgb(var(--info) / 0.7)',
 ]
+// 同序的「裸」变量版本：CostPanel 要按计费档叠 alpha，只能吃未包 rgb() 的变量，
+// 传上面已包好的值会拼出 rgb(rgb(...) / a) 这种非法 CSS 并静默失效。
+// 同一索引 = 同一个运行，与概览圆点、图表保持同色。
+// 注意第 7/8 位：BAR_COLORS 靠 alpha 0.7 与第 2/4 位区分，而成本区的 alpha 已被
+// 三个计费档占用，无法再叠——故这两位在成本区与第 2/4 位同色。跨运行成本区因此
+// 只对前 6 个运行保证唯一色，超出的运行只出卡片、不进对比条（见挂载处）。
+const RUN_RGB_VARS = [
+  'var(--accent)',
+  'var(--positive)',
+  'var(--warning)',
+  'var(--info)',
+  'var(--negative)',
+  'var(--accent-hover)',
+]
+const MAX_COLORED_RUNS = RUN_RGB_VARS.length
 const COST_METRIC_DEFS: Array<{
   key: string
   label: string
@@ -140,6 +157,31 @@ export default function EvaluationComparePage() {
   const hasMultiTurnDims = dimTrendChart.series.length > 0
   const costChart = useMemo(() => buildCostChart(runs, statsByRun), [runs, statsByRun])
   const passRateChart = useMemo(() => buildPassRateChart(runs, statsByRun), [runs, statsByRun])
+
+  // 实算成本的入参：钱要按真实 usage 逐样例累加，不能拿 summary 的均值反推，
+  // 所以这里走明细行（子集模式只取勾选的样例，与上面的统计口径一致）。
+  const costEntries = useMemo<CrossRunCostEntry[]>(() =>
+    runs.slice(0, MAX_COLORED_RUNS).map((run, i) => {
+      let items: EvalResultRow[]
+      if (usingSubset) {
+        items = []
+        for (const a of aligned) {
+          if (!selectedKeys.has(a.key)) continue
+          const row = a.byRun[run.id]
+          if (row) items.push(row)
+        }
+      } else {
+        items = resultsByRun[run.id]?.items ?? []
+      }
+      return {
+        id: run.id,
+        label: runLabel(run),
+        model: (run.agent_config as { model?: string }).model ?? null,
+        items,
+        rgbVar: RUN_RGB_VARS[i],
+      }
+    }),
+  [runs, resultsByRun, aligned, selectedKeys, usingSubset])
 
   if (ids.length === 0) {
     return (
@@ -399,6 +441,12 @@ export default function EvaluationComparePage() {
               )}
             </section>
           )}
+
+          {/* 钱在前、量在后：下面那张图是 token/时延口径，回答的是「为什么贵」。 */}
+          <CrossRunCostSection
+            entries={costEntries}
+            subsetNote={usingSubset ? `· 子集（${selectedKeys.size} 个样例）` : undefined}
+          />
 
           {costChart.data.length > 0 && (
             <section className="card p-4 mb-5">
@@ -756,7 +804,7 @@ function SampleAlignmentSection({
   // 交叉对齐：仅保留所有 run 都运行过的样例（每个 run 都有该样例的结果行），
   // 排除「某次未运行」的样例，让对比只落在可比的公共子集上。
   const [crossOnly, setCrossOnly] = useState(false)
-  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，任一 run 执行异常）+ 分数低于阈值（阈值 + 维度）。
+  // 快速筛选：异常样例三态（不筛 / 仅异常 / 排除异常，任一 run 执行异常或空回复）+ 分数低于阈值（阈值 + 维度）。
   const [abnormalMode, setAbnormalMode] = useState<'all' | 'only' | 'exclude'>('all')
   const [threshold, setThreshold] = useState('')
   const [thresholdDim, setThresholdDim] = useState('')
@@ -869,7 +917,7 @@ function SampleAlignmentSection({
         </label>
         <div className="flex items-center gap-1.5 text-[12px]">
           <span className="text-text-tertiary">异常样例</span>
-          <span className="text-[10px] text-text-tertiary">(任一 run error/不可达/超时)</span>
+          <span className="text-[10px] text-text-tertiary">(任一 run error/不可达/超时/空回复)</span>
           <div className="inline-flex rounded-md border border-border overflow-hidden text-[11px]">
             {([
               ['all', '不筛'],
@@ -1072,20 +1120,19 @@ function sampleHasDifference(a: AlignedSample, runs: EvalRunDetail[]): boolean {
   return false
 }
 
-// 「执行异常」状态：agent 跑挂 / 不可达 / 超时 / 报错。不含 fail —— fail 是判分
-// 未达合格线（跑通了但没答好），不是执行异常。
-const ABNORMAL_STATUSES = new Set(['error', 'agent_unreachable', 'agent_timeout'])
+// 「异常样例」判定已抽到 @/lib/evalSemantics（与单次详情页共用）：执行状态异常
+// （error / 不可达 / 超时）或空回复。不含 fail —— fail 是判分未达合格线而非跑挂。
 
 // 折叠逐轮 score key（`<base>.turn<N>` / `<base>.conversation`）到评估器级 base。
 function collapseCompareDim(key: string): string {
   return parseDimKey(key).base
 }
 
-// 对齐样例是否「异常」：任一 run 上该样例执行异常即命中。
+// 对齐样例是否「异常」：任一 run 上该样例执行异常或空回复即命中。
 function alignedHasAbnormal(a: AlignedSample, runs: EvalRunDetail[]): boolean {
   return runs.some(r => {
     const row = a.byRun[r.id]
-    return row != null && ABNORMAL_STATUSES.has(row.status)
+    return row != null && rowIsAbnormal(row)
   })
 }
 
@@ -1170,6 +1217,18 @@ function SampleCompareDetail({ aligned, runs }: {
                         )
                       })}
                     </div>
+                  </div>
+                )}
+
+                {/* 评估参考依据：与单次详情页同源，冻结于首评时点。 */}
+                {(row.expected_output_criteria?.length ?? 0) > 0 && (
+                  <div className="mb-2">
+                    <div className="field-label" title="评估启动时冻结的样例答案关键点；源样例之后被修改也不影响本次评分依据">
+                      评估参考依据 ({row.expected_output_criteria!.length})
+                    </div>
+                    <ul className="list-disc list-inside space-y-0.5 rounded-md border border-border bg-fill/5 px-3 py-2 text-[11px] text-text-secondary">
+                      {row.expected_output_criteria!.map((c, i) => <li key={i}>{c}</li>)}
+                    </ul>
                   </div>
                 )}
 

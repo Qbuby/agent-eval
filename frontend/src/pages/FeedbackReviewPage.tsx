@@ -4,6 +4,8 @@ import { Button, Drawer, SkeletonRow, ErrorCard } from '@/components/ui'
 import { formatApiError } from '@/lib/errors'
 import { feedbackReviewApi } from '@/services/feedbackReview'
 import MarkdownView from '@/components/MarkdownView'
+import MessageContentView from '@/components/MessageContentView'
+import { contentToText, hasAttachments } from '@/lib/contentBlocks'
 import type {
   FeedbackBatchSummary,
   FeedbackSampleRow,
@@ -295,9 +297,14 @@ function BatchSamplesDrawer({
                     </td>
                     <td
                       className="text-text-primary truncate max-w-[360px]"
-                      title={s.question}
+                      title={contentToText(s.question_content ?? s.question)}
                     >
-                      {s.question}
+                      {hasAttachments(s.question_content) && (
+                        <span className="mr-1" title="含图片附件">
+                          🖼️
+                        </span>
+                      )}
+                      {contentToText(s.question_content ?? s.question)}
                     </td>
                     <td className="text-right font-mono tabular-nums text-text-secondary">
                       {s.feedback_count}
@@ -382,7 +389,9 @@ function SampleFeedbackDrawer({
           <div>
             <div className="field-label">问题</div>
             <div className="bg-fill/5 rounded-md p-3">
-              <MarkdownView text={data.question} />
+              {/* 带附件样例走 question_content（图片缩略图 + 文本），纯文本样例
+                  仍是原来的 Markdown 路径。 */}
+              <MessageContentView content={data.question_content ?? data.question ?? ''} />
             </div>
           </div>
           {data.answer != null && (

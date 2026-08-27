@@ -4,10 +4,15 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from agent_eval.api.dependencies import get_manager
-from agent_eval.api.exporters import ExportColumn, build_export_response, validate_format
+from agent_eval.api.exporters import (
+    ExportColumn,
+    attach_agent_replies,
+    build_export_response,
+    validate_format,
+)
 from agent_eval.api.schemas import AddCasesRequest, BatchDeleteRequest, TestCaseInput
 from agent_eval.auth.dependencies import (
     ROLE_ADMIN,
@@ -18,9 +23,12 @@ from agent_eval.data.benchmark_import import (
     iter_upload_rows,
     parse_conversations,
 )
+from agent_eval.data.content_blocks import content_to_text
+from agent_eval.data.xlsx_images import row_images_for_upload
 from agent_eval.data.dataset_manager import DatasetManager
 from agent_eval.data.schemas import validate_and_parse
 from agent_eval.db import async_session_factory
+from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import ConversationCategoryRow
 from agent_eval.governance.helpers import log_audit
 from agent_eval.models.test_case import TestCase, TurnExpectation
@@ -43,29 +51,31 @@ async def list_cases(
 ):
     as_of_dt = datetime.fromisoformat(as_of) if as_of else None
     try:
-        cases = await mgr.load_cases(
-            name, as_of=as_of_dt, splits=[split] if split else None,
-            tags=tag,
-        )
+        # 无客户端筛选时直接使用 Langfuse dataset_items 真分页；翻页只传输当前页。
+        # search/category/tag/split 需要检查样例内容，才回退到 provider 的共享全量快照。
+        if not any((search, category, tag, split)):
+            page_items, total = await mgr.load_cases_page(
+                name, page=page, page_size=page_size, as_of=as_of_dt
+            )
+        else:
+            cases = await mgr.load_cases(
+                name, as_of=as_of_dt, splits=[split] if split else None,
+                tags=tag,
+            )
+            if search:
+                search_lower = search.lower()
+                cases = [
+                    c for c in cases
+                    if search_lower in c.name.lower()
+                    or search_lower in (c.description or "").lower()
+                ]
+            if category:
+                cases = [c for c in cases if (c.category or "") == category]
+            total = len(cases)
+            start = (page - 1) * page_size
+            page_items = cases[start:start + page_size]
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LangSmith API error: {e}") from e
-
-    if search:
-        search_lower = search.lower()
-        cases = [
-            c for c in cases
-            if search_lower in c.name.lower() or search_lower in (c.description or "").lower()
-        ]
-
-    # 受管类别过滤：与 search/tag 同构（全量 load + 内存 filter）。category 存在
-    # case.category（→ Langfuse item metadata["category"]，见 converter）。
-    if category:
-        cases = [c for c in cases if (c.category or "") == category]
-
-    total = len(cases)
-    start = (page - 1) * page_size
-    end = start + page_size
-    page_items = cases[start:end]
+        raise HTTPException(status_code=502, detail=f"Langfuse API error: {e}") from e
 
     return {
         "items": [c.model_dump(mode="json", exclude_none=True) for c in page_items],
@@ -173,9 +183,13 @@ async def _parse_conversation_cases(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # xlsx 内嵌图片：锚点只记行号，故按 Excel 行号取图，由 parse_conversations
+    # 按布局挂到对应的 user 轮（见其 row_images 说明）。非 xlsx / 无图时是空
+    # dict，整条链路退化为纯文本导入。
     return _cases_from_conversation_rows(
         row_iter, messages_column=messages_column, goal_column=goal_column,
         category=category, column_map=column_map, source="file_imported",
+        row_images=row_images_for_upload(content, filename),
     )
 
 
@@ -187,25 +201,32 @@ def _cases_from_conversation_rows(
     category: str | None = None,
     column_map: dict[str, str] | None = None,
     source: str = "file_imported",
+    row_images: dict[int, list[dict]] | None = None,
 ) -> tuple[list[TestCase], int]:
     """行迭代器 → (对话 TestCase 列表, 跳过行数)。
 
     与文件格式解耦——上传文件走 iter_upload_rows 产出行，飞书多维表格走
     records_to_rows 产出同形行（{列名: 值} 的 dict），两者共用此下游：同一套
     parse_conversations 三布局识别 + column_map + TestCase 构造。
+
+    row_images（可选）：xlsx 内嵌图片，Excel 行号 → 图片块。只有上传 xlsx 才有；
+    飞书来源的行没有行号，传 None 即纯文本路径。
     """
     try:
         conversations, skipped = parse_conversations(
             rows, messages_column=messages_column, goal_column=goal_column,
-            column_map=column_map,
+            column_map=column_map, row_images=row_images,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"解析失败：{e}") from e
 
     cases: list[TestCase] = []
     for i, conv in enumerate(conversations):
+        # content 可能是 content blocks 数组（带图样例），直接切片会把块对象
+        # 拼进名字（base64 图更会把整段编码塞进去）；走纯文本投影拿可读首句。
         first = next(
-            (m["content"] for m in conv.input_messages if m.get("content")), ""
+            (content_to_text(m["content"]) for m in conv.input_messages
+             if m.get("content")), ""
         )
         cases.append(TestCase(
             dataset_version="",  # 由调用方（import 端点）按 name 设定
@@ -332,7 +353,11 @@ async def preview_conversations(
     samples = []
     for c in cases[:5]:
         user_msgs = [m for m in c.input_messages if m.get("role") == "user"]
-        first_user = next((m["content"] for m in user_msgs if m.get("content")), "")
+        # 带图消息的 content 是 content blocks 数组，直接切片会漏出块对象；
+        # 走纯文本投影（附件渲染成 [图片] 占位）拿到可读首句。
+        first_user = next(
+            (content_to_text(m["content"]) for m in user_msgs if m.get("content")), ""
+        )
         samples.append({
             "name": c.name,
             "turns": len(user_msgs),
@@ -604,6 +629,14 @@ async def export_conversations(
             "source": c.source,
         })
 
+    # 多轮对话样例的 agent 回复以 case_ref = Langfuse item id 存储（= c.id）。
+    # content 是 build_transcript(turns) 的整段文本，直接落进「Agent 回复」列。
+    async with async_session_factory() as session:
+        replies = await Repository(session).get_current_agent_replies(
+            "conversation", [r["id"] for r in rows],
+        )
+    attach_agent_replies(rows, replies)
+
     columns = [
         ExportColumn("id", "ID"),
         ExportColumn("name", "名称"),
@@ -612,6 +645,8 @@ async def export_conversations(
         ExportColumn("conversation_goal", "会话目标"),
         ExportColumn("input_messages", "对话消息"),
         ExportColumn("turn_expectations", "逐轮期望"),
+        ExportColumn("agent_reply", "Agent 回复"),
+        ExportColumn("agent_reply_version", "Agent 回复版本"),
         ExportColumn("source", "来源"),
     ]
     return build_export_response(

@@ -81,6 +81,43 @@ class AuthSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AUTH_", env_file=_ENV_FILE, extra="ignore")
 
 
+class OmniAgentSettings(BaseSettings):
+    """系统智能体服务端连接配置。
+
+    浏览器只访问 agent_eval；backend 通过此内部地址代理 OmniAgent SSE。生产同 Pod
+    默认走 loopback，本地 Compose 显式覆盖为服务 DNS，避免与被测智能体配置混用。
+    """
+
+    internal_url: str = "http://127.0.0.1:8090/api/agent/langgraph"
+    timeout: float = 300.0
+    execution_enabled: bool = False
+    execution_secret_key: str = ""
+    execution_token_ttl_seconds: int = 300
+    execution_tenant_allowlist: str = ""
+    product_plane_enabled: bool = False
+    worker_enabled: bool = False
+    runner: str = "disabled"  # disabled | local_dev | kubernetes
+    kubernetes_runner_confirmed: bool = False
+    kubernetes_namespace: str = "omniagent-sandbox-staging"
+    kubernetes_template: str = "omniagent-execution-v1"
+    kubernetes_ready_timeout_seconds: int = 180
+    kubernetes_claim_ttl_seconds: int = 900
+    artifact_storage: str = "filesystem"  # filesystem | minio
+    artifact_root: str = ".data/omniagent-artifacts"
+    artifact_scanner: str = "disabled"  # disabled | development | clamav
+    clamav_command: str = "clamscan"
+    minio_endpoint: str = ""
+    minio_access_key: str = ""
+    minio_secret_key: str = ""
+    minio_bucket: str = "omniagent-artifacts"
+    minio_secure: bool = True
+    worker_poll_seconds: float = 1.0
+
+    model_config = SettingsConfigDict(
+        env_prefix="OMNIAGENT_", env_file=_ENV_FILE, extra="ignore"
+    )
+
+
 class SecuritySettings(BaseSettings):
     """Crypto material that is *not* tied to user-session JWTs.
 
@@ -180,6 +217,7 @@ class Settings(BaseSettings):
     langsmith: LangSmithSettings = LangSmithSettings()
     langfuse: LangfuseSettings = LangfuseSettings()
     auth: AuthSettings = AuthSettings()
+    omniagent: OmniAgentSettings = OmniAgentSettings()
     security: SecuritySettings = SecuritySettings()
     routing: RoutingSettings = RoutingSettings()
     governance: GovernanceSettings = GovernanceSettings()

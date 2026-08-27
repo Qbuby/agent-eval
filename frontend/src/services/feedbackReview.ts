@@ -1,4 +1,5 @@
 import api from './client'
+import type { ContentBlock } from '@/lib/contentBlocks'
 
 // ---- 类型契约 ----
 // 后端 routers/feedback_review.py 的响应字段名与本 UI 的历史命名不一致
@@ -40,7 +41,10 @@ export interface SampleFeedbackDetail {
 export interface FeedbackSampleRow {
   id: string
   row_index: number
+  // question 恒为纯文本投影（附件渲染成 [图片] 占位）；带附件样例另有
+  // question_content 存 canonical blocks，展示以它为准。
   question: string
+  question_content?: ContentBlock[] | null
   answer: string | null
   feedback_count: number
   avg_overall: number | null
@@ -64,6 +68,8 @@ export interface FeedbackSampleDetail {
   tenant_name: string
   row_index: number
   question: string
+  // 同 FeedbackSampleRow：question 是纯文本投影，带附件样例另有 blocks。
+  question_content?: ContentBlock[] | null
   answer: string | null
   extra: Record<string, unknown>
   feedbacks: SampleFeedbackDetail[]
@@ -111,6 +117,7 @@ interface RawSampleRow {
   id: string
   row_index: number
   question: string
+  question_content?: ContentBlock[] | null
   answer: string | null
   feedback_count: number
   avg_overall: number | null
@@ -144,6 +151,7 @@ interface RawSampleDetail {
   tenant_name: string | null
   row_index: number
   question: string
+  question_content?: ContentBlock[] | null
   answer: string | null
   extra: Record<string, unknown>
   feedback_count: number
@@ -233,6 +241,7 @@ export const feedbackReviewApi = {
         tenant_name: r.data.tenant_name ?? '—',
         row_index: r.data.row_index,
         question: r.data.question,
+        question_content: r.data.question_content ?? null,
         answer: r.data.answer,
         extra: r.data.extra ?? {},
         feedbacks: (r.data.feedbacks ?? []).map(mapFeedback),

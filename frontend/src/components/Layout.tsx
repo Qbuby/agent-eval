@@ -43,6 +43,7 @@ const NAV_GROUPS: NavGroup[] = [
       { to: '/traces', label: '调用轨迹', icon: 'activity' },
       { to: '/evaluators', label: '评估器', icon: 'beaker' },
       { to: '/evaluation', label: '评估', icon: 'gauge' },
+      { to: '/omniagent', label: '系统智能体', icon: 'bot' },
       { to: '/tracing-metrics', label: 'Tracing 指标', icon: 'pulse' },
       // 客户反馈：内部角色（admin + 内部普通 user）均可见，故放在 internalOnly 的运行组。
       { to: '/feedback', label: '客户反馈', icon: 'inbox' },
@@ -184,6 +185,13 @@ function NavIcon({ name }: { name: string }) {
         <svg {...props}>
           <path d="M2.5 3.5h11a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H6l-3 2.5v-2.5H2.5a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1z" />
           <path d="M4.5 6.5h7M4.5 8.5h4" />
+        </svg>
+      )
+    case 'bot':
+      return (
+        <svg {...props}>
+          <rect x="2.5" y="4.5" width="11" height="8.5" rx="2" />
+          <path d="M8 2v2.5M5.5 8h.1M10.4 8h.1M5.5 10.5h5" />
         </svg>
       )
     default:

@@ -38,6 +38,11 @@ from agent_eval.config import settings
 from agent_eval.db import async_session_factory
 from agent_eval.db_models.repository import Repository
 from agent_eval.db_models.tables import BenchmarkCaseRow
+from agent_eval.data.content_blocks import (
+    content_attachments,
+    content_to_text,
+    split_question_content,
+)
 from agent_eval.evaluation.agent_adapter import (
     AgentResponse,
     OpenAICompatibleAdapter,
@@ -68,6 +73,24 @@ logger = logging.getLogger(__name__)
 # 则折叠回评估器名；否则整串保留（单轮 key 无此后缀，零回归）。
 # 注意：逐样例落库（create_eval_score）仍用完整 key，详情页逐轮展示不受影响。
 _TURN_SUFFIX_RE = re.compile(r"^(turn\d+|conversation)$")
+
+
+def _case_reference_criteria(case: dict[str, Any]) -> list[str]:
+    """本次运行冻结的答案关键点：优先取样例显式字段，回退到 metadata.reference_criteria。
+
+    resolve_eval_start_args 已把三类来源（对话集 / 上传文件 / 基准集）的关键点归一
+    进 ``case['expected_output_criteria']`` 与 ``metadata['reference_criteria']``。这里
+    返回的列表会随 test_results 一起落库，补评时按快照复用，不跟随源样例后续修改漂移。
+    """
+    value = case.get("expected_output_criteria")
+    if not value:
+        meta = case.get("metadata")
+        value = meta.get("reference_criteria") if isinstance(meta, dict) else None
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _collapse_score_key(key: str) -> str:
@@ -230,21 +253,43 @@ def _make_adapter(
     *,
     thread_id: str | None = None,
     client: httpx.AsyncClient | None = None,
+    reply_version: Any | None = None,
+    sticky_thread: bool = False,
 ) -> Any:
     """Build the HTTP adapter for one case.
 
+    ``reply_version`` 非空 → 该样例消费**预生成回复**（reply_source='persisted'）：
+    返回一个同接口的假 adapter，把已存回复按 invoke 逐次交还，全程不建 SSE、不
+    调 agent。放在这里短路是为了让单轮 / 多轮 / 双模三条评估路径共用同一入口，
+    打分、聚合、落库逻辑一行不改。见 reply_generator.PersistedReplyAdapter。
+
     - ``type='sse'`` defaults to LangGraph v2 payload/event shape (the production
       agent used in D:/files/EPtestcases/agent_chat_sse_*.py). The caller passes
-      a per-case thread_id so the agent receives a stable conversation handle
-      (even though agent-side id rewriting may change what LangSmith records).
+      a per-case thread_id, which the adapter uses as a **readable prefix** for
+      the session id it derives per invocation.
     - ``type='openai'`` for OpenAI-compatible /v1/chat/completions.
     - ``type='sse_generic'`` for the legacy templated SSE behaviour.
+
+    ``sticky_thread`` 决定会话号的复用策略，只有多轮回放该传 True：
+    被测 agent 按 ``configurable.thread_id`` 划会话——同一 thread_id 就是同一场
+    对话，带上一次调用的上下文继续。
+      - False（默认，单轮）：adapter 每次 invoke 现场派生一个新会话号，因此同一
+        样例的每次重试也各自落在干净会话里。历史缺陷是会话号一存到底，
+        ``_invoke_with_retry`` 在同一 adapter 上重试时 agent 带着上次失败尝试的
+        残留上下文重答，且无日志无标记。
+      - True（多轮回放）：整段对话共用一个会话号，agent 端要靠它维持上下文
+        （见 multiturn.replay_conversation，每轮只发当轮 user 消息）。
 
     ``client`` lets the caller inject one shared, connection-pooled
     ``httpx.AsyncClient`` for the whole run so 20 concurrent cases reuse
     keepalive connections (and one DNS lookup) instead of each opening a
     fresh client — the dominant cause of burst DNS failures / agent_unreachable.
     """
+    if reply_version is not None:
+        from agent_eval.evaluation.reply_generator import adapter_from_version
+
+        return adapter_from_version(reply_version)
+
     t = agent_cfg.get("type", "sse")
     if t == "openai":
         return OpenAICompatibleAdapter(
@@ -265,6 +310,7 @@ def _make_adapter(
             thread_id=thread_id,
             language=agent_cfg.get("language", "请用中文回复"),
             client=client,
+            sticky_thread=sticky_thread,
         )
     if t == "sse_generic":
         return SSEStreamAdapter(
@@ -273,7 +319,9 @@ def _make_adapter(
             payload_template=agent_cfg.get("payload_template"),
             timeout=float(agent_cfg.get("timeout", 120.0)),
             mode="generic",
+            thread_id=thread_id,
             client=client,
+            sticky_thread=sticky_thread,
         )
     raise ValueError(f"unknown agent type: {t!r}")
 
@@ -698,13 +746,22 @@ async def _run_multiturn_case(
     input_messages = case.get("input_messages") or []
     conversation_goal = case.get("conversation_goal")
     turn_expectations = case.get("turn_expectations") or []
-    question = case.get("question") or ""
+    # 多轮的 question 是首条 user 消息的单值快照；带图轮下它是 canonical
+    # blocks，而 test_results.question 是 Text 列 —— 落库前投影成纯文本。
+    question = content_to_text(case.get("question"))
     expected = case.get("expected_output") or ""
     agent_type = agent_cfg.get("type", "sse")
 
-    # 整段对话共用一个 thread_id（agent 端按它维持上下文）。
+    # 整段对话共用一个 thread_id（agent 端按它维持上下文）—— 多轮回放必须
+    # sticky_thread=True，否则每轮拿到新会话号、agent 上下文断裂，多轮评估失去意义。
     thread_id = f"eval-{case.get('name','conv')}-{uuid.uuid4().hex[:8]}"
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    adapter = _make_adapter(
+        agent_cfg,
+        thread_id=thread_id,
+        client=http_client,
+        reply_version=case.get("_reply_version"),
+        sticky_thread=True,
+    )
     if retry_policy is None:
         retry_policy = _retry_policy_from_cfg(agent_cfg)
 
@@ -858,12 +915,15 @@ async def _invoke_one_agent(
     cancel_event: asyncio.Event | None,
     retry_policy: _RetryPolicy | None,
     http_client: httpx.AsyncClient | None,
+    reply_version: Any | None = None,
 ) -> dict[str, Any]:
     """跑一个 agent 拿一份回复。返回 {output_text, tool_calls, cot_steps, latency_ms,
     first_thinking_token_ms, first_answer_token_ms, usage, error_message, error_type,
     attempts_made, thread_id}。对比模式下 A/B 各调一次，供并发使用。"""
     thread_id = f"eval-{case_name}-{uuid.uuid4().hex[:8]}"
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    adapter = _make_adapter(
+        agent_cfg, thread_id=thread_id, client=http_client, reply_version=reply_version,
+    )
     messages = [{"role": "user", "content": question}]
     policy = retry_policy or _retry_policy_from_cfg(agent_cfg)
 
@@ -877,6 +937,8 @@ async def _invoke_one_agent(
         },
         "error_message": None, "error_type": None, "attempts_made": 0,
         "thread_id": thread_id,
+        # 实际发出的会话号（adapter 逐次派生），成功后由 raw_response 交回。
+        "sent_thread_id": None,
     }
     try:
         try:
@@ -889,6 +951,9 @@ async def _invoke_one_agent(
             out["usage"] = _extract_usage(resp)
             raw = getattr(resp, "raw_response", None)
             if isinstance(raw, dict):
+                sent = raw.get("sent_thread_id")
+                if isinstance(sent, str) and sent:
+                    out["sent_thread_id"] = sent
                 tcs = raw.get("tool_calls")
                 if isinstance(tcs, list):
                     out["tool_calls"] = tcs
@@ -940,18 +1005,26 @@ async def _run_comparative_case(
     slot 顺序喂 judge，拿回后按 swap 标记把 verdict 还原到真实 A/B。
     """
     question = case["question"]
+    # 带附件样例的 question 是 canonical blocks：原始形状送 agent（附件不丢），
+    # 纯文本投影供 judge prompt 与落库快照（question 列是 Text）。
+    question_text = content_to_text(question)
+    # 附件走旁路送 judge：prompt 文本仍是投影（``[图片]`` 占位、可落库回显），
+    # 图片本身在 client 层按方言转形状挂到用户消息上，让 judge 真看到图。
+    question_attachments = content_attachments(question)
     expected = case.get("expected_output") or ""
     invoked_at = datetime.now(timezone.utc)
 
-    # 1) 并发跑 A、B。
+    # 1) 并发跑 A、B。任一侧带 _reply_version 即该侧消费预生成回复（A/B 可独立选）。
     a_res, b_res = await asyncio.gather(
         _invoke_one_agent(
             agent_cfg=agent_cfg, question=question, case_name=case.get("name", "case") + "-A",
             cancel_event=cancel_event, retry_policy=retry_policy, http_client=http_client,
+            reply_version=case.get("_reply_version"),
         ),
         _invoke_one_agent(
             agent_cfg=agent_cfg_b, question=question, case_name=case.get("name", "case") + "-B",
             cancel_event=cancel_event, retry_policy=retry_policy, http_client=http_client,
+            reply_version=case.get("_reply_version_b"),
         ),
     )
 
@@ -1035,12 +1108,13 @@ async def _run_comparative_case(
                 cmp_result = await run_comparative_judge(
                     params=spec.get("params") or {},
                     provider=provider_row,
-                    input_text=question,
+                    input_text=question_text,
                     output_a=slot_a,
                     output_b=slot_b,
                     expected_output=expected,
                     metadata=case.get("metadata"),
                     evaluator_name=label,
+                    attachments=question_attachments,
                 )
             except Exception as exc:
                 entry["error"] = f"{label}: {type(exc).__name__}: {exc}"
@@ -1071,7 +1145,8 @@ async def _run_comparative_case(
         "case_name": case.get("name"),
         "case_source": case.get("source"),
         "thread_id": a_res["thread_id"],
-        "question": question,
+        # question 列是 Text：落纯文本投影（附件成 [图片] 占位），不落 blocks 数组。
+        "question": question_text,
         "expected_output": expected,
         "expected_tool_calls": case.get("expected_tool_calls") or [],
         "invoked_at": invoked_at,
@@ -1101,6 +1176,7 @@ async def _replay_one_side(
     cancel_event: asyncio.Event | None,
     retry_policy: _RetryPolicy | None,
     http_client: httpx.AsyncClient | None,
+    reply_version: Any | None = None,
 ) -> dict[str, Any]:
     """回放一侧（A 或 B）整段多轮对话，返回 multiturn.replay_conversation 的结果
     dict（含 turns / tool_calls / steps / usage / latency_ms / attempts / error…）。
@@ -1111,7 +1187,11 @@ async def _replay_one_side(
 
     agent_type = agent_cfg.get("type", "sse")
     thread_id = f"eval-{case_name}-{uuid.uuid4().hex[:8]}"
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    # sticky_thread=True：多轮回放要靠固定会话号让 agent 端维持上下文。
+    adapter = _make_adapter(
+        agent_cfg, thread_id=thread_id, client=http_client, reply_version=reply_version,
+        sticky_thread=True,
+    )
     policy = retry_policy or _retry_policy_from_cfg(agent_cfg)
 
     async def _invoke(adp: Any, msgs: list[dict[str, Any]]):
@@ -1184,16 +1264,19 @@ async def _run_multiturn_comparative_case(
     invoked_at = datetime.now(timezone.utc)
 
     # 1) 并发回放 A、B 两侧整段对话（各维持独立 thread 上下文）。
+    #    任一侧带 _reply_version 即该侧逐轮消费预生成回复，不连 agent。
     a_replay, b_replay = await asyncio.gather(
         _replay_one_side(
             agent_cfg=agent_cfg, case_name=case.get("name", "conv") + "-A",
             input_messages=input_messages, cancel_event=cancel_event,
             retry_policy=retry_policy, http_client=http_client,
+            reply_version=case.get("_reply_version"),
         ),
         _replay_one_side(
             agent_cfg=agent_cfg_b, case_name=case.get("name", "conv") + "-B",
             input_messages=input_messages, cancel_event=cancel_event,
             retry_policy=retry_policy, http_client=http_client,
+            reply_version=case.get("_reply_version_b"),
         ),
     )
 
@@ -1318,6 +1401,7 @@ async def _run_multiturn_comparative_case(
             *, spec: dict[str, Any], input_text: str, real_a: str, real_b: str,
             expected_output: str, metadata: dict[str, Any] | None, evaluator_name: str,
             tools_a: str | None = None, tools_b: str | None = None,
+            attachments: list[dict[str, Any]] | None = None,
         ) -> tuple[dict[str, Any] | None, str | None]:
             """按 swap 喂 judge 并还原，返回 (restored_verdict, error)。
 
@@ -1325,6 +1409,10 @@ async def _run_multiturn_comparative_case(
             走**同一个 swap 决策**入槽——否则位置随机化后 judge 看到的「回答 A」是一侧、
             「工具调用 A」却是另一侧，判定就建立在错配的组合上。故按 swap 把工具调用注入
             metadata 副本的 actual_tool_calls_a/_b（不改传入 metadata，避免污染下一次调用）。
+
+            attachments 是该轮 user 的 canonical 附件块，原样透传给 judge 客户端。它与
+            tools_a/tools_b 相反——附件属于「题面」、A/B 两侧共享，故不参与 swap；
+            input_text 仍是纯文本投影，真实图片另挂成多模态块。仅逐轮对比传。
             """
             provider_row = spec.get("_provider")
             if provider_row is None:
@@ -1346,6 +1434,7 @@ async def _run_multiturn_comparative_case(
                     expected_output=expected_output,
                     metadata=call_metadata,
                     evaluator_name=evaluator_name,
+                    attachments=attachments,
                 )
             except Exception as exc:
                 return None, f"{evaluator_name}: {type(exc).__name__}: {exc}"
@@ -1407,12 +1496,16 @@ async def _run_multiturn_comparative_case(
                 turn_meta["turn_index"] = ti
                 turn_meta["expected_tool_calls"] = json.dumps(expected_tc, ensure_ascii=False)
                 verdict, err = await _compare_once(
-                    spec=spec, input_text=a_turn.get("user", ""),
+                    # 带附件轮的 user 是 canonical blocks 数组：prompt 里仍用纯文本
+                    # 投影（附件→``[图片]`` 占位、可落库回显），真实图片另经
+                    # attachments 挂成多模态块，judge 才能真看图判两侧优劣。
+                    spec=spec, input_text=content_to_text(a_turn.get("user")),
                     real_a=a_turn.get("assistant", ""), real_b=b_turn.get("assistant", ""),
                     expected_output=turn_expected, metadata=turn_meta,
                     evaluator_name=f"{label}.turn{ti}",
                     tools_a=json.dumps(a_turn.get("tool_calls") or [], ensure_ascii=False),
                     tools_b=json.dumps(b_turn.get("tool_calls") or [], ensure_ascii=False),
+                    attachments=content_attachments(a_turn.get("user")),
                 )
                 if err:
                     scoped.append({
@@ -1430,6 +1523,9 @@ async def _run_multiturn_comparative_case(
             if conversation_goal:
                 conv_meta = dict(case_metadata or {})
                 conv_meta["conversation_goal"] = conversation_goal
+                # 会话级刻意不传 attachments：input 是纯文本 goal，output 是整段
+                # transcript（图已投影成占位）；跨轮聚合还会撞 JUDGE_MAX_ATTACHMENTS
+                # 的静默截断，judge 拿到残缺图集比统一不看图更容易误判。看图放逐轮那层。
                 verdict, err = await _compare_once(
                     spec=spec, input_text=conversation_goal,
                     real_a=transcript_a, real_b=transcript_b,
@@ -1587,6 +1683,15 @@ async def _run_one_case(
         )
 
     question = case["question"]
+    # 带附件样例的 question 是 canonical blocks 数组：原样送 agent（多模态入参），
+    # 但 judge prompt / 内建 evaluator / 落库快照（Text 列）一律用纯文本投影。
+    question_text = content_to_text(question)
+    # 附件走旁路送 judge：prompt 文本仍是投影（``[图片]`` 占位、可落库回显），
+    # 图片本身在 client 层按方言转形状挂到用户消息上，让 judge 真看到图。
+    # 默认带图、不设能力开关：纯文本样例这里得到 []，请求体与改造前逐字节一致；
+    # 带图样例若把 provider 指向纯文本模型，judge 会 4xx 并如实落 evaluation_error
+    # ——比让它对着 [图片] 占位给出一个自信的假分更可取（与「绝不伪造分数」一致）。
+    question_attachments = content_attachments(question)
     expected = case.get("expected_output") or ""
     expected_tool_calls = case.get("expected_tool_calls") or []
     # We send a thread_id the agent CAN consume; the agent may rewrite it on
@@ -1595,7 +1700,12 @@ async def _run_one_case(
     # (start_time, question text) instead.
     thread_id = f"eval-{case.get('name','case')}-{uuid.uuid4().hex[:8]}"
 
-    adapter = _make_adapter(agent_cfg, thread_id=thread_id, client=http_client)
+    adapter = _make_adapter(
+        agent_cfg,
+        thread_id=thread_id,
+        client=http_client,
+        reply_version=case.get("_reply_version"),
+    )
     messages = [{"role": "user", "content": question}]
     if retry_policy is None:
         retry_policy = _retry_policy_from_cfg(agent_cfg)
@@ -1609,6 +1719,15 @@ async def _run_one_case(
     first_thinking_token_ms: int | None = None
     first_answer_token_ms: int | None = None
     attempts_made = 0
+    # adapter 每次 invoke 现场派生会话号，上面这个 thread_id 只是可读前缀。
+    # 实际发出的那个由 adapter 经 raw_response.sent_thread_id 交回——落库必须记
+    # 实际值，否则事后无法判定某条样例究竟落在哪个会话里（这正是历史上
+    # 208×2 条样例无法自证会话是否干净的根因）。
+    sent_thread_id: str | None = None
+    agent_identity: str | None = None
+    # 流被中途切断（ReadError/RemoteProtocolError）时 adapter 保留部分内容并标记
+    # truncated。落进 full_trace 让详情页能看出这条回答本身就不完整。
+    stream_truncated = False
     usage = {
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
         "cache_creation_tokens": None, "cache_read_tokens": None,
@@ -1633,6 +1752,18 @@ async def _run_one_case(
                 steps_raw = raw.get("steps")
                 if isinstance(steps_raw, list):
                     cot_steps = steps_raw
+                # adapter 每次 invoke 现场派生会话号，因此上面这个 thread_id 变量
+                # 只是前缀，真正发给 agent 的是 adapter 记在 raw 里的这一个。落库
+                # 必须记实际值，否则事后无法判定某条样例落在哪个会话（正是历史上
+                # 208 条样例无法自证会话干净的根因）。
+                sent = raw.get("sent_thread_id")
+                if isinstance(sent, str) and sent:
+                    sent_thread_id = sent
+                ident = raw.get("identity")
+                if isinstance(ident, str) and ident:
+                    agent_identity = ident
+                if raw.get("truncated"):
+                    stream_truncated = True
             if not actual_tool_calls:
                 actual_tool_calls = _extract_tool_calls_from_response(resp)
             # Time-to-first-token, derived from per-step first_token_ms that
@@ -1697,11 +1828,12 @@ async def _run_one_case(
                     judge_result = await run_configurable_judge(
                         params=spec.get("params") or {},
                         provider=provider_row,
-                        input_text=question,
+                        input_text=question_text,
                         output_text=output_text,
                         expected_output=expected,
                         metadata=case.get("metadata"),
                         evaluator_name=label,
+                        attachments=question_attachments,
                     )
                 except Exception as e:
                     logger.warning(
@@ -1768,8 +1900,12 @@ async def _run_one_case(
         "case_id": case.get("id"),
         "case_name": case.get("name"),
         "case_source": case.get("source"),
-        "thread_id": thread_id,
-        "question": question,
+        # 落**实际发出**的会话号，不落 runner 生成的前缀 —— 只有前者能拿去被测
+        # 服务端反查这条样例究竟落在哪个会话里。agent 没被调到（预生成回复、
+        # 空问题、连接彻底失败）时才退回前缀。
+        "thread_id": sent_thread_id or thread_id,
+        # question 列是 Text：落纯文本投影（附件渲染成 [图片] 占位）。
+        "question": question_text,
         "expected_output": expected,
         "expected_tool_calls": expected_tool_calls,
         "invoked_at": invoked_at,
@@ -1786,6 +1922,13 @@ async def _run_one_case(
         "tool_call_count": len(actual_tool_calls),
         "message_count": len(messages),
         "scores": scores,
+        # 溯源三元组，落进 full_trace.session 供详情页与事后审计读：
+        # 实际发出的会话号 + 本次请求身份 + 尝试次数。attempts_made > 1 时
+        # 说明发生过重试，而每次重试现在各有独立会话号，最后成功那次的号即
+        # sent_thread_id —— 前面失败尝试写脏的会话不会污染它。
+        "sent_thread_id": sent_thread_id,
+        "agent_identity": agent_identity,
+        "stream_truncated": stream_truncated,
         **usage,
     }
 
@@ -1866,25 +2009,17 @@ async def _execute_run(
                 handle.progress["failed"] += 1
                 handle.progress["completed"] += 1
                 return
-            # 对比模式不走 acceptance/scores 投影（相对胜负，非通过/失败）——直接按
-            # 行 status 映射执行/评分事实：scored=评分完成，execution_error=执行异常，
-            # 其余（judge 未出结论）计为评分错误。
-            if agent_cfg_b is not None:
-                st = res.get("status")
-                projection = {
-                    "execution_status": "abnormal" if st == "execution_error" else "success",
-                    "evaluation_status": "completed" if st == "scored" else (
-                        "error" if st == "evaluation_error" else "unknown"
-                    ),
-                    "acceptance_decision": None,
-                }
-            else:
-                projection = project_case(
-                    stored_status=res.get("status"),
-                    error_type=res.get("error_type"),
-                    scores=res.get("scores") or {},
-                    acceptance_policy=acceptance_policy,
-                )
+            # 对比模式不走 acceptance/scores 投影（相对胜负，非通过/失败）。这里
+            # 把模式标记与 comparison 原文一并交给 project_case 统一判定，避免逐样
+            # 例投影与下面 aggregate_semantics 的 run 级 facts 两套口径打架。
+            projection = project_case(
+                stored_status=res.get("status"),
+                error_type=res.get("error_type"),
+                scores=res.get("scores") or {},
+                acceptance_policy=acceptance_policy,
+                comparison=res.get("comparison"),
+                is_comparative=agent_cfg_b is not None,
+            )
             res.update(projection)
             per_case_results.append(res)
             if projection["execution_status"] == "abnormal" or projection[
@@ -1915,11 +2050,30 @@ async def _execute_run(
                             full_trace["steps"] = res["cot_steps"]
                         if res.get("conversation"):
                             full_trace["conversation"] = res["conversation"]
+                    # 会话溯源：把**实际发出**的会话号 / 身份 / 是否被截断落进
+                    # full_trace，使每条样例事后都能自证「跑在哪个会话里、是否干
+                    # 净」。thread_id 列已存实际值，这里冗余一份是为了在 steps 为
+                    # 空（零字节即断、agent 报错）时仍留有溯源线索 —— 那恰恰是最
+                    # 需要追查会话的场景。只取需要的标量，绝不整个 headers 落库
+                    # （里面有 Authorization / api key，full_trace 会直接渲染到前端）。
+                    _prov = {
+                        k: res.get(k)
+                        for k in ("sent_thread_id", "agent_identity", "stream_truncated")
+                        if res.get(k)
+                    }
+                    if _prov:
+                        full_trace = {**(full_trace or {}), "session": _prov}
+                    # 冻结评估输入的原始附件 blocks。question 仍落纯文本投影，
+                    # 旧导出/搜索/judge 消费方不变；纯文本样例这里得到 None。
+                    _, question_content = split_question_content(case.get("question"))
                     created = await repo.create_test_result(
                         uuid.UUID(run_id),
                         benchmark_case_id=bench_id,
                         question=res["question"],
+                        question_content=question_content,
                         expected_output=res.get("expected_output") or None,
+                        # 冻结本次运行的答案关键点快照，补评复用不漂移。
+                        expected_output_criteria=_case_reference_criteria(case),
                         thread_id=res["thread_id"],
                         actual_output=res["actual_output"],
                         actual_tool_calls=res["actual_tool_calls"] or None,
@@ -1938,6 +2092,11 @@ async def _execute_run(
                         status=res["status"],
                         attempts_made=res.get("attempts_made", 1),
                         comparison=res.get("comparison"),
+                        # 消费预生成回复时固定记录实际用的版本（A 侧为准），
+                        # 供详情页溯源「这条结果是哪个版本的回复打出来的」。
+                        reply_version_id=(
+                            getattr(case.get("_reply_version"), "id", None)
+                        ),
                     )
                     # 多轮 judge 理由（#137）：score_reasons 仅多轮 case 带，单轮无此键
                     # → .get 兜底空 dict，details 退回 {}，单轮零回归。
@@ -2231,24 +2390,57 @@ async def _notify_run_complete(
         evaluation_completed = int(facts.get("evaluation_completed") or 0)
         skipped = int(facts.get("skipped") or 0)
         icon = "✅" if status == "completed" else "⚠️"
+        # 对比 run 的评分单位是 evaluator × 评估范围，不是样例：分数落在
+        # comparison JSONB 而非 score 行，样例级「完成/跳过」在这里无可解释含义。
+        # 故 Judge 行按 evaluator 展开；且对比是相对胜负、无阈值验收，验收整行去掉，
+        # 避免「仅评分，未配置验收规则」这种对对比无信息量又易误读的表述。
+        cmp_summary = (summary or {}).get("comparison_summary")
+        cmp_evaluators = (
+            cmp_summary.get("evaluators")
+            if isinstance(cmp_summary, dict) else None
+        )
+        cmp_evaluators = [e for e in (cmp_evaluators or []) if isinstance(e, dict)]
         head = (
             f"{icon} **评估完成：{run_name}**\n"
             f"- 运行状态：**{status}**\n"
             f"- Agent 执行：成功 **{execution_success}/{total}**，异常 **{execution_abnormal}**\n"
-            f"- Judge 评分：完成 **{evaluation_completed}**，跳过 **{skipped}**\n"
         )
-        if acceptance.get("configured"):
-            pass_rate = acceptance.get("pass_rate")
-            rate_text = (
-                f"{float(pass_rate) * 100:.1f}%"
-                if pass_rate is not None else "无数据"
-            )
-            head += (
-                f"- 显式验收：通过率 **{rate_text}**，结论 "
-                f"**{acceptance.get('run_decision') or 'undetermined'}**\n"
-            )
+        if cmp_evaluators:
+            ac = cmp_summary.get("answer_counts")
+            if isinstance(ac, dict):
+                head += (
+                    f"- A/B 有效回答：A **{int(ac.get('a_valid') or 0)}**（空白 "
+                    f"{int(ac.get('a_blank') or 0)}）／B **{int(ac.get('b_valid') or 0)}**"
+                    f"（空白 {int(ac.get('b_blank') or 0)}）\n"
+                )
+            head += "- Judge 评分（按评估器 × 评估范围）：\n"
+            for e in cmp_evaluators:
+                label = e.get("label") or e.get("evaluator_key") or "对比评估器"
+                seg = (
+                    f"  · {label}：有效 **{int(e.get('scored') or 0)}**，"
+                    f"评分失败 **{int(e.get('evaluation_errors') or 0)}**"
+                )
+                if int(e.get("skipped") or 0):
+                    seg += f"，空白跳过 **{int(e.get('skipped') or 0)}**"
+                seg += (
+                    f"；A 胜 **{int(e.get('a_wins') or 0)}** / B 胜 "
+                    f"**{int(e.get('b_wins') or 0)}** / 平 **{int(e.get('ties') or 0)}**\n"
+                )
+                head += seg
         else:
-            head += "- 显式验收：**仅评分，未配置验收规则**\n"
+            head += f"- Judge 评分：完成 **{evaluation_completed}**，跳过 **{skipped}**\n"
+            if acceptance.get("configured"):
+                pass_rate = acceptance.get("pass_rate")
+                rate_text = (
+                    f"{float(pass_rate) * 100:.1f}%"
+                    if pass_rate is not None else "无数据"
+                )
+                head += (
+                    f"- 显式验收：通过率 **{rate_text}**，结论 "
+                    f"**{acceptance.get('run_decision') or 'undetermined'}**\n"
+                )
+            else:
+                head += "- 显式验收：**仅评分，未配置验收规则**\n"
 
         # 分析摘要（LLM 叙述，失败自动退规则摘要；这里再兜一层，绝不阻断通知）。
         try:
@@ -2703,6 +2895,7 @@ async def start_run(
     notify_open_ids: list[str] | None = None,
     eval_mode: str = "single",
     agent_cfg_b: dict | None = None,
+    reply_source: str = "live",
 ) -> str:
     """Create a test_runs row, register an asyncio task, return run_id.
 
@@ -2737,6 +2930,7 @@ async def start_run(
             acceptance_policy=acceptance_policy,
             eval_mode=eval_mode,
             agent_config_b=agent_cfg_b,
+            reply_source=reply_source,
             status="running",
         )
         await session.commit()
@@ -2830,13 +3024,83 @@ def _expected_judge_dims(
     return dims
 
 
+# 补评失败原因分类：区分「等一会儿再点可能就好」与「不改配置永远不会好」。
+# 判据取自 judge_clients 抛出的 JudgeClientError 文本形态（provider_type 前缀 +
+# HTTP 码 / httpx 异常类名）。先认暂时性、再认配置类，两者都认不出时算暂时性
+# ——宁可让用户白试一次，也不要误报「你得先改配置」。
+_RESCORE_TRANSIENT_RE = re.compile(
+    r"timeout|timed out|ReadError|WriteError|ConnectError|ConnectTimeout"
+    r"|RemoteProtocolError|connection error|HTTP 5[0-9][0-9]|HTTP 429"
+    r"|overload|rate limit|too many requests",
+    re.IGNORECASE,
+)
+# 4xx（参数被拒 / 鉴权 / 体积超限）、多模态不支持、以及缺 model/base_url 这类
+# 确定性配置缺失。带图样例配纯文本 judge 就落在这里：附件块照方言转好送出去，
+# 上游模型 400 拒收 —— 重试一百次都是同一个 400，必须先换 provider/模型。
+_RESCORE_CONFIG_RE = re.compile(
+    r"HTTP 4[0-9][0-9]|image|vision|multimodal|media[_ ]type|unsupported"
+    r"|not support|is required|invalid.?api.?key|unauthorized",
+    re.IGNORECASE,
+)
+# 前端提示条只展示前若干条原因（全量在服务端日志里），免得撑满整页。
+_RESCORE_FAILURE_SAMPLES = 5
+# 上游 4xx/5xx 常把整页 HTML 错误页塞进 body（nginx 的 405 页面就有六七行标签），
+# 原样贴进提示条既撑版面又没信息量。只留标签里的可读文字：优先 <title>，没有就
+# 取剥掉标签后的正文，再把换行压成空格 —— 顺带让原因文本能被 DOM 文本匹配到。
+_HTML_MARKUP_RE = re.compile(r"<\s*(?:html|head|body|title|center|h1|pre)\b", re.IGNORECASE)
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+# 单条原因在提示条里的展示上限；全量原文在服务端日志里。
+_RESCORE_ERROR_MAXLEN = 200
+
+
+def _classify_rescore_error(message: str) -> str:
+    """判一条 judge 错误是 ``"transient"``（可重试）还是 ``"config"``（须先改配置）。"""
+    if not message:
+        return "transient"
+    if _RESCORE_TRANSIENT_RE.search(message):
+        return "transient"
+    if _RESCORE_CONFIG_RE.search(message):
+        return "config"
+    return "transient"
+
+
+def _compact_judge_error(message: str) -> str:
+    """把 judge 错误压成一行可读文本：剥掉 HTML 错误页、合并空白、截断。"""
+    text = message or ""
+    if _HTML_MARKUP_RE.search(text):
+        # 保留 HTML 之前的前缀（provider 名 + HTTP 码就在这一段），只换掉页面本体。
+        cut = text.index("<")
+        head, page = text[:cut], text[cut:]
+        title = _HTML_TITLE_RE.search(page)
+        text = f"{head}{title.group(1) if title else _HTML_TAG_RE.sub(' ', page)}"
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    if len(text) > _RESCORE_ERROR_MAXLEN:
+        text = text[:_RESCORE_ERROR_MAXLEN].rstrip() + "…"
+    return text
+
+
+def _dedupe_failures(failures: list[dict[str, str]]) -> list[dict[str, str]]:
+    """同一维度在多条样例上同样报错时只留一条，免得提示条列出一串重复项。"""
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict[str, str]] = []
+    for f in failures:
+        key = (f["dimension"], f["error"], f["kind"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(f)
+    return unique
+
+
 async def _rescore_comparison_result(
     *,
     comparison: dict[str, Any],
     judge_specs: list[dict[str, Any]],
     full_trace: dict[str, Any],
     result_id: str,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, list[dict[str, str]]]:
     """对一条对比 result 的 comparison 补评——复用已存 A/B 回答，不重跑 agent。
 
     对比模式的分数存在 ``comparison`` JSONB（evaluator_verdicts[].scoped_verdicts[]），
@@ -2852,7 +3116,9 @@ async def _rescore_comparison_result(
     返回 ``(recovered_scope_count, still_has_unscored)``：
       * recovered = 本次成功补回的 scope 数；
       * still_has_unscored = 补评后是否仍有 evaluation_error 的 scope（决定 result
-        能否回到 completed）。
+        能否回到 completed）；
+      * errors = 本次失败 scope 的 {dimension, error}，供上层透出「为什么还没补上」
+        —— 只写日志的话用户在页面上永远只能看到一句「仍未出分」。
     """
     conv = full_trace.get("conversation") if isinstance(full_trace, dict) else None
     a_turns = (conv.get("turns") or []) if isinstance(conv, dict) else []
@@ -2885,6 +3151,7 @@ async def _rescore_comparison_result(
     async def _compare_once(
         *, spec: dict[str, Any], input_text: str, real_a: str, real_b: str,
         expected_output: str, metadata: dict[str, Any] | None, evaluator_name: str,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
         provider_row = spec.get("_provider")
         if provider_row is None:
@@ -2901,6 +3168,8 @@ async def _rescore_comparison_result(
                 expected_output=expected_output,
                 metadata=metadata,
                 evaluator_name=evaluator_name,
+                # 附件属于题面、A/B 两侧共享，故不随 swap 入槽（与 slot_a/slot_b 不同）。
+                attachments=attachments,
             )
         except Exception as exc:  # noqa: BLE001
             return None, f"{evaluator_name}: {type(exc).__name__}: {exc}"
@@ -2909,9 +3178,10 @@ async def _rescore_comparison_result(
         return restore_verdict(cmp_result.verdict, swapped=swap), None
 
     recovered = 0
+    errors: list[dict[str, str]] = []
     entries = comparison.get("evaluator_verdicts") if isinstance(comparison, dict) else None
     if not isinstance(entries, list):
-        return 0, False
+        return 0, False, []
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -2957,17 +3227,23 @@ async def _rescore_comparison_result(
                         b_turn.get("tool_calls") or [], ensure_ascii=False),
                 }
                 verdict, err = await _compare_once(
-                    spec=spec, input_text=a_turn.get("user", ""),
+                    # 带图轮的 user 是 canonical blocks：prompt 里仍是纯文本投影，
+                    # 真实图片走 attachments 旁路，与首评的带图口径保持一致——否则
+                    # 同一维度首评看得到图、补评看不到，两次打分依据不同。
+                    spec=spec, input_text=content_to_text(a_turn.get("user")),
                     real_a=a_turn.get("assistant", ""), real_b=b_turn.get("assistant", ""),
                     expected_output=te.get("expected_output") or "",
                     metadata=turn_meta,
                     evaluator_name=f"{label}.turn{ti}",
+                    attachments=content_attachments(a_turn.get("user")),
                 )
             elif scope == "conversation":
                 if not goal:
                     continue
                 conv_meta = {"conversation_goal": goal}
                 verdict, err = await _compare_once(
+                    # 会话级不传 attachments：input 是纯文本 goal，output 是整段
+                    # transcript（各轮图已投影成 [图片] 占位），与首评侧同口径。
                     spec=spec, input_text=goal,
                     real_a=transcript_a, real_b=transcript_b,
                     expected_output=goal, metadata=conv_meta,
@@ -2979,6 +3255,16 @@ async def _rescore_comparison_result(
             if err:
                 logger.warning("rescore comparison[%s] result %s scope %s failed: %s",
                                label, result_id, scope, err)
+                dim_name = (
+                    f"{label}.turn{sv.get('turn_index')}" if scope == "turn"
+                    else f"{label}.conversation"
+                )
+                # err 由 _compare_once 拼成 "{evaluator_name}: ..."，而 evaluator_name
+                # 就是 dim_name，去掉前缀免得前端把维度名显示两遍。
+                errors.append({
+                    "dimension": dim_name,
+                    "error": err.removeprefix(f"{dim_name}: "),
+                })
                 continue
             sv["status"] = "scored"
             sv["verdict"] = verdict
@@ -3022,7 +3308,7 @@ async def _rescore_comparison_result(
         for entry in entries if isinstance(entry, dict)
         for sv in (entry.get("scoped_verdicts") or [])
     )
-    return recovered, still_unscored
+    return recovered, still_unscored, errors
 
 
 async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
@@ -3040,7 +3326,12 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
       5. 不触碰 execution_error（agent 没答的样例无回答可评）。
 
     返回统计：{run_id, results_scanned, dimensions_recovered, results_completed,
-              results_still_missing}。汇总刷新由上层 reaggregate 负责。
+              results_still_missing, failures_transient, failures_config,
+              failures}。汇总刷新由上层 reaggregate 负责。
+    ``failures`` 是失败维度的原因样本（同维度同错去重后取前
+    _RESCORE_FAILURE_SAMPLES 条；原因已压成一行并剥掉上游 HTML 错误页），
+    ``failures_config`` > 0 表示至少有一个维度是上游 judge 拒收本次输入
+    （典型：带图样例配了纯文本模型），这类再点重试不会变好，得先换 provider。
     """
     from agent_eval.evaluation import multiturn
 
@@ -3059,6 +3350,7 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
         return {
             "run_id": run_id, "results_scanned": 0, "dimensions_recovered": 0,
             "results_completed": 0, "results_still_missing": 0,
+            "failures_transient": 0, "failures_config": 0, "failures": [],
             "note": "no configurable_judge evaluators on this run",
         }
     await _resolve_judge_providers(judge_specs)
@@ -3067,6 +3359,17 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
     results_completed = 0
     results_still_missing = 0
     results_scanned = 0
+    # 失败维度的原因（全量收集，响应里只带前若干条）。
+    failures: list[dict[str, str]] = []
+
+    def _note_failure(dimension: str, message: str) -> None:
+        # 分类看原文（HTTP 码有时只出现在会被剥掉的那段页面文字里），展示用压缩后的一行。
+        raw = (message or "").strip()
+        failures.append({
+            "dimension": dimension,
+            "error": _compact_judge_error(raw) or "未知错误",
+            "kind": _classify_rescore_error(raw),
+        })
 
     async with async_session_factory() as session:
         repo = Repository(session)
@@ -3083,12 +3386,14 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
             cmp_json = r.comparison if isinstance(r.comparison, dict) else None
             if cmp_json is not None:
                 full_trace = r.full_trace if isinstance(r.full_trace, dict) else {}
-                recovered, still_missing = await _rescore_comparison_result(
+                recovered, still_missing, cmp_errors = await _rescore_comparison_result(
                     comparison=cmp_json,
                     judge_specs=judge_specs,
                     full_trace=full_trace,
                     result_id=str(r.id),
                 )
+                for ce in cmp_errors:
+                    _note_failure(ce["dimension"], ce["error"])
                 if recovered <= 0 and not still_missing:
                     # 无失败 scoped、无恢复 → 该条对比结果本就齐全，跳过。
                     continue
@@ -3117,7 +3422,16 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                 turns = conv.get("turns") or []
                 goal = conv.get("goal")
                 turn_exps = conv.get("turn_expectations") or []
-                turn_idxs = {t.get("turn_index") for t in turns if isinstance(t.get("turn_index"), int)}
+                # 只把「回复非空」的轮算进本应出分：score_conversation 对空回复轮
+                # 一律跳过、不产 score（见 multiturn.score_conversation 的空白轮
+                # 判据）。若这里把空回复轮也算上，该维度会永远落在 missing 里、
+                # 永远补不上，样例状态就再也回不到 scored。
+                turn_idxs = {
+                    t.get("turn_index")
+                    for t in turns
+                    if isinstance(t.get("turn_index"), int)
+                    and (t.get("assistant") or "").strip()
+                }
                 expected_dims = _expected_judge_dims(
                     specs=judge_specs, is_multiturn=True,
                     turn_expectations=turn_exps, turn_indices=turn_idxs,
@@ -3143,7 +3457,7 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
             new_checks: dict[str, list[dict[str, Any]]] = {}
             if is_multiturn:
                 (
-                    new_scores, new_reasons, new_checks, _fd, _le,
+                    new_scores, new_reasons, new_checks, mt_failed, mt_error,
                 ) = await multiturn.score_conversation(
                     turns=turns,
                     conversation_goal=goal,
@@ -3153,7 +3467,20 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                     case_id=str(r.id),
                     only_dims=missing,
                 )
+                if mt_failed and mt_error:
+                    # score_conversation 只透出「失败维度数 + 最后一条错误」，无法
+                    # 逐维度归因，故按批记一条并带上一个代表维度名。
+                    _note_failure(
+                        f"多轮 {mt_failed} 个维度（如 {sorted(missing)[0]}）", mt_error,
+                    )
             else:
+                # 回喂本次运行冻结的答案关键点（落库快照，非源样例）——与首评
+                # 走 metadata.reference_criteria 同一注入路径，保证补评的 judge
+                # 看到相同参考标准，不因源数据后续修改而漂移。
+                snap_criteria = list(r.expected_output_criteria or [])
+                rescore_metadata: dict[str, Any] | None = (
+                    {"reference_criteria": snap_criteria} if snap_criteria else None
+                )
                 for spec in judge_specs:
                     label = spec.get("label") or "judge"
                     if label not in missing:
@@ -3168,13 +3495,19 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
                             input_text=r.question or "",
                             output_text=r.actual_output or "",
                             expected_output=r.expected_output or "",
-                            metadata=None,
+                            metadata=rescore_metadata,
                             evaluator_name=label,
+                            # 回喂本次运行冻结的原始附件 blocks（question 列只有纯文本
+                            # 投影）：补评只看投影会与首评口径不一致。纯文本样例该列为
+                            # NULL，content_attachments 返回 []，请求体与改造前一致。
+                            attachments=content_attachments(r.question_content),
                         )
                     except Exception as e:  # noqa: BLE001
                         logger.warning("rescore single[%s] crashed on result %s: %s", label, r.id, e)
+                        _note_failure(label, f"{type(e).__name__}: {e}")
                         continue
                     if jr.error and not jr.scores:
+                        _note_failure(label, jr.error)
                         continue
                     for s in jr.scores:
                         new_scores[label] = float(s.value)
@@ -3222,4 +3555,7 @@ async def rescore_missing_dimensions(run_id: str) -> dict[str, Any]:
         "dimensions_recovered": dims_recovered,
         "results_completed": results_completed,
         "results_still_missing": results_still_missing,
+        "failures_transient": sum(1 for f in failures if f["kind"] == "transient"),
+        "failures_config": sum(1 for f in failures if f["kind"] == "config"),
+        "failures": _dedupe_failures(failures)[:_RESCORE_FAILURE_SAMPLES],
     }

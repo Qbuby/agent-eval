@@ -33,6 +33,7 @@ dependencies = [
     "openpyxl>=3.1.0",
     "langfuse>=3.14,<4",
     "lark-oapi>=1.4.0",
+    "minio==7.2.18",
 ]
 
 [project.optional-dependencies]
@@ -47,12 +48,18 @@ bench = [
     "evalscope>=1.6.0",
     "bfcl-eval==2025.10.27.1",
 ]
+kubernetes-runner = [
+    "k8s-agent-sandbox @ git+https://github.com/deku0818/agent-sandbox.git@a9db14672e77fbd15981fb2af9b73934e29b0cfe#subdirectory=clients/python/agentic-sandbox-client",
+]
 
 [project.scripts]
 agent-eval = "agent_eval.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_eval"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -2,8 +2,20 @@ import { Fragment, useId, useState, useRef, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Button, Dialog, useConfirm, useToast, ExportMenu } from '@/components/ui'
+import { agentRepliesApi, keyPointsApi } from '@/services'
 import { projectsApi, benchmarkApi, type BenchmarkCase, type SchemaColumn, type ImportPreview } from '@/services/benchmark'
+import AgentReplyGenerateDialog from '@/components/AgentReplyGenerateDialog'
+import AgentReplyBatchVersionDialog from '@/components/AgentReplyBatchVersionDialog'
+import CaseCategoryBatchDialog from '@/components/CaseCategoryBatchDialog'
+import { AgentReplyVersionsDrawer } from '@/components/AgentReplyVersionsDrawer'
+import KeyPointsExtractDialog from '@/components/KeyPointsExtractDialog'
+import { SelectionBar } from '@/components/SelectionBar'
+import QuestionContentEditor, { questionFilled } from '@/components/QuestionContentEditor'
+import MessageContentView from '@/components/MessageContentView'
+import { contentToText } from '@/lib/contentBlocks'
+import type { MessageContent } from '@/lib/contentBlocks'
 import { formatApiError, toToastMessage } from '@/lib/errors'
+import { addIds, collectAllIds, pageSelectionState, togglePageIds } from '@/lib/batchSelection'
 
 export default function BenchmarkPage() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -40,15 +52,30 @@ export default function BenchmarkPage() {
   // switch to the preview step (conditional render), so fileRef would be null
   // at confirm time. Keeping the File here makes confirm-import reliable.
   const [importFile, setImportFile] = useState<File | null>(null)
-  const [newQuestion, setNewQuestion] = useState('')
+  // 问题支持带附件：字符串（纯文本）或 canonical blocks 数组（带图/文档/视频）
+  const [newQuestion, setNewQuestion] = useState<MessageContent>('')
+  // 提交成功后 +1 重挂 QuestionContentEditor，清掉它内部的空附件行草稿
+  const [newAttachKey, setNewAttachKey] = useState(0)
   const [newAnswer, setNewAnswer] = useState('')
   const [newKeyPoints, setNewKeyPoints] = useState('')
   const [newNegativePoints, setNewNegativePoints] = useState('')
   const [newCategoryId, setNewCategoryId] = useState('')
   const [showAddCategory, setShowAddCategory] = useState(false)
   const [newCategoryName, setNewCategoryName] = useState('')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [genOpen, setGenOpen] = useState(false)
+  const [genSingleId, setGenSingleId] = useState<string | null>(null)
+  // 批量切换当前版本：按「最新 / vN / 版本备注」在每个样例各自的版本链里解析
+  const [batchVerOpen, setBatchVerOpen] = useState(false)
+  // 批量改类别：在样例所在 project 的既有类别之间搬动，或清空
+  const [batchCatOpen, setBatchCatOpen] = useState(false)
+  const [versionsCaseRef, setVersionsCaseRef] = useState<string | null>(null)
+  // 提炼关键点：勾选了就只提炼勾选的，没勾选就全量扫待提炼样例。
+  const [extractOpen, setExtractOpen] = useState(false)
 
-  const pageSize = 20
+  const [pageSize, setPageSize] = useState(20)
+  // 跨页全选（逐页拉 id）进行中
+  const [selectingAll, setSelectingAll] = useState(false)
 
   const { data: projects } = useQuery({
     queryKey: ['projects'],
@@ -63,7 +90,7 @@ export default function BenchmarkPage() {
   })
 
   const { data: casesData, isLoading } = useQuery({
-    queryKey: ['benchmark-cases', projectId, page, search, categoryFilter],
+    queryKey: ['benchmark-cases', projectId, page, pageSize, search, categoryFilter],
     queryFn: () => benchmarkApi.listCases(projectId!, {
       page, page_size: pageSize,
       search: search || undefined,
@@ -141,6 +168,7 @@ export default function BenchmarkPage() {
       queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })
       setShowCreate(false)
       setNewQuestion('')
+      setNewAttachKey(k => k + 1)
       setNewAnswer('')
       setNewKeyPoints('')
       setNewNegativePoints('')
@@ -192,6 +220,50 @@ export default function BenchmarkPage() {
   const cases = casesData?.items ?? []
   const total = casesData?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const caseIdsOnPage = useMemo(() => cases.map(c => c.id), [cases])
+  const { data: replyStates } = useQuery({
+    queryKey: ['agent-reply-states', 'benchmark', caseIdsOnPage],
+    queryFn: () => agentRepliesApi.listStates('benchmark', caseIdsOnPage).then(r => r.data),
+    enabled: caseIdsOnPage.length > 0,
+  })
+  const replyStateMap = new Map((replyStates ?? []).map(s => [s.case_ref, s]))
+
+  // 表头 checkbox 只反映当页；跨页累积的总数走 SelectionBar。
+  const pageSel = pageSelectionState(selectedIds, caseIdsOnPage)
+
+  function toggleSelect(id: string) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  // 「选择全部 N 条」：按当前筛选逐页拉 id 并入选中集合。
+  async function selectAllMatching() {
+    if (!projectId) return
+    setSelectingAll(true)
+    try {
+      const ids = await collectAllIds(async (p, size) => {
+        const r = await benchmarkApi.listCases(projectId, {
+          page: p, page_size: size,
+          search: search || undefined,
+          category_id: categoryFilter || undefined,
+        })
+        return { ids: r.data.items.map(c => c.id), total: r.data.total }
+      })
+      setSelectedIds(prev => addIds(prev, ids))
+    } catch (e) {
+      toast.error(toToastMessage(formatApiError(e, { fallbackMessage: '全选失败' })))
+    } finally {
+      setSelectingAll(false)
+    }
+  }
+
+  function refreshReplyStates() {
+    queryClient.invalidateQueries({ queryKey: ['agent-reply-states'] })
+  }
 
   const getCategoryName = (id: string | null) => {
     if (!id) return '—'
@@ -262,6 +334,43 @@ export default function BenchmarkPage() {
           + 类别
         </button>
         <div className="flex-1" />
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          onClick={() => { setGenSingleId(null); setGenOpen(true) }}
+        >
+          agent生成答案{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 批量切换这些样例的当前版本：评估「使用已有回复」消费的就是当前版本 */}
+        <Button
+          onClick={() => setBatchVerOpen(true)}
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的当前版本批量切到同一标识'}
+        >
+          批量切换版本{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 批量改类别：只在该 project 已有的类别之间搬动或清空，新建类别走上方类别管理 */}
+        <Button
+          onClick={() => setBatchCatOpen(true)}
+          variant="secondary"
+          size="sm"
+          disabled={selectedIds.size === 0}
+          title={selectedIds.size === 0 ? '请先勾选样例' : '把这些样例的类别批量改成同一个，或清空'}
+        >
+          批量改类别{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
+        {/* 从参考答案提炼关键点：勾选了就只提炼这几条，没勾选就全量扫「有答案但关键点为空」的。 */}
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => setExtractOpen(true)}
+          title="用大模型从参考答案提炼关键点，供 judge 逐条核对"
+        >
+          提炼关键点{selectedIds.size > 0 ? ` (${selectedIds.size})` : ''}
+        </Button>
         <ExportMenu
           disabled={!projectId}
           onExport={async (format) => {
@@ -285,10 +394,32 @@ export default function BenchmarkPage() {
         </Button>
       </div>
 
+      <SelectionBar
+        selectedCount={selectedIds.size}
+        total={total}
+        pageCount={cases.length}
+        pageSelectedCount={pageSel.count}
+        onSelectAll={selectAllMatching}
+        onClear={() => setSelectedIds(new Set())}
+        selectingAll={selectingAll}
+        pageSize={pageSize}
+        onPageSizeChange={size => { setPageSize(size); setPage(1) }}
+      />
+
       <div className="table-card">
         <table className="table-base">
           <thead>
             <tr>
+              <th className="w-10 text-center">
+                <input
+                  type="checkbox"
+                  checked={pageSel.all}
+                  ref={el => { if (el) el.indeterminate = pageSel.some }}
+                  onChange={() => setSelectedIds(prev => togglePageIds(prev, caseIdsOnPage))}
+                  aria-label="全选当前页"
+                  className="accent-accent w-3.5 h-3.5"
+                />
+              </th>
               <th>问题</th>
               {!categoryFilter && <th className="w-28">类别</th>}
               {extraColumns.map((col: SchemaColumn) => (
@@ -298,14 +429,16 @@ export default function BenchmarkPage() {
               ))}
               <th className="w-20">有答案</th>
               <th className="w-20">来源</th>
+              <th className="w-28">agent回复</th>
               <th className="w-16 text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             {cases.map(c => {
               const isOpen = expandedId === c.id
-              const colSpan = 3 + (categoryFilter ? 0 : 1) + extraColumns.length
+              const colSpan = 5 + (categoryFilter ? 0 : 1) + extraColumns.length
               const expectedTools = (c.extra_fields?.expected_tool_calls ?? []) as Array<Record<string, unknown>>
+              const replyState = replyStateMap.get(c.id)
               return (
               <Fragment key={c.id}>
               <tr
@@ -313,9 +446,21 @@ export default function BenchmarkPage() {
                 onClick={() => setExpandedId(isOpen ? null : c.id)}
                 title="点击展开/收起 参考答案与期望工具调用"
               >
+                <td className="text-center" onClick={e => e.stopPropagation()}>
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(c.id)}
+                    onChange={() => toggleSelect(c.id)}
+                    className="accent-accent w-3.5 h-3.5"
+                  />
+                </td>
                 <td className="max-w-[460px]">
                   <span className="inline-block w-3 mr-1 text-text-tertiary">{isOpen ? '▾' : '▸'}</span>
-                  <span className="truncate inline-block max-w-[420px] align-middle">{c.question}</span>
+                  {/* 带附件样例的预览用 question_content 的文本投影（含 [图片] 占位），
+                      与后端落库的 question 快照措辞一致；纯文本样例即 question 本身。 */}
+                  <span className="truncate inline-block max-w-[420px] align-middle">
+                    {contentToText(c.question_content ?? c.question)}
+                  </span>
                 </td>
                 {!categoryFilter && <td className="text-text-tertiary">{getCategoryName(c.category_id)}</td>}
                 {extraColumns.map((col: SchemaColumn) => (
@@ -329,6 +474,20 @@ export default function BenchmarkPage() {
                   </span>
                 </td>
                 <td className="text-text-tertiary text-[11px]">{c.source}</td>
+                <td onClick={e => e.stopPropagation()}>
+                  {replyState?.has_reply ? (
+                    <button
+                      onClick={() => setVersionsCaseRef(c.id)}
+                      className="text-action text-[11px]"
+                      title="查看 / 回溯 agent 生成的回复版本"
+                    >
+                      v{replyState.current_version_number ?? '—'}
+                      {replyState.version_count > 1 ? ` · 共${replyState.version_count}版` : ''}
+                    </button>
+                  ) : (
+                    <span className="text-[11px] text-text-tertiary">未生成</span>
+                  )}
+                </td>
                 <td className="text-right" onClick={e => e.stopPropagation()}>
                   <div className="flex gap-3 justify-end opacity-0 group-hover:opacity-100 transition-opacity">
                     <button onClick={() => setEditCase(c)} className="text-action">编辑</button>
@@ -352,6 +511,14 @@ export default function BenchmarkPage() {
               {isOpen && (
                 <tr className="bg-fill/5">
                   <td colSpan={colSpan} className="px-3 py-3">
+                    {/* 列表列只放文本投影（含 [图片] 占位），附件缩略图放展开行，
+                        避免表格行高被图片撑开。纯文本样例不渲染这一块。 */}
+                    {c.question_content ? (
+                      <div className="mb-4">
+                        <div className="page-eyebrow mb-1">问题</div>
+                        <MessageContentView content={c.question_content} />
+                      </div>
+                    ) : null}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <div className="page-eyebrow mb-1">参考答案</div>
@@ -569,7 +736,7 @@ export default function BenchmarkPage() {
             <Button
               variant="primary"
               size="md"
-              disabled={!newQuestion.trim()}
+              disabled={!questionFilled(newQuestion)}
               loading={createMutation.isPending}
               onClick={() => createMutation.mutate()}
             >
@@ -581,13 +748,13 @@ export default function BenchmarkPage() {
         <div className="space-y-4">
           <div>
             <label htmlFor={newQuestionId} className="field-label">问题</label>
-            <textarea
-              id={newQuestionId}
+            <QuestionContentEditor
+              key={newAttachKey}
+              textareaId={newQuestionId}
               value={newQuestion}
-              onChange={e => setNewQuestion(e.target.value)}
+              onChange={setNewQuestion}
               rows={3}
               placeholder="输入测试问题…"
-              className="input resize-y"
             />
           </div>
           <div>
@@ -676,6 +843,54 @@ export default function BenchmarkPage() {
           />
         </div>
       </Dialog>
+
+      <AgentReplyGenerateDialog
+        open={genOpen}
+        onClose={() => { setGenOpen(false); setGenSingleId(null) }}
+        datasetType="benchmark"
+        projectId={projectId}
+        caseIds={genSingleId ? [genSingleId] : Array.from(selectedIds)}
+        onFinished={refreshReplyStates}
+      />
+
+      <AgentReplyBatchVersionDialog
+        open={batchVerOpen}
+        onClose={() => setBatchVerOpen(false)}
+        datasetType="benchmark"
+        caseRefs={Array.from(selectedIds)}
+        onDone={refreshReplyStates}
+      />
+
+      {/* 基准集类别是 project 维度的实体（category_id），弹窗只给既有类别，不允许现场造新名 */}
+      <CaseCategoryBatchDialog
+        open={batchCatOpen}
+        onClose={() => setBatchCatOpen(false)}
+        datasetType="benchmark"
+        caseRefs={Array.from(selectedIds)}
+        onDone={() => {
+          queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })
+          queryClient.invalidateQueries({ queryKey: ['categories', projectId] })
+        }}
+      />
+
+      <AgentReplyVersionsDrawer
+        open={!!versionsCaseRef}
+        onClose={() => setVersionsCaseRef(null)}
+        datasetType="benchmark"
+        caseRef={versionsCaseRef}
+        caseTitle={cases.find(c => c.id === versionsCaseRef)?.question?.slice(0, 60) ?? null}
+        onRetryCase={ref => { setVersionsCaseRef(null); setGenSingleId(ref); setGenOpen(true) }}
+        onChanged={refreshReplyStates}
+      />
+
+      {/* 批量提炼关键点：勾选集为空则由弹窗全量扫待提炼样例 */}
+      <KeyPointsExtractDialog
+        open={extractOpen}
+        onClose={() => setExtractOpen(false)}
+        target="benchmark"
+        caseIds={Array.from(selectedIds)}
+        onFinished={() => queryClient.invalidateQueries({ queryKey: ['benchmark-cases'] })}
+      />
     </div>
   )
 }
@@ -714,10 +929,50 @@ function EditCaseModal({
     setEditCase({ ...editCase, extra_fields: { ...extraFields, [key]: value } })
   }
 
+  const modalToast = useToast()
+  const [extractingOne, setExtractingOne] = useState(false)
+
+  // 问题内容从 editCase 派生：带附件读 question_content 的 blocks，纯文本读 question。
+  // 写回时同步两个字段（question 存文本投影），保存后由后端 split_question_content 重算。
+  const editQuestion: MessageContent = editCase
+    ? (editCase.question_content ?? editCase.question ?? '')
+    : ''
+  const setEditQuestion = (next: MessageContent) => {
+    if (!editCase) return
+    if (typeof next === 'string') {
+      setEditCase({ ...editCase, question: next, question_content: null })
+    } else {
+      setEditCase({ ...editCase, question: contentToText(next), question_content: next })
+    }
+  }
+
+  // 单条提炼：结果只回填输入框，用户核对（可改）后随表单一起保存，不落库。
+  const extractOneKeyPoints = async () => {
+    if (!editCase?.reference_answer?.trim()) {
+      modalToast.error('请先填写参考答案')
+      return
+    }
+    setExtractingOne(true)
+    try {
+      const res = await keyPointsApi.extractOne({
+        answer: editCase.reference_answer,
+        // 提炼只吃纯文本，带附件样例传文本投影（含 [图片] 占位）
+        question: contentToText(editQuestion) || undefined,
+      })
+      setEditCase({ ...editCase, key_points: res.data.points })
+      modalToast.success(`提炼出 ${res.data.points.length} 个关键点，确认后点保存`)
+    } catch (e) {
+      modalToast.error(toToastMessage(formatApiError(e, { fallbackMessage: '提炼失败' })))
+    } finally {
+      setExtractingOne(false)
+    }
+  }
+
   const handleSave = () => {
     if (!editCase) return
     const data: any = {
-      question: editCase.question,
+      // 后端 split_question_content 会把它拆成 question 文本投影 + question_content
+      question: editQuestion,
       reference_answer: editCase.reference_answer,
       category_id: editCase.category_id,
     }
@@ -742,7 +997,7 @@ function EditCaseModal({
           <Button
             variant="primary"
             size="md"
-            disabled={!editCase?.question?.trim()}
+            disabled={!questionFilled(editQuestion)}
             loading={isPending}
             onClick={handleSave}
           >
@@ -755,12 +1010,13 @@ function EditCaseModal({
         <div className="space-y-4">
           <div>
             <label htmlFor={questionId} className="field-label">问题</label>
-            <textarea
-              id={questionId}
-              value={editCase.question}
-              onChange={e => setEditCase({ ...editCase, question: e.target.value })}
+            {/* key 绑 case id：切换样例时重置控件内部的空附件行 draft */}
+            <QuestionContentEditor
+              key={editCase.id}
+              value={editQuestion}
+              onChange={setEditQuestion}
+              textareaId={questionId}
               rows={3}
-              className="input resize-y"
             />
           </div>
 
@@ -807,7 +1063,19 @@ function EditCaseModal({
                 />
               </div>
               <div>
-                <label htmlFor={keyPointsId} className="field-label">关键点（逗号分隔）</label>
+                <div className="flex items-center justify-between">
+                  <label htmlFor={keyPointsId} className="field-label">关键点（逗号分隔）</label>
+                  {/* 提炼结果只回填输入框，用户核对（可改）后随表单一起保存 */}
+                  <button
+                    type="button"
+                    onClick={extractOneKeyPoints}
+                    disabled={extractingOne || !editCase.reference_answer?.trim()}
+                    className="text-action text-[11px] disabled:opacity-40"
+                    title={editCase.reference_answer?.trim() ? '用大模型从参考答案提炼关键点' : '请先填写参考答案'}
+                  >
+                    {extractingOne ? '提炼中…' : 'AI 提炼'}
+                  </button>
+                </div>
                 <input
                   id={keyPointsId}
                   value={editCase.key_points?.join(', ') || ''}

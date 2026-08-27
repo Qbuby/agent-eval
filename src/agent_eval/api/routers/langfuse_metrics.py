@@ -80,21 +80,26 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def _input_preview(value, max_len: int = 300) -> str | None:
-    """列表用 input 预览：文本化后截断，避免大 JSON 撑爆列表 payload。
+    """列表用 input 预览：优先提取用户问题正文，取不到才退回紧凑 JSON。
 
-    str 原样使用；dict/list 等用紧凑 JSON 序列化。超长截断并加省略号。
+    直接序列化整个 trace.input 会让列表列全是 ``{"messages":[{"role":"user",…``
+    这种壳，真正的问题被挤到截断之外。所以先走 ``_question_from_trace_input``
+    （与导入备选数据集同一套口径），提取失败再退回 JSON 以免丢信息。
+    超长截断并加省略号。
     """
     if value is None:
         return None
-    if isinstance(value, str):
-        text = value
-    else:
-        try:
-            import json
+    text = _question_from_trace_input(value)
+    if not text:
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                import json
 
-            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-        except (TypeError, ValueError):
-            text = str(value)
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                text = str(value)
     text = text.strip()
     if not text:
         return None
@@ -346,11 +351,19 @@ def _parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value)
 
 
-def _trace_filters(environment: str | None, from_: str | None, to: str | None):
-    """构造 LangfuseTraceMetricRow 上的 environment + trace_timestamp 窗口 where 列表。"""
+def _trace_filters(environment: list[str] | None, from_: str | None, to: str | None):
+    """构造 LangfuseTraceMetricRow 上的 environment + trace_timestamp 窗口 where 列表。
+
+    ``environment`` 是**多选**过滤项：重复传同名 query param 即多选
+    （``?environment=a&environment=b``），空列表 / None 表示不过滤（全部环境）。
+    单值走 ``==``、多值走 ``IN``，让 Postgres 对单值仍能用等值索引。
+    """
     clauses = []
-    if environment:
-        clauses.append(LangfuseTraceMetricRow.environment == environment)
+    envs = [e for e in (environment or []) if e and e.strip()]
+    if len(envs) == 1:
+        clauses.append(LangfuseTraceMetricRow.environment == envs[0])
+    elif envs:
+        clauses.append(LangfuseTraceMetricRow.environment.in_(envs))
     dt_from = _parse_dt(from_)
     dt_to = _parse_dt(to)
     if dt_from is not None:
@@ -365,7 +378,9 @@ def _trace_filters(environment: str | None, from_: str | None, to: str | None):
 # --------------------------------------------------------------------------- #
 @router.get("/stats", response_model=MetricsStatsResponse)
 async def get_metrics_stats(
-    environment: str | None = Query(None, description="精确匹配某 env；不传则全 env"),
+    environment: list[str] | None = Query(
+        None, description="多选 env（可重复传）；不传则全 env"
+    ),
     from_: str | None = Query(None, alias="from", description="trace_timestamp 下界 (ISO)"),
     to: str | None = Query(None, description="trace_timestamp 上界 (ISO)"),
 ) -> MetricsStatsResponse:
@@ -438,7 +453,9 @@ async def get_metrics_stats(
 
 @router.get("/trends", response_model=MetricsTrendResponse)
 async def get_metrics_trends(
-    environment: str | None = Query(None),
+    environment: list[str] | None = Query(
+        None, description="多选 env（可重复传）；不传则全 env"
+    ),
     from_: str | None = Query(None, alias="from"),
     to: str | None = Query(None),
     bucket: str = Query("day", description="时间分桶粒度，传给 date_trunc"),
@@ -508,7 +525,9 @@ async def get_metrics_trends(
 
 @router.get("/traces", response_model=TraceListResponse)
 async def list_traces(
-    environment: str | None = Query(None),
+    environment: list[str] | None = Query(
+        None, description="多选 env（可重复传）；不传则全 env"
+    ),
     from_: str | None = Query(None, alias="from"),
     to: str | None = Query(None),
     name: str | None = Query(None, description="按 trace name 模糊匹配 (ilike)"),
@@ -773,7 +792,12 @@ def _text_from_value(value) -> str:
 
 
 def _question_from_trace_input(trace_input) -> str:
-    """从 trace.input 提取用户问题：优先 messages 里最后一条 user，回退整体文本。"""
+    """从 trace.input 提取用户问题：优先 messages 里最后一条 user，回退整体文本。
+
+    LangGraph 中断恢复（interrupt/resume）的 trace 没有 messages，形状是
+    ``{"goto":[],"graph":null,"resume":"<用户补充的内容>","update":null}``，
+    用户输入在 ``resume`` 里，单独兜一层。
+    """
     if isinstance(trace_input, dict):
         messages = trace_input.get("messages")
         if isinstance(messages, list):
@@ -782,6 +806,11 @@ def _question_from_trace_input(trace_input) -> str:
                     txt = _text_from_value(msg.get("content"))
                     if txt:
                         return txt
+        resume = trace_input.get("resume")
+        if resume is not None:
+            txt = _text_from_value(resume)
+            if txt:
+                return txt
     return _text_from_value(trace_input)
 
 

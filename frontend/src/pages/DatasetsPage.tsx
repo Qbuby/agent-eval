@@ -20,7 +20,7 @@ export default function DatasetsPage() {
   const [search, setSearch] = useState('')
 
   // 备选数据集页只看 candidate 类型，与多轮对话集隔离。
-  const { data: datasets, isLoading, isFetching } = useQuery({
+  const { data: datasets, isLoading, isFetching, isError, error, refetch } = useQuery({
     queryKey: ['datasets', 'candidate'],
     queryFn: () => datasetsApi.list({ type: 'candidate' }).then((r) => r.data),
     staleTime: 30_000,
@@ -90,6 +90,20 @@ export default function DatasetsPage() {
           新建数据集
         </Button>
       </div>
+
+      {isError && (
+        <div className="card mb-4 flex items-center gap-3 border-negative/30 bg-negative/5 p-4">
+          <div className="min-w-0 flex-1">
+            <div className="text-[13px] font-medium text-negative">数据集加载失败</div>
+            <div className="mt-1 text-[12px] text-text-secondary">
+              {toToastMessage(formatApiError(error, { fallbackMessage: '暂时无法加载数据集。' }))}
+            </div>
+          </div>
+          <Button variant="secondary" size="sm" loading={isFetching} onClick={() => void refetch()}>
+            重试
+          </Button>
+        </div>
+      )}
 
       {showCreate && (
         <form

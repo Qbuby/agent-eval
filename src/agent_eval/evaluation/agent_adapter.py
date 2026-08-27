@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from agent_eval.data.content_blocks import content_to_text
+
 
 @dataclass
 class AgentResponse:
@@ -38,10 +40,16 @@ class AgentHTTPStatusError(httpx.HTTPStatusError):
         return f"{base}\nResponse body: {self.response_body}"
 
 
-def _render_payload_value(value: Any, question: str) -> Any:
-    """递归展开 payload 模板中的运行时占位符。"""
+def _render_payload_value(value: Any, question: str | list[dict[str, Any]]) -> Any:
+    """递归展开 payload 模板中的运行时占位符。
+
+    带图样例的 question 是多模态 content 数组，无法嵌进模板字符串；此时
+    ``{input}`` 用数组里的文本块拼接后的纯文本替换（模板通常只用它填提示语），
+    真正的多模态数组由 ``_build_payload`` 直接写进 ``question`` 字段。
+    """
     if isinstance(value, str):
-        return value.replace("{input}", question).replace(
+        text = content_to_text(question)
+        return value.replace("{input}", text).replace(
             "{uuid}", uuid.uuid4().hex[:12]
         )
     if isinstance(value, dict):
@@ -145,17 +153,36 @@ class SSEStreamAdapter:
         thread_id: str | None = None,
         language: str = "请用中文回复",
         client: httpx.AsyncClient | None = None,
+        sticky_thread: bool = False,
     ):
         self.url = url
+        self.payload_template = payload_template or {}
         self.timeout = timeout
         self.mode = mode
         self.thread_id = thread_id
         self.language = language
-        self.payload_template = payload_template or {}
+        # 会话复用策略。被测 agent 按 configurable.thread_id 划会话——同一
+        # thread_id 就是同一场对话，带着上一次调用的上下文继续。
+        #   sticky_thread=False（默认）：每次 invoke 派生一个**新**会话号，
+        #     单轮样例之间、以及同一样例的每次重试，都落在互不相干的干净会话里。
+        #   sticky_thread=True：整个 adapter 生命周期共用一个会话号，仅供
+        #     multiturn.replay_conversation 逐轮回放使用（agent 端要靠它维持
+        #     上下文，每轮只发当轮 user 消息）。
+        # 历史缺陷：thread_id 曾作为实例属性一存到底，非多轮路径下每次重试都
+        # 复用同一会话号，agent 带着上次未完成尝试的残留上下文重答，且全程无
+        # 日志无标记（见 _invoke_with_retry 在同一 adapter 上循环）。
+        self.sticky_thread = bool(sticky_thread)
+        self._invocations = 0
         req_headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if headers:
             req_headers.update(headers)
         self._headers = req_headers
+        # 调用方显式配了身份就尊重它；否则每次请求注入一个唯一的 X-User-Id，
+        # 使被测服务端日志能反查到底是哪一次评测调用。header 必须 latin-1 可编码
+        # （h11 硬要求），故身份用纯 ASCII 的 uuid，不复用可能含中文的 thread_id。
+        self._inject_identity = not any(
+            k.lower() == "x-user-id" for k in req_headers
+        )
         # Reuse an injected pooled client on high-concurrency runs; otherwise
         # own a private client (CLI / tests). Headers are applied per-request
         # so a shared client can serve many adapters with different auth.
@@ -166,7 +193,37 @@ class SSEStreamAdapter:
             self._client = httpx.AsyncClient(headers=req_headers, timeout=timeout)
             self._owns_client = True
 
-    def _build_payload(self, question: str) -> dict[str, Any]:
+    def _next_thread_id(self) -> str:
+        """本次调用要用的会话号。
+
+        ``sticky_thread=True``（多轮回放）时整段对话共用 ``self.thread_id``；
+        否则**每次调用现场派生一个新号**，把传入的 thread_id 仅当作可读前缀，
+        再缀上单调计数与随机段。这样同一 adapter 的第 N 次调用（含每一次重试）
+        都落在互不相干的干净会话里，且从会话号本身就能看出这是第几次调用。
+        """
+        base = self.thread_id
+        if self.sticky_thread and base:
+            return base
+        self._invocations += 1
+        suffix = f"i{self._invocations}-{uuid.uuid4().hex[:8]}"
+        return f"{base}-{suffix}" if base else f"eval_{suffix}"
+
+    def _build_payload(
+        self, question: str | list[dict[str, Any]], thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """构造请求体。``question`` 可以是纯文本，也可以是多模态 content 数组
+        （Anthropic canonical blocks：``[{"type":"text",...},{"type":"image",...}]``）。
+
+        数组形态原样进 ``question`` 字段——被测 agent 的 ``ChatAgentRequest.question``
+        声明为 ``str | list[dict]``，其 content 预处理会把 image/document/video 的
+        URL 块下载落沙箱、按 provider 归一化格式，评测侧不需要做任何转换。
+        ``payload_template`` 的 ``{input}`` 占位符只在纯文本时代换（数组无法做字符串
+        替换），故渲染时用文本摘要，避免把 JSON 塞进模板槽位。
+
+        ``thread_id`` 由 ``invoke`` 经 ``_next_thread_id`` 算好后传入，以便调用方
+        拿到**实际发出**的会话号写进 raw_response；单独调用本方法（测试）时省略，
+        此时按同一策略现场派生。
+        """
         rendered = _render_payload_value(self.payload_template, question)
         if not isinstance(rendered, dict):
             rendered = {}
@@ -184,7 +241,7 @@ class SSEStreamAdapter:
                 if key not in {"question", "configurable"}
             }
             configurable: dict[str, Any] = {
-                "thread_id": self.thread_id or f"eval_{uuid.uuid4().hex[:12]}",
+                "thread_id": thread_id or self._next_thread_id(),
                 "language": self.language,
             }
             template_configurable = rendered.get("configurable")
@@ -207,18 +264,36 @@ class SSEStreamAdapter:
             payload["question"] = question
 
         if "conversation_id" not in payload:
-            payload["conversation_id"] = f"eval_{uuid.uuid4().hex[:12]}"
+            # generic 模式的会话键是 conversation_id，同样每次调用一个新值；
+            # 用 invoke 算好的那个，使 raw_response 记录的与发出的是同一个值。
+            payload["conversation_id"] = thread_id or self._next_thread_id()
 
         return payload
 
     async def invoke(self, messages: list[dict[str, Any]]) -> AgentResponse:
-        question = ""
+        # 取最后一条 user 消息的 content 原样送出：可能是 str，也可能是多模态
+        # content 数组（带图样例）。不在此拍平成字符串，否则图片信息丢失。
+        question: str | list[dict[str, Any]] = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
-                question = msg.get("content", "")
+                content = msg.get("content", "")
+                question = content if isinstance(content, (str, list)) else str(content)
                 break
 
-        payload = self._build_payload(question)
+        # 本次调用实际发出的会话号与身份，先算出来再建 payload/header，使
+        # raw_response 记录的与真正发出的必然是同一个值（而非事后猜测）。
+        sent_thread_id = self._next_thread_id()
+        payload = self._build_payload(question, thread_id=sent_thread_id)
+        req_headers = self._headers
+        identity: str | None = next(
+            (v for k, v in self._headers.items() if k.lower() == "x-user-id"), None
+        )
+        if self._inject_identity:
+            # 每次请求一个唯一身份，使被测服务端日志能定位到具体这一次调用。
+            # 只在本次请求的头副本上加，不污染 self._headers（共享 client 下
+            # 同一 adapter 会发多次请求，逐次身份必须各不相同）。
+            identity = f"agent-eval-{uuid.uuid4().hex[:16]}"
+            req_headers = {**self._headers, "X-User-Id": identity}
         full_text: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         active_tools: dict[str, dict[str, Any]] = {}
@@ -245,6 +320,11 @@ class SSEStreamAdapter:
             "cache_creation_tokens": 0,
         }
         usage_seen = False
+        # OmniAgent 的带内控制帧（服务端异常 / 0.x 中断与排队）以及 v1 的
+        # command_result / structured_output 协议帧。它们都混在 HTTP 200 的 SSE
+        # 流里，不属于 LangGraph astream_events，须在事件解析前单独截获。
+        control_frames: list[dict[str, Any]] = []
+        protocol_frames: list[dict[str, Any]] = []
 
         start = time.perf_counter()
         # 流式读取途中对端切断（judge 的大 payload 常触发被测 agent 或上游网关
@@ -256,7 +336,7 @@ class SSEStreamAdapter:
         # HTTPStatusError（上游明确 4xx/5xx 拒绝）不在此捕获，照常冒泡。
         truncated = False
         try:
-            async with self._client.stream("POST", self.url, json=payload, headers=self._headers) as resp:
+            async with self._client.stream("POST", self.url, json=payload, headers=req_headers) as resp:
                 try:
                     resp.raise_for_status()
                 except httpx.HTTPStatusError as exc:
@@ -287,6 +367,31 @@ class SSEStreamAdapter:
                         continue
 
                     if self.mode == "langgraph_v2":
+                        # OmniAgent 把异常与中断**写在流里**（HTTP 200 早已发出，
+                        # 见 omniagent/api/services/response_service.py）：
+                        #   {"status": "error", "error": ...}      服务端异常
+                        #   {"event": "interrupted", "interrupt": ...} 等待人工输入
+                        #   {"event": "enqueued", "message": ...}  该会话有未答中断，本次排队
+                        # 这三种帧都不是 astream_events 事件，_handle_langgraph_event
+                        # 认不出而静默丢弃，结果是「跑失败」长得和「答了空话」一样。
+                        # 必须在这里显式截获并记录，让上层把样例判成 error 而不是
+                        # 假 pass / 无差别 skipped。
+                        control = self._detect_control_frame(obj)
+                        if control is not None:
+                            control_frames.append(control)
+                            if control["kind"] in ("interrupted", "enqueued"):
+                                # 0.x agent 停下等输入 / 被排队，本次调用不会再产出答案。
+                                # v1 HTTP 入口已取消中断，但保留兼容读取旧服务。
+                                break
+                            continue
+                        protocol = self._detect_protocol_frame(obj)
+                        if protocol is not None:
+                            protocol_frames.append(protocol)
+                            if protocol["kind"] == "command_result":
+                                text = protocol.get("detail")
+                                if isinstance(text, str) and text:
+                                    full_text.append(text)
+                            continue
                         if self._handle_langgraph_event(
                             obj, full_text, tool_calls, active_tools, usage_acc,
                             steps, thought_state, start,
@@ -327,10 +432,46 @@ class SSEStreamAdapter:
         # Build raw_response carrying tool_calls, usage, and the ordered CoT
         # step list so the runner can persist it into test_results.full_trace.
         raw: dict[str, Any] = {}
+        # 本次**实际发出**的会话号与身份，无条件记录。放在 tool_calls/steps/usage
+        # 的条件写之前且不带任何 if：零字节即断（truncated）时恰恰最需要知道当时
+        # 用的是哪个会话，若挂在条件下就会正好在最该溯源的场景里丢掉。
+        # 上层据此可判定每条样例是否落在干净会话里 —— 落库前无从事后补算。
+        raw["sent_thread_id"] = sent_thread_id
+        if identity:
+            raw["identity"] = identity
         if truncated:
             # 流被中途切断——已累积内容可能不完整。上层据此把「拿到部分答案」
             # 与「连接彻底失败/无评分」区分开，并允许散文兜底对部分文本抽分。
             raw["truncated"] = True
+        if control_frames:
+            # 带内控制帧（服务端异常 / 中断 / 排队）。与 truncated 同理无条件
+            # 落库：这是判定「本次调用是否算失败」的唯一依据，HTTP 层看不出来。
+            # agent_error 给上层一个不必解析明细就能判 error 的布尔位；
+            # interrupted / enqueued 不算 agent 挂了，但同样没有有效答案，
+            # 由上层按 incomplete 处理（沙箱在服务端也被 hold 着）。
+            raw["control_frames"] = control_frames
+            kinds = {c["kind"] for c in control_frames}
+            if "error" in kinds:
+                # 明细优先，但必须保持**真值**：服务端偶尔只发 {"status": "error"}
+                # 而不带 error 字段，此时 detail 是 None。若直接落 None，上层
+                # `if raw.get("agent_error")` 会把挂掉的样例判成正常 —— 这一位的
+                # 全部意义就是不解析明细也能判 error，故明细为空时退回 True。
+                raw["agent_error"] = next(
+                    (c["detail"] for c in control_frames
+                     if c["kind"] == "error" and c.get("detail")),
+                    True,
+                )
+            if kinds & {"interrupted", "enqueued"}:
+                raw["incomplete"] = True
+        if protocol_frames:
+            raw["protocol_frames"] = protocol_frames
+            structured = next(
+                (frame.get("detail") for frame in reversed(protocol_frames)
+                 if frame["kind"] == "structured_output"),
+                None,
+            )
+            if structured is not None:
+                raw["structured_output"] = structured
         if tool_calls:
             raw["tool_calls"] = tool_calls
         if steps:
@@ -354,6 +495,57 @@ class SSEStreamAdapter:
             latency_ms=latency_ms,
             raw_response=raw or None,
         )
+
+    @staticmethod
+    def _detect_control_frame(obj: dict[str, Any]) -> dict[str, Any] | None:
+        """识别 OmniAgent 写在 SSE 流里的**非事件**控制帧，非控制帧返回 None。
+
+        OmniAgent 的 ``astream_raw_events`` 用同一条 ``text/event-stream``
+        混发两类东西：LangGraph 的 ``astream_events`` 事件（带 ``event``:
+        ``on_chat_model_stream`` 等），以及三种自造的控制帧。控制帧要害在于
+        **HTTP 状态码早已是 200**（StreamingResponse 一开就发头），所以服务端
+        异常不会走 ``raise_for_status``，只能在流里发现：
+
+        - ``{"status": "error", "error": "..."}`` — 服务端 500 级异常
+          （``_run()`` 的 except 把它塞进队列）
+        - ``{"event": "interrupted", "interrupt": {...}}`` — agent 等人工输入
+          （tool_approval 或 user_question）；该会话沙箱被 hold 不回收
+        - ``{"event": "enqueued", "message": "..."}`` — 该 thread 有未回答的
+          ask 中断，本次请求被排队，不会产出答案
+
+        返回 ``{"kind": ..., "detail": ...}``；``kind`` 取上述三者之一。
+
+        为什么必须显式识别：``_handle_langgraph_event`` 按 ``obj["event"]``
+        分派，``status``/``interrupted``/``enqueued`` 都落不进任何分支，被静默
+        丢弃 → 上层只看到 ``content == ""``，与「agent 正常答了空话」不可区分，
+        判成 skipped 甚至假 pass。评估必须把它们记成 error。
+        """
+        if obj.get("status") == "error":
+            return {"kind": "error", "detail": obj.get("error")}
+        event = obj.get("event")
+        if event == "interrupted":
+            return {"kind": "interrupted", "detail": obj.get("interrupt")}
+        if event == "enqueued":
+            return {"kind": "enqueued", "detail": obj.get("message")}
+        return None
+
+    @staticmethod
+    def _detect_protocol_frame(obj: dict[str, Any]) -> dict[str, Any] | None:
+        """识别 OmniAgent v1 的 HTTP SSE 协议帧，普通 LangGraph 事件返回 None。
+
+        v1 除原始 ``astream_events`` 外还会发送两种框架级结果：斜杠命令以
+        ``command_result.text`` 返回，结构化输出以 ``structured_output`` 返回。
+        两者都不应交给 ``_handle_langgraph_event``，否则会被静默丢弃。
+        """
+        event = obj.get("event")
+        if event == "command_result":
+            return {"kind": "command_result", "detail": obj.get("text")}
+        if event == "structured_output":
+            return {
+                "kind": "structured_output",
+                "detail": obj.get("structured_output"),
+            }
+        return None
 
     @staticmethod
     def _handle_langgraph_event(

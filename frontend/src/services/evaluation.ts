@@ -251,6 +251,9 @@ export const evaluationApi = {
       dimensions_recovered?: number
       results_completed?: number
       results_still_missing?: number
+      failures_transient?: number
+      failures_config?: number
+      failures?: Array<{ dimension: string; error: string; kind: 'transient' | 'config' }>
       error?: string
       note?: string
     }>(`/eval/runs/${runId}/rescore-status`)

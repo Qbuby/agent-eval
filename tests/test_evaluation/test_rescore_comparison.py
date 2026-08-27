@@ -89,7 +89,7 @@ async def test_rescore_comparison_recovers_failed_scoped_verdict(monkeypatch):
     monkeypatch.setattr(langfuse_runner, "pick_swap", lambda: False)
 
     comparison = _comparison_with_failed_turn()
-    recovered, still_missing = await langfuse_runner._rescore_comparison_result(
+    recovered, still_missing, errors = await langfuse_runner._rescore_comparison_result(
         comparison=comparison,
         judge_specs=[_spec()],
         full_trace=_full_trace(),
@@ -98,6 +98,7 @@ async def test_rescore_comparison_recovers_failed_scoped_verdict(monkeypatch):
 
     assert recovered == 1
     assert still_missing is False
+    assert errors == []
     # 原地回写：turn1 从 evaluation_error → scored，带上补评 verdict。
     scoped = comparison["evaluator_verdicts"][0]["scoped_verdicts"]
     t1 = next(s for s in scoped if s.get("turn_index") == 1)
@@ -119,7 +120,7 @@ async def test_rescore_comparison_still_failing_stays_error(monkeypatch):
     monkeypatch.setattr(langfuse_runner, "pick_swap", lambda: False)
 
     comparison = _comparison_with_failed_turn()
-    recovered, still_missing = await langfuse_runner._rescore_comparison_result(
+    recovered, still_missing, errors = await langfuse_runner._rescore_comparison_result(
         comparison=comparison,
         judge_specs=[_spec()],
         full_trace=_full_trace(),
@@ -128,6 +129,10 @@ async def test_rescore_comparison_still_failing_stays_error(monkeypatch):
 
     assert recovered == 0
     assert still_missing is True
+    # errors 透出可操作原因：维度名 + 去掉维度前缀的错误。
+    assert len(errors) == 1
+    assert errors[0]["dimension"].endswith(".turn1")
+    assert errors[0]["error"] == "provider still down"
     scoped = comparison["evaluator_verdicts"][0]["scoped_verdicts"]
     t1 = next(s for s in scoped if s.get("turn_index") == 1)
     assert t1["status"] == "evaluation_error"
