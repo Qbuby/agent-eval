@@ -2,450 +2,268 @@
 
 # Agent Eval
 
-**Agent 自动化测试与优化闭环系统**
+**面向 AI Agent 的评估、回归测试与受控执行平台**
 
-面向 LangChain / LangGraph Agent 的全链路 Trace 采集、多维度评估与策略驱动优化平台。
+把分散的 Trace、测试集、LLM Judge 和人工复核，组织成可复现、可审计、可持续迭代的工程闭环。
 
-`Python 3.11+` · `FastAPI` · `PostgreSQL` · `LangSmith` · `React 18` · `BFCL-v4`
+`Python 3.11+` · `FastAPI` · `PostgreSQL` · `React 18` · `LangSmith` · `Langfuse` · `Kubernetes`
 
 </div>
 
 ---
 
-## 概览
+## 项目定位
 
-Agent Eval 把 Agent 的「能力回归测试」从人工抽查变成可度量、可复现、可自动收敛的工程流程。
+Agent Eval 解决的不是“调用一次模型并展示分数”，而是 Agent 上线后更难的工程问题：
 
-系统围绕三件事展开：
+- 如何从真实 Trace 和标准数据集构建可版本化的测试资产；
+- 如何同时评估答案、工具调用、推理过程、性能与错误恢复；
+- 如何对单轮、多轮、图片输入和双模型 A/B 结果进行统一回归分析；
+- 如何让 Agent 执行长任务，同时控制权限、租户边界、资源配额和产物生命周期。
 
-| | |
+项目包含两条相互衔接的主线：
+
+| 主线 | 解决的问题 | 关键能力 |
+|---|---|---|
+| **Agent Evaluation Workbench** | Agent 的质量是否可度量、可比较、可回归？ | 数据集管理、Trace 导入、规则与 LLM Judge、单/多轮评估、A/B 对比、成本分析、报告导出 |
+| **Governed OmniAgent** | Agent 如何安全地执行有状态、长耗时任务？ | 多会话对话、审批动作、任务队列、隔离执行、记忆、制品、通知、调度、事件审计 |
+
+![OmniAgent workbench](e2e/omniagent-two-tenant/evidence/a-work-panel.png)
+
+> 截图来自双租户验收环境，仅包含测试 canary 数据。完整验收说明与哈希见
+> [`e2e/omniagent-two-tenant/evidence/`](e2e/omniagent-two-tenant/evidence/)。
+
+## 核心能力
+
+### 1. 评估与回归
+
+- **多源测试资产**：支持 LangSmith 数据集、线上 Trace、Excel / CSV / JSON 导入和 LLM 用例生成。
+- **多种评估形态**：覆盖单轮、多轮、图片附件、已有回复回放和双模型比较评估。
+- **可组合评分**：规则评分、LLM-as-Judge 与混合策略并存，可记录评估依据并执行补评。
+- **可解释分析**：结果详情保留逐轮回答、工具调用、Token、延迟、成本与低分原因。
+- **回归闭环**：支持异常样例筛选、跨运行比较、失败模式聚类、策略生成与 A/B 验证。
+
+### 2. 数据与协作
+
+- 三类数据集的 CRUD、版本化、批量编辑、分类和导出；
+- Agent 回复预生成、版本切换、按模型批量选择与答案关键点提炼；
+- JWT 认证、租户隔离、角色权限、审计日志与评估完成通知；
+- Langfuse 指标、环境筛选和输入预览，兼容 LangSmith Trace 工作流。
+
+### 3. OmniAgent 产品平面
+
+OmniAgent 不是直接获得数据库和集群权限。所有高影响操作都进入受治理的产品平面：
+
+```text
+用户请求
+  -> 多会话 SSE 对话
+  -> 能力调用 / 动作预览
+  -> 风险分级与人工审批
+  -> 持久化 Job
+  -> Worker 租约与重试
+  -> 隔离运行时
+  -> Artifact 扫描、归档与审计事件
+```
+
+产品平面提供：
+
+- **持久任务状态机**：排队、租约、心跳、重试、取消、超时回收和幂等执行；
+- **受控动作**：参数摘要、风险等级、审批状态和执行结果形成完整审计链；
+- **用户资产**：个人记忆、制品、通知、调度和事件流均绑定租户与所有者；
+- **可恢复对话**：会话与消息落库，支持断线恢复、取消和失败重试。
+
+### 4. 隔离执行与安全边界
+
+执行层采用 fail-closed 设计，默认不开启 Kubernetes runner。启用时需同时通过配置、镜像、RBAC 和租户白名单门禁。
+
+| 控制面 | 设计 |
 |---|---|
-| **采** | 通过 LangChain Callback 或 HTTP Adapter 零侵入采集 Agent 的推理步骤、工具调用、延迟与 Token 开销 |
-| **评** | 五维评分体系（输出正确性 · 工具序列 · 推理质量 · 性能 · 错误恢复）+ LLM-as-Judge，支持规则 / LLM / 混合三种模式 |
-| **优** | 失败模式聚类 → LLM 生成策略 → 应用到 Agent 配置副本 → 回归对照。三重安全阀（收敛、停滞、回归）兜底 |
+| 租户边界 | 查询与变更同时约束 `tenant_id` 和资源 owner；跨租户访问统一返回 404 |
+| 最小权限 | 普通聊天 sidecar 不获得执行权限；执行能力使用独立 ServiceAccount 与窄化 RBAC |
+| 供应链 | 运行镜像要求不可变 SHA-256 digest；可选 Axi 运行时另设哈希与许可双门禁 |
+| 网络隔离 | SandboxTemplate 默认限制公网和 sandbox 间横向访问 |
+| 制品安全 | 路径逃逸与符号链接检查、大小配额、扫描状态、过期回收和授权下载 |
+| 安全回滚 | 先关闭 worker，再移除凭据与执行身份；重复回滚必须满足幂等状态证明 |
 
-数据集托管在 LangSmith，全流程可通过 **CLI**、**FastAPI 后端** 和 **React Web UI** 三种接口驱动。
+## 系统架构
 
----
-
-## 架构
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                  LoopController  —  闭环控制器                    │
-│         收敛判断 · 停滞检测 · 回归保护 · A/B 分流                  │
-└──────┬──────────────────┬──────────────────┬─────────────────────┘
-       │                  │                  │
-       ▼                  ▼                  ▼
-┌──────────────┐  ┌────────────────┐  ┌───────────────────┐
-│   数据层      │  │    评估层       │  │     优化层         │
-│              │  │                │  │                   │
-│ DatasetMgr   │→│ TraceCollector │→│ FailureAnalyzer   │
-│ CaseGenerator│  │ 5 × Scorer     │  │ StrategyGenerator │
-│ TraceExtract │  │ RegressionDet. │  │ StrategyApplicator│
-└──────────────┘  └────────────────┘  └───────────────────┘
-       │                  │                  │
-       └──────────────────┼──────────────────┘
-                          ▼
-              ┌─────────────────────┐
-              │     PostgreSQL      │
-              │      + LangSmith     │
-              │       + Grafana      │
-              └─────────────────────┘
-```
-
-### 闭环迭代流
-
-```
-加载用例 → 执行 Agent → 采集 Trace → 五维评分
-    ↑                                     │
-    │                               达标? ──→ 是 → 输出报告
-    │                                 │
-    │                                 否
-    │                                 ▼
-    └── 补充用例 ← 失败分析 → 生成策略 → 应用策略 → 重新测试
+```text
+                         +----------------------+
+                         |   React Workbench    |
+                         | datasets / eval / AI |
+                         +----------+-----------+
+                                    |
+                                    v
++------------------+     +----------+-----------+     +------------------+
+| LangSmith /      |<--->| FastAPI Application |<--->| PostgreSQL       |
+| Langfuse / LLM   |     | auth / eval / admin  |     | business state  |
++------------------+     +----------+-----------+     +------------------+
+                                    |
+                       +------------+-------------+
+                       |                          |
+                       v                          v
+             +---------+----------+     +---------+----------+
+             | OmniAgent sidecar  |     | Product-plane     |
+             | streamed chat      |     | worker / outbox   |
+             +--------------------+     +---------+----------+
+                                                  |
+                                                  v
+                                        +---------+----------+
+                                        | Kubernetes sandbox |
+                                        | isolated runtime   |
+                                        +--------------------+
 ```
 
-每轮迭代：加载 → 并发执行 → 采 Trace → 五维打分 → 收敛判断 → 回归检测 → 停滞检测 → 失败聚类 → LLM 生成策略 → 策略应用 → 下一轮。
+### 值得关注的工程取舍
 
----
-
-## 功能矩阵
-
-### 数据层
-
-| 能力 | 说明 |
-|------|------|
-| 数据集 CRUD | LangSmith 托管，支持 tag / split / as-of 版本快照 |
-| 用例导入 | JSON / JSONL 文件、LangSmith 线上 trace、外部 LangSmith 数据集同步 |
-| 用例生成 | `generate scenario` 从场景描述生成、`generate mutate` 从现有用例变异（rephrase / edge_case / adversarial） |
-| Benchmark 导入 | Excel / CSV 批量导入标准数据集 |
-| 数据路由 | 不同数据集路由到不同评估方法，匹配器驱动 |
-
-### 评估层
-
-| 维度 | 默认权重 | 评分方式 | 关键逻辑 |
-|------|---------|---------|---------|
-| 输出正确性 | 0.30 | 规则 + LLM | 关键词 / 正则匹配（0.4）+ LLM 语义判定（0.6） |
-| 工具调用序列 | 0.25 | 规则 | 覆盖率 0.35 + LCS 顺序 0.25 + 参数匹配 0.25 + 冗余惩罚 0.15 |
-| 推理质量 | 0.20 | LLM Judge | 逻辑连贯 · 信息利用 · 幻觉检测 · 推理效率 |
-| 性能 | 0.15 | 规则 | 延迟 / Token / 调用次数对阈值的比值 |
-| 错误恢复 | 0.10 | 规则 + LLM | 重试检测（0.4）+ 恢复策略合理性（0.6） |
-
-评分器全部继承 `DimensionScorer` 基类，可按需增减维度。支持的 Agent 接入方式：
-
-- **Python Factory** — 实现 `AgentFactory` 协议（`get_config()` / `create(config)`）
-- **OpenAI-Compatible API** — 任意兼容 `/v1/chat/completions` 的 HTTP 端点
-- **SSE Stream** — 自定义事件流协议，通过 `payload_template` 配置
-- **BFCL-v4** — 接入 Berkeley Function Calling Leaderboard 作为标准化基准
-
-### 优化层
-
-失败用例（总分 `< 0.7`）进入九类预定义失败模式：`tool_selection_error` · `tool_param_error` · `missing_tool_call` · `redundant_tool_call` · `reasoning_error` · `hallucination` · `instruction_following` · `context_loss` · `error_handling`。
-
-策略类型：`prompt` · `tool_config` · `system_param` · `composite`。每条变更包含 `change_type` / `target` / `before` / `after` / `reason`，按风险等级（low / medium / high）标注。
-
-### 闭环控制
-
-| 参数 | 默认 | 作用 |
-|------|------|------|
-| `target_score` | 0.85 | 达标即收敛 |
-| `max_iterations` | 10 | 硬限制 |
-| `min_improvement` | 0.01 | 低于此视为停滞 |
-| `stagnation_patience` | 3 | 连续停滞轮数上限 |
-| `regression_tolerance` | 0.05 | 回归容忍度，超出回滚 |
-| `enable_ab_test` | true | A/B 分流验证 |
-
-停止原因：`target_reached` · `stagnation` · `regression_with_stagnation` · `max_iterations_reached` · `no_failures_to_optimize` · `no_strategy_changes`。
-
-### 治理与调度
-
-| 模块 | 职责 |
-|------|------|
-| `governance/` | 用例去重、生命周期管理、校验器、审计日志 |
-| `routing/` | 订阅者 + 匹配器 + 引擎，数据集路由到对应评估方法 |
-| `scheduler/` | 定时任务调度、事件驱动 poller、服务管理 |
-| `auth/` | JWT + bcrypt，多项目隔离 |
-
----
+1. **评估记录优先于瞬时响应**：用例、运行、逐维评分、成本与评估依据均持久化，支持复盘和补评。
+2. **控制面与执行面分离**：FastAPI 负责鉴权、策略和状态，隔离运行时只接收短期授权的任务规格。
+3. **租约而非进程内任务**：长任务通过数据库状态机协调，服务重启后可回收失效租约并继续处理。
+4. **迁移与后端同镜像**：Compose 中 migrate 与 backend 复用同一镜像，避免 schema 与运行代码漂移。
+5. **危险能力显式开启**：产品平面、worker、runner、租户 allowlist 和集群确认缺一不可。
 
 ## 快速开始
 
-### 1. 安装
+### 前置条件
+
+- Python 3.11+
+- Node.js 20+
+- PostgreSQL 16，或 Docker Compose v2
+- 可选：LangSmith / Langfuse / OpenAI-compatible LLM 凭据
+
+### 本地开发
 
 ```bash
-pip install -e .
-pip install -e ".[dev]"      # 开发依赖
-pip install -e ".[bench]"    # BFCL-v4 / evalscope 支持
-```
+git clone https://github.com/Qbuby/agent-eval.git
+cd agent-eval
 
-### 2. 配置
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+pip install -e ".[dev]"
 
-复制 `eval_config.example.yaml` 为 `eval_config.yaml`，并在 `.env` 中配置：
+cp .env.example .env
+# 填写 AUTH_SECRET_KEY、SECURITY_FERNET_KEY 和所需的模型/Trace 配置
 
-```ini
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=postgres
-DB_PASSWORD=postgres
-DB_NAME=agent_eval
-
-LLM_PROVIDER=openai
-LLM_MODEL=claude-opus-4-7
-LLM_JUDGE_MODEL=claude-opus-4-7
-LLM_BASE_URL=https://your-endpoint/v1
-LLM_API_KEY=sk-...
-
-LANGSMITH_API_KEY=lsv2_...
-LANGSMITH_API_URL=https://api.smith.langchain.com
-```
-
-### 3. 初始化数据库
-
-```bash
 alembic upgrade head
-agent-eval init-db
-```
-
-### 4. 启动后端 + 前端
-
-```bash
 agent-eval server --host 0.0.0.0 --port 8000
-cd frontend && npm install && npm run dev
 ```
 
----
-
-## 典型用法
-
-### 数据集管理
+另开终端启动前端：
 
 ```bash
-agent-eval dataset create my-eval-set --desc "初始评测集"
-agent-eval dataset add-case my-eval-set --from-file cases.json
-agent-eval dataset import-traces my-eval-set --project prod-agent --status success --limit 100
-agent-eval dataset list --filter eval
-agent-eval dataset show my-eval-set --tag failure --limit 20
-agent-eval dataset stats my-eval-set
-agent-eval dataset versions my-eval-set
-agent-eval dataset export my-eval-set -o ./backup.jsonl --format jsonl
+cd frontend
+npm install
+npm run dev
 ```
 
-### LLM 用例生成
+- Web UI: `http://localhost:3000`
+- OpenAPI: `http://localhost:8000/docs`
+
+### Docker Compose
 
 ```bash
-agent-eval dataset generate scenario my-eval-set \
-    --scenario "用户问天气并要求写一封邮件" \
-    --count 5 --tag weather --tag email
-
-agent-eval dataset generate mutate my-eval-set \
-    --case-id 3f2a --count 3 --strategy adversarial
+cp .env.example .env
+docker compose up -d --build postgres migrate backend frontend
 ```
 
-### 评估
+Compose 会按 `postgres -> migrate -> backend -> frontend` 启动评估工作台：
+
+- Web UI: `http://localhost`
+- API: `http://localhost:8000`
+
+仓库还定义了可选的 OmniAgent 服务。其本地构建依赖相邻的上游 `OmniAgent` 源码目录；准备好该目录和模型配置后，可启动完整栈：
 
 ```bash
-# 基于 Python Factory
-agent-eval evaluate my-eval-set \
-    --agent-module myapp.agent:factory \
-    --concurrency 5
-
-# 基于 HTTP API
-agent-eval evaluate my-eval-set \
-    --api-url https://my-agent/v1 \
-    --api-type openai \
-    --api-key sk-... \
-    --api-model gpt-4o
-
-# 基于 YAML 配置
-agent-eval evaluate my-eval-set --config eval_config.yaml
+docker compose up -d --build
 ```
 
-### 闭环优化
+## CLI 示例
 
 ```bash
-agent-eval run my-eval-set \
-    --agent-module myapp.agent:factory \
-    --target-score 0.85 \
-    --max-iterations 10 \
-    --concurrency 5
-```
+# 初始化数据库
+agent-eval init-db
 
-### 标准 Benchmark
+# 从线上 Trace 构造回归数据集
+agent-eval dataset create checkout-regression --desc "Checkout agent regression set"
+agent-eval dataset import-traces checkout-regression \
+  --project production-agent --status success --limit 100
 
-```bash
+# 评估 OpenAI-compatible Agent
+agent-eval evaluate checkout-regression \
+  --api-url https://agent.example.com/v1 \
+  --api-type openai \
+  --api-model agent-model \
+  --api-key "$AGENT_API_KEY" \
+  --concurrency 5
+
+# 运行带收敛与回归保护的优化闭环
+agent-eval run checkout-regression \
+  --agent-module myapp.agent:factory \
+  --target-score 0.85 \
+  --max-iterations 10
+
+# 执行 BFCL-v4 标准基准
 agent-eval bench bfcl \
-    --api-url https://api.openai.com/v1 \
-    --api-key sk-... \
-    --model gpt-4o \
-    --categories simple,multi_turn \
-    --concurrency 5
+  --api-url https://api.example.com/v1 \
+  --api-key "$AGENT_API_KEY" \
+  --model agent-model
 ```
 
----
+## 代码地图
 
-## 项目结构
+```text
+src/agent_eval/
+├── api/                     FastAPI 路由、鉴权与应用装配
+├── data/                    数据集、Trace、内容块与图片导入
+├── evaluation/              执行编排、Judge、成本和报告
+├── optimization/            失败分析与策略生成
+├── loop/                    收敛、停滞和回归保护
+├── governance/              去重、校验、生命周期与审计
+├── db_models/               SQLAlchemy 模型与 Repository
+├── services/omniagent_chat.py
+├── omniagent_data/          受控数据目录与查询层
+└── omniagent_runtime/       动作、任务、制品、配额、调度与 worker
 
-```
-agent_eval/
-├── pyproject.toml               项目配置与 CLI 入口
-├── alembic/                     数据库迁移
-├── eval_config.example.yaml     HTTP Agent 评测配置样例
-├── bfcl_config.example.yaml     BFCL-v4 Benchmark 配置样例
-│
-├── src/agent_eval/
-│   ├── cli.py                   Typer CLI 入口（dataset / bench / run / evaluate / server）
-│   ├── config.py                Pydantic Settings 全局配置
-│   ├── db.py                    SQLAlchemy async engine + session
-│   │
-│   ├── api/                     FastAPI 后端
-│   │   ├── app.py               应用装配
-│   │   ├── dependencies.py      依赖注入
-│   │   ├── schemas.py           请求/响应模型
-│   │   └── routers/             auth · projects · datasets · cases · traces
-│   │                            benchmark · candidates · generate · routing
-│   │                            scheduler · governance · config
-│   │
-│   ├── auth/                    JWT + bcrypt + 多项目隔离
-│   ├── models/                  Pydantic 数据模型（TestCase · Trace · Score · Optimization）
-│   ├── db_models/               SQLAlchemy ORM + Repository
-│   │
-│   ├── data/                    数据层
-│   │   ├── dataset_manager.py   数据集版本与用例加载
-│   │   ├── langsmith_provider.py LangSmith 适配
-│   │   ├── case_generator.py    LLM 驱动用例生成
-│   │   ├── trace_extractor.py   从线上 trace 回溯用例
-│   │   ├── benchmark_import.py  Excel / CSV 导入
-│   │   └── converter.py         格式转换
-│   │
-│   ├── evaluation/              评估层
-│   │   ├── orchestrator.py      并发执行 + 评分编排
-│   │   ├── trace_collector.py   LangChain Callback
-│   │   ├── agent_adapter.py     OpenAI / SSE HTTP 适配器
-│   │   ├── bench_config.py      YAML 配置
-│   │   ├── bfcl_runner.py       BFCL-v4 集成
-│   │   ├── regression.py        回归检测
-│   │   ├── report.py            报告生成
-│   │   └── scorers/             output · tool_sequence · reasoning
-│   │                            performance · error_recovery · llm_judge
-│   │
-│   ├── optimization/            优化层
-│   │   ├── failure_analyzer.py  LLM 分类 + 聚类
-│   │   ├── strategy_generator.py LLM 策略生成
-│   │   └── strategy_applicator.py 策略应用
-│   │
-│   ├── loop/                    闭环控制器
-│   │   └── controller.py        收敛 / 停滞 / 回归三重安全阀
-│   │
-│   ├── governance/              治理
-│   │   ├── dedup.py · lifecycle.py · validator.py · audit.py
-│   │
-│   ├── routing/                 数据集路由
-│   │   ├── engine.py · matcher.py · subscriber.py
-│   │
-│   └── scheduler/               调度
-│       ├── service.py · poller.py · events.py
-│
-├── frontend/                    React 18 + Vite + TypeScript + Tailwind
-│   └── src/
-│       ├── pages/               Login · Register · Projects · Dashboard
-│       │                        Datasets · DatasetDetail · Traces
-│       │                        Benchmark · Candidates · Generate
-│       │                        AutoCollect · Routing · Scheduler
-│       │                        Audit · Config
-│       ├── components/Layout.tsx
-│       ├── services/            Axios + React Query
-│       ├── stores/              Zustand
-│       └── types/
-│
-├── grafana/dashboards/          Grafana Dashboard JSON
-├── prototype/                   原型草稿
-└── tests/                       单测 + 集成测试
-    ├── test_api/ · test_data/ · test_scorers/
-    ├── test_optimization/ · test_loop/ · test_governance/
+frontend/src/
+├── pages/                   数据集、评估、对比、管理与 OmniAgent 页面
+├── components/              批量操作、成本分析、消息与产品面板
+├── services/                类型化 API 客户端
+└── lib/                     内容块、定价、评估语义和报告导出
+
+deploy/
+├── omniagent/               Prompt、Skills、overlay 与运行时镜像
+└── k8s/
+    ├── omniagent-sidecar/   基础对话 sidecar
+    └── omniagent-execution/ 受控执行、RBAC、sandbox 与验收工具
 ```
 
----
+## 质量保障
 
-## Web UI
+仓库包含 50+ 个测试模块，覆盖 API、数据导入、评估语义、OmniAgent runtime、租户隔离和部署脚本。
 
-前端基于 React 18 + TypeScript + Vite + TailwindCSS + Zustand + React Query + Recharts。
+```bash
+pytest
+ruff check src tests
 
-| 页面 | 功能 |
-|------|------|
-| Projects | 多项目管理 |
-| Dashboard | 评估结果概览、五维趋势、通过率 |
-| Datasets / DatasetDetail | 数据集 CRUD、用例浏览 / 筛选 / 编辑 |
-| Traces | 线上 trace 浏览与回溯导入 |
-| Benchmark | BFCL 及自定义 Benchmark 执行 |
-| Generate | LLM 驱动的用例生成界面 |
-| Candidates | 候选用例审核与入库 |
-| AutoCollect | 线上 trace 自动采集 |
-| Routing | 数据集 → 评估方法路由配置 |
-| Scheduler | 定时评估任务 |
-| Audit | 操作审计日志 |
-| Config | 系统配置 |
-
----
-
-## Grafana 可视化
-
-| 面板 | 类型 | 数据来源 |
-|------|------|---------|
-| 闭环总览 | 折线图 | `loop_control_log.aggregate_score by iteration` |
-| 五维评分趋势 | 多线折线图 | `evaluation_scores` 按 dimension 聚合 |
-| 失败模式分布 | 堆叠柱状图 | `optimizations.failure_analysis` JSONB 解析 |
-| 用例通过率热力图 | 热力图 | `test_results × test_runs` 交叉 |
-| 性能趋势 | 多线折线图 | `test_results.latency_ms / total_tokens` |
-| 优化策略效果 | 柱状图 | `optimizations.improvement_delta` |
-| 回归告警 | 表格 | `loop_control_log WHERE safety_stopped = true` |
-
-数据源直连 PostgreSQL，利用 JSONB 字段的 `->>`、`jsonb_array_elements` 做深度查询。
-
----
-
-## Agent Factory 接口
-
-接入闭环需实现以下协议：
-
-```python
-from typing import Any, Protocol
-
-class AgentFactory(Protocol):
-    def get_config(self) -> dict[str, Any]:
-        """返回当前 Agent 配置（system_prompt, tools, temperature 等）"""
-        ...
-
-    def create(self, config: dict[str, Any]) -> AgentProtocol:
-        """根据配置创建 Agent 实例"""
-        ...
+cd frontend
+npm run lint
+npm run build
 ```
 
-策略应用器会深拷贝 `get_config()` 的返回值并修改，随后通过 `create()` 实例化新版本 Agent 进行对照评估——**不会**原地修改用户的 Agent。
+OmniAgent 还提供分层验收：
 
----
+- 部署单测验证 RBAC、镜像门禁、模板渲染和回滚语义；
+- 双租户 E2E 验证列表、详情、变更和事件游标均不泄漏跨租户资源；
+- staging smoke test 默认只读，live 模式必须显式二次确认并严格清理测试资源。
 
-## 数据模型
+## 当前边界
 
-### 7 张核心表
+- Kubernetes 执行平面默认关闭；启用前必须准备不可变镜像并通过 staging 验收。
+- 可选 Axi runtime 的制品身份验证不等于使用许可，书面许可确认仍是独立门禁。
+- `.env.example` 仅含占位符。真实密钥应由 Secret Manager 或部署平台注入，禁止提交到仓库。
+- 本仓库维护 Agent Eval 集成与治理层；OmniAgent 上游框架源码不复制进本仓库。
 
-| 表 | 职责 | 关键字段 |
-|---|------|---------|
-| `dataset_versions` | 数据集版本 | `version_tag` (UNIQUE), `parent_version` |
-| `test_cases` | 用例存储 | `input_messages` / `expected_tool_calls` (JSONB), `tags` (ARRAY + GIN) |
-| `test_runs` | 批次记录 | `agent_config` 快照 (JSONB), `ab_group`, `optimization_id` |
-| `test_results` | 执行结果 | `actual_output`, `actual_tool_calls`, `full_trace` (JSONB) |
-| `evaluation_scores` | 评分明细 | `dimension`, `score`, `weight`, `weighted_score`, `details` (JSONB) |
-| `optimizations` | 优化记录 | `failure_analysis`, `strategy_detail`, `improvement_delta` (JSONB) |
-| `loop_control_log` | 闭环日志 | `loop_session_id`, `iteration`, `aggregate_score`, `converged`, `safety_stopped` |
+## 使用说明
 
-关系：
-
-```
-dataset_versions ←── test_cases
-                 ←── test_runs ←── test_results ←── evaluation_scores
-                                ←── optimizations
-                                ←── loop_control_log
-```
-
----
-
-## 环境变量
-
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `DB_HOST` · `DB_PORT` · `DB_USER` · `DB_PASSWORD` · `DB_NAME` | localhost:5432 / postgres | PostgreSQL |
-| `LLM_PROVIDER` | openai | LLM 提供商 |
-| `LLM_MODEL` | gpt-4o | Agent 默认模型 |
-| `LLM_JUDGE_MODEL` | gpt-4o | Judge 模型 |
-| `LLM_BASE_URL` | — | 自定义 OpenAI 兼容端点 |
-| `LLM_API_KEY` | — | API Key |
-| `LANGSMITH_API_KEY` / `LANGSMITH_API_URL` | — | LangSmith 托管 |
-| `EVAL_BATCH_CONCURRENCY` | 5 | 评估并发 |
-| `EVAL_FAILURE_THRESHOLD` | 0.7 | 失败判定阈值 |
-| `LOOP_TARGET_SCORE` | 0.85 | 收敛目标 |
-| `LOOP_MAX_ITERATIONS` | 10 | 最大轮数 |
-
----
-
-## 实现状态
-
-| 阶段 | 状态 |
-|------|------|
-| 数据层 — DatasetManager · LangSmithProvider · CaseGenerator · TraceExtractor · BenchmarkImport | 完成 |
-| 评估层 — TraceCollector · 五维评分 · HTTP Adapter · BFCL-v4 · RegressionDetector | 完成 |
-| 优化层 — FailureAnalyzer · StrategyGenerator · StrategyApplicator | 完成 |
-| 闭环控制器 — LoopController + 三重安全阀 | 完成 |
-| API 层 — FastAPI + 13 个 router + JWT Auth | 完成 |
-| Web UI — React + 14 个页面 | 完成 |
-| 治理 — 去重 / 生命周期 / 校验 / 审计 | 完成 |
-| 路由 — 数据集 → 评估方法 | 完成 |
-| 调度 — 定时任务 + 事件驱动 | 完成 |
-| Grafana Dashboard | 进行中 |
-| 端到端示例 Agent | 进行中 |
-
----
-
-## 许可
-
-内部项目，详见仓库根目录声明。
+本仓库目前未声明开源许可证，主要用于个人作品展示与技术评审。第三方组件和可选集成仍受各自许可证约束。
